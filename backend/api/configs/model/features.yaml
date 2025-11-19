@@ -1,0 +1,58 @@
+symbols:
+  - XAUUSD
+  - EURUSD
+  - GBPUSD
+  - USDJPY
+  - USDCHF
+  - USDCAD
+horizon: "1h"
+
+features:
+  # Core price/vol
+  - name: close_t
+    type: float
+  - name: atr14_m15_pct
+    type: float         # 100*ATR(14)/close on M15
+  - name: rvol15
+    type: float         # sum vol last 15m / baseline 5d same TOD
+
+  # Trend / structure
+  - name: ema20_gt_ema50
+    type: int           # 0/1
+  - name: ema_slope_20_m15
+    type: float
+  - name: adx14_m15
+    type: float
+  - name: di_pos_gt_di_neg
+    type: int           # 0/1
+  - name: dist_to_nearest_sr_bp
+    type: float         # basis points
+
+  # Lagged bars (M1 or M5)
+  - { name: ret_1m,  type: float }
+  - { name: ret_5m,  type: float }
+  - { name: ret_15m, type: float }
+
+  # Exogenous (internal-first)
+  - name: usd_basket_d1h_pct
+    type: float        # + = USD strong, − = USD weak
+  - name: vix_d1h_pct
+    type: float        # optional, omit if unavailable
+  - name: dxy_d1h_pct
+    type: float        # optional
+  - name: yield10y_d1h_bps
+    type: float        # optional
+
+  # Session/time
+  - name: tod_min
+    type: int          # minutes since session open
+  - name: dow
+    type: int          # 1..7
+
+labeling:
+  cls_target: "up_1h"   # 1 if close_{t+1h} > close_t else 0
+  reg_target: "move_1h_pct"  # 100*(close_{t+1h}/close_t - 1)
+
+meta:
+  leakage_guard: true
+  tz: "UTC"             # store raw timestamps in UTC

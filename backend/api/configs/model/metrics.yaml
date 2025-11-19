@@ -1,0 +1,11 @@
+classification:
+  - AUC
+  - Brier
+  - Accuracy@0.6_0.4
+  - PrecisionRecall@bull
+  - PrecisionRecall@bear
+regression:
+  - MAE
+  - RMSE
+calibration:
+  - reliability_curve

@@ -1,0 +1,10 @@
+classification:
+  name: up_1h
+  positive: "close_{t+1h} > close_t"
+  thresholds:
+    bull: 0.60
+    bear: 0.40
+
+regression:
+  name: move_1h_pct
+  formula: "100*(close_{t+1h}/close_t - 1)"
