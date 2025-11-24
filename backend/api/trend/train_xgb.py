@@ -11,7 +11,12 @@ MODEL_DIR = BASE / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 FEATURE_COLS = [
-    "atr14_m15_pct","rvol15","ret_15m","usd_basket_d1h_pct","tod_min","dow",
+    "atr14_h1_pct",
+    "rvol_h1",
+    "ret_1h",
+    "usd_basket_h1_pct",
+    "tod_min",
+    "dow",
 ]
 TARGET_BIN = "up_1h"
 TARGET_REG = "move_1h_pct"

@@ -69,43 +69,64 @@ def parse_snap_value(val):
     tf = _norm_tf(str(tf)) if tf else None
     return df, tf
 
-def resample_to_m15(df_in, tf_label):
-    if tf_label == "M15":
+def resample_to_h1(df_in, tf_label):
+    """
+    Normalize any TF to H1 bars.
+
+    - If tf_label == "H1": use bars as-is
+    - If smaller TF (M1/M5/M15): resample to 1H
+    """
+    if tf_label == "H1":
         return df_in.copy()
+
     df = df_in.copy()
     dt = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
     df = df.assign(dt=dt).set_index("dt")
-    rule = "15min"  # Pandas >=2.2
+
+    rule = "1H"
     o = df["open"].resample(rule).first()
     h = df["high"].resample(rule).max()
     l = df["low"].resample(rule).min()
     c = df["close"].resample(rule).last()
     v = df["volume"].resample(rule).sum()
-    out = pd.DataFrame({"open":o,"high":h,"low":l,"close":c,"volume":v}).dropna(how="any")
+
+    out = pd.DataFrame(
+        {"open": o, "high": h, "low": l, "close": c, "volume": v}
+    ).dropna(how="any")
+
     out = out.reset_index()
     out["ts_ms"] = (out["dt"].astype("int64") // 1_000_000).astype(np.int64)
-    return out[["ts_ms","open","high","low","close","volume"]]
+    return out[["ts_ms", "open", "high", "low", "close", "volume"]]
 
 def pull_symbol_any_tf(symbol):
     keys = scan_snap_keys(symbol)
     if not keys:
-        return pd.DataFrame(columns=["ts_ms","open","high","low","close","volume"])
+        return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
+
     frames = []
     for k in keys:
         raw = R.get(k)
-        if not raw: continue
-        if isinstance(raw,(bytes,bytearray)): raw = raw.decode("utf-8","ignore")
+        if not raw:
+            continue
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+
         df, tf = parse_snap_value(raw)
-        if df is None or df.empty: continue
+        if df is None or df.empty:
+            continue
+
         tf = tf or _norm_tf(k.split(":")[-1])
-        df_m15 = resample_to_m15(df, tf)
-        if not df_m15.empty: frames.append(df_m15)
+        df_h1 = resample_to_h1(df, tf)
+        if not df_h1.empty:
+            frames.append(df_h1)
+
     if not frames:
-        return pd.DataFrame(columns=["ts_ms","open","high","low","close","volume"])
+        return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
+
     out = pd.concat(frames, ignore_index=True)
     out = out.sort_values("ts_ms").drop_duplicates(subset=["ts_ms"]).reset_index(drop=True)
     out["symbol"] = symbol
-    out["timeframe"] = "M15"
+    out["timeframe"] = "H1"
     return out
 
 def atr14(ohlc):
@@ -132,44 +153,74 @@ def rvol_m15_rowwise(df_upto):
     return curr / denom
 
 def build_features(df):
+    """
+    Build H1 feature columns to match infer_rt.FEATURE_COLS_H1:
+      atr14_h1_pct, rvol_h1, ret_1h, usd_basket_h1_pct, tod_min, dow
+    """
     out = df.copy()
-    out["ret_15m"] = out["close"].pct_change().fillna(0.0) * 100.0
+
+    # 1-hour return in percent
+    out["ret_1h"] = out["close"].pct_change().fillna(0.0) * 100.0
+
+    # ATR14 as percent of price on H1
     atr = atr14(out)
-    out["atr14_m15_pct"] = (pd.Series(atr) / out["close"]).fillna(0.0) * 100.0
+    out["atr14_h1_pct"] = (pd.Series(atr) / out["close"]).fillna(0.0) * 100.0
+
+    # Relative volume on H1 – reuse existing rowwise logic
     rvol_vals = []
     for i in range(len(out)):
         rvol_vals.append(rvol_m15_rowwise(out.iloc[:i+1]))
-    out["rvol15"] = rvol_vals
+    out["rvol_h1"] = rvol_vals
+
+    # Time-of-day and day-of-week
     dt = pd.to_datetime(out["ts_ms"], unit="ms", utc=True)
     out["tod_min"] = dt.dt.hour * 60 + dt.dt.minute
     out["dow"] = dt.dt.dayofweek + 1
-    out["usd_basket_d1h_pct"] = np.nan  # stitched later if majors present
+
+    # USD basket tilt (H1) – stitched later
+    out["usd_basket_h1_pct"] = np.nan
     return out
 
 def label_next_1h(df):
+    """
+    For H1 bars, 'next 1h' is just the next bar.
+    """
     df = df.copy()
-    next_close = df["close"].shift(-4)  # 4 x M15
+    next_close = df["close"].shift(-1)  # 1 x H1
     move_pct = (next_close / df["close"] - 1.0) * 100.0
     df["move_1h_pct"] = move_pct
     df["up_1h"] = (move_pct > 0).astype(int)
     return df
 
 def stitch_usd_basket(symbol_frames):
-    needed = {"EURUSD":"-", "GBPUSD":"-", "AUDUSD":"-", "USDJPY":"+", "USDCHF":"+", "USDCAD":"+"}
-    avail = {k:v for k,v in needed.items() if k in symbol_frames and not symbol_frames[k].empty}
-    if not avail: return None
+    """
+    Build H1 USD basket in percent:
+      - Use ret_1h from each symbol
+      - Flip sign for quote-USD pairs (EURUSD/GBPUSD/AUDUSD)
+      - Take simple mean across symbols
+    """
+    needed = {"EURUSD": "-", "GBPUSD": "-", "AUDUSD": "-", "USDJPY": "+", "USDCHF": "+", "USDCAD": "+"}
+    avail = {k: v for k, v in needed.items() if k in symbol_frames and not symbol_frames[k].empty}
+    if not avail:
+        return None
+
     aligned = None
     for sym in avail.keys():
-        f = symbol_frames[sym][["ts_ms","ret_15m"]].rename(columns={"ret_15m": f"r_{sym}"})
+        f = symbol_frames[sym][["ts_ms", "ret_1h"]].rename(columns={"ret_1h": f"r_{sym}"})
         aligned = f if aligned is None else aligned.merge(f, on="ts_ms", how="outer")
+
     aligned = aligned.sort_values("ts_ms").ffill()
     cols = [c for c in aligned.columns if c.startswith("r_")]
     arr = aligned[cols].copy()
+
     for c in cols:
-        if c.endswith(("EURUSD","GBPUSD","AUDUSD")): arr[c] = -arr[c]
-        else: arr[c] = +arr[c]
-    aligned["usd_basket_d1h_pct"] = arr.mean(axis=1).rolling(4, min_periods=1).sum()
-    return aligned[["ts_ms","usd_basket_d1h_pct"]]
+        if c.endswith(("EURUSD", "GBPUSD", "AUDUSD")):
+            arr[c] = -arr[c]
+        else:
+            arr[c] = +arr[c]
+
+    aligned["usd_basket_h1_pct"] = arr.mean(axis=1)
+    return aligned[["ts_ms", "usd_basket_h1_pct"]]
 
 def main():
     frames = {}
@@ -195,10 +246,10 @@ def main():
 
     # expected columns (ensure they exist)
     keep = [
-        "symbol","ts_ms","close",
-        "atr14_m15_pct","rvol15","ret_15m",
-        "usd_basket_d1h_pct","tod_min","dow",
-        "move_1h_pct","up_1h"
+         "symbol", "ts_ms", "close",
+         "atr14_h1_pct", "rvol_h1", "ret_1h",
+         "usd_basket_h1_pct", "tod_min", "dow",
+         "move_1h_pct", "up_1h",
     ]
     for c in keep:
         if c not in all_df.columns:
