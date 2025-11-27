@@ -437,10 +437,16 @@ export type InstrumentRow = {
   symbol: string;
   price: number;
   bias: Bias;
+  short_term_score?: number;
+  long_term_score?: number;
+  st_trend_label?: Bias;   // NEW: ST trend label from backend
+  ht_trend_label?: Bias; 
   direction: Direction;
   prob_up_1h: number; // 0..1
   expected_move_pct_1h: number; // signed, +0.30 => up 0.30%
   target_price_1h: number;
+  expected_move_pct_4h?: number;
+  target_price_4h?: number;
   reasons: string[];
   confidence_band?: number; // ATR units
   updated_broker_ts: number; // epoch ms
@@ -450,11 +456,30 @@ export type InstrumentRow = {
   tz_offset_min?: number;
   decision?: "BUY" | "SELL" | "";
   target_pips?: number;
+  
+
 };
 
 // Map backend /trend/predict/all row -> InstrumentRow (defensive defaults)
 function mapApiRowToInstrument(r: any): InstrumentRow {
   const label: string = (r?.label || "").toString();
+  // short-term and long-term trends from backend
+  // short-term and long-term trends from backend
+  // prefer new H1/H4 scores if present, fall back to older score_* fields
+  const st =
+    typeof r?.st_trend_score === "number"
+      ? r.st_trend_score
+      : (typeof r?.score_raw_tech === "number" ? r.score_raw_tech : null);
+
+  const ht =
+    typeof r?.ht_trend_score === "number"
+      ? r.ht_trend_score
+      : (typeof r?.score_tech === "number" ? r.score_tech : null);
+
+  // optional explicit labels from backend
+  const stLabelApi: string = (r?.st_trend_label || "").toString();
+  const htLabelApi: string = (r?.ht_trend_label || "").toString();
+
   const decision: string = (r?.decision || "").toString();
   const bias: Bias =
     label === "Strong Bullish" ? "Strong Bullish" :
@@ -481,6 +506,13 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
   const target_price =
     typeof r?.target_price_1h === "number" ? r.target_price_1h : null;
 
+  // 4h horizon (if backend sends them)
+  const exp_move_4h =
+    typeof r?.expected_move_pct_4h === "number" ? r.expected_move_pct_4h : undefined;
+
+  const target_price_4h =
+    typeof r?.target_price_4h === "number" ? r.target_price_4h : undefined;
+
   // reasons: normalize to string[]
   const reasons: string[] = Array.isArray(r?.reasons)
     ? r.reasons.map(String)
@@ -495,10 +527,30 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
     symbol: String(r?.symbol || ""),
     price: NaN as any, // priced separately from M1 feed
     bias,
+    short_term_score: st ?? undefined,
+    long_term_score: ht ?? undefined,
+    st_trend_label:
+      stLabelApi === "Strong Bullish" ||
+      stLabelApi === "Bullish" ||
+      stLabelApi === "Neutral" ||
+      stLabelApi === "Bearish" ||
+      stLabelApi === "Strong Bearish"
+        ? (stLabelApi as Bias)
+        : undefined,
+    ht_trend_label:
+      htLabelApi === "Strong Bullish" ||
+      htLabelApi === "Bullish" ||
+      htLabelApi === "Neutral" ||
+      htLabelApi === "Bearish" ||
+      htLabelApi === "Strong Bearish"
+        ? (htLabelApi as Bias)
+        : undefined,
     direction,
     prob_up_1h: typeof prob_up === "number" ? prob_up : NaN as any,
     expected_move_pct_1h: typeof exp_move === "number" ? exp_move : 0,
     target_price_1h: target_price ?? (typeof r?.target === "number" ? r.target : undefined),
+    expected_move_pct_4h: exp_move_4h,
+    target_price_4h: target_price_4h,
     decision: typeof r?.decision === "string" ? (r.decision as any) : "",
     target_pips: typeof r?.target_pips === "number" ? r.target_pips : undefined,
     reasons,
@@ -596,6 +648,15 @@ function biasToScore(b: Bias): number {
       return -2;
   }
 }
+function scoreToTrendLabel(s?: number): string {
+  if (typeof s !== "number") return "—";
+  if (s >= 0.6) return "Strong Bullish";
+  if (s >= 0.2) return "Bullish";
+  if (s > -0.2) return "Neutral";
+  if (s > -0.6) return "Bearish";
+  return "Strong Bearish";
+}
+
 
 function biasToPill(b?: Bias): { text: string; className: string; arrow: string } {
   const base = "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium";
@@ -738,9 +799,12 @@ const TableView: React.FC<{
         <thead className="bg-slate-900/60 text-slate-300 text-xs">
           <tr>
             <th className="px-4 py-3 text-left font-medium">Instrument</th>
-            <th className="px-4 py-3 text-left font-medium">Status</th>
+            <th className="px-4 py-3 text-left font-medium">HT Trend</th>
+            <th className="px-4 py-3 text-left font-medium">ST Trend</th>
             <th className="px-4 py-3 text-left font-medium">Price (M1)</th>
             <th className="px-4 py-3 text-left font-medium">1h Target</th>
+            <th className="px-4 py-3 text-left font-medium">4h Target</th>
+
             <th className="px-4 py-3 text-left font-medium">ProbUp</th>
             <th className="px-4 py-3 text-left font-medium">Reasons</th>
             <th className="px-4 py-3 text-left font-medium">Updated (broker)</th>
@@ -749,7 +813,8 @@ const TableView: React.FC<{
         </thead>
         <tbody className="divide-y divide-slate-800/60 text-sm">
           {displayRows.map((r) => {
-  const pill = biasToPill(r.bias);
+            const htLabel: Bias = (r.ht_trend_label as Bias | undefined) ?? r.bias;
+            const pill = biasToPill(htLabel);
   
   // prefer the row's broker-aligned timestamp; fallback to live price ts
   const rawPriceTs = prices?.[r.symbol]?.lastTs ?? r.updated_broker_ts;
@@ -770,10 +835,24 @@ const TableView: React.FC<{
       {/* Instrument */}
       <td className="px-4 py-3 text-slate-200 font-medium">{r.symbol}</td>
 
-      {/* Status (pill) */}
+      {/* HT Trend (existing status) */}
       <td className="px-4 py-3">
         <span className={pill.className}>{pill.text}</span>
       </td>
+
+      
+      {/* ST Trend (backend st_trend_label if present, else score-based) */}
+      <td className="px-4 py-3">
+        {(() => {
+          const lbl: Bias =
+            (r.st_trend_label as Bias | undefined) ??
+            (scoreToTrendLabel(r.short_term_score) as Bias);
+          const pillSt = biasToPill(lbl);
+          return <span className={pillSt.className}>{pillSt.text}</span>;
+        })()}
+      </td>
+
+
 
       {/* Price (M1) */}
       <td className="px-4 py-3">
@@ -855,6 +934,80 @@ const TableView: React.FC<{
     <span className="text-slate-500">—</span>
   )}
 </td>
+ 
+{/* 4h Target (extended horizon) */}
+{/* 4h Target (H4 model only) */}
+<td className="px-4 py-3 text-slate-200">
+  {showTarget ? (
+    (() => {
+      const hasPct4h = typeof r.expected_move_pct_4h === "number";
+      const hasTp4h  = typeof r.target_price_4h === "number";
+
+      // If backend hasn’t sent any H4 fields yet ? show placeholder
+      if (!hasPct4h && !hasTp4h) {
+        return (
+          <span className="text-slate-500">
+            ? —{/* no 4h model yet */}
+          </span>
+        );
+      }
+
+      // live price preferred, fallback to row.price
+      const px = typeof prices?.[r.symbol]?.price === "number"
+        ? prices[r.symbol].price
+        : (typeof r.price === "number" ? r.price : NaN);
+
+      const pip = pipSize(r.symbol);
+      const pxOk = Number.isFinite(px);
+
+      const pctVal = hasPct4h ? (r.expected_move_pct_4h as number) : undefined;
+      const pctText4h = hasPct4h ? pctSym(pctVal, r.symbol) : "—";
+
+      // 1) explicit backend H4 target
+      let target4h: number | null = hasTp4h ? (r.target_price_4h as number) : null;
+
+      // guard: if explicit target is basically equal to current price, treat as “no target”
+      if (
+        target4h != null &&
+        pxOk &&
+        Math.abs(target4h - (px as number)) < 0.5 * pip
+      ) {
+        target4h = null;
+      }
+
+      // 2) if no explicit price but we have a 4h %, derive from that
+      if (target4h == null && pxOk && typeof pctVal === "number") {
+        const dir =
+          r.decision === "SELL" ? -1 :
+          r.decision === "BUY"  ? +1 :
+          Math.sign(pctVal);
+        const pct = Math.abs(pctVal) / 100;
+        target4h = (px as number) * (1 + dir * pct);
+      }
+
+      // If still nothing sensible, show placeholder
+      if (target4h == null) {
+        return (
+          <span className="text-slate-500">
+            ? —{/* cannot compute 4h yet */}
+          </span>
+        );
+      }
+
+      return (
+        <span>
+          {pctText4h} {"-"}{" "}
+          <span className="tabular-nums">
+            {fmtPrice(r.symbol, target4h, decimalsFromPrice(px as number))}
+          </span>
+        </span>
+      );
+    })()
+  ) : (
+    <span className="text-slate-500">—</span>
+  )}
+</td>
+
 
 
       {/* ProbUp */}
@@ -864,7 +1017,26 @@ const TableView: React.FC<{
 
       {/* Reasons */}
       <td className="px-4 py-3 text-slate-300">
-        {showReasons && Array.isArray(r.reasons) ? r.reasons.slice(0,2).join("; ") : "—"}
+        {showReasons && Array.isArray(r.reasons) && r.reasons.length > 0 ? (
+          <div className="flex items-center gap-1">
+            {/* short preview, full text on hover via title */}
+            <span
+              className="truncate max-w-xs block"
+              title={r.reasons.join("; ")}
+            >
+              {r.reasons.slice(0, 2).join("; ")}
+            </span>
+
+            {/* +N badge if there are more reasons */}
+            {r.reasons.length > 2 && (
+              <span className="shrink-0 text-[11px] text-slate-400">
+                +{r.reasons.length - 2}
+              </span>
+            )}
+          </div>
+        ) : (
+          "—"
+        )}
       </td>
 
       {/* Updated (broker) */}

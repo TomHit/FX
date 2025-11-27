@@ -1,27 +1,497 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Literal, List, Tuple, Optional,Any,Dict
-from fastapi import APIRouter, HTTPException, Depends,Query,Request,Header
+
+
+from typing import Literal, List, Tuple, Optional, Any, Dict
+from fastapi import APIRouter, HTTPException, Depends, Query, Request, Header
 from pydantic import BaseModel, Field, validator
-import os, json, time as _time, logging,redis,re,time
+import os
+import json
+import time as _time
+import logging
+import redis
+import re
+import time
 import math
 import httpx
 from .db import db
 from fastapi.responses import JSONResponse
 from pathlib import Path
 import xgboost as xgb
+from api.macro_state import get_macro_snapshot
 import csv
-from typing import Any, Dict, List
+from api.trend.infer_rt import (
+    predict_next_hour,
+    predict_next_4h,
+    pull_latest_h1,
+    pull_latest_h4,
+)
+
+
 log = logging.getLogger("xtl.trend")
+
+# --- H4 model toggle (default OFF to avoid slow path/504s) ---
+ENABLE_H4_MODEL = os.getenv("ENABLE_H4_MODEL", "false").lower() == "true"
+log.info(f"[TREND] ENABLE_H4_MODEL={ENABLE_H4_MODEL}")
 
 
 REG_PATH = Path("/opt/xauapi/api/trend/models/xgb_reg.json")
 CLS_PATH = Path("/opt/xauapi/api/trend/models/xgb_cls.json")
 
+
+
+# --- Opportunity thresholds & helpers (H1 + H4) ---
+
+# H1: "immediate" room thresholds (in percent)
+ROOM_THRESHOLDS_H1: dict[str, float] = {
+    "XAUUSD": 0.02,   # gold typically ~0.5-1.3% daily, tune later
+    "EURUSD": 0.02,
+    "GBPUSD": 0.02,
+    "USDJPY": 0.02,
+    "USDCHF": 0.02,
+    "USDCAD": 0.02,
+}
+
+# H4: larger-structure room thresholds (can be equal or slightly higher than H1)
+ROOM_THRESHOLDS_H4: dict[str, float] = {
+    "XAUUSD": 0.03,
+    "EURUSD": 0.03,
+    "GBPUSD": 0.03,
+    "USDJPY": 0.03,
+    "USDCHF": 0.03,
+    "USDCAD": 0.03,
+}
+
+# Minimum overall opportunity score (0-100 scale) before we surface an item.
+# Can be tuned or overridden via env var: XTREND_OPP_SCORE_MIN
+try:
+    OPP_SCORE_MIN: float = float(os.getenv("XTREND_OPP_SCORE_MIN", "40.0"))
+except Exception:
+    OPP_SCORE_MIN = 40.0
+
+
+
+def _room_thr_h1(sym: str) -> float:
+    """
+    Per-symbol 1h opportunity threshold.
+    If symbol not listed, default to 1.0% so nothing explodes.
+    """
+    if not sym:
+        return 1.0
+    return float(ROOM_THRESHOLDS_H1.get(sym.upper(), 1.0))
+
+
+def _room_thr_h4(sym: str) -> float:
+    """
+    Per-symbol 4h "structure" threshold.
+    If symbol not listed, fall back to its own H1 threshold.
+    """
+    if not sym:
+        return 1.0
+    return float(ROOM_THRESHOLDS_H4.get(sym.upper(), _room_thr_h1(sym)))
+
+
+# Where we keep per-symbol frozen H1 opportunity snapshots in Redis
+
+# Where we keep per-symbol frozen H1 opportunity snapshots in Redis
+OPP_SNAPSHOT_PREFIX = "xtl:trend:opp:h1"
+
+
+def _opp_snapshot_key(sym: str, opp_dir: str) -> str:
+    d = opp_dir.strip().upper()
+    if d in ("BUY", "LONG", "UP", "BULL", "BULLISH"):
+        d = "UP"
+    elif d in ("SELL", "SHORT", "DOWN", "BEAR", "BEARISH"):
+        d = "DOWN"
+    return f"{OPP_SNAPSHOT_PREFIX}:{sym}:{d}"
+
+
+def _freeze_or_snapshot_opp(sym: str, row: dict[str, Any], now_ms: int | None = None) -> dict[str, Any]:
+    """
+    Create or load a frozen 1-hour opportunity snapshot.
+
+    Rules:
+      - First time (no snapshot): freeze direction, basis, expected_move_pct_1h and target_price_1h.
+      - Later calls: ignore new model values and reuse frozen fields from Redis.
+
+    This keeps:
+      - alert_created_ms
+      - direction / opp_direction
+      - expected_move_pct_1h
+      - target_price_1h
+
+    stable for the whole 1-hour window until the alert is hit or expired.
+    """
+    if now_ms is None:
+        now_ms = int(_time.time() * 1000)
+
+    # 1) Normalise direction from the live row
+    opp_dir = (row.get("opp_direction") or row.get("direction") or "").upper()
+    row["direction"] = opp_dir
+    row["opp_direction"] = opp_dir
+
+    if not opp_dir:
+        row["_opp_is_new"] = False
+        return row
+
+    # 2) Look for an existing snapshot for this symbol+direction
+    snap_key = _opp_snapshot_key(sym, opp_dir)
+    try:
+        snap = R.hgetall(snap_key) or {}
+    except Exception:
+        snap = {}
+
+    def _snap_get_float(key: str, fallback: float | None = None) -> float | None:
+        val = snap.get(key)
+        if val is None:
+            return fallback
+        try:
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", "ignore")
+            return float(val)
+        except Exception:
+            return fallback
+
+    def _snap_get_int(key: str, fallback: int | None = None) -> int | None:
+        val = snap.get(key)
+        if val is None:
+            return fallback
+        try:
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", "ignore")
+            return int(float(val))
+        except Exception:
+            return fallback
+
+    def _snap_get_str(key: str, fallback: str | None = None) -> str | None:
+        val = snap.get(key)
+        if val is None:
+            return fallback
+        if isinstance(val, bytes):
+            val = val.decode("utf-8", "ignore")
+        try:
+            return json.loads(val)
+        except Exception:
+            return val
+
+    # If snapshot exists but has a bogus basis (<= 0), drop it and rebuild.
+    if snap:
+        existing_basis = _snap_get_float("basis_price", 0.0)
+        try:
+            basis_val = float(existing_basis)
+        except Exception:
+            basis_val = 0.0
+        if basis_val <= 0.0:
+            try:
+                R.delete(snap_key)
+            except Exception:
+                pass
+            snap = {}
+
+    # -------------------------------------------------
+    # CASE A: snapshot exists -> REUSE frozen values
+    # -------------------------------------------------
+    if snap:
+        # Direction: freeze from snapshot
+        snap_dir = _snap_get_str("opp_direction", opp_dir) or opp_dir
+        snap_dir_u = str(snap_dir).upper()
+        row["direction"] = snap_dir_u
+        row["opp_direction"] = snap_dir_u
+
+        # Alert time
+        alert_ms = _snap_get_int("alert_created_ms", now_ms) or now_ms
+        row["alert_created_ms"] = alert_ms
+
+        # Basis, move, target
+        basis = _snap_get_float("basis_price", None)
+        move = _snap_get_float("opp_expected_move_pct_1h", None)
+        if move is None:
+            move = _snap_get_float("expected_move_pct_1h", 0.0)
+        target = _snap_get_float("target_price_1h", None)
+
+        if basis is not None:
+            row["basis_price"] = basis
+            row["alert_price_1h"] = basis
+
+        if move is not None:
+            row["opp_expected_move_pct_1h"] = move
+            row["expected_move_pct_1h"] = move
+
+        if target is not None:
+            row["target_price_1h"] = target
+
+        status = _snap_get_str("status", "active")
+        if status is not None:
+            row["status"] = status
+
+        row["_opp_is_new"] = False
+        return row
+
+    # -------------------------------------------------
+    # CASE B: no snapshot yet -> create one from live row
+    # -------------------------------------------------
+    alert_ms = int(now_ms)
+
+    # Basis from last_close / last_price / existing basis
+    basis: float | None = None
+    last_px = row.get("last_close")
+    if isinstance(last_px, (int, float)) and last_px > 0:
+        basis = float(last_px)
+    else:
+        last_px = row.get("last_price")
+        if isinstance(last_px, (int, float)) and last_px > 0:
+            basis = float(last_px)
+
+    if basis is None:
+        existing_basis = row.get("basis_price") or row.get("alert_price_1h")
+        if isinstance(existing_basis, (int, float)) and existing_basis > 0:
+            basis = float(existing_basis)
+
+    # Move from opp_expected_move_pct_1h or expected_move_pct_1h
+    move_raw = row.get("opp_expected_move_pct_1h")
+    if move_raw is None:
+        move_raw = row.get("expected_move_pct_1h")
+    try:
+        move = float(move_raw) if move_raw is not None else 0.0
+    except Exception:
+        move = 0.0
+
+    # If we still do not have meaningful basis or move, do not create an alert
+    if basis is None or basis <= 0 or abs(move) < 1e-6:
+        row["_opp_is_new"] = False
+        return row
+
+    # Target based on basis and move
+    try:
+        target = basis * (1.0 + move / 100.0)
+    except Exception:
+        target = basis
+
+    # Write frozen values back into the row
+    row["alert_created_ms"] = alert_ms
+    row["basis_price"] = basis
+    row["alert_price_1h"] = basis
+    row["opp_expected_move_pct_1h"] = move
+    row["expected_move_pct_1h"] = move
+    row["target_price_1h"] = target
+    row["status"] = "active"
+
+    # Build a snapshot payload for Redis
+    payload = {
+        "symbol": sym,
+        "direction": opp_dir,
+        "opp_direction": opp_dir,
+        "alert_created_ms": alert_ms,
+        "basis_price": basis,
+        "opp_expected_move_pct_1h": move,
+        "expected_move_pct_1h": move,
+        "target_price_1h": target,
+        "status": "active",
+        "alert_id": row.get("alert_id"),
+        "opp_id": row.get("opp_id"),
+        "score": row.get("opp_score"),
+        "p_up": row.get("prob_up"),
+    }
+
+    try:
+        encoded = {k: json.dumps(v) for k, v in payload.items()}
+        R.hset(snap_key, mapping=encoded)
+    except Exception as e:
+        log.warning("[OPP] _freeze_or_snapshot_opp save failed sym=%s err=%r", sym, e)
+
+    try:
+        _save_alert_snapshot(sym, payload)
+    except Exception as e:
+        log.warning("[OPP] _freeze_or_snapshot_opp history save failed sym=%s err=%r", sym, e)
+
+    row["_opp_is_new"] = True
+    return row
+
+import json as _json
+
+def _append_opp_history(sym: str, opp_dir: str, snap: dict[str, Any]) -> None:
+    """
+    Append one final alert record to Redis history.
+    Stored newest-first.
+    """
+    try:
+        now_ms = int(time.time() * 1000)
+    except Exception:
+        now_ms = 0
+
+    try:
+        open_ts = int(float(snap.get("alert_created_ms", now_ms)))
+    except Exception:
+        open_ts = now_ms
+
+    try:
+        exp_ts = int(float(snap.get("opp_expire_ts", open_ts + 3600_000)))
+    except Exception:
+        exp_ts = open_ts + 3600_000
+
+    alert_id = f"{sym}-{open_ts}"
+
+    item = {
+        "id": alert_id,
+        "symbol": sym,
+        "direction": opp_dir.lower(),
+        "alert_created_ms": open_ts,
+        "opp_expire_ts": exp_ts,
+    }
+
+    for field in ("expected_move_pct_1h", "target_price_1h", "basis_price_1h", "p_up"):
+        v = snap.get(field)
+        if v is None:
+            continue
+        try:
+            item[field] = float(v)
+        except Exception:
+            pass
+
+    try:
+        key = "xtl:trend:opp:history"
+        R.lpush(key, _json.dumps(item))
+        R.ltrim(key, 0, 199)  # keep last 200 alerts
+    except Exception as e:
+        log.warning("[OPP] history lpush failed sym=%s dir=%s err=%r", sym, opp_dir, e)
+
+
+
+
+
+def _delta_thr_h1(sym: str, thr1: float) -> float:
+    """
+    Minimum change in 1h forecast (in percent) before we treat it as a fresh
+    opportunity signal.
+
+    Default rule:
+    - 0.5 * room threshold, but not less than 0.10%.
+      e.g. if room_thr_h1 = 0.4%, delta_thr = 0.20%;
+           if room_thr_h1 = 1.0%, delta_thr = 0.50%.
+    """
+    try:
+        base = float(thr1)
+    except (TypeError, ValueError):
+        base = 1.0
+    # optional env override per symbol if you ever need it
+    env_key = f"XTREND_DELTA_THR_{(sym or '').upper()}"
+    env_val = os.getenv(env_key)
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            pass
+    # default: half of room, floored at 0.10%
+    return max(0.2, 0.5 * base)
+
+
+def _compute_opp_score(sym: str, row: dict, m1: float | None, thr1: float) -> float:
+    """
+    Compute an overall opportunity score on a 0-100 style scale using:
+    - Room vs per-symbol threshold (H1 expected move).
+    - Alignment of ST/HT trend with the move direction.
+    - H1 model probability (p_up).
+
+    Returns 0.0 if inputs are unusable.
+    """
+    # 1) basic sanity
+    try:
+        move = float(m1)
+    except (TypeError, ValueError):
+        return 0.0
+
+    try:
+        base_thr = float(thr1)
+    except (TypeError, ValueError):
+        base_thr = 0.0
+
+    if base_thr <= 0.0:
+        return 0.0
+
+    # Direction of the opportunity: +1 (up) / -1 (down)
+    if move > 0:
+        direction = 1.0
+    elif move < 0:
+        direction = -1.0
+    else:
+        return 0.0
+
+    abs_move = abs(move)
+
+    # --- Room score (0-40) -----------------------------------------------
+    # ratio = 1.0 -> just at threshold -> 0 pts
+    # ratio = 2.0 or more -> 40 pts
+    ratio = abs_move / base_thr
+    if ratio <= 1.0:
+        room_score = 0.0
+    elif ratio >= 2.0:
+        room_score = 40.0
+    else:
+        room_score = 40.0 * (ratio - 1.0)  # linear 1.0..2.0 -> 0..40
+
+    # --- Trend alignment (ST+HT) (0-40) -----------------------------------
+    def _safe_float(v: Any) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    st_tr = _safe_float(row.get("st_trend_score"))
+    ht_tr = _safe_float(row.get("ht_trend_score"))
+
+    # Convert to "support" in [0, 2]:
+    # - For longs, positive trend scores support the move.
+    # - For shorts, negative trend scores support the move.
+    support = 0.0
+    if direction > 0:
+        support += max(st_tr, 0.0) + max(ht_tr, 0.0)
+    else:
+        support += max(-st_tr, 0.0) + max(-ht_tr, 0.0)
+
+    # Each full "unit" of support (both ST+HT strongly aligned) is ~40 pts.
+    # st_tr / ht_tr are already in [-1,1], so support is 0..2.
+    trend_score = max(0.0, min(40.0, 20.0 * support))
+
+    # --- Probability confidence (0-10) ------------------------------------
+    p_up = row.get("p_up", row.get("prob_up"))
+    try:
+        p_up_val = float(p_up)
+    except (TypeError, ValueError):
+        p_up_val = 0.5
+
+    spread = abs(p_up_val - 0.5)  # 0..0.5
+
+    if spread <= 0.05:
+        conf_score = 0.0
+    elif spread >= 0.20:
+        conf_score = 10.0
+    else:
+        # 0.05 -> 0, 0.20 -> 10
+        conf_score = 10.0 * (spread - 0.05) / 0.15
+
+    total = room_score + trend_score + conf_score
+    # Safety clamp
+    if total < 0.0:
+        total = 0.0
+    if total > 100.0:
+        total = 100.0
+    return total
+
+def _sign(v: float | None) -> int:
+    """Return +1 / -1 / 0 for a numeric value."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return 0
+    if x > 0:
+        return 1
+    if x < 0:
+        return -1
+    return 0
+
 REG_MODEL: xgb.Booster | None = None
 CLS_MODEL: xgb.Booster | None = None
-
 
 BROKER_DIGITS = int(os.getenv("BROKER_DIGITS", "3"))  # set 3 if your XAU broker uses 3 digits
 FORCE_TZ_OFFSET_MIN = os.getenv("FORCE_TZ_OFFSET_MIN")  # e.g., "0", "120", "180"
@@ -31,6 +501,208 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://default:xau12345@10.0.0.132:6379/0")
 R = redis.from_url(REDIS_URL, decode_responses=True)
 log.info(f"[TREND]  module={__file__}")
 log.info(f"[TREND] REDIS_URL={REDIS_URL}")
+
+# Store last-perceived H1 move in Redis so we can compute prediction delta
+PRED_DELTA_KEY_FMT = "xtl:trend:last_move_pct_h1:%s"
+
+
+
+#def _write_alert_history(row: dict):
+    # prepend or append depending on UI preferences
+    #R.lpush("opp:history", json.dumps(row))
+    #R.ltrim("opp:history", 0, 200)
+
+
+def _delete_live_snapshot(sym: str, opp_dir: str | None = None):
+    """
+    Remove the live per-symbol snapshot from Redis.
+
+    If opp_dir is None, delete both directions + legacy key.
+    """
+    try:
+        # Legacy key (cleanup)
+        R.delete(f"opp:snap:{sym}")
+
+        # New per-direction snapshots
+        if opp_dir:
+            R.delete(_opp_snapshot_key(sym, opp_dir))
+        else:
+            for d in ("UP", "DOWN"):
+                R.delete(_opp_snapshot_key(sym, d))
+    except Exception as e:
+        log.warning("[OPP] _delete_live_snapshot failed sym=%s err=%r", sym, e)
+
+
+
+# --------------------------
+# ALERT HISTORY HELPERS (Redis)
+# --------------------------
+
+
+ALERT_HASH_PREFIX = "xtl:trend:opp:h1:"
+ALERT_INDEX_KEY = "xtl:trend:opp:h1:index"
+
+
+
+def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
+    """
+    Store an alert snapshot in Redis.
+
+    IMPORTANT:
+    - If payload["alert_id"] is present, we use it as-is.
+    - Otherwise we fall back to the old "{ts}:{SYM}:{DIR}" format and
+      also write that back into payload["alert_id"].
+    """
+    sym = (symbol or payload.get("symbol") or "").upper()
+    direction = str(
+        payload.get("opp_direction") or payload.get("direction") or ""
+    ).upper()
+
+    # 1) use existing alert_id if provided
+    alert_id = str(payload.get("alert_id") or "").strip()
+
+    # 2) fallback: old-style id
+    if not alert_id:
+        try:
+            ts = int(payload.get("alert_created_ms") or int(time.time() * 1000))
+        except Exception:
+            ts = int(time.time() * 1000)
+
+        alert_id = f"{ts}:{sym}:{direction or 'NA'}"
+        payload["alert_id"] = alert_id
+
+    key = f"{ALERT_HASH_PREFIX}{alert_id}"
+
+    try:
+        mapping = {k: json.dumps(v) for k, v in payload.items()}
+        R.hset(key, mapping=mapping)
+        R.lpush(ALERT_INDEX_KEY, alert_id)
+        R.ltrim(ALERT_INDEX_KEY, 0, 99)
+    except Exception as e:
+        log.warning("[OPP] _save_alert_snapshot failed id=%s err=%r", alert_id, e)
+
+    return alert_id
+
+def _load_opp_history(limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Return the latest *completed* alert history from Redis LIST index.
+
+    Reads from xtl:trend:opp:h1:index and per-alert hashes
+    xtl:trend:opp:h1:{alert_id}, but only returns alerts whose status
+    is "hit" or "expired".
+    """
+    out: list[dict[str, Any]] = []
+
+    try:
+        ids = R.lrange(ALERT_INDEX_KEY, 0, max(0, limit - 1))
+    except Exception as e:
+        log.warning("[OPP] _load_opp_history index read failed err=%r", e)
+        return out
+
+    # avoid duplicate rows if the same alert_id is in the list multiple times
+    seen_ids: set[str] = set()
+
+    for raw_id in ids:
+        if not raw_id:
+            continue
+
+        # raw_id can be bytes or str depending on Redis config
+        if isinstance(raw_id, bytes):
+            aid = raw_id.decode("utf-8", "ignore")
+        else:
+            aid = str(raw_id)
+
+        aid = aid.strip()
+        if not aid:
+            continue
+        if aid in seen_ids:
+            # de-dup in case the id was pushed multiple times
+            continue
+        seen_ids.add(aid)
+
+        key = f"{ALERT_HASH_PREFIX}{aid}"
+        try:
+            h = R.hgetall(key)
+        except Exception as e:
+            log.warning("[OPP] _load_opp_history hgetall failed key=%s err=%r", key, e)
+            continue
+
+        if not h:
+            continue
+
+        decoded: dict[str, Any] = {}
+        for k, v in h.items():
+            # keys/values can be bytes or str
+            if isinstance(k, bytes):
+                k_dec = k.decode("utf-8", "ignore")
+            else:
+                k_dec = str(k)
+
+            if isinstance(v, bytes):
+                v_str = v.decode("utf-8", "ignore")
+            else:
+                v_str = str(v)
+
+            try:
+                decoded[k_dec] = json.loads(v_str)
+            except Exception:
+                decoded[k_dec] = v_str
+
+        decoded["alert_id"] = aid
+
+        # --- NEW RULE: history shows only completed opportunities ---
+        status = decoded.get("status") or "active"
+        if status not in ("hit", "expired"):
+            # still live / not evaluated -> do not show in history table
+            continue
+        decoded["status"] = status
+
+        # default fields for UI
+        decoded.setdefault("realized_move_pct", None)
+        decoded.setdefault("max_drawdown_pct", None)
+        decoded.setdefault("expired_ts", None)
+        decoded.setdefault("hit_ts", None)
+
+        out.append(decoded)
+
+    # newest first by alert_created_ms if present
+    out.sort(key=lambda d: d.get("alert_created_ms") or 0, reverse=True)
+    return out
+
+
+# --------------------------
+# ALERT STATUS UPDATE HELPERS
+# --------------------------
+
+def _mark_alert_hit(alert_id: str, realized_move_pct: float, now_ms: int):
+    """Mark a stored alert as hit."""
+    key = f"xtl:trend:opp:h1:{alert_id}"
+    try:
+        if not R.exists(key):
+            return
+
+        R.hset(key, mapping={
+            "status": json.dumps("hit"),
+            "hit_ts": json.dumps(now_ms),
+            "realized_move_pct": json.dumps(realized_move_pct),
+        })
+    except Exception as e:
+        log.warning("[OPP] _mark_alert_hit failed id=%s err=%r", alert_id, e)
+
+
+def _mark_alert_expired(alert_id: str, now_ms: int):
+    """Mark a stored alert as expired (time horizon reached)."""
+    key = f"xtl:trend:opp:h1:{alert_id}"
+    try:
+        if not R.exists(key):
+            return
+
+        R.hset(key, mapping={
+            "status": json.dumps("expired"),
+            "expired_ts": json.dumps(now_ms),
+        })
+    except Exception as e:
+        log.warning("[OPP] _mark_alert_expired failed id=%s err=%r", alert_id, e)
 
 
 
@@ -44,6 +716,7 @@ def _calib_multiplier(sym: str) -> float:
     except Exception:
         return 1.0
 
+
 def _pct_decimals(sym: str, value: float | None = None) -> int:
     s = sym.upper()
     if s.endswith("JPY"):
@@ -56,107 +729,284 @@ def _pct_decimals(sym: str, value: float | None = None) -> int:
         a = abs(value)
         if a < 0.01:   # < 0.01% -> 4 dp (prevents 0.00%)
             return 4
-        if a < 0.1:    # < 0.10% -> 3 dp
+        if a < 0.10:   # < 0.10% -> 3 dp
             return 3
     return 2
+
+
+def _price_decimals(sym: str) -> int:
+    s = sym.upper()
+    if s.endswith("JPY"):
+        return 3
+    if s == "XAUUSD":
+        return 2
+    return 5
+
+
+def _pip(sym: str) -> float:
+    s = sym.upper()
+    if s == "XAUUSD":
+        return 0.1
+    if s.endswith("JPY"):
+        return 0.01
+    return 0.0001
+
+def _round_pct(sym: str, v: float) -> float:
+    return round(float(v), _pct_decimals(sym, float(v)))
+
+
 
 def _normalize_pct(sym: str, v: float | None) -> float | None:
     """
     Ensure v is in PERCENT units.
-    If a fractional input sneaks in (e.g., 0.0004 meaning 0.04%),
-    scale it to percent. Keep symbol-aware rounding.
+    If a fractional input sneaks in (for example 0.0004 meaning 0.04%),
+    scale it to percent. Then apply a symbol-specific stretch
+    for XAUUSD so that displayed moves are closer to historical reality.
     """
     if not isinstance(v, (int, float)):
         return None
+
     x = float(v)
-    # Treat any |x| < 1.0 as fraction-of-1 and scale to percent
+
+    # 1) If the model gave a fraction (0.0004 => 0.04%), convert to percent
     if abs(x) < 1.0:
         x *= 100.0
+
+    S = sym.upper()
+    if S == "XAUUSD":
+        # Quick-fix stretch for gold:
+        # median |move_1h_pct| ~ 0.16, current preds ~ 0.02 ? ~8x too small
+        x *= 8.0
+
     return _round_pct(sym, x)
 
 
 
 def _build_reasons(sym: str, label: str, p_up: float, extra: Dict[str, Any]) -> List[str]:
+    """
+    Build human-readable reasons for the dashboard / prediction meter.
+
+    Inputs:
+      sym   - symbol (for example XAUUSD)
+      label - trend label from detection ("Bullish", "Bearish", "Strong Bullish", etc.)
+      p_up  - model probability of up move
+      extra - feature bag; expected keys (if available):
+              - tf_scope: "H1" or "H4" (for ST vs HT reasons)
+              - base_reasons: List[str] from infer_rt / rule engine
+              - feat_rvol15: float, relative volume on M15
+              - feat_usd_basket: float, USD basket tilt
+              - macro_dxy_z: float, DXY z-score
+              - macro_yield_z: float, 10Y yield z-score
+              - macro_usd_rate_z: float, short-rate z-score
+              - macro_vix_z: float, VIX z-score
+    """
     reasons: List[str] = []
+
+    # per-symbol macro config from symbol_meta.json, if present
+    meta = _get_meta(sym)
+    macro_cfg = (meta.get("macro") or {}) if isinstance(meta, dict) else {}
+
+    # Which timeframe are we explaining? (H1 = ST, H4 = HT)
+    tf_scope = (extra.get("tf_scope") or "").upper()
+    if tf_scope == "H4":
+        tf_txt = "4h"
+    elif tf_scope == "H1":
+        tf_txt = "1h"
+    else:
+        tf_txt = "1h/4h"
+
+    # 0) Base reasons from upstream (infer_rt / rule engine), if any
+    base_reasons: List[str] = []
+    br = extra.get("base_reasons")
+    if isinstance(br, list):
+        base_reasons = [str(r) for r in br if isinstance(r, str) and r.strip()]
+    elif isinstance(br, str) and br.strip():
+        base_reasons = [br.strip()]
+
+    if base_reasons:
+        reasons.extend(base_reasons)
+
     lbl = (label or "").lower()
 
-    # 1) Trend / structure
-    if lbl == "bullish":
-        reasons.append("Trend engine sees a bullish 1h structure")
-    elif lbl == "bearish":
-        reasons.append("Trend engine sees a bearish 1h structure")
+    # 1) Structure reason (explicitly tag H1 or H4)
+    if "bullish" in lbl or "bearish" in lbl:
+        strong = "strong " if "strong" in lbl else ""
+        dir_txt = "bullish" if "bullish" in lbl else "bearish"
+        struct_reason = f"{strong.capitalize()}{dir_txt} {tf_txt} structure"
+        reasons.append(struct_reason)
 
-    # 2) Relative volume (RVOL on M15)
-    rv = extra.get("feat_rvol15")
+    # 2) Relative volume (if present)
+    rvol = extra.get("feat_rvol15")
+    if isinstance(rvol, (int, float)):
+        try:
+            rv = float(rvol)
+            if rv > 1.3:
+                reasons.append(f"RVOL ~{rv:.1f}x (elevated)")
+            elif rv < 0.7:
+                reasons.append(f"RVOL ~{rv:.1f}x (low)")
+        except Exception:
+            pass
+
+    # 3) USD basket / macro tone
+    usd_tilt = extra.get("feat_usd_basket")
+    if isinstance(usd_tilt, (int, float)):
+        try:
+            ut = float(usd_tilt)
+            if abs(ut) >= 0.2:
+                tone = "supportive" if ut < 0 else "headwind"
+                reasons.append(f"USD tone {tone} ({ut:+.2f}%)")
+        except Exception:
+            pass
+
+    # 4) Macro z-scores (optional, only if configured for symbol)
+    dxy_z = extra.get("macro_dxy_z")
+    if isinstance(dxy_z, (int, float)) and macro_cfg.get("use_dxy"):
+        try:
+            dz = float(dxy_z)
+            if abs(dz) >= 1.0:
+                side = "risk-off" if dz > 0 else "risk-on"
+                reasons.append(f"DXY {side} (z={dz:+.1f})")
+        except Exception:
+            pass
+
+    vix_z = extra.get("macro_vix_z")
+    if isinstance(vix_z, (int, float)) and macro_cfg.get("use_vix"):
+        try:
+            vz = float(vix_z)
+            if abs(vz) >= 1.0:
+                tone = "higher volatility" if vz > 0 else "calmer volatility"
+                reasons.append(f"VIX signals {tone} (z={vz:+.1f})")
+        except Exception:
+            pass
+
+    # 5) Model confidence wording (probability)
+    if isinstance(p_up, (int, float)):
+        try:
+            pu = float(p_up)
+            if pu >= 0.7:
+                reasons.append(f"Model up-bias (ProbUp {pu:.2f})")
+            elif pu <= 0.3:
+                reasons.append(f"Model down-bias (ProbUp {pu:.2f})")
+        except Exception:
+            pass
+
+    return reasons
+
+def _compute_weighted_status(
+    sym: str,
+    tech_score: float | None,
+    p_up: float | None,
+    extra: Dict[str, Any] | None,
+) -> Tuple[float, str, float, float, float]:
+    """
+    Combine technical trend, model probability and macro backdrop
+    into a single [-1, 1] score and label bucket.
+
+    Returns:
+        combined_score, label, tech_component, model_component, macro_component
+    """
+    # 1) technical component (already in [-1, 1] from trend engine)
     try:
-        rv_val = float(rv) if rv is not None else None
+        t = float(tech_score)
     except Exception:
-        rv_val = None
+        t = 0.0
+    t = max(min(t, 1.0), -1.0)
 
-    if isinstance(rv_val, (int, float)):
-        if rv_val >= 2.0:
-            reasons.append(f"Volume ~{rv_val:.1f}x normal (RVOL)")
-        elif rv_val >= 1.3:
-            reasons.append("Volume above normal (RVOL > 1.3x)")
-        elif rv_val <= 0.6:
-            reasons.append("Volume below normal (RVOL < 0.6x)")
-        # 0.6–1.3x -> treated as normal; no extra sentence
+    # 2) model component: map p_up in [0,1] to [-1,1]
+    m = 0.0
+    if isinstance(p_up, (int, float)):
+        m = float(p_up)
+        m = max(min(m, 1.0), 0.0)
+        # 0.5 -> 0, 1.0 -> +1, 0.0 -> -1
+        m = (m - 0.5) * 2.0
 
-    # 3) USD basket tilt (proxy for DXY / macro USD tone)
-    basket = extra.get("feat_usd_basket")
-    try:
-        basket_val = float(basket) if basket is not None else None
-    except Exception:
-        basket_val = None
+    # 3) macro component from per-symbol config and macro z-scores
+    macro_val = 0.0
+    if isinstance(extra, dict):
+        meta = _get_meta(sym)
+        macro_cfg = (meta.get("macro") or {}) if isinstance(meta, dict) else {}
 
-    if isinstance(basket_val, (int, float)) and abs(basket_val) >= 0.10:
-        # basket_val > 0  => broad USD strength
-        # basket_val < 0  => broad USD weakness
-        inv_pairs = {"EURUSD", "GBPUSD", "AUDUSD"}  # USD is quote
-        s = sym.upper()
+        agg = 0.0
+        w_sum = 0.0
 
-        if basket_val > 0:
-            # USD stronger
-            if s in inv_pairs:
-                reasons.append("Broad USD strength, a headwind for the pair")
-            else:
-                reasons.append("Broad USD strength supporting the move")
-        else:
-            # USD weaker
-            if s in inv_pairs:
-                reasons.append("Broad USD weakness supporting the move")
-            else:
-                reasons.append("Broad USD weakness, a headwind for the pair")
+        def _add_macro(key_cfg: str, extra_key: str) -> None:
+            nonlocal agg, w_sum
+            if extra_key not in extra:
+                return
+            try:
+                z = float(extra.get(extra_key))
+            except Exception:
+                return
 
-    # 4) Model confidence band
-    try:
-        p_val = float(p_up)
-    except Exception:
-        p_val = None
+            cfg = macro_cfg.get(key_cfg) or {}
+            sign = float(cfg.get("sign", 1.0))
+            weight = float(cfg.get("weight", 0.0))
+            z_on = float(cfg.get("z_on", 0.0))
 
-    if isinstance(p_val, (int, float)):
-        if p_val >= 0.70:
-            reasons.append(f"Model confidence is high (ProbUp {p_val:.2f})")
-        elif p_val >= 0.60:
-            reasons.append(f"Model edge with decent confidence (ProbUp {p_val:.2f})")
-        elif p_val <= 0.40:
-            reasons.append(f"Model leans down (ProbUp {p_val:.2f})")
+            if weight == 0.0:
+                return
 
-    # 5) Fallback to any raw reason from detection if nothing else
-    raw_reason = extra.get("reason")
-    if not reasons and isinstance(raw_reason, str) and raw_reason:
-        reasons.append(raw_reason)
+            # ignore tiny moves; treat half of z_on as "small"
+            if abs(z) < max(0.3, z_on * 0.5):
+                return
 
-    # De-duplicate while preserving order
-    out: List[str] = []
-    for r in reasons:
-        if r not in out:
-            out.append(r)
-    return out
+            # squash z to [-1, 1] by dividing by 3 sigmas
+            z_norm = max(min(z / 3.0, 1.0), -1.0)
+            contrib = sign * z_norm * weight
+            agg += contrib
+            w_sum += abs(weight)
+
+        # DXY, 10Y, short rate, VIX
+        _add_macro("dxy", "macro_dxy_z")
+        _add_macro("yield", "macro_yield_z")
+        _add_macro("usd_rate", "macro_usd_rate_z")
+        _add_macro("vix", "macro_vix_z")
+
+        # Optional: RVOL as macro-style driver (deviation from 1.0x)
+        rv = extra.get("feat_rvol15")
+        try:
+            rv_val = float(rv) if rv is not None else None
+        except Exception:
+            rv_val = None
+
+        if isinstance(rv_val, (int, float)):
+            cfg = macro_cfg.get("rvol") or {}
+            sign = float(cfg.get("sign", 1.0))
+            weight = float(cfg.get("weight", 0.0))
+            if weight != 0.0:
+                # deviation from 1.0, scaled so +/- 1.5x maps near +/-1
+                delta = rv_val - 1.0
+                if abs(delta) >= 0.1:
+                    rv_norm = max(min(delta / 1.5, 1.0), -1.0)
+                    agg += sign * rv_norm * weight
+                    w_sum += abs(weight)
+
+        if w_sum > 0.0:
+            macro_val = max(min(agg / w_sum, 1.0), -1.0)
+
+    # Weights for components
+    W_TECH = 0.5
+    W_MODEL = 0.3
+    W_MACRO = 0.2
+
+    combined = (W_TECH * t) + (W_MODEL * m) + (W_MACRO * macro_val)
+    combined = max(min(combined, 1.0), -1.0)
+
+    # Map to label buckets
+    if combined >= 0.6:
+        lbl = "Strong Bullish"
+    elif combined >= 0.2:
+        lbl = "Bullish"
+    elif combined <= -0.6:
+        lbl = "Strong Bearish"
+    elif combined <= -0.2:
+        lbl = "Bearish"
+    else:
+        lbl = "Neutral"
+
+    return combined, lbl, t, m, macro_val
 
 
-def _round_pct(sym: str, v: float) -> float:
-    return round(float(v), _pct_decimals(sym, float(v)))
 
 def _fmt_mtime(p: Path) -> str:
     try:
@@ -207,6 +1057,63 @@ async def _startup_models():
 
 PRED_LOG = Path("/opt/xauapi/api/trend/out/predict_log.csv")
 PRED_RAW_LOG = PRED_LOG.with_name("predict_reg_debug.csv")
+
+OPP_LOG = PRED_LOG.with_name("opportunities_log.csv")
+
+
+def _log_opportunity(row: dict) -> None:
+    """
+    Append one opportunity row to opportunities_log.csv.
+
+    This lets you later evaluate:
+    - when it appeared (opp_open_ts)
+    - when it expired (opp_expire_ts)
+    - whether the realized move hit the expected room.
+    """
+    try:
+        is_new = not OPP_LOG.exists()
+        with OPP_LOG.open("a", newline="") as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow([
+                    "opp_open_ts",          # when we surfaced this opportunity
+                    "symbol",
+                    "opp_direction",       # "UP"/"DOWN"
+                    "opp_confidence",      # "high"/"medium"
+                    "expected_move_pct_1h",
+                    "target_price_1h",
+                    "basis_price_1h",
+                    "opp_min_room_h1",
+                    "opp_min_room_h4",
+                    "opp_h4_agree",        # True/False/None
+                    "opp_expire_ts",       # when the 1h horizon ends
+                    "target_close_ts",     # same as opp_expire_ts (for now)
+                    "decision",            # BUY/SELL/ABSTAIN from headline
+                ])
+            w.writerow([
+                int(row.get("opp_open_ts", 0)),
+                row.get("symbol", ""),
+                row.get("opp_direction", ""),
+                row.get("opp_confidence", ""),
+                float(row.get("expected_move_pct_1h", 0.0)),
+                float(row.get("target_price_1h", 0.0))
+                    if row.get("target_price_1h") not in (None, "") else "",
+                float(row.get("basis_price_1h", 0.0))
+                    if row.get("basis_price_1h") not in (None, "") else "",
+                float(row.get("opp_min_room_h1", 0.0)),
+                float(row.get("opp_min_room_h4", 0.0)),
+                row.get("opp_h4_agree", ""),
+                int(row.get("opp_expire_ts", 0)),
+                int(row.get("target_close_ts", 0)),
+                row.get("decision", ""),
+            ])
+    except Exception:
+        # logging must never break API
+        pass
+
+
+
+
 
 
 def _log_prediction(row: dict, last_close: float) -> None:
@@ -274,7 +1181,7 @@ def predict_eval_ready(limit: int = 500):
             dff["t_close_ms"] = dff["t_open_ms"] + (15*60*1000)
             hit = dff.loc[dff["t_close_ms"] == target_close_ts]
             if hit.empty:
-                # tolerate slight clock skews: nearest within ±1 min
+                # tolerate slight clock skews: nearest within +/- 1 min
                 hit = dff.iloc[(dff["t_close_ms"] - target_close_ts).abs().argsort()[:1]]
             close1h = float(hit["close"].iloc[0])
 
@@ -806,7 +1713,7 @@ def price_all(
             device_used = pinned_device
         else:
             snap, bmeta = _read_freshest_snap_for_user_or_any(user_id, sym_u, "M1")
-            # ^ this may pick “any” device; we’ll expose which one below if your helper sets it,
+            # ^ this may pick any device; we will expose which one below if your helper sets it,
             # otherwise leave device_used None
 
         if not snap:
@@ -913,6 +1820,12 @@ def _scan_freshest_device_snap(sym: str, tfu: str):
             break
     return best, best_dev
 
+@router.get("/predict/ping")
+def predict_ping():
+    return {"ok": True, "msg": "predict router alive"}
+
+
+
 @router.get("/predict/all")
 def predict_all(
     tf: str = "M15",
@@ -921,388 +1834,663 @@ def predict_all(
     x_device_id: str | None = Header(None, convert_underscores=False),
     user = Depends(require_auth_optional),
 ):
+    """
+    Main prediction feed.
+
+    ST trend  = 1-hour structure (H1) + H1 model + macro
+    HT trend  = 4-hour structure (H4) + H4 model + macro
+
+    - Uses H1 XGBoost model via infer_rt.predict_next_hour.
+    - Uses H4 XGBoost model via infer_rt.predict_next_4h.
+    - ST trend fields are based on H1 (tech + model + macro).
+    - HT trend fields are based on H4 (tech + model + macro).
+    - Reasons are returned separately for H1 and H4:
+        * reasons_h1 -> ST (1h) reasons
+        * reasons_h4 -> HT (4h) reasons
+      and "reasons" keeps H1 reasons for backward compatibility.
+    """
+
+    
+
     tfu = (tf or "M15").upper()
     syms = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
 
-    # prefer user's device if present; fall back to freshest-any
+    # Build H1 + H4 frames once per request (avoid repeated Redis scans inside infer_rt)
+    need_syms = ["XAUUSD", "EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCHF", "USDCAD"]
+    now_frames_h1 = {s: pull_latest_h1(s) for s in need_syms}
+    now_frames_h4 = {s: pull_latest_h4(s) for s in need_syms} if ENABLE_H4_MODEL else None
+
+
+    # prefer user's device if present; fall back to freshest-any for OHLC snapshots
     user_id = getattr(user, "user_id", None) if user else None
-    load_models_if_needed()
-    if REG_MODEL is None or CLS_MODEL is None:
-        return {"ok": False, "reason": "model_not_loaded"}
 
-    rows = []
+    rows: list[dict] = []
+    now_ms = int(_time.time() * 1000)
+
+    # helper: map score [-1,1] -> label
+    def _score_to_label(s: float) -> str:
+        if s >= 0.6:
+            return "Strong Bullish"
+        elif s >= 0.2:
+            return "Bullish"
+        elif s <= -0.6:
+            return "Strong Bearish"
+        elif s <= -0.2:
+            return "Bearish"
+        else:
+            return "Neutral"
+
+    TF_MS_LOCAL = {"M15": 15 * 60_000, "H1": 60 * 60_000, "H4": 4 * 60 * 60_000}
+
+    # Macro snapshot once per request (shared by H1/H4)
+    try:
+        macro = get_macro_snapshot()
+    except Exception:
+        macro = None
+
     for sym in syms:
+        
+        # --- 1) Run H1 + H4 models -------------------------------------------
+        try:
+            pr_h1 = predict_next_hour(sym, now_frames=now_frames_h1)
+        except Exception as e:
+            log.exception("[predict_all] predict_next_hour EXC sym=%s", sym)
+            pr_h1 = {"ok": False, "reason": "infer_exc_h1", "detail": str(e)}
+
+        if not isinstance(pr_h1, dict):
+            pr_h1 = {"ok": False, "reason": "infer_not_dict_h1"}
+
+        if ENABLE_H4_MODEL:
+            try:
+                pr_h4 = predict_next_4h(sym, now_frames=now_frames_h4)
+            except Exception as e:
+                log.exception("[predict_all] predict_next_4h EXC sym=%s", sym)
+                pr_h4 = {"ok": False, "reason": "infer_exc_h4", "detail": str(e)}
+        else:
+            # fast stub if H4 model is disabled via env
+            pr_h4 = {"ok": False, "reason": "h4_disabled"}
+
+        if not isinstance(pr_h4, dict):
+            pr_h4 = {"ok": False, "reason": "infer_not_dict_h4"}
+        
+
+        ok_h1 = pr_h1.get("ok", False)
+        ok_h4 = pr_h4.get("ok", False)
+
+        # --- 2) Latest OHLC + broker meta -----------------------------------
         snap, broker = _read_freshest_snap_for_user_or_any(user_id, sym, tfu)
-        if not snap:
-            rows.append({"symbol": sym, "label": "Neutral", "score": 0.0, "reason": "no_data"})
-            continue
+        bars = (snap or {}).get("bars") or []
 
-        bars = snap.get("bars") or []
-        if not bars:
-            rows.append({"symbol": sym, "label": "Neutral", "score": 0.0, "reason": "empty_bars"})
-            continue
+        tf_ms = TF_MS_LOCAL.get(tfu, 60 * 60_000)
 
-        # Build close/high/low arrays from CLOSED bars only
-        closes, highs, lows = [], [], []
-        now_ms = int(time.time() * 1000)
-        off_min = int(((broker or {}).get("tz_offset_min")) or 0)
-
-        m15_next_ms = _next_boundary_ms(15*60, now_ms, off_min)   # UI: next 15m close (“Next bar in”)
-        h1_next_ms  = _next_boundary_ms(60*60, now_ms, off_min)   # Horizon: next H1 close
-        best, best_dev = _scan_freshest_device_snap(sym, tfu)   # returns {'price', 't_ms'}, 'dev_<id>'
-        last_closed_ms = m15_next_ms - (15 * 60 * 1000)     
-
-        TF_MS = {"M15": 15*60*1000, "H1": 60*60*1000, "H4": 4*60*60*1000}
-        tf_ms = TF_MS.get(tfu, 60*60*1000)
-
-        for b in bars:
+        last_closed = None
+        for b in reversed(bars):
             t_ms = _ms_from_t(b.get("t_open_ms") or b.get("t"))
             if t_ms is None:
                 continue
             is_closed = (b.get("complete") is True) or (t_ms + tf_ms <= now_ms)
-            if not is_closed:
-                continue
-            closes.append(float(b.get("c", 0.0)))
-            highs.append(float(b.get("h", 0.0)))
-            lows.append(float(b.get("l", 0.0)))
+            if is_closed:
+                last_closed = {**b, "t_open_ms": t_ms}
+                break
 
-        if len(closes) < 20:
-            rows.append({"symbol": sym, "label": "Neutral", "score": 0.0, "reason": "insufficient_bars"})
-            continue
+        # price basis: prefer model lastClose (H1 first, then H4), else OHLC
+        last_close = None
+        if isinstance(pr_h1.get("lastClose"), (int, float)):
+            last_close = float(pr_h1["lastClose"])
+        elif isinstance(pr_h4.get("lastClose"), (int, float)):
+            last_close = float(pr_h4["lastClose"])
+        elif isinstance(last_closed, dict) and isinstance(last_closed.get("c"), (int, float)):
+            last_close = float(last_closed["c"])
 
-        # Use your existing detection params + logic
-        params = DetectParams(
-            ma=MAParams(fast=10 if tfu == "M15" else 20, slow=20 if tfu == "M15" else 50, type="ema"),
-            slope=SlopeParams(period=10 if tfu == "M15" else 20, threshold=0.30),
-            structure=StructureParams(atrMult=1.5, zigzagPct=0.6),
-            strength=StrengthParams(adxMin=20, lookback=14, useDIbias=True),
-        )
-        label, score, extra = compute_label_and_score(closes, highs, lows, params)
+        # --- 2b) Latest M1 price for user-facing targets ------------------
+        last_price_m1 = None
+        try:
+            snap_m1, _ = _read_freshest_snap_for_user_or_any(user_id, sym, "M1")
+        except Exception:
+            snap_m1 = None
+
+        bars_m1 = (snap_m1 or {}).get("bars") or []
+        for b in reversed(bars_m1):
+            c = b.get("c")
+            if isinstance(c, (int, float)):
+                last_price_m1 = float(c)
+                break
+
+        # Fallback to last_close if we could not get a clean M1 price
+        if last_price_m1 is None and isinstance(last_close, (int, float)):
+            last_price_m1 = last_close
+
+
+        # broker tz for H1 horizon timestamp
+        off_min = 0
+        try:
+            off_min = int((broker or {}).get("tz_offset_min") or 0)
+        except Exception:
+            off_min = 0
+
+        target_close_ts = _next_boundary_ms(60 * 60, now_ms, off_min)
+
+        # --- 3) Model probabilities & raw move (H1/H4) ----------------------
+        def _safe_p_up(pr: dict, fallback: float = 0.5) -> float:
+            try:
+                return float(pr.get("p_up", pr.get("probUp", fallback)))
+            except (TypeError, ValueError):
+                return fallback
+
+        p_up_h1 = _safe_p_up(pr_h1, 0.5)
+        p_up_h4 = _safe_p_up(pr_h4, p_up_h1)
+
+        def _safe_move_pct(pr: dict) -> float:
+            """
+            Treat move_pct / predMovePct as already in PERCENT.
+            Example: 0.97 -> 0.97% move magnitude.
+            """
+            raw = pr.get("move_pct", pr.get("predMovePct"))
+            try:
+                return abs(float(raw)) if raw is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        mag_pct_h1 = _safe_move_pct(pr_h1)
+        mag_pct_h4 = _safe_move_pct(pr_h4)
+
+
+        # Direction from probability band for each TF
+        direction_sign_h1 = 1.0 if p_up_h1 >= 0.5 else -1.0
+        direction_sign_h4 = 1.0 if p_up_h4 >= 0.5 else -1.0
+
+        signed_pct_1h = mag_pct_h1 * direction_sign_h1
+        signed_pct_4h = mag_pct_h4 * direction_sign_h4
 
         
-        # --- NEW: get p_up via preloaded models; fallback to infer_rt; then to rule score ---
-        # --- Use preloaded Booster models for p_up (and optional 1h target move) ---
-        p_up = None
-        move_pct = None
-        feat_rvol15 = None
-        feat_usd_basket = None
-
-        try:
-           load_models_if_needed()
-           if CLS_MODEL is not None and REG_MODEL is not None:
-               # Build features exactly as before
-               from api.trend.infer_rt import pull_latest_m15, compute_usd_basket, build_features_m15
-
-               need_syms = ["XAUUSD","EURUSD","GBPUSD","AUDUSD","USDJPY","USDCHF","USDCAD"]
-               now_frames = {s: pull_latest_m15(s) for s in need_syms}
-               df_sym = now_frames.get(sym)
-
-               if df_sym is not None and not df_sym.empty and len(df_sym) >= 8:
-                   basket = compute_usd_basket(now_frames)
-                   X = build_features_m15(df_sym, basket).astype("float32")
-                   
-                   try:
-                       row_feat = X.iloc[0]
-                       if isinstance(extra, dict):
-                           extra.setdefault("feat_rvol15", float(row_feat.get("rvol15", 0.0)))
-                           extra.setdefault("feat_ret_15m", float(row_feat.get("ret_15m", 0.0)))
-                           extra.setdefault("feat_usd_basket", float(row_feat.get("usd_basket_d1h_pct", 0.0)))
-                   except Exception:
-                       pass
-
-                   # DMatrix for Booster prediction
-                   dmat = xgb.DMatrix(X)
-
-
-                   # Classifier: probability of class 1
-                   probs = CLS_MODEL.predict(dmat)  # shape (n,) for binary:logistic or (n, k) for softprob
-                   if probs.ndim == 1:
-                       p_up = float(probs[0])
-                   else:
-                       # softprob: take prob of positive class (index 1)
-                       p_up = float(probs[0, 1])
-
-                   # Regressor: signed percent move (e.g., +0.40)
-                   pred = REG_MODEL.predict(dmat)
-                   move_pct = float(pred[0])
-                   
-
-
-        except Exception:
-            p_up = None
-            move_pct = None
-
-        if p_up is None:
-            # Fallback: infer_rt or rule-based
-            try:
-               from api.trend.infer_rt import predict_next_hour
-               pr = predict_next_hour(sym)
-               if isinstance(pr, dict):
-                   if pr.get("p_up") is not None:
-                       p_up = float(pr["p_up"])
-                   if pr.get("move_pct") is not None:
-                       move_pct = float(pr["move_pct"])
-            except Exception:
-                p_up = None
-                move_pct = None
-
-        if p_up is None:
-            p_up = 0.5 * (score + 1.0)
-
-        # (optional) quick ATR estimate for target sizing (existing policy sizing)
-        atr_val = None
-        try:
-            lb = max(5, params.strength.lookback)
-            _atr_vals = atr(highs, lows, closes, lb)
-            atr_val = float(_atr_vals[-1]) if _atr_vals is not None and len(_atr_vals) else None
-        except Exception:
-            atr_val = None
-
-        # Existing policy decision (direction/size based on prob & ATR)
-        decision, target_pips, confidence = _policy_decision(sym, p_up, atr_val)
-        # --- Derive display fields for 1h target ---
-        # --- Derive display fields for 1h target (single source of truth) ---
-        def _price_decimals(sym: str) -> int:
-            s = sym.upper()
-            if s.endswith("JPY"):
-                return 3
-            if s == "XAUUSD":
-                return 2
-            return 5
-
-        def _pip(sym_: str) -> float:
-            s = sym_.upper()
-            if s == "XAUUSD":
-                return 0.1
-            if s.endswith("JPY"):
-                return 0.01
-            return 0.0001
-
-        last_px = float(closes[-1]) if closes else None
+        # --- 4) Build H1 / H4 targets (signed) ------------------------------
         decimals = _price_decimals(sym)
 
-        
-        # reasons / extras
-               
-        row_extra: Dict[str, Any] = {}
+        # H1 expected move in percent (signed)
+        try:
+            expected_move_pct_1h = round(float(signed_pct_1h), 2)
+        except Exception:
+            expected_move_pct_1h = 0.0
 
-        if isinstance(extra, dict):
-            # Merge raw extras + any pre-existing reasons
-            merged_for_reasons = dict(extra or {})
+        # Use latest M1 price as the user-visible basis if available
+        price_for_targets = last_price_m1 if isinstance(last_price_m1, (int, float)) else last_close
 
-            # If caller already attached reasons / reason, preserve them as base
-            base_reasons: List[str] = []
-            if extra.get("reasons"):
-                base_reasons = list(extra["reasons"])
-            elif extra.get("reason"):
-                base_reasons = [extra["reason"]]
+        if isinstance(price_for_targets, (int, float)):
+            target_price_1h = round(
+                float(price_for_targets) * (1.0 + expected_move_pct_1h / 100.0),
+                decimals,
+            )
+        else:
+            target_price_1h = price_for_targets
 
-            if base_reasons:
-                merged_for_reasons.setdefault("base_reasons", base_reasons)
+        # H4 expected move in percent (signed)
+        try:
+            expected_move_pct_4h = round(float(signed_pct_4h), 2)
+        except Exception:
+            expected_move_pct_4h = 0.0
 
-            # Single call to reason engine (trend + RVOL + USD basket + prob)
-            reasons = _build_reasons(sym, label, p_up, merged_for_reasons)
-            if reasons:
-                row_extra["reasons"] = reasons
-            elif base_reasons:
-                row_extra["reasons"] = base_reasons
-
-        # Always provide a list (UI expects array)
-        if "reasons" not in row_extra:
-            row_extra["reasons"] = []
-
-
-        # -------- unified expected_move_pct_1h + target_price_1h ----------
-        final_pct = None   # percent units, signed (e.g. +0.04 means +0.04%)
-        final_target = None
-
-        
-        # 1) Prefer regressor output (normalize, align sign with label, clamp) + logging
-        if isinstance(move_pct, (int, float)) and isinstance(last_px, (int, float)):
-            raw = float(move_pct)            # raw model output (fraction or percent)
-            mlt = _calib_multiplier(sym)     # ENV-based scaler (CALIB_X or CALIB_<SYM>_X)
-            scaled = raw * mlt               # apply calibration (no-op if 1.0)
-
-            # DEBUG/telemetry: write lightweight CSV row (ts,sym,tf,raw,mlt)
-            try:
-                # journalctl-friendly
-                log.info("reg_raw sym=%s tf=%s raw=%.8f mul=%.4f", sym, tfu, raw, mlt)
-                PRED_RAW_LOG.parent.mkdir(parents=True, exist_ok=True)
-                with PRED_RAW_LOG.open("a", buffering=1) as f:
-                   f.write(f"{int(time.time()*1000)},{sym},{tfu},raw,{raw:.8f},{mlt:.4f}\n")
-            except Exception:
-                pass
-
-            # Convert to PERCENT units (handles fraction->percent automatically)
-            pct_n = _normalize_pct(sym, scaled)
-            if isinstance(pct_n, (int, float)):
-                lbl = (label or "").lower()
-
-                # Align sign with classifier label (direction)
-                if lbl == "bearish" and pct_n > 0:
-                    pct_n = -pct_n
-                elif lbl == "bullish" and pct_n < 0:
-                    pct_n = abs(pct_n)
-
-                # Clamp outliers
-                pct_n = max(min(pct_n, 5.0), -5.0)
-
-                # Final write
-                final_pct = float(pct_n)
-                final_target = round(float(last_px) * (1.0 + final_pct / 100.0), decimals)
-
-                # Debug after normalization & alignment
-                try:
-                   log.info(
-                      "reg_norm sym=%s tf=%s pct=%.6f last=%.6f target=%s label=%s",
-                      sym, tfu, final_pct, float(last_px), str(final_target), lbl
-                   )
-                   with PRED_RAW_LOG.open("a", buffering=1) as f:
-                      f.write(
-                          f"{int(time.time()*1000)},{sym},{tfu},norm,{final_pct:.6f},"
-                          f"{float(last_px):.6f},{final_target}\n"
-                      )
-                except Exception:
-                   pass
-
-            
-        # 2) Fallback: derive from policy pips when regressor missing
-        if final_pct is None and isinstance(target_pips, (int, float)) and isinstance(last_px, (int, float)):
-            pip = _pip(sym)
-            abs_raw = abs(float(target_pips))
-            S = sym.upper()
-            # interpret policy value (your code stored: JPY/majors as price delta; XAU as pip-count)
-            if S == "XAUUSD":
-                delta_abs = abs_raw * pip         # pip-count ? price delta
-            elif S.endswith("JPY"):
-                delta_abs = abs_raw                # already price delta
-            else:
-                delta_abs = abs_raw                # majors: already price delta
-
-            # sign from decision
-            delta = delta_abs if str(decision).upper() == "BUY" else -delta_abs
-            final_target = round(float(last_px) + delta, decimals)
-            final_pct = (delta / float(last_px)) * 100.0
-
-        # 3) Write fields if available
-        if isinstance(final_pct, (int, float)):
-            row_extra["expected_move_pct_1h"] = float(_round_pct(sym, final_pct))
-        if isinstance(final_target, (int, float)):
-            row_extra["target_price_1h"] = float(final_target)
+        if isinstance(price_for_targets, (int, float)):
+            target_price_4h = round(
+                float(price_for_targets) * (1.0 + expected_move_pct_4h / 100.0),
+                decimals,
+            )
+        else:
+            target_price_4h = price_for_targets
 
 
-        row = {
-            "symbol": sym,
-            "label": label,
-            "score": score,
-            "p_up": round(float(p_up), 4) if p_up is not None else None,
-            "prob_up": round(float(p_up), 4) if p_up is not None else None,
-            "prob_up_1h": round(float(p_up), 4) if p_up is not None else None,
-            "decision": decision,
-            "confidence": confidence,
-            # keep policy target sizing (as before)
-            "target_pips": None if target_pips is None else round(float(target_pips), 6),
-            # add regression outputs (UI can use directly)
-            "expected_move_pct_1h": row_extra.get("expected_move_pct_1h"),
-            "target_price_1h": row_extra.get("target_price_1h"),
-            **row_extra,
-            # timing/meta
-            "update_tf": "M15",
-            "next_update_ts": m15_next_ms,
-            "next_update_eta_ms": max(0, m15_next_ms - now_ms),
-            "horizon": "H1",
-            "target_close_ts": h1_next_ms,
-            "eta_ms": max(0, h1_next_ms - now_ms),
-            "server_now_ms": now_ms,
-            "device_id": best_dev,
-            "updated_broker_ms": int(last_closed_ms),
+        # --- 5) Pure "structure" scores from H1/H4 moves --------------------
+        # These are TECH components only, in [-1, 1]
+        st_thr = 0.35   # ~0.35% -> strong short term view
+        ht_thr = 0.70   # ~0.7% -> strong higher-timeframe view
 
+        st_tech = 0.0
+        if signed_pct_1h is not None:
+            st_tech = max(min(signed_pct_1h / st_thr, 1.0), -1.0)
+
+        ht_tech = 0.0
+        if signed_pct_4h is not None:
+            ht_tech = max(min(signed_pct_4h / ht_thr, 1.0), -1.0)
+
+        # --- 6) Base reasons from model payload (H1/H4) ---------------------
+        base_reasons_h1: list[str] = []
+        if isinstance(pr_h1, dict):
+            r_raw = pr_h1.get("reasons") or pr_h1.get("reason")
+            if isinstance(r_raw, list):
+                base_reasons_h1 = [str(x) for x in r_raw if x]
+            elif isinstance(r_raw, str) and r_raw:
+                base_reasons_h1 = [str(r_raw)]
+
+        base_reasons_h4: list[str] = []
+        if isinstance(pr_h4, dict):
+            r_raw = pr_h4.get("reasons") or pr_h4.get("reason")
+            if isinstance(r_raw, list):
+                base_reasons_h4 = [str(x) for x in r_raw if x]
+            elif isinstance(r_raw, str) and r_raw:
+                base_reasons_h4 = [str(r_raw)]
+
+        # --- 7) Build feature bags (RVOL + macro) for ST/HT -----------------
+        extra_h1: Dict[str, Any] = {
+            "base_reasons": base_reasons_h1,
+            "feat_rvol15": pr_h1.get("rvol15"),
+            "feat_usd_basket": pr_h1.get("usd_basket_d1h_pct"),
+            "tf_scope": "H1",
+        }
+        extra_h4: Dict[str, Any] = {
+            "base_reasons": base_reasons_h4,
+            "feat_rvol15": pr_h4.get("rvol15"),
+            "feat_usd_basket": pr_h4.get("usd_basket_d1h_pct"),
+            "tf_scope": "H4",
         }
 
-        # attach timing/meta for countdowns and horizon
-        row.update({
-            "update_tf": "M15",
-            "next_update_ts": m15_next_ms,
-            "next_update_eta_ms": max(0, m15_next_ms - now_ms),
+        if isinstance(macro, dict):
+            for d in (extra_h1, extra_h4):
+                d["macro_dxy_z"] = macro.get("dxy_z")
+                d["macro_yield_z"] = macro.get("us10y_z")
+                d["macro_usd_rate_z"] = macro.get("usd_short_rate_z")
+                d["macro_vix_z"] = macro.get("vix_z")
 
-            "horizon": "H1",
-            "target_close_ts": h1_next_ms,
-            "eta_ms": max(0, h1_next_ms - now_ms),
-
-            "server_now_ms": now_ms,
-        })
-        # --- DIAGNOSTIC: one line per symbol so you can tail logs ---
-        log.info(
-            "predict[m15] sym=%s p_up=%.3f move_pct=%s decision=%s target_px=%s ver=%s last_close=%.5f",
-            sym,
-            float(row["p_up"]),
-            ("%.2f" % row["expected_move_pct_1h"]) if row.get("expected_move_pct_1h") is not None else "None",
-            row.get("decision"),
-            ( "%.5f" % row["target_price_1h"] ) if row.get("target_price_1h") is not None else "None",
-            MODEL_VERSION,
-            float(closes[-1]) if closes else float("nan"),
+        # --- 8) Weighted ST/HT status (structure + model + macro) ----------
+        # ST uses H1 tech + H1 prob/features
+        st_combined, st_label_w, st_t, st_m, st_macro = _compute_weighted_status(
+            sym, st_tech, p_up_h1, extra_h1
         )
-        # append to CSV log
-        try:
-            _log_prediction(row, closes[-1] if closes else None)
-        except Exception:
-            pass
+        # HT uses H4 tech + H4 prob/features
+        ht_combined, ht_label_w, ht_t, ht_m, ht_macro = _compute_weighted_status(
+            sym, ht_tech, p_up_h4, extra_h4
+        )
 
+        # Fallback labels if compute_weighted_status ever returns ""
+        if not st_label_w:
+            st_label_w = _score_to_label(st_tech)
+        if not ht_label_w:
+            ht_label_w = _score_to_label(ht_tech)
 
+        # Headline = HT (4h) combined status
+        combined_score = ht_combined
+        combined_label = ht_label_w
+
+        # --- 9) Headline label/decision/confidence --------------------------
+        label = combined_label
+        if label == "Bullish":
+            decision = "BUY"
+        elif label == "Bearish":
+            decision = "SELL"
+        elif label == "Strong Bullish":
+            decision = "BUY"
+        elif label == "Strong Bearish":
+            decision = "SELL"
+        else:
+            decision = "ABSTAIN"
+
+        # confidence purely from H1 probability band (short horizon)
+        spread = abs(p_up_h1 - 0.5)
+        if spread >= 0.20:
+            confidence = "high"
+        elif spread >= 0.05:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        headline_score = combined_score
+
+        # --- 10) Build row skeleton -----------------------------------------
+        row: Dict[str, Any] = {
+            "symbol": sym,
+
+            # headline / HT bucket (4h combined)
+            "label": label,
+            "score": float(headline_score),
+            "decision": decision,
+            "confidence": confidence,
+
+            # raw model probability (H1 as main)
+            "p_up": p_up_h1,
+            "prob_up": p_up_h1,
+            "prob_up_h1": p_up_h1,
+            "prob_up_h4": p_up_h4,
+
+            # ST + HT trend (already structure+model+macro)
+            "st_trend_label": st_label_w,
+            "st_trend_score": float(st_combined),
+            "ht_trend_label": ht_label_w,
+            "ht_trend_score": float(ht_combined),
+
+            # for debugging / introspection
+            "st_tech_component": float(st_t),
+            "st_model_component": float(st_m),
+            "st_macro_component": float(st_macro),
+            "ht_tech_component": float(ht_t),
+            "ht_model_component": float(ht_m),
+            "ht_macro_component": float(ht_macro),
+
+            # targets (1h real model, 4h real model)
+            "expected_move_pct_1h": expected_move_pct_1h,
+            "target_price_1h": target_price_1h,
+            "expected_move_pct_4h": expected_move_pct_4h,
+            "target_price_4h": target_price_4h,
+            "basis_price_1h": price_for_targets,
+
+            # horizon info (H1 primary)
+            "horizon": "H1",
+            "target_close_ts": target_close_ts,
+            "update_tf": tfu,
+            "server_now_ms": now_ms,
+
+            # raw payloads for debugging
+            "raw": pr_h1,
+            "raw_h4": pr_h4,
+        }
+
+        if not ok_h1:
+            row.setdefault("reason_h1_error", pr_h1.get("reason", "model_error_h1"))
+        if not ok_h4:
+            row.setdefault("reason_h4_error", pr_h4.get("reason", "model_error_h4"))
+
+        # --- 11) Build separate reasons for H1 and H4 ----------------------
+        reasons_h1 = _build_reasons(sym, st_label_w, p_up_h1, extra_h1)
+        reasons_h4 = _build_reasons(sym, ht_label_w, p_up_h4, extra_h4)
+
+        # Fallbacks if still empty
+        if not reasons_h1 and st_label_w in ("Bullish", "Bearish", "Strong Bullish", "Strong Bearish"):
+            direction = "upside" if "Bullish" in st_label_w else "downside"
+            try:
+                pct_txt = f"{float(expected_move_pct_1h):.2f}%"
+            except Exception:
+                pct_txt = "the next 1h"
+            reasons_h1 = [f"H1 model+trend sees {direction} room of about {pct_txt}"]
+
+        if not reasons_h4 and ht_label_w in ("Bullish", "Bearish", "Strong Bullish", "Strong Bearish"):
+            direction = "upside" if "Bullish" in ht_label_w else "downside"
+            try:
+                pct_txt = f"{float(expected_move_pct_4h):.2f}%"
+            except Exception:
+                pct_txt = "the next few hours"
+            reasons_h4 = [f"H4 structure+model+macro suggest {direction} bias of about {pct_txt}"]
+
+        # Attach to row:
+        # - reasons_h1: ST (1h)
+        # - reasons_h4: HT (4h)
+        # - reasons: keep H1 reasons for backward compatibility in UI
+        if reasons_h1:
+            row["reasons_h1"] = reasons_h1
+        if reasons_h4:
+            row["reasons_h4"] = reasons_h4
+
+        row["reasons"] = reasons_h1 or reasons_h4 or []
+        
 
         rows.append(row)
-
-   
-
-    
-    now_ms = int(_time.time() * 1000)
-
-    # pick a safe boundary for UI refresh:
-    # 1) prefer the earliest per-row next_update_ts we already computed
-    # 2) fallback: snap to next 15-minute boundary from server clock (UTC)
-    TF_MS = 15 * 60 * 1000
-    try:
-       next_update_ts = min(
-           int(r.get("next_update_ts"))
-           for r in rows
-           if isinstance(r.get("next_update_ts"), (int, float)) and r.get("next_update_ts") > 0
-       )
-    except Exception:
         
-        next_update_ts = ((now_ms // TF_MS) + 1) * TF_MS
-
-    # UI should wake a hair after the boundary; clamp to [2s, 60s]
-    poll_after_ms = max(2_000, min(60_000, int(next_update_ts - now_ms + 500)))
-    
-    # --- Compute 'computed_at' (when this prediction snapshot was prepared) ---
-    # Prefer a per-row timestamp if present; else use server 'now'
-    computed_at = None
-    try:
-       computed_at = next(
-          int(r["server_now_ms"])
-          for r in rows
-          if isinstance(r.get("server_now_ms"), (int, float))
-       )
-    except Exception:
-       computed_at = int(_time.time() * 1000)
-    # summarize timing/meta for top-level hints
-    poll_after_ms = min((int(r.get("next_update_eta_ms", 0)) for r in rows), default=0)
-    next_update_ts = min((int(r.get("next_update_ts", 0)) for r in rows), default=0)
-    computed_at = next(
-        (int(r["server_now_ms"]) for r in rows if isinstance(r.get("server_now_ms"), (int, float))),
-        int(_time.time() * 1000)
-    )
 
     return {
         "ok": True,
         "tf": tfu,
         "rows": rows,
-        "next_update_ts": int(next_update_ts),
-        "poll_after_ms": int(poll_after_ms),
-        "model_version": MODEL_VERSION,
-        "computed_at": int(computed_at),
     }
 
+
+@router.get("/opportunities")
+def trend_opportunities(
+    tf: str = "M15",
+    symbols: str = "XAUUSD,EURUSD,USDJPY,GBPUSD,USDCAD,USDCHF",
+    device: str | None = Query(None),
+    x_device_id: str | None = Header(None, convert_underscores=False),
+    user = Depends(require_auth_optional),
+):
+    """
+    Live opportunities feed.
+
+    Logic:
+    - Primary trigger is H1 expected move (expected_move_pct_1h).
+    - H4 expected move (expected_move_pct_4h) is used as confirmation / filter.
+
+    Combinations:
+
+    1) |H1| < H1_threshold
+       -> no opportunity, even if H4 is big.
+
+    2) |H1| >= H1_threshold and sign(H1) == sign(H4) and |H4| >= H4_threshold
+       -> opportunity, opp_confidence = "high".
+
+    3) |H1| >= H1_threshold and sign(H1) == sign(H4) but |H4| < H4_threshold
+       -> opportunity, opp_confidence = "medium".
+
+    4) |H1| >= H1_threshold and H4 missing
+       -> opportunity, opp_confidence = "high" if |H1| is much bigger than
+          threshold, else "medium".
+
+    5) |H1| >= H1_threshold and sign(H1) != sign(H4)
+       -> drop (no opportunity) - we do not want countertrend / chop.
+
+    This does not represent trade signals, only "room to move".
+    """
+
+    tfu = (tf or "M15").upper()
+
+    # Reuse main prediction logic (H1/H4 model + structure + macro)
+    base = predict_all(
+        tf=tfu,
+        symbols=symbols,
+        device=device,
+        x_device_id=x_device_id,
+        user=user,
+    )
+
+    if not isinstance(base, dict):
+        return {"ok": False, "reason": "predict_all_not_dict"}
+
+    if not base.get("ok", True):
+        # Bubble underlying reason (e.g. models not loaded, no_data, etc.)
+        return base
+
+    rows_in = base.get("rows") or []
+    opp_rows: list[dict[str, Any]] = []
+
+    now_ms = int(_time.time() * 1000)
+
+    for row in rows_in:
+        sym = str(row.get("symbol") or "").upper()
+        if not sym:
+            continue
+
+        thr1 = _room_thr_h1(sym)
+        thr4 = _room_thr_h4(sym)
+
+        # Extract H1 / H4 expected move (%)
+        try:
+            m1 = float(row.get("expected_move_pct_1h"))
+        except (TypeError, ValueError):
+            m1 = None
+
+        try:
+            m4 = float(row.get("expected_move_pct_4h"))
+        except (TypeError, ValueError):
+            m4 = None
+
+        s1 = _sign(m1)
+        s4 = _sign(m4)
+
+        # --------------------------------------------------
+        # 1) Check if we already have an ACTIVE snapshot
+        #    (so we keep showing it even if room shrinks)
+        # --------------------------------------------------
+        has_active_snapshot = False
+        try:
+            for d in ("UP", "DOWN"):
+                snap_key = _opp_snapshot_key(sym, d)
+                snap = R.hgetall(snap_key)
+                if not snap:
+                    continue
+
+                # Update hit/expired state based on latest price
+                _evaluate_alert_outcome(sym, snap, row, now_ms)
+
+                raw_status = snap.get("status")
+                if raw_status is None:
+                    status = "active"
+                else:
+                    try:
+                        # values are stored via json.dumps(...)
+                        status = json.loads(raw_status)
+                    except Exception:
+                        status = str(raw_status)
+
+                if status == "active":
+                    has_active_snapshot = True
+                    break
+        except Exception:
+            has_active_snapshot = False
+
+        # --------------------------------------------------
+        # 2) Primary trigger: H1 must have enough room
+        #    BUT ONLY IF there is NO active snapshot.
+        #    If a snapshot is already open, we keep the
+        #    row visible until it hits or expires.
+        # --------------------------------------------------
+        if (not has_active_snapshot) and (
+            not isinstance(m1, (int, float)) or s1 == 0 or abs(m1) < thr1
+        ):
+            continue
+
+
+        # --- Layer A: prediction delta gate -------------------------------
+        # Only surface a fresh opportunity if the forecast actually changed
+        # enough compared to the last seen 1h move for this symbol.
+
+        # --- Layer A: prediction delta gate -------------------------------
+        # Only surface a fresh opportunity if the forecast actually changed
+        # enough compared to the last seen 1h move for this symbol.
+        delta_pct = None
+        delta_thr = _delta_thr_h1(sym, thr1)
+
+        try:
+            key = PRED_DELTA_KEY_FMT % sym
+            prev_str = R.get(key)
+            if prev_str is not None:
+                try:
+                    prev_val = float(prev_str)
+                    delta_pct = abs(m1 - prev_val)
+                except (TypeError, ValueError):
+                    delta_pct = None
+            # Always update stored value for next call; 90-minute TTL is enough
+            R.set(key, f"{m1:.6f}", ex=90 * 60)
+        except Exception:
+            # Redis issues must not break the endpoint
+            delta_pct = None
+
+        # If we have a previous forecast and the change is too small,
+        # do not treat this as a new opportunity.
+        if delta_pct is not None and delta_pct < delta_thr and not has_active_snapshot:
+            continue
+
+        # Base direction from H1
+        opp_dir = "UP" if s1 > 0 else "DOWN"
+        opp_conf = "medium"
+        h4_agree: bool | None = None
+
+        # --- Combine with H4 when available (structure confirmation) ---
+        if isinstance(m4, (int, float)) and s4 != 0:
+            if s1 == s4:
+                # Same direction -> confirmation
+                h4_agree = True
+
+                # Strong confirm = H4 also has decent room
+                if abs(m4) >= thr4:
+                    opp_conf = "high"
+                else:
+                    opp_conf = "medium"
+            else:
+                # H4 conflicts with H1 -> drop this entirely (no opportunity)
+                continue
+        else:
+            # No usable H4 -> rely purely on H1 magnitude for confidence
+            if abs(m1) >= 1.5 * thr1:
+                opp_conf = "high"
+            else:
+                opp_conf = "medium"
+
+        # --- Overall opportunity score (room + trend + confidence) ----------
+        opp_score = _compute_opp_score(sym, row, m1, thr1)
+
+          # Once an alert is opened, keep it visible until it hits or the 1h window expires.
+        if opp_score < OPP_SCORE_MIN and not has_active_snapshot:
+        
+            continue
+
+
+        # --- Construct enriched opportunity row for UI + logging ------------
+        # --- Construct enriched opportunity row for UI + logging ------------
+        out = dict(row)  # start from predict_all row
+
+        # Use a 1h bucket so the opportunity ID is stable within that hour
+        hour_ms = 60 * 60 * 1000
+        bucket_open_ts = (now_ms // hour_ms) * hour_ms
+
+        # When opportunity appears (open) = start of that hour bucket
+        opp_open_ts = bucket_open_ts
+
+        # Expiry = one hour after bucket open (logical H1 horizon)
+        opp_expire_ts = bucket_open_ts + hour_ms
+
+        # Deterministic ID: symbol + horizon + direction + hour-bucket
+        opp_id = f"{sym}-H1-{opp_dir}-{opp_open_ts}"
+
+        out["opp_id"] = opp_id
+        out["opp_direction"] = opp_dir            # "UP" / "DOWN"
+        out["opp_confidence"] = opp_conf          # "high" / "medium"
+        out["opp_horizon"] = "H1"
+        out["opp_h4_agree"] = h4_agree            # True / False / None
+        out["opp_open_ts"] = opp_open_ts
+        out["opp_expire_ts"] = opp_expire_ts
+        out["opp_min_room_h1"] = thr1
+        out["opp_min_room_h4"] = thr4
+        out["opp_score"] = round(float(opp_score), 1)
+
+
+        # Expose prediction delta so UI / logs can show how "fresh" it is
+        if delta_pct is not None:
+            out["opp_delta_pct"] = delta_pct
+            out["opp_delta_thr"] = delta_thr
+
+        # Small textual summary for debugging / UI
+        tag_bits: list[str] = []
+        tag_bits.append(f"H1 move {m1:.3f}% (thr {thr1:.3f}%)")
+        if isinstance(m4, (int, float)):
+            tag_bits.append(f"H4 move {m4:.3f}% (thr {thr4:.3f}%)")
+            if h4_agree:
+                tag_bits.append("H1+H4 aligned")
+            else:
+                tag_bits.append("H1/H4 conflict")
+        tag_bits.append(f"opp_direction={opp_dir}")
+        tag_bits.append(f"opp_confidence={opp_conf}")
+        out.setdefault("opp_reason", "; ".join(tag_bits))
+
+        # Ensure time fields exist for UI refresh, even if predict_all stubbed
+        out.setdefault("update_tf", tfu)
+        out.setdefault("server_now_ms", now_ms)
+
+        out = _freeze_or_snapshot_opp(sym, out, now_ms)
+
+               
+
+        opp_rows.append(out)
+    history = _load_opp_history(limit=50)
+
+    return {
+        "ok": True,
+        "tf": tfu,
+        "rows": opp_rows,
+        "history": history,
+    }
+
+@router.get("/opportunities/history")
+def opportunities_history(limit: int = 100):
+    """
+    TEMP: history via CSV is deprecated.
+    Frontend now uses in-session history only.
+    This endpoint returns an empty list to keep compatibility.
+    """
+    return {"ok": True, "rows": []}
 
 
 @router.get("/predict/health")
@@ -2032,7 +3220,7 @@ def trend_state2(
             return 0
         if xi >= 1_000_000_000_000_000_000:  # ns
             return xi // 1_000_000
-        if xi >= 1_000_000_000_000_000:      # µs
+        if xi >= 1_000_000_000_000_000:      # microseconds
             return xi // 1_000
         if xi >= 1_000_000_000_000:          # ms
             return xi
@@ -2403,7 +3591,7 @@ def trend_state2(
                   dev_snap = json.loads(raw_str)
                   dev_bars = dev_snap.get("bars") or []
                   if dev_bars:
-                      # persist hydration to the user-facing key so next call isn’t “Warming”
+                      # persist hydration to the user-facing key so next call is not Warming
                       key_user = f"xtl:trend:snap:{uid}:{sym}:{tfu}"
                       R.setex(key_user, 900, raw_str)
                       # use hydrated snapshot for this response too
@@ -2732,7 +3920,7 @@ def trend_state2(
         next_close_ts = last_closed_ts + tf_ms
 
 
-    # roll forward if we’re already past it (covers missed bars, clock skew, etc.)
+    # roll forward if we are already past it (covers missed bars, clock skew, etc.)
     EPS = 500  # ms cushion
     while next_close_ts <= server_now_ms - EPS:
         next_close_ts += tf_ms
@@ -2890,7 +4078,7 @@ def trend_state2(
     # --- Include forming bar if present so preview matches MT5 "now" ---
     include_forming = bool(norm and (norm[-1].get("complete") is False))
 
-    # --- Apply tailing limit (default 60; clamp 30–500) ---
+    # --- Apply tailing limit (default 60; clamp 30 to 500) ---
     N = max(30, min(int(n or 60), 500))
     tail = norm[-N:]
 
@@ -3200,3 +4388,175 @@ def trend_detect(req: DetectReq, user_id: str = Depends(get_user_id)) -> DetectR
         preview=preview,
         broker=BrokerMeta(**broker_safe),
     )
+
+@router.get("/predict/4h_debug")
+def predict_4h_debug(
+    symbol: str = Query("EURUSD"),
+    user = Depends(require_auth_optional),
+):
+    """
+    Debug helper: compare H4 model move_pct vs recent H4 realised volatility.
+    """
+    sym = (symbol or "EURUSD").upper()
+    user_id = getattr(user, "user_id", None) if user else None
+
+    # 1) Get the latest H4 bars from snap (same mechanism as other endpoints)
+    snap, broker = _read_freshest_snap_for_user_or_any(user_id, sym, "H4")
+    if not snap:
+        return {"ok": False, "reason": "no_h4_snap"}
+
+    bars = snap.get("bars") or []
+    if not bars:
+        return {"ok": False, "reason": "empty_h4_bars"}
+
+    tf_ms = _tf_ms_from_u("H4")
+    now_ms = int(time.time() * 1000)
+
+    opens: list[float] = []
+    closes: list[float] = []
+    ranges_pct: list[float] = []
+
+    # Use ONLY CLOSED bars, and treat bars as dicts: {t,o,h,l,c,complete}
+    for b in bars:
+        t_ms = _ms_from_t(b.get("t_open_ms") or b.get("t"))
+        if t_ms is None:
+            continue
+
+        is_closed = (b.get("complete") is True) or (t_ms + tf_ms <= now_ms)
+        if not is_closed:
+            continue
+
+        try:
+            o = float(b.get("o"))
+            h = float(b.get("h"))
+            l = float(b.get("l"))
+            c = float(b.get("c"))
+        except (TypeError, ValueError):
+            continue
+
+        opens.append(o)
+        closes.append(c)
+        if o:
+            ranges_pct.append(100.0 * abs(h - l) / abs(o))
+
+    if len(closes) < 20 or len(opens) < 20:
+        return {
+            "ok": False,
+            "reason": "not_enough_closed_h4_bars",
+            "bars": len(closes),
+        }
+
+    # Only last 20 closed bars
+    opens_tail = opens[-20:]
+    closes_tail = closes[-20:]
+    last_close = closes_tail[-1]
+
+    # Realised candle body moves in %
+    moves_pct = [100.0 * (c - o) / o for o, c in zip(opens_tail, closes_tail)]
+    max_abs_move = max(abs(m) for m in moves_pct)
+
+    # ATR-like avg range %
+    if ranges_pct:
+        ranges_tail = ranges_pct[-20:]
+        avg_range_pct = sum(ranges_tail) / len(ranges_tail)
+    else:
+        avg_range_pct = None
+
+    # 2) Get model prediction for H4
+    try:
+        from api.trend.infer_rt import predict_next_4h
+        pr4 = predict_next_4h(sym)
+    except Exception as e:
+        return {"ok": False, "reason": "h4_model_error", "detail": str(e)}
+
+    mv4 = pr4.get("move_pct") or pr4.get("movePct")
+    tp4 = pr4.get("targetPrice") or pr4.get("target_price")
+
+    return {
+        "ok": True,
+        "symbol": sym,
+        "last_close": last_close,
+        "model_move_pct": mv4,
+        "model_target_price": tp4,
+        "max_abs_move_pct_last_20": max_abs_move,
+        "avg_range_pct_last_20": avg_range_pct,
+        "raw": pr4,
+    }
+
+def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
+    """
+    Evaluates whether an opportunity HIT target or EXPIRED.
+    FIX-1 applied: correct last_price logic from snapshot.
+    """
+
+    alert_id = snap.get("alert_id")
+    if not alert_id:
+        return
+
+    direction = snap.get("opp_direction")
+    target = snap.get("target_price_1h")
+    basis = snap.get("alert_price_1h")
+    alert_ms = snap.get("alert_created_ms") or 0
+
+    # ---------------------------------------------
+    # FIX-1: Determine correct last_price
+    # ---------------------------------------------
+    last_price = None
+
+    # Preferred: snapshot last_price (live update every minute)
+    if isinstance(snap.get("last_price"), (int, float)):
+        last_price = float(snap["last_price"])
+
+    # Fallback: row last_close from prediction engine
+    elif isinstance(row.get("last_close"), (int, float)):
+        last_price = float(row["last_close"])
+
+    # Fallback: basis_price (should never happen but safe)
+    elif isinstance(basis, (int, float)):
+        last_price = float(basis)
+
+    # Absolute fallback (should never trigger)
+    else:
+        last_price = 0.0
+
+    # ---------------------------------------------
+    # 1) Check HIT
+    # ---------------------------------------------
+    hit = False
+    if direction == "BUY" and last_price >= target:
+        hit = True
+    elif direction == "SELL" and last_price <= target:
+        hit = True
+
+    if hit:
+        _write_alert_history({
+            "alert_time_ms": alert_ms,
+            "symbol": sym,
+            "direction": direction,
+            "horizon_min": 60,
+            "expected_move_pct": snap.get("opp_expected_move_pct_1h"),
+            "hit_target": True,
+            "realized_move_pct": ((last_price - basis) / basis * 100)
+                if basis else None,
+            "time_to_target_min": (now_ms - alert_ms) / 60000,
+        })
+        _delete_live_snapshot(sym, direction)
+        return
+
+    # ---------------------------------------------
+    # 2) Check EXPIRED (60 min)
+    # ---------------------------------------------
+    if now_ms - alert_ms >= 3600 * 1000:
+        _write_alert_history({
+            "alert_time_ms": alert_ms,
+            "symbol": sym,
+            "direction": direction,
+            "horizon_min": 60,
+            "expected_move_pct": snap.get("opp_expected_move_pct_1h"),
+            "hit_target": False,
+            "realized_move_pct": ((last_price - basis) / basis * 100)
+                if basis else None,
+            "time_to_target_min": 60,
+        })
+        _delete_live_snapshot(sym, direction)
+        return
