@@ -79,21 +79,25 @@ const tfMsFrom = (tf: TfLabel) =>
                  4  * 60 * 60 * 1000;
 
 export function fmtBrokerTime(
-  msUtc: number,
-  broker?: BrokerMeta | null
-) {
-  const offMs = (broker?.tz_offset_min ?? 0) * 60_000;
-  // Shift UTC by broker offset, then render in UTC to avoid double-shift.
+  epochMs: number | null | undefined,
+  broker?: { tz_offset_min?: number | string | null }
+): string {
+  if (!epochMs || !Number.isFinite(epochMs)) return "";
+
+  const offMin = Number(broker?.tz_offset_min ?? 0);
+  const offMs = Number.isFinite(offMin) ? offMin * 60_000 : 0;
+
   return new Intl.DateTimeFormat("en-GB", {
-    timeZone: "UTC",
+    timeZone: "UTC",           // IMPORTANT: stay in UTC, we already applied offset
     year: "numeric",
     month: "short",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     hour12: true,
-  }).format(new Date(msUtc + offMs));
+  }).format(new Date(Number(epochMs) + offMs));
 }
+
 
 // ---- MA helpers (client-side preview only) ----
 function sma(values: number[], p: number) {
@@ -128,6 +132,21 @@ function linePath(xs: number[], ys: number[]) {
     }
   }
   return d;
+}
+
+function decimalsFromPrice(price: number): number {
+  if (!Number.isFinite(price)) return 2;
+
+  const p = Math.abs(price);
+
+  // Metals / indices (XAU etc.) – usually 2 decimals
+  if (p >= 200) return 2;
+
+  // JPY-style FX pairs (e.g. 150.xxx) – typically 3 decimals
+  if (p >= 20) return 3;
+
+  // Majors around 1.x (EURUSD, GBPUSD, etc.) – 5 decimals
+  return 5;
 }
 
 
@@ -319,7 +338,7 @@ export function floorToTfInBrokerTZ(
 }
 
 
-const ENABLE_BROKER_VERIFY = false;
+const ENABLE_BROKER_VERIFY = true;
 
 async function verifyLastBarAgainstBrokerSafely(opts: {
   symbol: string;
@@ -414,6 +433,23 @@ export function formatInBrokerOffsetOnly(
   }).format(new Date(Number(msUtc) + offMs));
 }
 
+// Use this when t_open_ms / t_close_ms are already in broker wall-clock ms
+export function formatBrokerWall(
+  msWall: number | null | undefined
+): string {
+  if (!msWall || !Number.isFinite(msWall)) return "—";
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "UTC", // do NOT reapply broker offset; value is already wall-time
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(new Date(Number(msWall)));
+}
+
+
 const DEFAULT_CFG = {
   symbol: "XAUUSD",
   trendTF: "1h" as TfLabel,
@@ -434,9 +470,17 @@ const DEFAULT_CFG = {
 const USER = (typeof window !== "undefined" && (window as any).__XTL_USER__?.username) || "anon";
 const cfgKey = (s: string) => `xtl_trend_cfg_${USER}_${s}_v5`;
 const loadCfg = (s: string) => {
-  try { const raw = localStorage.getItem(cfgKey(s)); if (raw) return JSON.parse(raw); } catch {}
-  return DEFAULT_CFG;
+  // try per-symbol stored config first
+  try {
+    const raw = localStorage.getItem(cfgKey(s));
+    if (raw) return JSON.parse(raw);
+  } catch {}
+
+  // fallback: default settings, but with the requested symbol
+  const sym = (s && s.trim().toUpperCase()) || DEFAULT_CFG.symbol;
+  return { ...DEFAULT_CFG, symbol: sym };
 };
+
 const saveCfg = (cfg: any) => { try { localStorage.setItem(cfgKey(cfg.symbol), JSON.stringify(cfg)); } catch {} };
 
 // ===== Utils
@@ -673,48 +717,52 @@ function CandlesPreview({
         })}
 
         {/* time markers (start / end) */}
+        
         <text x={pad} y={H - 4} fontSize="10" fill="#94a3b8">
-          {fmtBrokerTime(((data[0] as any).t_open_ms ?? data[0].t * 1000), broker)} 
+          {formatBrokerWall(
+            barOpenMs(data[0] as any, 0)
+          )}
         </text>
         <text x={W - pad} y={H - 4} fontSize="10" fill="#94a3b8" textAnchor="end">
-           {fmtBrokerTime(((data[data.length - 1] as any).t_open_ms ?? data[data.length - 1].t * 1000), broker)}
+          {formatBrokerWall(
+            barOpenMs(data[data.length - 1] as any, 0)
+          )}
         </text>
+
       </svg>
     </div>
   </div>
 );
 }
 
-function getBarOpenMs(
-  bar: { t_open_ms?: number; t_close_ms?: number; t?: number },
-  tfMs: number
-): number {
-  if (typeof bar?.t_open_ms === "number") return bar.t_open_ms;
-  if (typeof bar?.t === "number") return bar.t * 1000;        // legacy preview bars {t,o,h,l,c}
-  if (typeof bar?.t_close_ms === "number" && tfMs > 0) return bar.t_close_ms - tfMs;
-  return 0;
-}
 
 function MiniCandleChart({
   bars,
   broker,
   tfMs,
   height = 280,
-  pivots,        
+  pivots,
   showPivots,
   maPreview,
 }: {
-  
-  bars: { t_open_ms: number; t_close_ms: number; o: number; h: number; l: number; c: number; complete?: boolean }[];
+  bars: {
+    t_open_ms: number;
+    t_close_ms: number;
+    o: number;
+    h: number;
+    l: number;
+    c: number;
+    complete?: boolean;
+  }[];
   broker?: any;
   tfMs: number;
   height?: number;
-  pivots?: { t_open_ms: number; price: number; kind: "H" | "L"; confirmed: boolean }[]; 
-  showPivots?: boolean; 
+  pivots?: { t_open_ms: number; price: number; kind: "H" | "L"; confirmed: boolean }[];
+  showPivots?: boolean;
   maPreview?: { fast: number[]; slow: number[]; times: number[] };
-
 }) {
   const mp = maPreview ?? { fast: [], slow: [], times: [] };
+
   if (!bars?.length) {
     return (
       <div className="aspect-[16/9] w-full rounded-xl bg-slate-950/60 border border-slate-800/60 grid place-items-center">
@@ -722,377 +770,422 @@ function MiniCandleChart({
       </div>
     );
   }
-  const dec = Math.max(
-    0,
-    Math.min(8, Number.isFinite(broker?.digits) ? Number(broker.digits) : 2)
-  );
 
-  const padL = 32, padR = 12, padT = 16, padB = 28;
+  // Detect decimals from actual price so EUR/USD gets 5, XAUUSD gets 2, etc.
+  const samplePrice =
+    bars[bars.length - 1]?.c ?? bars[0]?.c ?? 0;
+  const dec = decimalsFromPrice(samplePrice);
+
+
+  const padL = 32,
+    padR = 12,
+    padT = 16,
+    padB = 28;
   const W = Math.max(600, bars.length * 6) + padL + padR;
   const H = height;
+
   // fixed panel + gutter (so it never overlaps candles)
   const PANEL_W = 148;
-  const PANEL_PAD = 8;
-  const PANEL_LH = 16;
   const PANEL_MARGIN_R = 4;
   const PLOT_TO_PANEL_GAP = 16;
-  // gutter must be a bit wider than the panel
   const RIGHT_GUTTER = PANEL_W + PANEL_MARGIN_R + PLOT_TO_PANEL_GAP;
 
   const crisp = (v: number) => Math.round(v) + 0.5;
-  const ys = bars.flatMap(b => [b.h, b.l]);
+
+  const ys = bars.flatMap((b) => [b.h, b.l]);
   const yMin = Math.min(...ys);
   const yMax = Math.max(...ys);
   const yRange = yMax - yMin || 1;
-  const plotRight = padR + RIGHT_GUTTER;
 
+  const plotRight = padR + RIGHT_GUTTER;
   const xw = (W - padL - plotRight) / bars.length;
   const bodyW = Math.max(2, Math.floor(xw * 0.45));
 
   const y = (p: number) =>
     padT + (H - padT - padB) * (1 - (p - yMin) / yRange);
 
-  const last = bars[bars.length - 1];
-  
-  const fmt = (msUtc: number) => formatInBrokerTZ(msUtc, broker);
-
-
-
-
-  
   // --- hover state + helpers ---
-const [hover, setHover] = React.useState<null | { i: number; x: number }>(null);
-// --- Tooltip positioning (clamp + flip) ---
-const tipW = 200;
-const tipH = 112;
-const tipPad = 12;
-function placeTooltip(mx: number, my: number) {
-  let tx = mx + tipPad;
-  let ty = my - tipH / 2;
-  const rightLimit = W - padR - tipPad;
-  if (tx + tipW > rightLimit) {
-    tx = mx - tipW - tipPad;
-    if (tx < padL + tipPad) tx = rightLimit - tipW;
-  }
-  const topLimit = 8;
-  const botLimit = H - 8 - tipH;
-  if (ty < topLimit) ty = topLimit;
-  if (ty > botLimit) ty = botLimit;
-  return { tx, ty };
-}
+  const [hover, setHover] = React.useState<null | { i: number; x: number }>(
+    null
+  );
 
-// crisp strokes on high-DPI
+  const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const svg = e.currentTarget as SVGSVGElement;
+    const r = svg.getBoundingClientRect();
+    const mx = e.clientX - r.left;
 
-
-const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
-  const svg = e.currentTarget as SVGSVGElement;
-  const r = svg.getBoundingClientRect();
-  const mx = e.clientX - r.left;
-
-  // ignore outside the plot area
-  if (mx < padL || mx > W - plotRight) {
-    setHover(null);
-    return;
-  }
-
-  // snap to nearest candle center
-  let i = Math.round((mx - padL - xw / 2) / xw);
-  i = Math.max(0, Math.min(bars.length - 1, i));
-  const xc = padL + i * xw + xw / 2;
-  setHover({ i, x: xc });
-};
-
-const onLeave = () => setHover(null);
-
-return (
-  <div className="w-full overflow-x-auto rounded-xl border border-slate-800/60 bg-slate-950/60">
-    <svg
-      width={W}
-      height={H}
-      onMouseMove={onMove}
-      onMouseLeave={onLeave}
-      style={{ cursor: "crosshair", display: "block" }}
-    >
-      {/* grid frame */}
-      {/* grid frame */}
-      <line x1={padL} y1={crisp(padT)} x2={W - plotRight} y2={crisp(padT)} stroke="#1f2937" />
-      <line x1={padL} y1={crisp(H - padB)} x2={W - plotRight} y2={crisp(H - padB)} stroke="#1f2937" />
-
-      
-
-
-
-      {/* y labels + horizontal guides */}
-      {[0, 0.5, 1].map((p, i) => {
-        const v = yMin + p * yRange;
-        const yv = y(v);
-        return (
-          <g key={i}>
-            <line x1={padL} y1={yv} x2={W - plotRight} y2={yv} stroke="#111827" opacity={0.5} />
-            <text x={8} y={yv + 4} fill="#64748b" fontSize="10">
-              {v.toFixed(dec)}
-            </text>
-          </g>
-        );
-      })}
-
-      {/* candles */}
-      {bars.map((b, i) => {
-        const xc = padL + i * xw + xw / 2;
-        const bull = b.c >= b.o;
-        const color = bull ? "#22c55e" : "#ef4444";
-        const yH = y(b.h), yL = y(b.l), yO = y(b.o), yC = y(b.c);
-        const top = Math.min(yO, yC);
-        const h = Math.max(2, Math.abs(yO - yC));
-        return (
-          <g key={i}>
-            <line x1={xc} x2={xc} y1={yH} y2={yL} stroke={color} strokeWidth={1} />
-            <rect x={xc - bodyW / 2} y={top} width={bodyW} height={h} fill={color} />
-          </g>
-        );
-      })}
-      {/* --- ZigZag pivots overlay --- */}
-{showPivots && Array.isArray(pivots) && pivots.length > 0 && (
-  <g>
-    {/* build an index for x-positions */}
-    {(() => {
-      const indexByOpen = new Map<number, number>();
-      bars.forEach((b, i) => indexByOpen.set(b.t_open_ms, i));
-
-      // connector polyline
-      const points = pivots
-        .map((p) => {
-          const i = indexByOpen.get(p.t_open_ms);
-          if (i == null) return null;
-          const xc = padL + i * xw + xw / 2;
-          const yy = y(p.price);
-          return `${xc},${yy}`;
-        })
-        .filter(Boolean)
-        .join(" ");
-
-      return (
-        <>
-          <polyline
-            fill="none"
-            stroke="rgba(250,250,250,0.6)"
-            strokeWidth={1}
-            points={points}
-          />
-          {pivots.map((p, k) => {
-            const i = indexByOpen.get(p.t_open_ms);
-            if (i == null) return null;
-            const xc = padL + i * xw + xw / 2;
-            const yy = y(p.price);
-            const sz = 5;
-            const up = p.kind === "H";
-            const opacity = p.confirmed ? 1 : 0.6;
-            const pts = up
-              ? `${xc},${yy - sz} ${xc - sz},${yy + sz} ${xc + sz},${yy + sz}`   // ?
-              : `${xc},${yy + sz} ${xc - sz},${yy - sz} ${xc + sz},${yy - sz}`;   // ?
-            return (
-              <polygon
-                key={`pv-${k}`}
-                points={pts}
-                fill={up ? "#10b981" : "#ef4444"}
-                opacity={opacity}
-              />
-            );
-          })}
-          {/* HH/HL/LH/LL labels */}
-{(() => {
-  // Classify each pivot versus the previous pivot of the same type
-  const labels: { k: number; tag: "HH" | "HL" | "LH" | "LL" }[] = [];
-  let lastH: number | undefined;
-  let lastL: number | undefined;
-
-  pivots.forEach((p, k) => {
-    if (p.kind === "H") {
-      const tag = lastH == null ? "HH" : (p.price > lastH ? "HH" : "LH");
-      labels.push({ k, tag });
-      lastH = p.price;
-    } else {
-      const tag = lastL == null ? "HL" : (p.price > lastL ? "HL" : "LL");
-      labels.push({ k, tag });
-      lastL = p.price;
+    // ignore outside the plot area
+    if (mx < padL || mx > W - plotRight) {
+      setHover(null);
+      return;
     }
-  });
 
-  // Render the small text label near each pivot
-  return labels.map(({ k, tag }) => {
-    const p = pivots[k];
-    const i = indexByOpen.get(p.t_open_ms);
-    if (i == null) return null;
+    // snap to nearest candle center
+    let i = Math.round((mx - padL - xw / 2) / xw);
+    i = Math.max(0, Math.min(bars.length - 1, i));
     const xc = padL + i * xw + xw / 2;
-    const yy = y(p.price) + (p.kind === "H" ? -8 : 12); // above highs, below lows
+    setHover({ i, x: xc });
+  };
+
+  const onLeave = () => setHover(null);
+
+  return (
+    <div className="w-full overflow-x-auto rounded-xl border border-slate-800/60 bg-slate-950/60">
+      <svg
+        width={W}
+        height={H}
+        onMouseMove={onMove}
+        onMouseLeave={onLeave}
+        style={{ cursor: "crosshair", display: "block" }}
+      >
+        {/* top / bottom frame */}
+        <line
+          x1={padL}
+          y1={crisp(padT)}
+          x2={W - plotRight}
+          y2={crisp(padT)}
+          stroke="#1f2937"
+        />
+        <line
+          x1={padL}
+          y1={crisp(H - padB)}
+          x2={W - plotRight}
+          y2={crisp(H - padB)}
+          stroke="#1f2937"
+        />
+
+        {/* y labels + horizontal guides */}
+        {[0, 0.5, 1].map((p, i) => {
+          const v = yMin + p * yRange;
+          const yv = y(v);
+          return (
+            <g key={i}>
+              <line
+                x1={padL}
+                y1={yv}
+                x2={W - plotRight}
+                y2={yv}
+                stroke="#111827"
+                opacity={0.5}
+              />
+              <text x={8} y={yv + 4} fill="#64748b" fontSize={10}>
+                {v.toFixed(dec)}
+              </text>
+            </g>
+          );
+        })}
+
+        {/* candles */}
+        {bars.map((b, i) => {
+          const xc = padL + i * xw + xw / 2;
+          const bull = b.c >= b.o;
+          const color = bull ? "#22c55e" : "#ef4444";
+
+          const yH = y(b.h),
+            yL = y(b.l),
+            yO = y(b.o),
+            yC = y(b.c);
+          const top = Math.min(yO, yC);
+          const h = Math.max(2, Math.abs(yO - yC));
+
+          return (
+            <g key={i}>
+              <line
+                x1={xc}
+                x2={xc}
+                y1={yH}
+                y2={yL}
+                stroke={color}
+                strokeWidth={1}
+              />
+              <rect
+                x={xc - bodyW / 2}
+                y={top}
+                width={bodyW}
+                height={h}
+                fill={color}
+              />
+            </g>
+          );
+        })}
+
+        {/* --- ZigZag pivots overlay --- */}
+        {showPivots && Array.isArray(pivots) && pivots.length > 0 && (
+          <g>
+            {(() => {
+              const indexByOpen = new Map<number, number>();
+              bars.forEach((b, i) => indexByOpen.set(b.t_open_ms, i));
+
+              // connector polyline
+              const points = pivots
+                .map((p) => {
+                  const i = indexByOpen.get(p.t_open_ms);
+                  if (i == null) return null;
+                  const xc = padL + i * xw + xw / 2;
+                  const yy = y(p.price);
+                  return `${xc},${yy}`;
+                })
+                .filter(Boolean)
+                .join(" ");
+
+              return (
+                <>
+                  <polyline
+                    fill="none"
+                    stroke="rgba(250,250,250,0.6)"
+                    strokeWidth={1}
+                    points={points}
+                  />
+                  {pivots.map((p, k) => {
+                    const i = indexByOpen.get(p.t_open_ms);
+                    if (i == null) return null;
+                    const xc = padL + i * xw + xw / 2;
+                    const yy = y(p.price);
+                    const sz = 5;
+                    const up = p.kind === "H";
+                    const opacity = p.confirmed ? 1 : 0.6;
+                    const pts = up
+                      ? `${xc},${yy - sz} ${xc - sz},${yy + sz} ${
+                          xc + sz
+                        },${yy + sz}`
+                      : `${xc},${yy + sz} ${xc - sz},${yy - sz} ${
+                          xc + sz
+                        },${yy - sz}`;
+                    return (
+                      <polygon
+                        key={`pv-${k}`}
+                        points={pts}
+                        fill={up ? "#10b981" : "#ef4444"}
+                        opacity={opacity}
+                      />
+                    );
+                  })}
+
+                  {/* HH/HL/LH/LL labels */}
+                  {(() => {
+                    const labels: {
+                      k: number;
+                      tag: "HH" | "HL" | "LH" | "LL";
+                    }[] = [];
+                    let lastH: number | undefined;
+                    let lastL: number | undefined;
+
+                    pivots.forEach((p, k) => {
+                      if (p.kind === "H") {
+                        const tag =
+                          lastH == null
+                            ? "HH"
+                            : p.price > lastH
+                            ? "HH"
+                            : "LH";
+                        labels.push({ k, tag });
+                        lastH = p.price;
+                      } else {
+                        const tag =
+                          lastL == null
+                            ? "HL"
+                            : p.price > lastL
+                            ? "HL"
+                            : "LL";
+                        labels.push({ k, tag });
+                        lastL = p.price;
+                      }
+                    });
+
+                    return labels.map(({ k, tag }) => {
+                      const p = pivots[k];
+                      const i = indexByOpen.get(p.t_open_ms);
+                      if (i == null) return null;
+                      const xc = padL + i * xw + xw / 2;
+                      const yy =
+                        y(p.price) + (p.kind === "H" ? -8 : 12); // above highs, below lows
+
+                      return (
+                        <text
+                          key={`pv-lbl-${k}`}
+                          x={xc}
+                          y={yy}
+                          textAnchor="middle"
+                          fontSize={10}
+                          fill="#cbd5e1"
+                          style={{ pointerEvents: "none" }}
+                        >
+                          {tag}
+                        </text>
+                      );
+                    });
+                  })()}
+                </>
+              );
+            })()}
+          </g>
+        )}
+
+        {/* === MA preview overlays === */}
+        {mp.fast.length > 0 && (
+          <path
+            d={(() => {
+              const xs: number[] = [];
+              const ysMa: number[] = [];
+              for (let i = 0; i < bars.length; i++) {
+                const v = mp.fast[i];
+                if (!Number.isFinite(v)) continue;
+                const xc = padL + i * xw + xw / 2;
+                xs.push(xc);
+                ysMa.push(y(v));
+              }
+              return linePath(xs, ysMa);
+            })()}
+            stroke="#6366f1"
+            strokeWidth={1.2}
+            fill="none"
+          />
+        )}
+
+        {mp.slow.length > 0 && (
+          <path
+            d={(() => {
+              const xs: number[] = [];
+              const ysMa: number[] = [];
+              for (let i = 0; i < bars.length; i++) {
+                const v = mp.slow[i];
+                if (!Number.isFinite(v)) continue;
+                const xc = padL + i * xw + xw / 2;
+                xs.push(xc);
+                ysMa.push(y(v));
+              }
+              return linePath(xs, ysMa);
+            })()}
+            stroke="#facc15"
+            strokeWidth={1.2}
+            fill="none"
+          />
+        )}
+
+        
+        
+        {/* hover overlay (crosshair + fixed panel) */}
+{(() => {
+  try {
+    if (!bars.length) return null;
+
+    const idx = hover ? hover.i : bars.length - 1;
+    const i = Math.max(0, Math.min(bars.length - 1, idx));
+    const b = bars[i];
+    if (!b) return null;
+
+    const bull = b.c >= b.o;
+
+    const cross = hover ? (
+      <g pointerEvents="none">
+        <line
+          x1={hover.x}
+          y1={padT}
+          x2={hover.x}
+          y2={H - padB}
+          stroke="#475569"
+          strokeDasharray="3 3"
+        />
+        <circle
+          cx={hover.x}
+          cy={y(b.c)}
+          r={2}
+          fill={bull ? "#10b981" : "#f43f5e"}
+        />
+      </g>
+    ) : null;
+
+    // --- use bar OPEN in UTC, then format in broker TZ ---
+    // t_open_ms / t_close_ms are already broker wall-time ms ? no extra offset
+    const openMsWall = barOpenMs(
+      {
+        t_open_ms: (b as any).t_open_ms,
+        t_close_ms: (b as any).t_close_ms,
+        t: (b as any).t,
+      },
+      tfMs
+    );
+
+    const timeLabel =
+      openMsWall > 0 ? formatBrokerWall(openMsWall) : "—";
+
+
+    const panelLines = [
+      `Time: ${timeLabel}`,
+      `O: ${b.o.toFixed(dec)}`,
+      `H: ${b.h.toFixed(dec)}`,
+      `L: ${b.l.toFixed(dec)}`,
+      `C: ${b.c.toFixed(dec)}`,
+    ];
+
+    const panelPad = 10;
+    const lineH = 16;
+    const panelW = 180;
+    const panelH = panelPad * 2 + panelLines.length * lineH;
+
+    const fixedX = Math.max(padL + 8, W - padR - panelW - 12);
+    const fixedY = Math.max(padT + 8, 12);
+
+    const panel = (
+      <g transform={`translate(${fixedX},${fixedY})`} pointerEvents="none">
+        <rect
+          x={0}
+          y={0}
+          width={panelW}
+          height={panelH}
+          rx={10}
+          ry={10}
+          fill="rgba(2,6,23,.92)"
+          stroke="#334155"
+        />
+        {panelLines.map((t, k) => (
+          <text
+            key={k}
+            x={panelPad}
+            y={panelPad + (k + 1) * lineH - 4}
+            fill="#cbd5e1"
+            fontSize={12}
+            fontFamily="ui-sans-serif,system-ui"
+          >
+            {t}
+          </text>
+        ))}
+      </g>
+    );
 
     return (
-      <text
-        key={`pv-lbl-${k}`}
-        x={xc}
-        y={yy}
-        textAnchor="middle"
-        fontSize={10}
-        fill="#cbd5e1"
-        style={{ pointerEvents: "none" }}
-      >
-        {tag}
-      </text>
+      <>
+        {cross}
+        {panel}
+      </>
     );
-  });
+  } catch (err) {
+    console.error("[Trend] hover overlay error", err);
+    return null;
+  }
 })()}
 
-        </>
-      );
-    })()}
-  </g>
-)}
-
-      {/* === MA preview overlays === */}
-{mp.fast.length > 0 && (
-  <path
-    d={(() => {
-      const xs: number[] = [];
-      const ys: number[] = [];
-      for (let i = 0; i < bars.length; i++) {
-        const v = mp.fast[i];
-        if (!Number.isFinite(v)) continue;
-        const xc = padL + i * xw + xw / 2;
-        xs.push(xc);
-        ys.push(y(v));
-      }
-      return linePath(xs, ys);
-    })()}
-    stroke="#6366f1"
-    strokeWidth={1.2}
-    fill="none"
-  />
-)}
-
-{mp.slow.length > 0 && (
-  <path
-    d={(() => {
-      const xs: number[] = [];
-      const ys: number[] = [];
-      for (let i = 0; i < bars.length; i++) {
-        const v = mp.slow[i];
-        if (!Number.isFinite(v)) continue;
-        const xc = padL + i * xw + xw / 2;
-        xs.push(xc);
-        ys.push(y(v));
-      }
-      return linePath(xs, ys);
-    })()}
-    stroke="#facc15"
-    strokeWidth={1.2}
-    fill="none"
-  />
-)}
-
-      {/* footer label (first ? last) */}
-      <text x={padL} y={H - 10} fill="#94a3b8" fontSize="11">
-         {formatInBrokerTZ(bars[0].t_open_ms, broker)} · {formatInBrokerTZ(last.t_close_ms, broker)}
-      </text>
-      
-
-
-      {/* hover overlay (crosshair + fixed top-right info panel) */}
-      {(() => {
-        // show hovered bar if any; otherwise show the last bar
-        const i = hover ? hover.i : bars.length - 1;
-        const b = bars[i];
-        const bull = b.c >= b.o;
-
-        // crosshair only when hovering (doesn't block pointer events)
-        const cross = hover ? (
-          <g pointerEvents="none">
-            <line
-              x1={hover.x}
-              y1={padT}
-              x2={hover.x}
-              y2={H - padB}
-              stroke="#475569"
-              strokeDasharray="3 3"
-            />
-            <circle cx={hover.x} cy={y(b.c)} r={2} fill={bull ? "#10b981" : "#f43f5e"} />
-          </g>
-        ) : null;
-
-        // fixed info panel in plot's top-right
-        const panelW = 180;
-        const panelPad = 8;
-        const lineH = 16;
-        
-        const tOpenMs =
-        typeof b.t_open_ms === "number" ? b.t_open_ms :
-        typeof (b as any).t === "number" ? (b as any).t * 1000 :
-        (typeof b.t_close_ms === "number" && tfMs > 0 ? b.t_close_ms - tfMs : 0);
-        const openMs =
-          typeof b.t_open_ms === "number" ? b.t_open_ms :
-          (typeof b.t_close_ms === "number" ? (b.t_close_ms - tfMs) : 0);
-        const timeLabel = formatInBrokerTZ(openMs, broker);
-
-        const lines = [
-            `Time: ${timeLabel}`, 
-            `O: ${b.o.toFixed(dec)}`,
-            `H: ${b.h.toFixed(dec)}`,
-            `L: ${b.l.toFixed(dec)}`,
-            `C: ${b.c.toFixed(dec)}`,
-        ];
-
-        const panelH = panelPad * 2 + lines.length * lineH;
-                 
-        // Fixed top-right (clamped inside chart area)
-const fixedX = Math.max(padL + 8, W - padR - panelW - 12);
-const fixedY = Math.max(padT + 8, 12);
-
-const panel = (
-  <g transform={`translate(${fixedX},${fixedY})`} pointerEvents="none">
-    <rect
-      x={0}
-      y={0}
-      width={panelW}
-      height={panelH}
-      rx={10}
-      ry={10}
-      fill="rgba(2,6,23,.92)"
-      stroke="#334155"
-    />
-    {lines.map((t, k) => (
-      <text
-        key={k}
-        x={panelPad}
-        y={panelPad + (k + 1) * lineH - 4}
-        fill="#cbd5e1"
-        fontSize="12"
-        fontFamily="ui-sans-serif,system-ui"
-      >
-        {t}
-      </text>
-    ))}
-  </g>
-);
-
-
-        return (
-          <>
-            {cross}
-            {panel}
-          </>
-        );
-      })()}
-    </svg>
-  </div>
-);
-
+      </svg>
+    </div>
+  );
 }
 
-  
-
-
 export default function Trend() {
-  const [cfg, setCfg] = useState<any>(() => loadCfg(DEFAULT_CFG.symbol));
-  // removed appliedCfg state;
+   const [cfg, setCfg] = useState<any>(() => {
+    let sym = DEFAULT_CFG.symbol;
+
+    if (typeof window !== "undefined") {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const qSym = (params.get("symbol") || "").toUpperCase().trim();
+        if (qSym) sym = qSym;
+      } catch {
+        // ignore URL parse errors, fall back to default
+      }
+    }
+
+    return loadCfg(sym);
+  });
   
 
   const [state, setState] = React.useState<TrendResp| null>(null);
@@ -1556,42 +1649,54 @@ useEffect(() => () => {
 
 // ---- Preview bars: normalize ? sort ? dedupe ? tail(60) ----
 const previewBars: PreviewBarT[] = React.useMemo<PreviewBarT[]>(() => {
-  // Use only the server-served ms fields; no legacy conversions
-  const src = (server?.preview?.bars ?? []) as any[];
+  try {
+    // Use only the server-served ms fields; no legacy conversions
+    const src = (server?.preview?.bars ?? []) as any[];
 
-  const rows: PreviewBarT[] = (Array.isArray(src) ? src : [])
-    .map((b: any): PreviewBarT => ({
-      t_open_ms: Number(b?.t_open_ms ?? 0),
-      t_close_ms: Number(b?.t_close_ms ?? 0),
-      o: Number(b?.o),
-      h: Number(b?.h),
-      l: Number(b?.l),
-      c: Number(b?.c),
-      complete: typeof b?.complete === "boolean" ? b.complete : true,
-    }))
-    .filter((r) =>
-      r.t_open_ms > 0 &&
-      r.t_close_ms > 0 &&
-      Number.isFinite(r.o) &&
-      Number.isFinite(r.h) &&
-      Number.isFinite(r.l) &&
-      Number.isFinite(r.c)
-    )
-    .sort((a, b) => a.t_open_ms - b.t_open_ms);
+    const rows: PreviewBarT[] = (Array.isArray(src) ? src : [])
+      .map((b: any): PreviewBarT => ({
+        t_open_ms: Number(b?.t_open_ms ?? 0),
+        t_close_ms: Number(b?.t_close_ms ?? 0),
+        o: Number(b?.o),
+        h: Number(b?.h),
+        l: Number(b?.l),
+        c: Number(b?.c),
+        complete: typeof b?.complete === "boolean" ? b.complete : true,
+      }))
+      .filter((r) =>
+        r.t_open_ms > 0 &&
+        r.t_close_ms > 0 &&
+        Number.isFinite(r.o) &&
+        Number.isFinite(r.h) &&
+        Number.isFinite(r.l) &&
+        Number.isFinite(r.c)
+      )
+      .sort((a, b) => a.t_open_ms - b.t_open_ms);
 
-  // Dedupe by open slot (keep the last occurrence)
-  const out: PreviewBarT[] = [];
-  for (const r of rows) {
-    const last = out[out.length - 1];
-    if (last && last.t_open_ms === r.t_open_ms) {
-      out[out.length - 1] = { ...last, ...r };
-    } else {
-      out.push(r);
+    // Dedupe by open slot (keep the last occurrence)
+    const out: PreviewBarT[] = [];
+    for (const r of rows) {
+      const last = out[out.length - 1];
+      if (last && last.t_open_ms === r.t_open_ms) {
+        out[out.length - 1] = { ...last, ...r };
+      } else {
+        out.push(r);
+      }
     }
-  }
 
-  return out.slice(-300);
+    return out.slice(-300);
+  } catch (err) {
+    console.error("[Trend] previewBars build error:", err);
+    return [];
+  }
 }, [server?.preview?.bars]);
+
+// Last bar OPEN time (UTC ms) for labelling, aligned with MT5's "bar time"
+const lastBarOpenMs = React.useMemo<number | null>(() => {
+  if (!previewBars.length) return null;
+  return previewBars[previewBars.length - 1]!.t_open_ms || null;
+}, [previewBars]);
+
 
 // ---- MA preview series (matches what's on the backend, for chart overlay) ----
 const maPreview = React.useMemo(() => {
@@ -1683,6 +1788,36 @@ const tfMs = React.useMemo(() => {
   return cfg.trendTF === "15m" ? 900_000 : cfg.trendTF === "1h" ? 3_600_000 : 14_400_000;
 }, [server?.tf_ms, cfg.trendTF]);
 
+  // --- Last closed bar timestamp in broker TZ (for header label) ---
+  const lastClosedBar = React.useMemo(() => {
+    if (!previewBars.length) return null;
+
+    // Prefer a fully closed bar; if all are "complete === false", fall back to last
+    for (let i = previewBars.length - 1; i >= 0; i--) {
+      const b = previewBars[i] as any;
+      if (!b) continue;
+      if (b.complete === false) continue;
+      return b;
+    }
+    return previewBars[previewBars.length - 1] as any;
+  }, [previewBars]);
+
+  const lastSessionTsMs: number | null = React.useMemo(() => {
+    if (!lastClosedBar) return null;
+    const anyBar: any = lastClosedBar;
+    if (Number.isFinite(anyBar.t_close_ms)) return Number(anyBar.t_close_ms);
+    if (Number.isFinite(anyBar.t_open_ms)) return Number(anyBar.t_open_ms) + tfMs;
+    return null;
+  }, [lastClosedBar, tfMs]);
+
+  const lastSessionLabel =
+    lastSessionTsMs != null
+      ? formatInBrokerTZ(lastSessionTsMs, brokerMeta)
+      : server?.server_now_ms != null
+      ? formatInBrokerTZ(server.server_now_ms, brokerMeta)
+      : "—";
+
+
 
   
 
@@ -1764,13 +1899,72 @@ const tfMs = React.useMemo(() => {
 
 {/* Status row (computed inline to avoid scope issues) */}
 {(() => {
-  // 1) Use UTC milliseconds directly from the API (no ISO parse)
-  const lastUpdatedMs = Number(server?.serverNow ?? Date.now());
+    // 1) Choose the best "last updated" timestamp (broker session)
+    let lastUpdatedMs: number | null = null;
 
-  // 2) Resolve broker meta (prefer server; else fallback override), normalized to { tz_abbr, utc_offset_min }
+    // Prefer backend's last closed bar (close time, in ms)
+    const lastClosed =
+      typeof server?.lastClosedTs === "number"
+        ? server.lastClosedTs
+        : typeof (server as any)?.lastClosedTS === "number"
+        ? (server as any).lastClosedTS
+        : 0;
+
+    if (lastClosed > 0) {
+      lastUpdatedMs = lastClosed;
+    } else {
+      // Fallback: last CLOSED preview bar
+      const bars = previewBars;
+      if (bars.length) {
+        const lastBar: any = bars[bars.length - 1];
+
+        // Use t_close_ms if available, otherwise fall back to t_open_ms
+        const closeMs =
+          typeof lastBar.t_close_ms === "number" && lastBar.t_close_ms > 0
+            ? lastBar.t_close_ms
+            : typeof lastBar.t_open_ms === "number"
+            ? lastBar.t_open_ms
+            : 0;
+
+        if (closeMs > 0) {
+          lastUpdatedMs = closeMs;
+      }
+    }
+  }
+
+  
+  // Final fallback: use server "now"
+  if (!lastUpdatedMs) {
+    lastUpdatedMs = Number(server?.serverNow ?? Date.now());
+  }
+
+  // NEW: convert lastUpdatedMs (close time) ? bar OPEN time (MT5-style label)
+  if (lastUpdatedMs && tfMs > 0) {
+    if (previewBars.length > 0) {
+      // Prefer the open time of the last preview bar
+      const lastBar = previewBars[previewBars.length - 1] as AnyBar;
+      const openMs = barOpenMs(lastBar, tfMs);
+      if (openMs > 0) {
+        lastUpdatedMs = openMs;
+      } else {
+        // fallback: derive open from close
+        lastUpdatedMs = lastUpdatedMs - tfMs;
+      }
+    } else {
+      // No preview bars: derive open from close (lastClosedTs)
+      lastUpdatedMs = lastUpdatedMs - tfMs;
+    }
+  }
+
+  // 2) Resolve broker meta (prefer server; else fallback override)
   const brokerMeta: BrokerMeta | null = (() => {
-    return normalizeBroker(server?.broker) || normalizeBroker(getBrokerOverride?.()) || null;
+    return (
+      normalizeBroker((server as any)?.preview?.broker ?? server?.broker) ||
+      normalizeBroker(getBrokerOverride?.()) ||
+      null
+    );
   })();
+
 
   // 3) Format broker wall-time via offset-only helper
   const lastUpdatedLabel = brokerMeta
@@ -1788,7 +1982,9 @@ const tfMs = React.useMemo(() => {
             using device: <code>{usingDevice}</code>
           </div>
         )}
-        {brokerMeta?.tz_abbr ? <span className="ml-1 text-slate-500">({brokerMeta.tz_abbr})</span> : null}
+        {brokerMeta?.tz_abbr ? (
+          <span className="ml-1 text-slate-500">({brokerMeta.tz_abbr})</span>
+        ) : null}
       </div>
 
       {/* Center: countdown */}
@@ -1803,7 +1999,10 @@ const tfMs = React.useMemo(() => {
       <div className="text-right text-slate-400">
         Live:{" "}
         <span
-          className={cx("font-medium", live ? "text-emerald-300" : "text-slate-300")}
+          className={cx(
+            "font-medium",
+            live ? "text-emerald-300" : "text-slate-300"
+          )}
         >
           {live ? "On" : "Off"}
         </span>
@@ -1811,6 +2010,7 @@ const tfMs = React.useMemo(() => {
     </div>
   );
 })()}
+
 
 
           {notice && <div className="mt-2 text-xs text-amber-300">{notice}</div>}

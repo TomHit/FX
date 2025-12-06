@@ -107,206 +107,236 @@ def _opp_snapshot_key(sym: str, opp_dir: str) -> str:
     return f"{OPP_SNAPSHOT_PREFIX}:{sym}:{d}"
 
 
-def _freeze_or_snapshot_opp(sym: str, row: dict[str, Any], now_ms: int | None = None) -> dict[str, Any]:
+def _freeze_or_snapshot_opp(
+    sym: str, row: dict[str, Any], now_ms: int | None = None
+) -> dict[str, Any]:
     """
-    Create or load a frozen 1-hour opportunity snapshot.
+    Keeps a stable 1h opportunity snapshot per symbol.
 
-    Rules:
-      - First time (no snapshot): freeze direction, basis, expected_move_pct_1h and target_price_1h.
-      - Later calls: ignore new model values and reuse frozen fields from Redis.
+    Behaviour we want:
 
-    This keeps:
-      - alert_created_ms
-      - direction / opp_direction
-      - expected_move_pct_1h
-      - target_price_1h
+    - First time a symbol qualifies:
+        * Freeze direction (UP/DOWN), alert_created_ms,
+          basis/alert_price_1h, expected_move_pct_1h, target_price_1h.
+        * Store them in Redis.
 
-    stable for the whole 1-hour window until the alert is hit or expired.
+    - Subsequent calls during the 1h window:
+        * Ignore new prediction values and ALWAYS reuse the frozen ones,
+          even if the latest H1 sign has flipped.
+
+    - Only after the alert is marked hit/expired and the snapshot is
+      deleted can a new opportunity be opened again.
     """
     if now_ms is None:
-        now_ms = int(_time.time() * 1000)
+        now_ms = int(time.time() * 1000)
 
-    # 1) Normalise direction from the live row
-    opp_dir = (row.get("opp_direction") or row.get("direction") or "").upper()
-    row["direction"] = opp_dir
-    row["opp_direction"] = opp_dir
+    sym_u = (sym or "").upper()
 
-    if not opp_dir:
-        row["_opp_is_new"] = False
+    # ---- 1) direction sanity --------------------------------------
+    direction = (row.get("opp_direction") or row.get("direction") or "").upper()
+    if direction not in ("UP", "DOWN"):
+        # Nothing to freeze if we do not know the direction
         return row
 
-    # 2) Look for an existing snapshot for this symbol+direction
-    snap_key = _opp_snapshot_key(sym, opp_dir)
-    try:
-        snap = R.hgetall(snap_key) or {}
-    except Exception:
-        snap = {}
+    row["direction"] = direction
+    row["opp_direction"] = direction
 
-    def _snap_get_float(key: str, fallback: float | None = None) -> float | None:
+    # Helper to decode json-encoded values from Redis
+    def _snap_get(snap: dict, key: str, default=None):
         val = snap.get(key)
         if val is None:
-            return fallback
-        try:
-            if isinstance(val, bytes):
-                val = val.decode("utf-8", "ignore")
-            return float(val)
-        except Exception:
-            return fallback
-
-    def _snap_get_int(key: str, fallback: int | None = None) -> int | None:
-        val = snap.get(key)
-        if val is None:
-            return fallback
-        try:
-            if isinstance(val, bytes):
-                val = val.decode("utf-8", "ignore")
-            return int(float(val))
-        except Exception:
-            return fallback
-
-    def _snap_get_str(key: str, fallback: str | None = None) -> str | None:
-        val = snap.get(key)
-        if val is None:
-            return fallback
-        if isinstance(val, bytes):
-            val = val.decode("utf-8", "ignore")
+            return default
         try:
             return json.loads(val)
         except Exception:
             return val
 
-    # If snapshot exists but has a bogus basis (<= 0), drop it and rebuild.
-    if snap:
-        existing_basis = _snap_get_float("basis_price", 0.0)
+    # ---- 2) Reuse ANY existing active snapshot for this symbol -----
+    # This is the key change: if there is *already* an active snapshot
+    # for the symbol (UP or DOWN), we reuse it and ignore the new
+    # direction / new numbers.
+    for d0 in ("UP", "DOWN"):
+        key0 = _opp_snapshot_key(sym_u, d0)
         try:
-            basis_val = float(existing_basis)
+            snap0 = R.hgetall(key0) or {}
         except Exception:
-            basis_val = 0.0
-        if basis_val <= 0.0:
-            try:
-                R.delete(snap_key)
-            except Exception:
-                pass
-            snap = {}
+            snap0 = {}
+        if not snap0:
+            continue
 
-    # -------------------------------------------------
-    # CASE A: snapshot exists -> REUSE frozen values
-    # -------------------------------------------------
-    if snap:
-        # Direction: freeze from snapshot
-        snap_dir = _snap_get_str("opp_direction", opp_dir) or opp_dir
-        snap_dir_u = str(snap_dir).upper()
-        row["direction"] = snap_dir_u
-        row["opp_direction"] = snap_dir_u
+        status0 = _snap_get(snap0, "status", "active")
+        if status0 != "active":
+            continue
 
-        # Alert time
-        alert_ms = _snap_get_int("alert_created_ms", now_ms) or now_ms
+        # Reuse frozen fields from the first active snapshot we find
+        frozen_dir = _snap_get(snap0, "direction", d0)
+        row["direction"] = frozen_dir
+        row["opp_direction"] = frozen_dir
+
+        alert_ms = _snap_get(snap0, "alert_created_ms", now_ms)
         row["alert_created_ms"] = alert_ms
 
-        # Basis, move, target
-        basis = _snap_get_float("basis_price", None)
-        move = _snap_get_float("opp_expected_move_pct_1h", None)
-        if move is None:
-            move = _snap_get_float("expected_move_pct_1h", 0.0)
-        target = _snap_get_float("target_price_1h", None)
+        basis = _snap_get(
+            snap0,
+            "basis_price",
+            row.get("basis_price"),
+        )
+        row["basis_price"] = basis
+        row["alert_price_1h"] = basis
 
-        if basis is not None:
+        move_pct = _snap_get(
+            snap0,
+            "opp_expected_move_pct_1h",
+            row.get("opp_expected_move_pct_1h")
+            or row.get("expected_move_pct_1h"),
+        )
+        row["opp_expected_move_pct_1h"] = move_pct
+        row["expected_move_pct_1h"] = move_pct
+
+        target = _snap_get(
+            snap0,
+            "target_price_1h",
+            row.get("target_price_1h"),
+        )
+        row["target_price_1h"] = target
+
+        row["status"] = "active"
+        row["_opp_is_new"] = False
+        return row
+
+    # ---- 3) No active snapshot at all -> fall back to per-direction key ----
+    snap_key = _opp_snapshot_key(sym_u, direction)
+
+    try:
+        snap = R.hgetall(snap_key) or {}
+    except Exception:
+        snap = {}
+
+    if snap:
+        status = _snap_get(snap, "status", "active")
+        if status == "active":
+            # Reuse frozen fields (same as above, but for this direction only)
+            frozen_dir = _snap_get(snap, "direction", direction)
+            row["direction"] = frozen_dir
+            row["opp_direction"] = frozen_dir
+
+            alert_ms = _snap_get(snap, "alert_created_ms", now_ms)
+            row["alert_created_ms"] = alert_ms
+
+            basis = _snap_get(
+                snap,
+                "basis_price",
+                row.get("basis_price"),
+            )
             row["basis_price"] = basis
             row["alert_price_1h"] = basis
 
-        if move is not None:
-            row["opp_expected_move_pct_1h"] = move
-            row["expected_move_pct_1h"] = move
+            move_pct = _snap_get(
+                snap,
+                "opp_expected_move_pct_1h",
+                row.get("opp_expected_move_pct_1h")
+                or row.get("expected_move_pct_1h"),
+            )
+            row["opp_expected_move_pct_1h"] = move_pct
+            row["expected_move_pct_1h"] = move_pct
 
-        if target is not None:
+            target = _snap_get(
+                snap,
+                "target_price_1h",
+                row.get("target_price_1h"),
+            )
             row["target_price_1h"] = target
 
-        status = _snap_get_str("status", "active")
-        if status is not None:
-            row["status"] = status
+            row["status"] = "active"
+            row["_opp_is_new"] = False
+            return row
 
-        row["_opp_is_new"] = False
-        return row
-
-    # -------------------------------------------------
-    # CASE B: no snapshot yet -> create one from live row
-    # -------------------------------------------------
-    alert_ms = int(now_ms)
-
-    # Basis from last_close / last_price / existing basis
-    basis: float | None = None
-    last_px = row.get("last_close")
-    if isinstance(last_px, (int, float)) and last_px > 0:
-        basis = float(last_px)
-    else:
-        last_px = row.get("last_price")
-        if isinstance(last_px, (int, float)) and last_px > 0:
-            basis = float(last_px)
-
-    if basis is None:
-        existing_basis = row.get("basis_price") or row.get("alert_price_1h")
-        if isinstance(existing_basis, (int, float)) and existing_basis > 0:
-            basis = float(existing_basis)
-
-    # Move from opp_expected_move_pct_1h or expected_move_pct_1h
-    move_raw = row.get("opp_expected_move_pct_1h")
-    if move_raw is None:
-        move_raw = row.get("expected_move_pct_1h")
-    try:
-        move = float(move_raw) if move_raw is not None else 0.0
-    except Exception:
-        move = 0.0
-
-    # If we still do not have meaningful basis or move, do not create an alert
-    if basis is None or basis <= 0 or abs(move) < 1e-6:
-        row["_opp_is_new"] = False
-        return row
-
-    # Target based on basis and move
-    try:
-        target = basis * (1.0 + move / 100.0)
-    except Exception:
-        target = basis
-
-    # Write frozen values back into the row
+    # ---- 4) Still no usable snapshot -> create a brand new one -------------
+    # alert_created_ms
+    alert_ms = row.get("alert_created_ms")
+    if not isinstance(alert_ms, int):
+        try:
+            alert_ms = int(alert_ms)  # handle string-int
+        except Exception:
+            alert_ms = now_ms
     row["alert_created_ms"] = alert_ms
-    row["basis_price"] = basis
-    row["alert_price_1h"] = basis
-    row["opp_expected_move_pct_1h"] = move
-    row["expected_move_pct_1h"] = move
-    row["target_price_1h"] = target
-    row["status"] = "active"
 
-    # Build a snapshot payload for Redis
-    payload = {
-        "symbol": sym,
-        "direction": opp_dir,
-        "opp_direction": opp_dir,
+    # basis_price / alert_price_1h
+    basis = row.get("alert_price_1h")
+    if not isinstance(basis, (int, float)):
+        basis = row.get("basis_price")
+    if not isinstance(basis, (int, float)):
+        basis = (
+            row.get("last_close")
+            or row.get("last_price")
+            or row.get("price")
+        )
+
+    try:
+        basis_f = float(basis)
+    except (TypeError, ValueError):
+        basis_f = 0.0
+
+    # move pct (H1)
+    move = (
+        row.get("opp_expected_move_pct_1h")
+        or row.get("expected_move_pct_1h")
+    )
+    try:
+        move_f = float(move)
+    except (TypeError, ValueError):
+        move_f = 0.0
+
+    # If we cannot build a sensible snapshot, bail out gracefully
+    if basis_f <= 0.0 or abs(move_f) < 1e-6:
+        row["_opp_is_new"] = False
+        return row
+
+    # target price from frozen basis + move
+    target = row.get("target_price_1h")
+    if not isinstance(target, (int, float)):
+        target = basis_f * (1.0 + move_f / 100.0)
+
+    try:
+        target_f = float(target)
+    except (TypeError, ValueError):
+        target_f = basis_f
+
+    # Round prices for storage / UI
+    dec = _price_decimals(sym_u)
+    basis_f = round(basis_f, dec)
+    target_f = round(target_f, dec)
+
+    row["basis_price"] = basis_f
+    row["alert_price_1h"] = basis_f
+    row["opp_expected_move_pct_1h"] = move_f
+    row["expected_move_pct_1h"] = move_f
+    row["target_price_1h"] = target_f
+    row["status"] = "active"
+    row["_opp_is_new"] = True
+
+    # ---- 5) Store per-symbol snapshot for reuse ----------------------------
+    snap_payload = {
+        "symbol": sym_u,
+        "direction": row["direction"],
+        "opp_direction": row["opp_direction"],
         "alert_created_ms": alert_ms,
-        "basis_price": basis,
-        "opp_expected_move_pct_1h": move,
-        "expected_move_pct_1h": move,
-        "target_price_1h": target,
+        "basis_price": basis_f,
+        "alert_price_1h": basis_f,
+        "opp_expected_move_pct_1h": move_f,
+        "target_price_1h": target_f,
         "status": "active",
-        "alert_id": row.get("alert_id"),
-        "opp_id": row.get("opp_id"),
-        "score": row.get("opp_score"),
-        "p_up": row.get("prob_up"),
     }
 
     try:
-        encoded = {k: json.dumps(v) for k, v in payload.items()}
-        R.hset(snap_key, mapping=encoded)
-    except Exception as e:
-        log.warning("[OPP] _freeze_or_snapshot_opp save failed sym=%s err=%r", sym, e)
+        mapping = {k: json.dumps(v) for k, v in snap_payload.items()}
+        R.hset(snap_key, mapping=mapping)
+    except Exception:
+        # snapshot is purely UX; do not break endpoint
+        pass
 
-    try:
-        _save_alert_snapshot(sym, payload)
-    except Exception as e:
-        log.warning("[OPP] _freeze_or_snapshot_opp history save failed sym=%s err=%r", sym, e)
-
-    row["_opp_is_new"] = True
     return row
+
 
 import json as _json
 
@@ -2329,8 +2359,10 @@ def trend_opportunities(
                 if raw_status is None:
                     status = "active"
                 else:
+                    # Redis gives bytes; we stored JSON-encoded text.
+                    if isinstance(raw_status, bytes):
+                        raw_status = raw_status.decode("utf-8", "ignore")
                     try:
-                        # values are stored via json.dumps(...)
                         status = json.loads(raw_status)
                     except Exception:
                         status = str(raw_status)
@@ -3681,7 +3713,9 @@ def trend_state2(
             }
 
 
-    # ---------- closed-bar filter (compare in ms; keep bars.t in seconds) ----------
+    
+    
+   
     # ---------- closed-bar filter (time-based; t + TF_SEC <= now_s) ----------
     server_now_ms = int(time.time() * 1000)
     now_s = int(server_now_ms // 1000)
@@ -3690,12 +3724,38 @@ def trend_state2(
     closed: list[dict] = []
     for b in bars or []:
         try:
-            t_s = int(_to_ms_any(b.get("t")) // 1000)  # normalize to seconds
-            if (t_s + TF_SEC) <= now_s:  # bar is fully closed if its CLOSE is in the past
+            # Original bar time (epoch-like)
+            raw_t = b.get("t")
+            t_ms_raw = _to_ms_any(raw_t)        # normalize to ms
+            t_s = int(t_ms_raw // 1000)         # seconds (canonical "t")
+
+            # Prefer agent-supplied broker-grid timestamps if present
+            t_open_ms = b.get("t_open_ms")
+            t_close_ms = b.get("t_close_ms")
+
+            if t_open_ms is None:
+                t_open_ms = t_ms_raw
+            else:
+                t_open_ms = int(_to_ms_any(t_open_ms))
+
+            if t_close_ms is None:
+                t_close_ms = int(t_open_ms + TF_SEC * 1000)
+            else:
+                t_close_ms = int(_to_ms_any(t_close_ms))
+
+            # Bar is fully closed if its CLOSE is in the past
+            if (t_s + TF_SEC) <= now_s:
                 closed.append({
+                    # legacy open-time in seconds (used by some paths)
                     "t": t_s,
-                    "o": float(b["o"]), "h": float(b["h"]),
-                    "l": float(b["l"]), "c": float(b["c"]),
+                    # explicit broker-grid times in ms
+                    "t_open_ms": int(t_open_ms),
+                    "t_close_ms": int(t_close_ms),
+                    # OHLC
+                    "o": float(b["o"]),
+                    "h": float(b["h"]),
+                    "l": float(b["l"]),
+                    "c": float(b["c"]),
                     "complete": True,
                 })
         except Exception:
@@ -3708,12 +3768,13 @@ def trend_state2(
         closed = []
         for b in base:
             try:
-                t_s = int(_to_ms_any(b.get("t")) // 1000)
+                t_ms_raw = _to_ms_any(b.get("t"))
+                t_s = int(t_ms_raw // 1000)
                 closed.append({
-                    "t": t_s,
-                    "o": float(b["o"]), "h": float(b["h"]),
-                    "l": float(b["l"]), "c": float(b["c"]),
-                    "complete": True,
+                   "t": t_s,
+                   "o": float(b["o"]), "h": float(b["h"]),
+                   "l": float(b["l"]), "c": float(b["c"]),
+                   "complete": True,
                 })
             except Exception:
                 continue
@@ -3798,7 +3859,12 @@ def trend_state2(
     # TRUE close time of the last closed bar
     last_closed_ms = _last_open_ms + tf_ms
     # Next boundary is one TF after the last close (or snapshot hint)
-    next_close_ms = snap_next or (last_closed_ms + tf_ms if last_closed_ms else server_now_ms + tf_ms)
+    # Broker timezone offset (minutes) for boundary calculation
+    try:
+        broker_tz_offset_min = int((broker_safe or {}).get("tz_offset_min") or 0)
+    except Exception:
+        broker_tz_offset_min = 0
+    next_close_ts = _next_boundary_ms(TF_SEC, server_now_ms, broker_tz_offset_min or 0)
 
     # --- compute real label/score using your indicator logic ---
     try:
@@ -3834,14 +3900,30 @@ def trend_state2(
         )
     # --- adaptive polling hint for UI ---
     # how long until next close, based on the current server_now_ms we computed earlier
-    remain_ms = max(0, int((next_close_ms or 0) - server_now_ms))
+    # --- adaptive polling hint for UI ---
+    # Ensure we have a sane next_close_ms even if earlier computation skipped
+    if (
+        "next_close_ms" not in locals()
+        or not isinstance(next_close_ms, (int, float))
+        or next_close_ms <= 0
+    ):
+        try:
+            off_min = int((broker_safe or {}).get("tz_offset_min") or 0)
+        except Exception:
+            off_min = 0
+        # Align next boundary on broker grid: one TF after the current server_now_ms
+        base_next = ((server_now_ms + off_min * 60_000) // tf_ms) * tf_ms + tf_ms - off_min * 60_000
+        next_close_ms = int(base_next)
+
+    # how long until next close, based on the current server_now_ms we computed earlier
+    remain_ms = max(0, int(next_close_ms - server_now_ms))
 
     # default gentle polling if boundary isn't known
     poll_after_ms = 10_000
 
     # if we know the boundary, wake slightly after it; clamp to [2s, 60s]
     if next_close_ms and server_now_ms:
-        poll_after_ms = max(2_000, min(60_000,(next_close_ms - server_now_ms) + 500))
+        poll_after_ms = max(2_000, min(60_000, (next_close_ms - server_now_ms) + 500))
 
 
     
@@ -3949,43 +4031,18 @@ def trend_state2(
         f"serverNow_ist={_iso_ist(server_now)} lastClosed_ist={_iso_ist(last_closed_ts)} nextClose_ist={_iso_ist(next_close_ts)}"
     )
     # --- Prefer live broker bars (BID) when agent is reachable; fallback to snapshot ---
+    # --- Build preview rows from snapshot closed bars only (temporarily disable direct broker fetch) ---
     prev_rows_override = None
-    try:
-        raw_broker = _broker_bars_sync(symbol.upper(), tf, limit=300, price="bid")
-    except Exception:
-        raw_broker = []
+    rows_src = [
+        {
+            "t": int(_to_ms_any(b.get("t"))) // 1000,  # seconds (MT5 bar time = OPEN)
+            "o": float(b["o"]), "h": float(b["h"]),
+            "l": float(b["l"]), "c": float(b["c"]),
+            "complete": True,  # only closed bars
+        }
+        for b in closed
+    ]
 
-    if raw_broker:
-        tf_sec = 900 if tf == "M15" else (3600 if tf == "H1" else 14400)
-        now_s = int(time.time())
-        rows = []
-        for b in raw_broker[-305:]:
-            try:
-                t_raw = int(b.get("t", 0))
-                # normalize to **seconds** for a fair compare against now_s (which is seconds)
-                t_sec = (t_raw // 1000) if t_raw > 10_000_000_000 else t_raw
-                o = float(b["o"]); h = float(b["h"]); l = float(b["l"]); c = float(b["c"])
-                is_forming = (now_s < (t_sec + tf_sec))
-                rows.append({"t": t_sec, "o": o, "h": h, "l": l, "c": c, "complete": (not is_forming)})
-            except Exception:
-                continue
-        if rows:
-            # keep only closed bars so preview = last CLOSED candle like MT5
-            closed_rows = [r for r in rows if r.get("complete")]
-            prev_rows_override = closed_rows[-300:] if closed_rows else []
-    # choose source (broker first, else snapshot)
-    rows_src = (prev_rows_override or [])
-    # Fallback to snapshot 'closed' bars so we still render via the unified path
-    if not rows_src:
-        rows_src = [
-            {
-                "t": int(_to_ms_any(b.get("t")))//1000,  # seconds (MT5 bar time = OPEN)
-                "o": float(b["o"]), "h": float(b["h"]),
-                "l": float(b["l"]), "c": float(b["c"]),
-                "complete": True,  # only closed bars
-            }
-            for b in closed
-        ]
 
 
 
@@ -4006,7 +4063,7 @@ def trend_state2(
         norm = sorted(norm, key=lambda r: int(_epoch_to_ms_any(r.get("t"))))
     except Exception:
         pass
-    norm = [r for r in norm if r.get("complete")] or []
+    
 
     rows_src_len = len(rows_src or [])
     norm_closed_len = len(norm or [])
@@ -4057,9 +4114,9 @@ def trend_state2(
     last = norm[-1]  # last CLOSED broker row (what we intend to render)
    
 
-    off_ms = int((broker_safe or {}).get("tz_offset_min") or 0) * 60_000
-    last_open_ms  = (((_epoch_to_ms_any(last["t"]) + off_ms) // (TF_SEC * 1000)) * (TF_SEC * 1000)) - off_ms
-    last_close_ms = last_open_ms + (TF_SEC * 1000)
+    TF_MS = TF_SEC * 1000
+    last_open_ms = int(_epoch_to_ms_any(last["t"]))
+    last_close_ms = last_open_ms + TF_MS
 
     previewProbe = {
         "broker_tz_offset_min": (broker_safe or {}).get("tz_offset_min"),
@@ -4075,14 +4132,14 @@ def trend_state2(
         },
     }
 
-    # --- Include forming bar if present so preview matches MT5 "now" ---
-    include_forming = bool(norm and (norm[-1].get("complete") is False))
+    
 
     # --- Apply tailing limit (default 60; clamp 30 to 500) ---
     N = max(30, min(int(n or 60), 500))
     tail = norm[-N:]
 
 
+    
     # choose digits: prefer digits from snapshot -> fallback env BROKER_DIGITS
     digits = BROKER_DIGITS
     try:
@@ -4095,29 +4152,50 @@ def trend_state2(
     except Exception:
         pass
 
-    # round to broker digits
-    for r in tail:
-        r["o"] = round(r["o"], digits)
-        r["h"] = round(r["h"], digits)
-        r["l"] = round(r["l"], digits)
-        r["c"] = round(r["c"], digits)
+    # --- extra safety: never coarsen prices for FX ---
+    # infer decimals from the latest close and ensure digits is AT LEAST that
+    try:
+        if tail:
+            sample = abs(float(tail[-1]["c"]))
+            s = f"{sample:.8f}".rstrip("0").rstrip(".")
+            if "." in s:
+                inferred = len(s.split(".")[1])
+                if inferred > digits:
+                    digits = inferred
+    except Exception:
+        pass
 
-    prev_rows = tail  # <- do NOT overwrite later
+    # round to final digits (only if > 0), but now digits >= actual precision
+    if digits and digits > 0:
+        for r in tail:
+            r["o"] = round(float(r["o"]), digits)
+            r["h"] = round(float(r["h"]), digits)
+            r["l"] = round(float(r["l"]), digits)
+            r["c"] = round(float(r["c"]), digits)
 
-    # compute preview lastClosedTs based on whether the last row is forming
+    prev_rows = tail  # <- do NOT modify after this
+
+
+    
+    # --- Compute preview lastClosedTs & probe using agent-aligned times ----
+    last_open_ms = last_close_ms = None
+
     if prev_rows:
-        last_open = prev_rows[-1]["t"]
-        preview_last_closed_ts = (
-            last_open * 1000 if include_forming else (last_open + TF_SEC) * 1000
+        last_row = prev_rows[-1]
+        # trust agent_ohlc's alignment
+        last_open_ms = int(
+            last_row.get("t_open_ms") or _epoch_to_ms_any(last_row["t"])
         )
+        last_close_ms = int(
+            last_row.get("t_close_ms") or (last_open_ms + TF_SEC * 1000)
+        )
+
+        # lastClosedTs should be the CLOSE of the last bar
+        preview_last_closed_ts = last_close_ms
+        
     else:
         preview_last_closed_ts = None
 
-    # build preview payload
-    # --- Build probe for last CLOSED bar (already computed: last, TF_SEC, broker_safe, norm) ---
-    off_ms = int((broker_safe or {}).get("tz_offset_min") or 0) * 60_000  # agent broker TZ shift (ms)
-    last_open_ms  = (((_epoch_to_ms_any(last["t"]) + off_ms) // (TF_SEC * 1000)) * (TF_SEC * 1000)) - off_ms
-    last_close_ms = last_open_ms + (TF_SEC * 1000)
 
     previewProbe = {
         "broker_tz_offset_min": (broker_safe or {}).get("tz_offset_min"),
@@ -4128,8 +4206,8 @@ def trend_state2(
              "l": float(last["l"]), "c": float(last["c"]),
         },
         "render_bar": {
-            "t_open_ms": int(last_open_ms),
-            "t_close_ms": int(last_close_ms),
+            "t_open_ms": int(last_open_ms) if last_open_ms is not None else None,
+            "t_close_ms": int(last_close_ms) if last_close_ms is not None else None,
         },
     }
 
@@ -4158,42 +4236,64 @@ def trend_state2(
     }
 
 
-    # --- Build preview payload (repeat open/close calc per row; don't reference t_open_ms) ---
+    
     # Anchor each bar to the broker TF grid using tz_offset_min
-    off_ms = int((broker_safe or {}).get("tz_offset_min") or 0) * 60_000
-    bars_tail = []
-    for r in norm[-int(n or 60):]:
-        open_ms = (((_epoch_to_ms_any(r["t"]) + off_ms) // (TF_SEC * 1000)) * (TF_SEC * 1000)) - off_ms
-        bars_tail.append(
-            PreviewBar(
-                t_open_ms=int(open_ms),
-                t_close_ms=int(open_ms + (TF_SEC * 1000)),
-                o=r["o"], h=r["h"], l=r["l"], c=r["c"],
+    # --- Build preview payload (use raw MT5 UTC bar open; UI applies broker offset) ---
+    # --- Build preview payload using agent-aligned broker-grid timestamps ---
+    TF_MS = TF_SEC * 1000
+
+    bars_tail: list[PreviewBar] = []
+    tail_len = int(n or 60)
+
+    for r in norm[-tail_len:]:
+        try:
+            # Prefer agent-supplied broker-grid times if present
+            t_open_ms = r.get("t_open_ms")
+            t_close_ms = r.get("t_close_ms")
+
+            if t_open_ms is None:
+                # fallback: derive from legacy 't' (seconds or ms)
+                t_open_ms = _epoch_to_ms_any(r.get("t"))
+            else:
+                t_open_ms = _epoch_to_ms_any(t_open_ms)
+
+            if t_close_ms is None:
+                t_close_ms = int(t_open_ms + TF_MS)
+            else:
+                t_close_ms = _epoch_to_ms_any(t_close_ms)
+
+            if t_open_ms is None or t_close_ms is None:
+                continue
+
+            bars_tail.append(
+                PreviewBar(
+                t_open_ms=int(t_open_ms),
+                t_close_ms=int(t_close_ms),
+                o=float(r["o"]),
+                h=float(r["h"]),
+                l=float(r["l"]),
+                c=float(r["c"]),
             )
         )
+        except Exception:
+            continue
 
 
-    # --- Build preview payload (use MT5 UTC bar open; UI adds broker offset for display) ---   
     preview = PreviewPayload(
-    symbol=sym,
-    tf=tfu,
-    bars=[
-       PreviewBar(
-           # broker-grid anchoring using existing TF_SEC and broker_safe
-           t_open_ms = int((((( _epoch_to_ms_any(r["t"]) + int((broker_safe or {}).get("tz_offset_min") or 0) * 60000 )
-                               // (TF_SEC * 1000) ) * (TF_SEC * 1000))
-                             - int((broker_safe or {}).get("tz_offset_min") or 0) * 60000)),
-           t_close_ms = int((((( _epoch_to_ms_any(r["t"]) + int((broker_safe or {}).get("tz_offset_min") or 0) * 60000 )
-                               // (TF_SEC * 1000) ) * (TF_SEC * 1000))
-                             - int((broker_safe or {}).get("tz_offset_min") or 0) * 60000) + (TF_SEC * 1000)),
-           o=r["o"], h=r["h"], l=r["l"], c=r["c"],
+        symbol=sym,
+        tf=tfu,
+        bars=bars_tail,
+        # use preview_last_closed_ts which we computed from prev_rows
+        lastClosedTs=int(preview_last_closed_ts or 0),
+        probe=previewProbe,
+    )
 
-       )
-       for r in norm[-int(n or 60):]
-    ],
-    lastClosedTs=int(last_closed_ms or 0),
-    probe=previewProbe,
-)
+    try:
+        preview_out = preview.dict()
+    except Exception:
+        preview_out = dict(preview)
+    preview_out["broker"] = broker_safe
+
     try:
        preview_out = preview.dict()
     except Exception:
@@ -4241,7 +4341,7 @@ def trend_state2(
             last = prev_rows[-1]
             src_used = "broker" if prev_rows_override else "snapshot"
             log.info(
-                f"[TREND] preview {src_used} tf={tf} include_forming={include_forming} "
+                f"[TREND] preview {src_used} tf={tf} "
                 f"last_open_utc={last['t']} OHLC={last['o']},{last['h']},{last['l']},{last['c']} "
                 f"digits={digits}"
             )
