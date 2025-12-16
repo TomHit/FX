@@ -64,6 +64,7 @@ function decimalsFromPrice(px?: number): number | undefined {
 }
 
 // Symbol ? decimal places: JPY=3, XAUUSD=2, majors=5
+// Symbol ? decimal places: JPY=3, XAUUSD=2, majors=5
 function priceDecimals(sym: string): number {
   const s = (sym || "").toUpperCase();
   if (s === "XAUUSD") return 2;
@@ -72,11 +73,9 @@ function priceDecimals(sym: string): number {
 }
 
 function fmtPrice(sym: string, px: number | null | undefined, decimals?: number): string {
-  if (!Number.isFinite(px as any)) return "—";
+  if (!Number.isFinite(px as any)) return "";
 
-  const d = Number.isFinite(decimals as any)
-    ? (decimals as number)
-    : priceDecimals(sym);
+  const d = Number.isFinite(decimals as any) ? (decimals as number) : priceDecimals(sym);
 
   // Avoid floating-point artifacts before toFixed
   const k = Math.pow(10, d);
@@ -89,50 +88,56 @@ function fmtPrice(sym: string, px: number | null | undefined, decimals?: number)
 function calcTargetPrice(row: {
   symbol: string;
   price?: number;
-  decision?: "BUY"|"SELL"|"";
-  direction?: "up" | "down" | "flat"; 
+  decision?: "BUY" | "SELL" | "" | string;
+  direction?: "up" | "down" | "flat";
   target_price_1h?: number;
   target_pips?: number;              // may be pip-count OR price-delta
   expected_move_pct_1h?: number;     // percent, e.g. 0.40 => +0.40%
+  st_trend_label?: Bias;
+  bias?: Bias;
 }) {
   const px = Number(row.price);
-  const ps = pipSize(row.symbol);                    // 0.0001 (majors), 0.01 (JPY), 0.1 (XAU)
+  const ps = pipSize(row.symbol); // 0.0001 (majors), 0.01 (JPY), 0.1 (XAU)
   if (!Number.isFinite(px)) {
-    // we can still return the backend target even if live price is missing
     if (Number.isFinite(row.target_price_1h as any)) return row.target_price_1h as number;
     return null;
   }
 
-  // A) Prefer explicit backend target — this is the stabilized value we want to show.
-  if (Number.isFinite(row.target_price_1h as any)) {
-    return row.target_price_1h as number;
+  // A) Prefer explicit backend target (stable value)
+  if (Number.isFinite((row as any).target_price)) {
+    const t = Number((row as any).target_price);
+    if (Number.isFinite(t)) return t;
   }
 
-  // B) Pips-based fallback (supports “pip count” OR direct price-delta)
+  const dec = String(row.decision || "").toUpperCase();
+
+  // B) Pips-based fallback (supports pip count OR direct price-delta)
   if (Number.isFinite(row.target_pips as any)) {
     const tp = Number(row.target_pips);
     let d = Math.abs(tp) >= 5 ? tp * ps : tp;
-    if (row.decision === "SELL") d = -Math.abs(d);
-    else if (row.decision === "BUY") d = +Math.abs(d);
+    if (dec === "SELL") d = -Math.abs(d);
+    else if (dec === "BUY") d = +Math.abs(d);
     return px + d;
   }
 
-  // C) Percent-based fallback
+  // C) Percent-based fallback (1h) â€” direction should follow ST trend when available
   if (Number.isFinite(row.expected_move_pct_1h as any)) {
-   const pct = Number(row.expected_move_pct_1h) / 100;
-   // --- patch: infer direction when missing ---
-   let dir = 0;
-   if (row.decision === "SELL") dir = -1;
-   else if (row.decision === "BUY") dir = +1;
-   else if (row.direction === "down") dir = -1;
-   else if (row.direction === "up") dir = +1;
-   else dir = Math.sign(pct);
-   // --- end patch ---
-   return px * (1 + dir * Math.abs(pct));
+    const pctAbs = Math.abs(Number(row.expected_move_pct_1h)) / 100;
+    const stDir = trendDirFromBiasLabel(row.st_trend_label ?? row.bias);
+
+    const dir =
+      stDir !== 0 ? stDir :
+      dec === "SELL" ? -1 :
+      dec === "BUY"  ? +1 :
+      0;
+
+    if (dir === 0) return null;
+    return px * (1 + dir * pctAbs);
   }
-  
+
   return null;
 }
+
 
 
 
@@ -140,11 +145,46 @@ type TfLabel = "M1" | "M5" | "M15" | "H1" | "H4";
 
 type PredictRow = {
   symbol: string;
-  direction: "up" | "down" | "flat";
-  target_price_1h: number;
-  prob_up_1h?: number;             // 0..1
-  expected_move_pct_1h?: number;   // optional
+
+  // headline decisioning (from backend)
+  label?: string;
+  decision?: "BUY" | "SELL" | "ABSTAIN" | string;
+  confidence?: "low" | "medium" | "high" | string;
+  prob_up?: number; // canonical
+  p_up?: number;    // alias
+  probUp?: number;  // alias
+
+  // canonical model-driven target fields (preferred)
+  basis_price?: number;
+  target_price?: number;
+  expected_move_pct?: number;
+  model_source?: string; // "ml" | "na" etc.
+  target_close_ts?: number; // epoch ms
+  horizon_min?: number;      // minutes
+
+  // backward compat / fallbacks
+  expected_move_pct_1h?: number;
+  target_price_1h?: number;
+  basis_price_1h?: number;
+
+  expected_move_pct_4h?: number;
+  target_price_4h?: number;
+
+  // reasons
+  reasons?: string[];
+  reasons_h1?: string[];
+  reasons_h4?: string[];
+
+  // raw payloads (optional)
+  raw?: any;
+  raw_h4?: any;
+
+  // misc
+  update_tf?: string;
+  score?: number;
+  reason?: string;
 };
+
 
 type TfSnapshot = {
   tf: TfLabel;
@@ -180,7 +220,7 @@ function useOffsetClock(offsetMin: number) {
 
 // Format a timestamp (epoch seconds or ms) as broker time (offset minutes from UTC), invariant to viewer TZ
 function fmtBrokerTime(ts: number | null | undefined, _offsetMin: number) {
-  if (!ts && ts !== 0) return "—";
+  if (!ts && ts !== 0) return "";
   const ms = ts! < 2_000_000_000 ? ts! * 1000 : ts!;     // seconds ? ms
   
   return new Date(ms).toLocaleTimeString(
@@ -226,7 +266,7 @@ function useTfStripData(enabled: boolean = true): {
               r?.decision === "BUY" ? "up" : r?.decision === "SELL" ? "down" : "flat";
 
             // probability: prefer ML p_up, else fallback from score
-            const prob_up_1h: number | undefined =
+            const prob_up: number | undefined =
               typeof r?.p_up === "number" ? r.p_up :
               (typeof r?.score === "number" ? (r.score + 1) / 2 : undefined);
 
@@ -245,7 +285,7 @@ function useTfStripData(enabled: boolean = true): {
             return {
                symbol: r.symbol,
                direction,
-               prob_up_1h,
+               prob_up,
                expected_move_pct_1h:
                  typeof r?.expected_move_pct_1h === "number" ? r.expected_move_pct_1h : undefined,
                target_price_1h,
@@ -264,7 +304,7 @@ function useTfStripData(enabled: boolean = true): {
   }, []);
 
   React.useEffect(() => {
-    if (!enabled) return;                 // ? don’t poll when disabled
+    if (!enabled) return;                 // ? dont poll when disabled
     let t: number | null = null;
     const tick = async () => {
       await fetchAll();
@@ -353,8 +393,8 @@ function TFCard(props: {
   onClick: () => void;
 }) {
   const r0 = props.snapshot?.rows?.[0]; // show top symbol or an aggregate; adjust if you want per-symbol cards later
-  const dir = r0?.direction ?? "flat";
-  const prob = r0?.prob_up_1h != null ? Math.round((r0.prob_up_1h)*100) : null;
+  const dir = r0?.decision === "BUY" ? "up" : r0?.decision === "SELL" ? "down" : "flat";
+  const prob = typeof r0?.prob_up === "number" ? Math.round(r0.prob_up * 100) : null;
   const target = r0?.target_price_1h;
 
   const ring = props.active ? "ring-1 ring-amber-400" : "ring-1 ring-slate-700";
@@ -368,10 +408,10 @@ function TFCard(props: {
       <div className="text-xs uppercase tracking-wide text-slate-400">{props.label}</div>
       <div className={`mt-1 text-sm font-medium ${chip}`}>{dir.toUpperCase()}</div>
       <div className="mt-1 text-[11px] text-slate-400">
-        {prob != null ? `ProbUp: ${prob}%` : "ProbUp: —"}
+        {prob != null ? `ProbUp: ${prob}%` : "ProbUp: "}
       </div>
       <div className="mt-0.5 text-[11px] text-slate-400">
-        {target != null ? `Target(1h): ${target}` : "Target(1h): —"}
+        {target != null ? `Target(1h): ${target}` : "Target(1h): "}
       </div>
     </button>
   );
@@ -387,7 +427,7 @@ function TFStrip({ tf, setTf, enabled = true }: { tf: TfLabel; setTf: (t: TfLabe
         ))}
       </div>
       <div className="mt-2 text-[11px] text-slate-500">
-        {lastAt ? `Updated: ${new Date(lastAt).toLocaleTimeString()}` : (enabled ? "Loading…" : "Paused")}
+        {lastAt ? `Updated: ${new Date(lastAt).toLocaleTimeString()}` : (enabled ? "Loading" : "Paused")}
       </div>
     </div>
   );
@@ -442,9 +482,14 @@ type InstrumentRow = {
   st_trend_label?: Bias;   // ST trend label from backend
   ht_trend_label?: Bias;   // HT trend label from backend
   direction: Direction;
-  prob_up_1h: number;               // 0..1
-  expected_move_pct_1h: number;     // signed, +0.30 => up 0.30%
-  target_price_1h: number;
+  prob_up: number;               // 0..1
+  expected_move_pct?: number;   // distance (any horizon)
+  target_price?: number;        // price target (any horizon)
+  horizon_min?: number;         // ML-predicted time to hit
+
+  // --- legacy (read-only, compat) ---
+  expected_move_pct_1h?: number;
+  target_price_1h?: number;
   expected_move_pct_4h?: number;
   target_price_4h?: number;
 
@@ -470,9 +515,8 @@ type InstrumentRow = {
 // Map backend /trend/predict/all row -> InstrumentRow (defensive defaults)
 function mapApiRowToInstrument(r: any): InstrumentRow {
   const label: string = (r?.label || "").toString();
-  // short-term and long-term trends from backend
-  // short-term and long-term trends from backend
-  // prefer new H1/H4 scores if present, fall back to older score_* fields
+
+  // --- short-term / long-term trend scores ---
   const st =
     typeof r?.st_trend_score === "number"
       ? r.st_trend_score
@@ -483,11 +527,12 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
       ? r.ht_trend_score
       : (typeof r?.score_tech === "number" ? r.score_tech : null);
 
-  // optional explicit labels from backend
+  // explicit labels (if backend sends them)
   const stLabelApi: string = (r?.st_trend_label || "").toString();
   const htLabelApi: string = (r?.ht_trend_label || "").toString();
 
   const decision: string = (r?.decision || "").toString();
+
   const bias: Bias =
     label === "Strong Bullish" ? "Strong Bullish" :
     label === "Bullish"        ? "Bullish" :
@@ -499,29 +544,68 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
     decision === "BUY"  ? "up"   :
     decision === "SELL" ? "down" : "flat";
 
-  // Some backends send p_up, some send prob_up_1h already
-  const prob_up = typeof r?.prob_up_1h === "number" ? r.prob_up_1h
-                 : typeof r?.p_up === "number"      ? r.p_up
-                 : null;
+  // --- probabilities (legacy + new) ---
+  const prob_up =
+    typeof r?.prob_up === "number"      ? r.prob_up :
+    typeof r?.prob_up === "number"   ? r.prob_up :
+    typeof r?.p_up === "number"         ? r.p_up :
+    null;
 
-  // expected_move_pct_1h: use signed score% if present; else null
-  const exp_move =
-    typeof r?.expected_move_pct_1h === "number" ? r.expected_move_pct_1h :
-    (typeof r?.score === "number" ? r.score : null);
+  // --- NEW ML canonical fields ---
+  const horizon_min =
+    typeof r?.horizon_min === "number" ? r.horizon_min : undefined;
 
-  // target: accept either target_price_1h or target_pips translated later
-  const target_price =
-    typeof r?.target_price_1h === "number" ? r.target_price_1h : null;
+  const raw = (r as any)?.raw ?? null;
 
-  // 4h horizon (if backend sends them)
+  // Pull pct from canonical -> raw.predMovePct -> legacy expected_move_pct_1h -> score (very old fallback)
+  const pct_raw =
+    typeof r?.expected_move_pct === "number"
+      ? r.expected_move_pct
+      : (typeof (raw as any)?.predMovePct === "number"
+          ? (raw as any).predMovePct
+          : (typeof r?.expected_move_pct_1h === "number"
+              ? r.expected_move_pct_1h
+              : (typeof r?.score === "number" ? r.score : null)));
+
+  // Force sign to match decision (avoids "SELL but target above price")
+  const dec = String(decision || "").toUpperCase();
+  const basis_price =
+  typeof r?.basis_price === "number"
+    ? r.basis_price
+    : typeof (raw as any)?.lastClose === "number"
+      ? (raw as any).lastClose
+      : typeof r?.basis_price_1h === "number"
+        ? r.basis_price_1h
+        : null;
+
+  const sign = dec === "SELL" ? -1 : dec === "BUY" ? 1 : (typeof pct_raw === "number" ? (pct_raw >= 0 ? 1 : -1) : 1);
+  const expected_move_pct = typeof pct_raw === "number" ? Math.abs(pct_raw) * sign : null;
+
+  let target_price =
+    typeof r?.target_price === "number"
+      ? r.target_price
+      : (typeof (raw as any)?.targetPrice === "number"
+          ? (raw as any).targetPrice
+          : (typeof r?.target_price_1h === "number"
+              ? r.target_price_1h
+              : null));
+
+  // If target contradicts decision, recompute from basis_price + signed pct
+  if (typeof basis_price === "number" && typeof expected_move_pct === "number") {
+    const implied = basis_price * (1.0 + expected_move_pct / 100.0);
+    if (dec === "SELL" && typeof target_price === "number" && target_price > basis_price) target_price = implied;
+    if (dec === "BUY" && typeof target_price === "number" && target_price < basis_price) target_price = implied;
+    if (target_price == null) target_price = implied;
+  }
+
+  // --- legacy 4h (context only) ---
   const exp_move_4h =
     typeof r?.expected_move_pct_4h === "number" ? r.expected_move_pct_4h : undefined;
 
   const target_price_4h =
     typeof r?.target_price_4h === "number" ? r.target_price_4h : undefined;
 
-  // reasons: normalize to string[]
-  // ST / HT reasons from backend (keep legacy "reasons" for compat)
+  // --- reasons ---
   const reasons_h1: string[] = Array.isArray(r?.reasons_h1)
     ? r.reasons_h1.map(String)
     : Array.isArray(r?.reasons)
@@ -532,23 +616,23 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
     ? r.reasons_h4.map(String)
     : [];
 
-  // legacy "reasons" field: prefer ST reasons, else HT, else empty
   const reasons: string[] =
     reasons_h1.length ? reasons_h1 :
     (reasons_h4.length ? reasons_h4 : []);
 
-
-  // broker/device meta if present
+  // --- broker / device meta ---
   const tz_off =
     (typeof r?.broker_tz_offset_min === "number" ? r.broker_tz_offset_min :
-     typeof r?.tz_offset_min === "number"       ? r.tz_offset_min : undefined);
+     typeof r?.tz_offset_min === "number"        ? r.tz_offset_min : undefined);
 
   return {
     symbol: String(r?.symbol || ""),
     price: NaN as any, // priced separately from M1 feed
+
     bias,
     short_term_score: st ?? undefined,
     long_term_score: ht ?? undefined,
+
     st_trend_label:
       stLabelApi === "Strong Bullish" ||
       stLabelApi === "Bullish" ||
@@ -557,6 +641,7 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
       stLabelApi === "Strong Bearish"
         ? (stLabelApi as Bias)
         : undefined,
+
     ht_trend_label:
       htLabelApi === "Strong Bullish" ||
       htLabelApi === "Bullish" ||
@@ -565,26 +650,48 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
       htLabelApi === "Strong Bearish"
         ? (htLabelApi as Bias)
         : undefined,
+
     direction,
-    prob_up_1h: typeof prob_up === "number" ? prob_up : NaN as any,
-    expected_move_pct_1h: typeof exp_move === "number" ? exp_move : 0,
-    target_price_1h: target_price ?? (typeof r?.target === "number" ? r.target : undefined),
+
+    // --- probabilities / ML outputs ---
+    prob_up: typeof prob_up === "number" ? prob_up : NaN as any,
+
+    // canonical (ML-driven)
+    expected_move_pct: typeof expected_move_pct === "number" ? expected_move_pct : undefined,
+    target_price: typeof target_price === "number" ? target_price : undefined,
+    horizon_min,
+
+    // legacy compatibility (read-only)
+    expected_move_pct_1h:
+      typeof expected_move_pct === "number" ? expected_move_pct : 0,
+
+    target_price_1h:
+      typeof target_price === "number"
+        ? target_price
+        : (typeof r?.target === "number" ? r.target : undefined),
+
     expected_move_pct_4h: exp_move_4h,
     target_price_4h: target_price_4h,
+
     decision: typeof r?.decision === "string" ? (r.decision as any) : "",
     target_pips: typeof r?.target_pips === "number" ? r.target_pips : undefined,
+
     reasons,
     reasons_h1,
     reasons_h4,
+
     confidence_band: undefined,
-    // Use server_now_ms or updated_broker_ts if provided; fallback null
+
     updated_broker_ts:
       (typeof r?.updated_broker_ts === "number" ? r.updated_broker_ts :
-       typeof r?.server_now_ms    === "number" ? r.server_now_ms : 0),
+       typeof r?.server_now_ms === "number"      ? r.server_now_ms : 0),
+
     broker_tz_abbr: String(r?.broker_tz_abbr || ""),
     using_device: String(r?.using_device || ""),
+
     broker_tz_offset_min: tz_off,
     tz_offset_min: tz_off,
+
     structure: r?.structure ? String(r.structure) : undefined,
   };
 }
@@ -657,6 +764,13 @@ function usePredictRows(tf: "M1" | "M5" | "M15" | "H1" | "H4" = "M1") {
 /* -------------------------------------------------
  * UI helpers
  * ------------------------------------------------- */
+function trendDirFromBiasLabel(b?: Bias): number {
+  if (!b) return 0;
+  if (b === "Strong Bullish" || b === "Bullish") return +1;
+  if (b === "Strong Bearish" || b === "Bearish") return -1;
+  return 0;
+}
+
 function biasToScore(b: Bias): number {
   switch (b) {
     case "Strong Bullish":
@@ -672,7 +786,7 @@ function biasToScore(b: Bias): number {
   }
 }
 function scoreToTrendLabel(s?: number): string {
-  if (typeof s !== "number") return "—";
+  if (typeof s !== "number") return "";
   if (s >= 0.6) return "Strong Bullish";
   if (s >= 0.2) return "Bullish";
   if (s > -0.2) return "Neutral";
@@ -701,13 +815,13 @@ function biasToPill(b?: Bias): { text: string; className: string; arrow: string 
 
 
 function pct(n?: number): string {
-  if (typeof n !== "number" || isNaN(n)) return "—";
+  if (typeof n !== "number" || isNaN(n)) return "";
   const sign = n >= 0 ? "+" : "";
   return `${sign}${n.toFixed(2)}%`;
 }
 
 function pctSym(n?: number, sym?: string): string {
-  if (typeof n !== "number" || isNaN(n)) return "—";
+  if (typeof n !== "number" || isNaN(n)) return "";
   const x = n;
   const ax = Math.abs(x);
   const isJPY = !!sym && sym.toUpperCase().endsWith("JPY");
@@ -760,17 +874,17 @@ const InstCard: React.FC<{
 
   // --- Direction chip ---
   const dirLabel =
-    row.direction === "up" ? "UP" :
-    row.direction === "down" ? "DOWN" : "FLAT";
+    row.decision === "BUY" ? "UP" :
+    row.decision === "SELL" ? "DOWN" : "FLAT";
 
   const dirArrow =
-    row.direction === "up" ? "?" :
-    row.direction === "down" ? "?" : "•";
+    row.decision === "BUY" ? "?" :
+    row.decision === "SELL" ? "?" : "";
 
   const dirClass =
-    row.direction === "up"
+    row.decision === "BUY"
       ? "bg-emerald-500/10 text-emerald-300 border-emerald-400/30"
-      : row.direction === "down"
+      : row.decision === "SELL"
       ? "bg-rose-500/10 text-rose-300 border-rose-400/30"
       : "bg-slate-500/10 text-slate-300 border-slate-400/30";
 
@@ -814,11 +928,19 @@ const InstCard: React.FC<{
 
   // Accent ring based on direction
   const accentRing =
-    row.direction === "up"
+    row.decision === "BUY"
       ? "ring-1 ring-emerald-500/40"
-      : row.direction === "down"
+      : row.decision === "SELL"
       ? "ring-1 ring-rose-500/40"
       : "ring-1 ring-slate-500/30";
+
+  const stP = biasToPill(row.st_trend_label as any);
+  const htP = biasToPill(row.ht_trend_label as any);
+  const stLabel = stP.text;
+  const htLabel = htP.text;
+  const stPillClass = stP.className;
+  const htPillClass = htP.className;
+
 
   return (
     <Card className={`relative overflow-hidden hover:translate-y-[1px] transition-transform bg-gradient-to-b from-slate-950/80 to-slate-900/50 ${accentRing}`}>
@@ -834,81 +956,94 @@ const InstCard: React.FC<{
           <div className="text-xl tabular-nums text-slate-50">
             {Number.isFinite(livePrice as any)
               ? fmtPrice(row.symbol, livePrice!, decimalsFromPrice(livePrice))
-              : "—"}
+              : ""}
           </div>
         </div>
 
         
-        {/* Trend row */}
-        <div className="mt-3 flex flex-wrap items-center gap-3">
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center gap-2">
-              <span className={htPill.className}>{htPill.text}</span>
-              <span className="text-xs text-slate-400">HT Trend</span>
+        
+        {/* Trend (ST above / HT below) */}
+        <div className="mt-3 overflow-hidden rounded-xl border border-slate-800/60 bg-slate-950/25">
+          <div className="divide-y divide-slate-800/70">
+            {/* ST */}
+            <div className="flex items-center justify-between px-3 py-2">
+              <div className="flex items-center gap-2">
+                <span className={stPillClass}>{stLabel}</span>
+                <span className="text-[12px] text-slate-400">ST Trend</span>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <span className={stPill.className}>{stPill.text}</span>
-              <span className="text-xs text-slate-400">ST Trend</span>
-            </div>
-          </div>
 
-          <div className="ml-auto flex flex-col items-end">
-            <span
-              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${dirClass}`}
-            >
-              <span>{dirLabel}</span>
-            </span>
+            {/* HT */}
+            <div className="flex items-center justify-between px-3 py-2">
+              <div className="flex items-center gap-2">
+                <span className={htPillClass}>{htLabel}</span>
+                <span className="text-[12px] text-slate-400">HT Trend</span>
+              </div>
+            </div>
           </div>
         </div>
 
-  
 
-        {/* Key chips: structure + RVOL */}
-        <div className="mt-3 flex flex-wrap gap-2 text-[12px]">
-          <span className="inline-flex items-center rounded-full border border-slate-600/60 bg-slate-900/60 px-2 py-1 text-slate-200">
-            {structureText}
-          </span>
-          {rvolLine && (
-            <span className="inline-flex items-center rounded-full border border-amber-400/30 bg-amber-400/5 px-2 py-1 text-amber-200">
-              {rvolLine}
-            </span>
-          )}
+{/* ST / HT details split: above line = ST, below line = HT */}
+<div className="mt-3 overflow-hidden rounded-xl border border-slate-800/60 bg-slate-950/25">
+  {/* -------- ST (top) -------- */}
+  <div className="px-3 py-3">
+    {/* Key chips (ST only) */}
+    <div className="flex flex-wrap gap-2 text-[12px]">
+      <span className="inline-flex items-center rounded-full border border-slate-600/60 bg-slate-900/60 px-2 py-1 text-slate-200">
+        {structureText}
+      </span>
+      {rvolLine && (
+        <span className="inline-flex items-center rounded-full border border-amber-400/30 bg-amber-400/5 px-2 py-1 text-amber-200">
+          {rvolLine}
+        </span>
+      )}
+    </div>
+
+    
+    {/* ST Reasons */}
+    {showReasons && (
+      otherStReasons.length > 0 ? (
+        <div className="mt-3 text-[13px] text-slate-200">
+          <div className="font-semibold mb-1">ST Reasons</div>
+          <ul className="space-y-1">
+            {otherStReasons.slice(0, 3).map((r, i) => (
+              <li key={i} className="flex items-start gap-2">
+                <span className="mt-1 h-1.5 w-1.5 rounded-full bg-emerald-400/70" />
+                <span>{r}</span>
+              </li>
+            ))}
+          </ul>
         </div>
+     ) : (
+        <div className="mt-3 text-[12px] text-slate-500">ST Reasons not available</div>
+      )
+    )}
+    </div>
 
-        {/* Divider */}
-        {showReasons && (otherStReasons.length || htReasons.length) && (
-          <div className="mt-4 border-t border-slate-700/60 pt-3 space-y-3">
-            {/* ST reasons */}
-            {otherStReasons.length > 0 && (
-              <div className="text-[13px] text-slate-200">
-                <div className="font-semibold mb-1">ST Reasons</div>
-                <ul className="space-y-1">
-                  {otherStReasons.slice(0, 3).map((r, i) => (
-                    <li key={i} className="flex items-start gap-2">
-                      <span className="mt-1 h-1.5 w-1.5 rounded-full bg-emerald-400/70" />
-                      <span>{r}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
 
-            {/* HT reasons */}
-            {htReasons.length > 0 && (
-              <div className="text-[13px] text-slate-300">
-                <div className="font-semibold mb-1">HT Reasons</div>
-                <ul className="space-y-1">
-                  {htReasons.slice(0, 3).map((r, i) => (
-                    <li key={i} className="flex items-start gap-2">
-                      <span className="mt-1 h-1.5 w-1.5 rounded-full bg-slate-500/80" />
-                      <span>{r}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </div>
-        )}
+  {/* -------- Divider line (always) -------- */}
+  <div className="border-t border-slate-800/70" />
+
+  {/* -------- HT (bottom) -------- */}
+  <div className="px-3 py-3">
+    {showReasons && htReasons.length > 0 ? (
+      <div className="text-[13px] text-slate-300">
+        <div className="font-semibold mb-1">HT Reasons</div>
+        <ul className="space-y-1">
+          {htReasons.slice(0, 3).map((r, i) => (
+            <li key={i} className="flex items-start gap-2">
+              <span className="mt-1 h-1.5 w-1.5 rounded-full bg-slate-500/80" />
+              <span>{r}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    ) : (
+      <div className="text-[12px] text-slate-500">HT Reasons not available</div>
+    )}
+  </div>
+</div>
 
         {/* Updated time */}
         <div className="mt-4 text-[11px] text-slate-500">
@@ -921,300 +1056,366 @@ const InstCard: React.FC<{
 
 
 const TableView: React.FC<{
-  rows: InstrumentRow[]; showReasons: boolean; showTarget: boolean;
+  rows: InstrumentRow[];
+  showReasons: boolean;
+  showTarget: boolean;
   prices?: Record<string, { price: number; lastTs: number }>;
   brokerOffsetMin: number;
-}> = ({ rows, showReasons, showTarget, prices,brokerOffsetMin}) => {
+}> = ({ rows, showReasons, showTarget, prices, brokerOffsetMin }) => {
   // Build display rows: if predictions are empty, make rows from price symbols
   const displayRows: InstrumentRow[] =
     rows && rows.length
       ? rows
-      : (prices ? Object.keys(prices).map(sym => ({ symbol: sym } as InstrumentRow)) : []);
+      : prices
+        ? Object.keys(prices).map((sym) => ({ symbol: sym } as InstrumentRow))
+        : [];
 
-  // OPTIONAL: stable sort A?Z when we’re in fallback
+  // Stable sort A-Z when in fallback
   displayRows.sort((a, b) => (a.symbol || "").localeCompare(b.symbol || ""));
 
+  const [pulseOpen, setPulseOpen] = React.useState(false);
+  const [pulseRow, setPulseRow] = React.useState<InstrumentRow | null>(null);
+
+  const openPulse = (r: InstrumentRow) => {
+    setPulseRow(r);
+    setPulseOpen(true);
+  };
+  const closePulse = () => {
+    setPulseOpen(false);
+  };
 
   return (
-     <div className="overflow-x-auto rounded-2xl border border-slate-700/60 bg-slate-950/60 shadow-lg shadow-black/40">
-      <table className="min-w-full divide-y divide-slate-700/60">
-        <thead className="bg-slate-900/60 text-slate-300 text-xs">
-          <tr>
-            <th className="px-4 py-3 text-left font-medium">Instrument</th>
-            <th className="px-4 py-3 text-left font-medium">HT Trend</th>
-            <th className="px-4 py-3 text-left font-medium">ST Trend</th>
-            <th className="px-4 py-3 text-left font-medium">Price (M1)</th>
-            <th className="px-4 py-3 text-left font-medium">1h Target</th>
-            <th className="px-4 py-3 text-left font-medium">4h Target</th>
+    <>
+      <div className="overflow-x-auto rounded-2xl border border-slate-700/60 bg-slate-950/60 shadow-lg shadow-black/40">
+        <table className="min-w-full divide-y divide-slate-700/60">
+          <thead className="bg-slate-900/60 text-xs text-slate-300">
+            <tr>
+              <th className="px-4 py-3 text-left font-medium">Instrument</th>
+              <th className="px-4 py-3 text-left font-medium">HT Trend</th>
+              <th className="px-4 py-3 text-left font-medium">ST Trend</th>
+              <th className="px-4 py-3 text-left font-medium">Price (M1)</th>
+              <th className="px-4 py-3 text-left font-medium">Expected move (1h)</th>
+              <th className="px-4 py-3 text-left font-medium">Expected move (4h)</th>
+              <th className="px-4 py-3 text-left font-medium">ProbUp</th>
+              <th className="px-4 py-3 text-left font-medium">Pulse</th>
+              <th className="px-4 py-3 text-left font-medium">Reasons</th>
+            </tr>
+          </thead>
 
-            <th className="px-4 py-3 text-left font-medium">ProbUp</th>
-            <th className="px-4 py-3 text-left font-medium">Reasons</th>
-            <th className="px-4 py-3 text-left font-medium">Updated (broker)</th>
-            <th className="px-4 py-3 text-left font-medium">Device</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-slate-800/60 text-sm">
-          {displayRows.map((r) => {
-            const htLabel: Bias = (r.ht_trend_label as Bias | undefined) ?? r.bias;
-            const pill = biasToPill(htLabel);
-  
-  // prefer the row's broker-aligned timestamp; fallback to live price ts
-  const rawPriceTs = prices?.[r.symbol]?.lastTs ?? r.updated_broker_ts;
-  const priceTsMs  = toMs(rawPriceTs);
+          <tbody className="divide-y divide-slate-800/60 text-sm">
+            {displayRows.map((r) => {
+              const nowMs = Date.now();
 
-  // per-row offset if present; else page-level offset
-  const rowOffsetMin = (r?.broker_tz_offset_min ?? r?.tz_offset_min ?? brokerOffsetMin);
+              const isExpiredUI =
+                typeof r.horizon_min === "number" &&
+                typeof r.updated_broker_ts === "number" &&
+                nowMs > r.updated_broker_ts + r.horizon_min * 60_000;
 
-  // format the "Updated (broker)" cell strictly from the row's broker ts
-  const updatedTime = r.updated_broker_ts
-    ? fmtBrokerTime(toMs(r.updated_broker_ts), rowOffsetMin)
-    : "—";
+              if (isExpiredUI) return null;
 
-  const priceNow = prices?.[r.symbol]?.price;
-  
-  return (
-    <tr key={r.symbol} className="bg-slate-800/40 hover:bg-slate-800/60">
-      {/* Instrument */}
-      <td className="px-4 py-3 text-slate-200 font-medium">{r.symbol}</td>
+              const htLabel: Bias = (r.ht_trend_label as Bias | undefined) ?? (r.bias as Bias);
+              const pill = biasToPill(htLabel);
 
-      {/* HT Trend (existing status) */}
-      <td className="px-4 py-3">
-        <span className={pill.className}>{pill.text}</span>
-      </td>
+              const rawPriceTs = prices?.[r.symbol]?.lastTs ?? r.updated_broker_ts;
+              const priceTsMs = toMs(rawPriceTs);
 
-      
-      {/* ST Trend (backend st_trend_label if present, else score-based) */}
-      <td className="px-4 py-3">
-        {(() => {
-          const lbl: Bias =
-            (r.st_trend_label as Bias | undefined) ??
-            (scoreToTrendLabel(r.short_term_score) as Bias);
-          const pillSt = biasToPill(lbl);
-          return <span className={pillSt.className}>{pillSt.text}</span>;
-        })()}
-      </td>
+              const rowOffsetMin =
+                (r as any)?.broker_tz_offset_min ??
+                (r as any)?.tz_offset_min ??
+                brokerOffsetMin;
 
+              const priceNow = prices?.[r.symbol]?.price;
 
+              return (
+                <tr key={r.symbol} className="bg-slate-800/40 hover:bg-slate-800/60">
+                  {/* Instrument */}
+                  <td className="px-4 py-3 font-medium text-slate-200">{r.symbol}</td>
 
-      {/* Price (M1) */}
-      <td className="px-4 py-3">
-        <div className="tabular-nums text-slate-100"> 
-          {Number.isFinite(priceNow as any)
-            ? fmtPrice(r.symbol, priceNow as number, decimalsFromPrice(priceNow as number))
-            : "—"}
-        </div>
-        <div className="text-[11px] text-slate-500">
-           {fmtBrokerTime(
-             priceTsMs ?? toMs(r.updated_broker_ts),
-             rowOffsetMin
-           )}
-        </div>
-      </td>
+                  {/* HT Trend */}
+                  <td className="px-4 py-3">
+                    <span className={pill.className}>{pill.text}</span>
+                  </td>
 
-      {/* 1h Target */}
-      {/* 1h Target (safe/defensive) */}
-<td className="px-4 py-3 text-slate-200">
-  {showTarget ? (
-    (() => {
-      // live price (preferred) or row's own price if present
-      const px = typeof (prices?.[r.symbol]?.price) === "number"
-        ? (prices as any)[r.symbol].price
-        : (typeof r.price === "number" ? r.price : NaN);
+                  {/* ST Trend pill */}
+                  <td className="px-4 py-3">
+                    {(() => {
+                      const lbl: Bias =
+                        (r.st_trend_label as Bias | undefined) ??
+                        (scoreToTrendLabel(r.short_term_score) as Bias);
+                      const pillSt = biasToPill(lbl);
+                      return <span className={pillSt.className}>{pillSt.text}</span>;
+                    })()}
+                  </td>
 
-      // format percentage (already signed)
-      const pctText = pctSym(r.expected_move_pct_1h as any, r.symbol);
+                  {/* Price (M1) */}
+                  <td className="px-4 py-3">
+                    <div className="tabular-nums text-slate-100">
+                      {Number.isFinite(priceNow as any)
+                        ? fmtPrice(
+                            r.symbol,
+                            priceNow as number,
+                            decimalsFromPrice(priceNow as number)
+                          )
+                        : ""}
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      {fmtBrokerTime(priceTsMs ?? toMs(r.updated_broker_ts), rowOffsetMin)}
+                    </div>
+                  </td>
 
-      // compute target robustly (accepts explicit target, pips, or pct)
-      // plus: if target equals current price (within 0.5 pip), fall back to percent
-      const target = (() => {
-        try {
-          const pip = pipSize(r.symbol);
-          const pxOk = Number.isFinite(px);
+                  {/* Expected move (1h) - ST based + guaranteed side */}
+                  <td className="px-4 py-3 text-slate-200">
+                    {showTarget ? (
+                      (() => {
+                        const px =
+                          typeof prices?.[r.symbol]?.price === "number"
+                            ? prices[r.symbol].price
+                            : typeof r.price === "number"
+                              ? r.price
+                              : NaN;
 
-          // 1) explicit backend target
-          if (typeof r.target_price_1h === "number") {
-            const sameAsPx = pxOk && Math.abs(r.target_price_1h - (px as number)) < (0.5 * pip);
-            if (!sameAsPx) return r.target_price_1h;
-            // else fall through to compute from %/pips
-          }
+                        const pxOk = Number.isFinite(px);
+                        if (!pxOk) return <span className="text-slate-500">—</span>;
 
-          // 2) pips-based
-          if (pxOk && typeof r.target_pips === "number" && r.decision) {
-            const step = pip * Math.abs(r.target_pips);
-            return r.decision === "BUY" ? (px as number) + step : (px as number) - step;
-          }
+                        // Use 1h pct only (your column is Expected move (1h))
+                        const pctVal =
+                          typeof r.expected_move_pct_1h === "number"
+                            ? r.expected_move_pct_1h
+                            : null;
 
-          // 3) percent-based
-          if (pxOk && typeof r.expected_move_pct_1h === "number") {
-            const dir =
-              r.decision === "SELL" ? -1 :
-              r.decision === "BUY"  ? +1 :
-              Math.sign(r.expected_move_pct_1h);
-            const pct = Math.abs(r.expected_move_pct_1h) / 100;
-            return (px as number) * (1 + dir * pct);
-          }
+                        if (pctVal == null) return <span className="text-slate-500">—</span>;
 
-          return null;
-        } catch {
-          return null;
-        }
-      })();
+                       
 
 
-      return (
-        <span>
-          {pctText} {"-"}{" "}
-          <span className="tabular-nums">
-            {target != null
-              ? fmtPrice(r.symbol, target, decimalsFromPrice(px as number))
-              : "—"}
-          </span>
-        </span>
-      );
-    })()
-  ) : (
-    <span className="text-slate-500">—</span>
-  )}
-</td>
- 
-{/* 4h Target (extended horizon) */}
-{/* 4h Target (H4 model only) */}
-<td className="px-4 py-3 text-slate-200">
-  {showTarget ? (
-    (() => {
-      const hasPct4h = typeof r.expected_move_pct_4h === "number";
-      const hasTp4h  = typeof r.target_price_4h === "number";
+                        // ST direction MUST come from the same ST label you show in the ST pill
+                        const stLbl: Bias =
+                          (r.st_trend_label as Bias | undefined) ??
+                          (scoreToTrendLabel(r.short_term_score) as Bias) ??
+                          (r.bias as Bias);
 
-      // If backend hasn’t sent any H4 fields yet ? show placeholder
-      if (!hasPct4h && !hasTp4h) {
-        return (
-          <span className="text-slate-500">
-            ? —{/* no 4h model yet */}
-          </span>
-        );
-      }
+                        const stDir = trendDirFromBiasLabel(stLbl);
+                        if (stDir === 0) return <span className="text-slate-500">—</span>;
+                        
+                        const pctText =
+                          stDir > 0 ? `+${Math.abs(pctVal).toFixed(2)}%` :
+                          stDir < 0 ? `-${Math.abs(pctVal).toFixed(2)}%` :
+                          pctSym(pctVal, r.symbol);
 
-      // live price preferred, fallback to row.price
-      const px = typeof prices?.[r.symbol]?.price === "number"
-        ? prices[r.symbol].price
-        : (typeof r.price === "number" ? r.price : NaN);
+                        const pct = Math.abs(pctVal) / 100;
+                        let target = px * (1 + stDir * pct);
 
-      const pip = pipSize(r.symbol);
-      const pxOk = Number.isFinite(px);
+                        // hard guarantee:
+                        if (stDir > 0 && target <= px) target = px * (1 + Math.abs(pct));
+                        if (stDir < 0 && target >= px) target = px * (1 - Math.abs(pct));
 
-      const pctVal = hasPct4h ? (r.expected_move_pct_4h as number) : undefined;
-      const pctText4h = hasPct4h ? pctSym(pctVal, r.symbol) : "—";
+                        return (
+                          <span>
+                            {pctText && <>{pctText} {"-"} </>}
+                            <span className="tabular-nums">
+                              {fmtPrice(r.symbol, target, decimalsFromPrice(px))}
+                            </span>
+                          </span>
+                        );
+                      })()
+                    ) : (
+                      <span className="text-slate-500">—</span>
+                    )}
+                  </td>
 
-      // 1) explicit backend H4 target
-      let target4h: number | null = hasTp4h ? (r.target_price_4h as number) : null;
+                  {/* Expected move (4h) - HT informational */}
+                  <td className="px-4 py-3 text-slate-400">
+                    {showTarget ? (
+                      (() => {
+                        const px =
+                          typeof prices?.[r.symbol]?.price === "number"
+                            ? prices[r.symbol].price
+                            : typeof r.price === "number"
+                              ? r.price
+                              : NaN;
 
-      // guard: if explicit target is basically equal to current price, treat as “no target”
-      if (
-        target4h != null &&
-        pxOk &&
-        Math.abs(target4h - (px as number)) < 0.5 * pip
-      ) {
-        target4h = null;
-      }
+                        const pxOk = Number.isFinite(px);
+                        if (!pxOk) return <span className="text-slate-500">—</span>;
 
-      // 2) if no explicit price but we have a 4h %, derive from that
-      if (target4h == null && pxOk && typeof pctVal === "number") {
-        const dir =
-          r.decision === "SELL" ? -1 :
-          r.decision === "BUY"  ? +1 :
-          Math.sign(pctVal);
-        const pct = Math.abs(pctVal) / 100;
-        target4h = (px as number) * (1 + dir * pct);
-      }
+                        const pctVal =
+                          typeof r.expected_move_pct_4h === "number" ? r.expected_move_pct_4h : null;
 
-      // If still nothing sensible, show placeholder
-      if (target4h == null) {
-        return (
-          <span className="text-slate-500">
-            ? —{/* cannot compute 4h yet */}
-          </span>
-        );
-      }
+                        if (pctVal == null) return <span className="text-slate-500">—</span>;
 
-      return (
-        <span>
-          {pctText4h} {"-"}{" "}
-          <span className="tabular-nums">
-            {fmtPrice(r.symbol, target4h, decimalsFromPrice(px as number))}
-          </span>
-        </span>
-      );
-    })()
-  ) : (
-    <span className="text-slate-500">—</span>
-  )}
-</td>
+                        
 
 
+                        const htLbl: Bias =
+                          (r.ht_trend_label as Bias | undefined) ?? (r.bias as Bias);
 
-      {/* ProbUp */}
-      <td className="px-4 py-3 tabular-nums text-slate-200">
-        {r.prob_up_1h != null ? r.prob_up_1h.toFixed(2) : "—"}
-      </td>
+                        const htDir = trendDirFromBiasLabel(htLbl);
+                        if (htDir === 0) return <span className="text-slate-500">—</span>;
 
-      
-      {/* Reasons */}
-      <td className="px-4 py-3 text-slate-300">
-        {showReasons ? (
-          <div className="text-xs space-y-1 max-w-xs">
-            {/* ST (1h) reasons */}
-            <div
-              className="truncate text-slate-200"
-              title={
-                (r.reasons_h1 && r.reasons_h1.join("; ")) ||
-                (r.reasons && r.reasons.join("; ")) ||
-                ""
-              }
-            >
-              <span className="font-semibold">ST:</span>{" "}
-              {(() => {
-                const stList =
-                  (r.reasons_h1 && r.reasons_h1.length
-                    ? r.reasons_h1
-                    : r.reasons || []);
-                return stList.length
-                  ? stList.slice(0, 2).join("; ")
-                  : "—";
-              })()}
+                        const pctText =
+                          htDir > 0 ? `+${Math.abs(pctVal).toFixed(2)}%` :
+                          htDir < 0 ? `-${Math.abs(pctVal).toFixed(2)}%` :
+                          pctSym(pctVal, r.symbol);
+
+                        const pct = Math.abs(pctVal) / 100;
+                        let target = px * (1 + htDir * pct);
+
+                        // keep on correct side for HT too
+                        if (htDir > 0 && target <= px) target = px * (1 + Math.abs(pct));
+                        if (htDir < 0 && target >= px) target = px * (1 - Math.abs(pct));
+
+                        return (
+                          <span>
+                            {pctText && <>{pctText} {"-"} </>}
+                            <span className="tabular-nums">
+                              {fmtPrice(r.symbol, target, decimalsFromPrice(px))}
+                            </span>
+                          </span>
+                        );
+                      })()
+                    ) : (
+                      <span className="text-slate-500">—</span>
+                    )}
+                  </td>
+
+                  {/* ProbUp */}
+                  <td className="px-4 py-3 tabular-nums text-slate-200">
+                    {r.prob_up != null ? r.prob_up.toFixed(2) : ""}
+                  </td>
+
+                  {/* Pulse */}
+                  <td className="px-4 py-3">
+                    <button
+                      onClick={() => openPulse(r)}
+                      className="inline-flex items-center gap-2 rounded-xl border border-slate-700/70 bg-slate-900/40 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800/50"
+                      title="Open pulse commentary"
+                    >
+                      <span className="h-2 w-2 rounded-full bg-emerald-400/70" />
+                      Pulse
+                    </button>
+                  </td>
+
+                  {/* Reasons */}
+                  <td className="px-4 py-3 text-slate-300">
+                    {showReasons ? (
+                      <div className="max-w-xs space-y-1 text-xs">
+                        <div
+                          className="truncate text-slate-200"
+                          title={
+                            (r.reasons_h1 && r.reasons_h1.join("; ")) ||
+                            (r.reasons && r.reasons.join("; ")) ||
+                            ""
+                          }
+                        >
+                          <span className="font-semibold">ST:</span>{" "}
+                          {(r.reasons_h1 && r.reasons_h1.length ? r.reasons_h1 : (r.reasons || []))
+                            .slice(0, 2)
+                            .join("; ")}
+                        </div>
+
+                        <div
+                          className="truncate text-slate-400"
+                          title={r.reasons_h4 && r.reasons_h4.length ? r.reasons_h4.join("; ") : ""}
+                        >
+                          <span className="font-semibold">HT:</span>{" "}
+                          {(r.reasons_h4 && r.reasons_h4.length ? r.reasons_h4 : [])
+                            .slice(0, 2)
+                            .join("; ")}
+                        </div>
+                      </div>
+                    ) : (
+                      ""
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Pulse modal */}
+      {pulseOpen && pulseRow ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={closePulse}
+        >
+          <div
+            className="w-full max-w-2xl rounded-2xl border border-slate-700/70 bg-slate-950/95 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4 border-b border-slate-800/70 p-5">
+              <div>
+                <div className="text-xs uppercase tracking-wide text-slate-400">Pulse</div>
+                <div className="mt-1 text-lg font-semibold text-slate-100">{pulseRow.symbol}</div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {(() => {
+                    const htLbl: Bias = (pulseRow.ht_trend_label as any) ?? (pulseRow.bias as any);
+                    const stLbl: Bias =
+                      (pulseRow.st_trend_label as any) ??
+                      (scoreToTrendLabel(pulseRow.short_term_score) as any) ??
+                      (pulseRow.bias as any);
+                    const htP = biasToPill(htLbl);
+                    const stP = biasToPill(stLbl);
+                    return (
+                      <>
+                        <span className={htP.className}>HT: {htP.text}</span>
+                        <span className={stP.className}>ST: {stP.text}</span>
+                      </>
+                    );
+                  })()}
+                </div>
+              </div>
+              <button
+                onClick={closePulse}
+                className="rounded-xl border border-slate-700/70 bg-slate-900/40 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-800/60"
+              >
+                Close
+              </button>
             </div>
 
-            {/* HT (4h) reasons */}
-            <div
-              className="truncate text-slate-400"
-              title={r.reasons_h4 && r.reasons_h4.length
-                ? r.reasons_h4.join("; ")
-                : ""}
-            >
-              <span className="font-semibold">HT:</span>{" "}
-              {r.reasons_h4 && r.reasons_h4.length
-                ? r.reasons_h4.slice(0, 2).join("; ")
-                : "—"}
+            <div className="p-5">
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="rounded-xl border border-slate-800/70 bg-slate-900/30 p-4">
+                  <div className="text-xs font-semibold text-slate-300">ST commentary</div>
+                  <ul className="mt-2 space-y-1 text-sm text-slate-200">
+                    {(pulseRow.reasons_h1 && pulseRow.reasons_h1.length
+                      ? pulseRow.reasons_h1
+                      : pulseRow.reasons || [])
+                      .slice(0, 6)
+                      .map((x, i) => (
+                        <li key={i} className="flex items-start gap-2">
+                          <span className="mt-2 h-1.5 w-1.5 rounded-full bg-slate-500/80" />
+                          <span>{x}</span>
+                        </li>
+                      ))}
+                    {!((pulseRow.reasons_h1 && pulseRow.reasons_h1.length) || (pulseRow.reasons && pulseRow.reasons.length)) ? (
+                      <li className="text-slate-500">No ST commentary available</li>
+                    ) : null}
+                  </ul>
+                </div>
+
+                <div className="rounded-xl border border-slate-800/70 bg-slate-900/30 p-4">
+                  <div className="text-xs font-semibold text-slate-300">HT commentary</div>
+                  <ul className="mt-2 space-y-1 text-sm text-slate-200">
+                    {(pulseRow.reasons_h4 && pulseRow.reasons_h4.length ? pulseRow.reasons_h4 : [])
+                      .slice(0, 6)
+                      .map((x, i) => (
+                        <li key={i} className="flex items-start gap-2">
+                          <span className="mt-2 h-1.5 w-1.5 rounded-full bg-slate-500/80" />
+                          <span>{x}</span>
+                        </li>
+                      ))}
+                    {!(pulseRow.reasons_h4 && pulseRow.reasons_h4.length) ? (
+                      <li className="text-slate-500">No HT commentary available</li>
+                    ) : null}
+                  </ul>
+                </div>
+              </div>
             </div>
           </div>
-        ) : (
-          "—"
-        )}
-      </td>
-
-      {/* Updated (broker) */}
-      <td className="px-4 py-3 text-slate-400">
-        {updatedTime}
-      </td>
-
-      {/* Device */}
-      <td className="px-4 py-3 text-slate-400">{r.using_device ? `${r.using_device.slice(0,7)}…` : "—"}</td>
-    </tr>
-  );
-})}
-
-        </tbody>
-      </table>
-    </div>
+        </div>
+      ) : null}
+    </>
   );
 };
 
@@ -1224,10 +1425,9 @@ const TableView: React.FC<{
 export default function PredictionMeter() {
   // State
   const [view, setView] = React.useState<"cards" | "table">("cards");
-  const [showReasons, setShowReasons] = React.useState(true);
-  const [showTarget, setShowTarget] = React.useState(true);
-
-  // Fixed timeframe – backend is effectively M15 here
+  const showReasons = true;
+  const showTarget = true;
+  // Fixed timeframe  backend is effectively M15 here
   const tf: TfLabel = "M15";
   const { rows, error } = usePredictRows(tf);
 
@@ -1250,20 +1450,20 @@ export default function PredictionMeter() {
       case "strength":
         return arr.sort((a, b) => biasToScore(b.bias) - biasToScore(a.bias));
       case "prob":
-        return arr.sort((a, b) => b.prob_up_1h - a.prob_up_1h);
+        return arr.sort((a, b) => b.prob_up - a.prob_up);
       case "move":
         return arr.sort(
           (a, b) =>
-            Math.abs(b.expected_move_pct_1h) -
-            Math.abs(a.expected_move_pct_1h)
+            Math.abs(b.expected_move_pct_1h ?? 0) -
+            Math.abs(a.expected_move_pct_1h ?? 0)
         );
       case "az":
         return arr.sort((a, b) => a.symbol.localeCompare(b.symbol));
     }
   }, [rows, sort]);
 
-  const brokerAbbr = sortedRows[0]?.broker_tz_abbr || "—";
-  const device = sortedRows[0]?.using_device || "—";
+  const brokerAbbr = sortedRows[0]?.broker_tz_abbr || "";
+  const device = sortedRows[0]?.using_device || "";
 
   // Header clocks
   const now = useWallClock();
@@ -1337,31 +1537,6 @@ export default function PredictionMeter() {
       <Card className="mt-4">
         <CardContent className="flex flex-wrap items-center gap-4">
           {/* Toggles */}
-          <div className="flex items-center gap-3">
-            <label className="flex items-center gap-2 text-sm text-slate-300">
-              <input
-                type="checkbox"
-                className="accent-emerald-400"
-                checked={showReasons}
-                onChange={(e) => setShowReasons(e.target.checked)}
-              />
-              Show reasons
-            </label>
-            <label className="flex items-center gap-2 text-sm text-slate-300">
-              <input
-                type="checkbox"
-                className="accent-emerald-400"
-                checked={showTarget}
-                onChange={(e) => setShowTarget(e.target.checked)}
-              />
-              Show 1h target
-            </label>
-            <label className="flex items-center gap-2 text-sm text-slate-500">
-              <input type="checkbox" className="accent-emerald-400" disabled />
-              Confidence bands (later)
-            </label>
-          </div>
-
           {/* View */}
           {/* View + Sort (right side) */}
 <div className="flex items-center gap-6 text-sm ml-auto">
@@ -1403,7 +1578,7 @@ export default function PredictionMeter() {
       <option value="strength">Strength</option>
       <option value="prob">ProbUp</option>
       <option value="move">|ExpectedMove|</option>
-      <option value="az">A–Z</option>
+      <option value="az">AZ</option>
     </select>
   </div>
 </div>
@@ -1413,31 +1588,36 @@ export default function PredictionMeter() {
 
       {/* Content */}
       {view === "cards" ? (
-        (() => {
-          const baseRows: InstrumentRow[] =
-            sortedRows && sortedRows.length
-              ? sortedRows
-              : prices
-              ? Object.keys(prices).map(
-                  (sym) => ({ symbol: sym } as InstrumentRow)
-                )
-              : [];
+  <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-5">
+    {(sortedRows && sortedRows.length
+      ? sortedRows
+      : prices
+      ? Object.keys(prices).map(
+          (sym) => ({ symbol: sym } as InstrumentRow)
+        )
+      : []
+    ).map((r) => {
+      const nowMs = Date.now();
+      const isExpiredUI =
+        typeof r.horizon_min === "number" &&
+        typeof r.updated_broker_ts === "number" &&
+        nowMs > r.updated_broker_ts + r.horizon_min * 60_000;
 
-          return (
-            <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-5">
-              {baseRows.map((r) => (
-                <InstCard
-                  key={r.symbol}
-                  row={r}
-                  showReasons={showReasons}
-                  showTarget={showTarget}
-                  livePrice={prices?.[r.symbol]?.price}
-                />
-              ))}
-            </div>
-          );
-        })()
-      ) : (
+      if (isExpiredUI) return null;
+
+      return (
+        <InstCard
+          key={r.symbol}
+          row={r}
+          showReasons={showReasons}
+          showTarget={showTarget}
+          livePrice={prices?.[r.symbol]?.price}
+        />
+      );
+    })}
+  </div>
+) : (
+
         <div className="mt-6">
           <TableView
             rows={sortedRows}
@@ -1459,7 +1639,7 @@ export default function PredictionMeter() {
             ? `Price updated: ${new Date(
                 priceUpdatedAt
               ).toLocaleTimeString()}`
-            : "Waiting for live price…"}
+            : "Waiting for live price"}
         </p>
       )}
     </div>

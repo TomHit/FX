@@ -30,6 +30,8 @@ from api.trend.infer_rt import (
 from .trend_sr import summarize_sr_multi_tf
 
 from api.trend.infer_tth import predict_tth
+from openai import OpenAI
+client = OpenAI()
 
 
 log = logging.getLogger("xtl.trend")
@@ -2266,25 +2268,39 @@ def predict_all(
         ok_h1 = bool(pr_h1.get("ok", False))
         ok_h4 = bool(pr_h4.get("ok", False))
 
+        
         # --- B) Dynamic horizon (TTH) -------------------------------------
-        # TTH is *optional*. If it fails, we fallback to 60 minutes.
+        # If TTH is OK, choose horizon from bucket_idx (NOT tth.horizon_min which is 0 in your logs)
         horizon_min = 60
         p_dir = None
         tth_raw = None
+
+        TTH_BUCKET_MIN = [15, 30, 60, 120, 240]  # tune later
+
         if callable(predict_tth):
             try:
                 tth = predict_tth(sym)  # type: ignore[misc]
                 tth_raw = tth
                 if isinstance(tth, dict) and tth.get("ok"):
-                    horizon_min = int(tth.get("horizon_min") or horizon_min)
-                    p_dir = max(float(tth.get("p_up", 0.0)), float(tth.get("p_down", 0.0)))
-                else:
-                    # keep fallback horizon
-                    pass
+                    bidx = tth.get("bucket_idx", None)
+                    try:
+                       bidx_i = int(bidx) if bidx is not None else 2  # default to 60m
+                    except Exception:
+                       bidx_i = 2
+                    bidx_i = max(0, min(bidx_i, len(TTH_BUCKET_MIN) - 1))
+                    horizon_min = int(TTH_BUCKET_MIN[bidx_i])
+
+                    # directional probability summary (optional)
+                    try:
+                       p_dir = max(float(tth.get("p_up", 0.0)), float(tth.get("p_down", 0.0)))
+                    except Exception:
+                       p_dir = None
+                # else keep fallback 60m
             except Exception as e:
-                # IMPORTANT: do not break predict/all if TTH is misconfigured.
                 log.exception("[predict_all] predict_tth EXC sym=%s", sym)
                 tth_raw = {"ok": False, "reason": "tth_exc", "detail": str(e)}
+
+        
 
         # --- C) Latest OHLC + broker meta ---------------------------------
         snap, broker = _read_freshest_snap_for_user_or_any(user_id, sym, tfu)
@@ -2333,6 +2349,8 @@ def predict_all(
 
         target_close_ts_h1 = _next_boundary_ms(60 * 60, now_ms, off_min)
         target_close_ts_4h = _next_boundary_ms(4 * 60 * 60, now_ms, off_min)
+        # dynamic target close based on TTH-selected horizon
+        target_close_ts_dyn = _next_boundary_ms(int(horizon_min) * 60, now_ms, off_min)
 
         # --- D) build expected moves + targets ----------------------------
         p_up_h1 = _safe_p_up(pr_h1, 0.5)
@@ -2474,8 +2492,8 @@ def predict_all(
             "target_price_4h": target_price_4h,
             "basis_price_1h": price_for_targets,
 
-            "horizon": "H1",
-            "target_close_ts": target_close_ts_h1,
+            "horizon": f"{int(horizon_min)}m",
+            "target_close_ts": target_close_ts_dyn,
             "update_tf": tfu,
             "server_now_ms": now_ms,
             "updated_broker_ts": now_ms,
@@ -2488,6 +2506,12 @@ def predict_all(
             "raw": pr_h1,
             "raw_h4": pr_h4,
         }
+        # --- UI canonical fields (model-driven, no _1h suffix) ---
+        row["basis_price"] = price_for_targets
+        row["target_price"] = target_price_1h
+        row["expected_move_pct"] = expected_move_pct_1h
+        row["model_source"] = "ml" if ok_h1 else "na"
+
 
         if not ok_h1:
             row.setdefault("reason_h1_error", pr_h1.get("reason", "model_error_h1"))
@@ -2516,6 +2540,181 @@ def predict_all(
         rows.append(row)
 
     return {"ok": True, "tf": tfu, "rows": rows}
+
+def _redis_get_text(key: str) -> str | None:
+    try:
+        v = R.get(key)
+        if v is None:
+            return None
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8", "ignore")
+        return str(v)
+    except Exception:
+        return None
+
+def _redis_set_text(key: str, value: str, ttl_sec: int) -> None:
+    try:
+        R.setex(key, int(ttl_sec), value)
+    except Exception:
+        pass
+SYSTEM_PROMPT = (
+    "You are XauTrendLab Forecast Assistant. "
+    "Only use the provided JSON. Do not invent prices, levels, or times. "
+    "Return 2-4 short sentences: direction, target, time window, and why (from reasons)."
+)
+
+def call_llm_commentary(payload: dict) -> str:
+    resp = client.chat.completions.create(
+        model=os.getenv("XTL_COMMENTARY_MODEL", "gpt-4.1-mini"),
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        temperature=0.2,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def build_commentary_payload(row: dict) -> dict:
+    """
+    Build a STRICT, LLM-safe commentary payload from ML prediction row.
+    LLM must only narrate this data (no new numbers).
+    """
+    symbol = row.get("symbol")
+    horizon = row.get("horizon", "H1")
+    horizon_min = row.get("horizon_min")
+
+    payload = {
+        "instrument": symbol,
+        "direction": row.get("decision"),
+        "bias_label": row.get("label"),
+        "confidence": row.get("confidence"),
+        "horizon": f"{horizon_min} minutes" if horizon_min else horizon,
+        "prices": {
+            "basis_price": row.get("basis_price_1h"),
+            "target_price": row.get("target_price_1h"),
+            "expected_move_pct": row.get("expected_move_pct_1h"),
+        },
+        "structure": {
+            "short_term": row.get("st_trend_label"),
+            "higher_timeframe": row.get("ht_trend_label"),
+        },
+        "time_to_hit": {
+            "directional_probability": row.get("tth_p_dir"),
+            "p_up": (row.get("tth_raw") or {}).get("p_up"),
+            "p_down": (row.get("tth_raw") or {}).get("p_down"),
+            "target_close_ts": row.get("target_close_ts"),
+        },
+        "reasons": {
+            "h1": row.get("reasons_h1", []) or [],
+            "h4": row.get("reasons_h4", []) or [],
+        },
+        # keep this as “hint text only” until you wire real SR numbers
+        "support_resistance_hint": {
+            "support": "near recent intraday lows",
+            "resistance": "near prior supply zone",
+        },
+        "meta": {
+            "updated_broker_ts": row.get("updated_broker_ts"),
+            "tz_offset_min": row.get("broker_tz_offset_min"),
+            "model_version": "xtl-tth-v2",
+        },
+    }
+    return payload
+
+@router.get("/commentary")
+@router.get("/trend/commentary")
+def trend_commentary(
+    symbol: str,
+    tf: str = "H1",
+    user = Depends(require_auth_optional),
+):
+    
+    """
+    AI commentary for ML forecast.
+    Generated on-demand, cached per candle.
+    """
+    if os.getenv("XTL_ENABLE_COMMENTARY", "false").lower() != "true":
+         return {"ok": False, "reason": "commentary_disabled"}
+    tfu = (tf or "H1").upper()
+    sym_u = (symbol or "").upper().strip()
+    if not sym_u:
+        return {"ok": False, "reason": "missing_symbol"}
+
+    # Reuse existing ML prediction feed
+    resp = predict_all(tf=tfu, symbols=sym_u, user=user)
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return {"ok": False, "reason": "prediction_failed"}
+
+    row = None
+    for r in (resp.get("rows") or []):
+        if (r.get("symbol") or "").upper() == sym_u:
+            row = r
+            break
+    if not row:
+        return {"ok": False, "reason": "symbol_not_found"}
+
+    cache_key = f"xtl:trend:commentary:{sym_u}:{tfu}:{row.get('target_close_ts') or 0}"
+    cached = _redis_get_text(cache_key)
+    if cached:
+        return {"ok": True, "cached": True, "commentary": cached}
+
+    payload = build_commentary_payload(row)
+    try:
+        txt = call_llm_commentary(payload)
+        if not txt:
+            txt = "Commentary unavailable for this candle."
+    except Exception as e:
+        txt = f"Commentary unavailable ({type(e).__name__})."
+
+
+    now_ms = int(time.time() * 1000)
+
+    target_close_ts = row.get("target_close_ts")
+    buffer_sec = 10 * 60  # 10 min safety buffer
+
+    if isinstance(target_close_ts, (int, float)) and target_close_ts > now_ms:
+        ttl_sec = int((target_close_ts - now_ms) / 1000) + buffer_sec
+    else:
+        # fallback: short TTL to avoid stale cache
+        ttl_sec = 15 * 60
+
+    _redis_set_text(cache_key, txt, ttl_sec=ttl_sec)
+
+    return {
+        "ok": True,
+        "cached": False,
+        "commentary": txt,
+        "meta": {
+            "symbol": sym_u,
+            "tf": tfu,
+            "target_close_ts": row.get("target_close_ts"),
+            "ttl_sec": ttl_sec
+        },
+    }
+
+
+def call_llm_commentary(payload: dict) -> str:
+    """
+    Calls LLM to narrate ML forecast.
+    """
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False)
+        }
+    ]
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",  # or your choice
+        messages=messages,
+        temperature=0.2
+    )
+
+    return resp.choices[0].message.content.strip()
+
 
 @router.get("/opportunities")
 def trend_opportunities(
