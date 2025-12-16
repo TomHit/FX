@@ -343,47 +343,45 @@ const ENABLE_BROKER_VERIFY = true;
 async function verifyLastBarAgainstBrokerSafely(opts: {
   symbol: string;
   tf: "M15" | "H1" | "H4";
-  lastTsMs: number; // ms since epoch (OPEN time = lastClosedTs - tf)
+  lastTsMs: number; // ms since epoch (OPEN time)
   set: (s: BrokerCheck) => void;
 }) {
   const { symbol, tf, lastTsMs, set } = opts;
   try {
     if (!ENABLE_BROKER_VERIFY) {
       console.log("[VERIFY] disabled", { symbol, tf, lastTsMs });
-      // valid no-op state that satisfies BrokerCheck type
+      set({ kind: "idle" });
+      return;
+    }
+
+    // If we don't have a last closed bar yet, bail out quietly
+    if (!lastTsMs || !Number.isFinite(lastTsMs)) {
       set({ kind: "idle" });
       return;
     }
 
     set({ kind: "checking" });
 
-    // If we don't have a last closed bar yet, bail out gracefully
-    if (!lastTsMs || !Number.isFinite(lastTsMs)) {
+    const url = `${API_ORIGIN}/devices/compare_ohlc?symbol=${encodeURIComponent(
+      symbol,
+    )}&tf=${tf}&n=20`;
+
+    console.log("[VERIFY] req", { symbol, tf, lastTsMs, url });
+    const res = await fetch(url, { credentials: "include" });
+
+    if (!res.ok) {
+      // For any HTTP error (4xx/5xx), keep UI clean and just log it.
+      console.warn("[VERIFY] http error", res.status);
       set({ kind: "idle" });
       return;
     }
 
-    const url = `${API_ORIGIN}/devices/compare_ohlc?symbol=${encodeURIComponent(
-      symbol
-    )}&tf=${tf}&n=20`;
-
-    console.log("[VERIFY] req", { symbol, tf, lastTsMs, url });
-
-    const res = await fetch(url, { credentials: "include" });
-    if (!res.ok) {
-      set({ kind: "error", msg: `HTTP ${res.status}` });
-      return;
-    }
-
     const j = await res.json();
-    
-
     console.log("[VERIFY] resp", j);
 
     const lastSec = Math.floor(lastTsMs / 1000);
     const diffs: any[] = Array.isArray(j?.diffs) ? j.diffs : [];
     const hit = diffs.find((d) => d?.t === lastSec);
-    console.log("[VERIFY] last-sec", lastSec, "hit:", hit);
 
     if (hit && Array.isArray(hit.diffs) && hit.diffs.length > 0) {
       set({
@@ -398,7 +396,6 @@ async function verifyLastBarAgainstBrokerSafely(opts: {
       return;
     }
 
-    // optional arrays (if backend already added them)
     const missingInAppTS: number[] = Array.isArray(j?.missingInAppTS)
       ? j.missingInAppTS
       : [];
@@ -411,7 +408,8 @@ async function verifyLastBarAgainstBrokerSafely(opts: {
     set({ kind: "aligned" });
   } catch (err: any) {
     console.warn("[VERIFY] error", err);
-    set({ kind: "error", msg: err?.message || "compare failed" });
+    // Network / JSON / whatever ? stay silent in UI
+    set({ kind: "idle" });
   }
 }
 
@@ -594,148 +592,6 @@ function deepEqual(a: any, b: any) {
   try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; }
 }
 
-function CandlesPreview({
-  bars,
-  forming,
-  broker,
-  height = 300,
-  pad = 10,
-}: {
-  bars: { t: number; o: number; h: number; l: number; c: number; complete?: boolean }[];
-  forming?: { t: number; o: number; h: number; l: number; c: number; complete?: boolean } | null;
-  broker?: { tz_name?: string | null; tz_offset_min?: number | null } | null;
-  height?: number;
-  pad?: number;
-}) {
-  // Merge bars + optional forming (at the end)
-  const data = React.useMemo(() => {
-    const src = [...bars];
-    if (forming) src.push({ ...forming, complete: false });
-    // Limit to last N (keeps it light)
-    const N = Math.min(120, src.length);
-    return src.slice(-N);
-  }, [bars, forming]);
-
-  // Early empty state
-  if (!data.length) {
-    return (
-      <div className="aspect-[16/9] w-full rounded-xl bg-slate-950/60 border border-slate-800/60 grid place-items-center">
-        <div className="text-slate-500 text-sm">No bars yet</div>
-      </div>
-    );
-  }
-
-  // Dimensions
-  const width = Math.max(500, data.length * 6 + pad * 2); // ~6px per candle
-  const H = height;
-  const W = width;
-
-  // Scales
-  const minL = Math.min(...data.map((d) => d.l));
-  const maxH = Math.max(...data.map((d) => d.h));
-  const y = (v: number) => {
-    // invert (price high at top)
-    return pad + (H - pad * 2) * (1 - (v - minL) / Math.max(1e-9, maxH - minL));
-  };
-
-  const cw = 4; // candle body width
-  const gap = 2; // gap between candles
-  const step = cw + gap;
-
-  // X positions (even spacing)
-  const x = (i: number) => pad + i * step + cw / 2; // wick center
-  const bodyX = (i: number) => pad + i * step;
-
-  // Simple axis labels (min / mid / max)
-  const mid = (minL + maxH) / 2;
-  
-
-
-  return (
-  <div className="w-full overflow-auto rounded-xl border border-slate-800/60 bg-slate-950/60">
-    <div className="relative overflow-hidden">
-      <svg width={W} height={H}>
-        {/* bg */}
-        <rect x={0} y={0} width={W} height={H} fill="rgba(2,6,23,.6)" />
-
-        {/* horizontal grid lines */}
-        {[maxH, mid, minL].map((val, i) => (
-          <g key={i}>
-            <line
-              x1={0}
-              x2={W}
-              y1={y(val)}
-              y2={y(val)}
-              stroke="rgba(148,163,184,.25)"
-              strokeDasharray="4 4"
-            />
-            <text
-              x={W - 4}
-              y={y(val) - 4}
-              textAnchor="end"
-              fontSize="10"
-              fill="#94a3b8"
-            >
-              {val.toFixed(2)}
-            </text>
-          </g>
-        ))}
-
-        {/* Candles */}
-        {data.map((d, i) => {
-          const isUp = d.c >= d.o;
-          const wickX = x(i);
-          const bh = Math.max(1, Math.abs(y(d.o) - y(d.c))); // body height
-          const by = Math.min(y(d.o), y(d.c));                 // body y
-          // Colors — closed vs forming dim
-          const alpha = d.complete === false ? 0.5 : 0.95;
-          const stroke = isUp ? `rgba(34,197,94,${alpha})` : `rgba(244,63,94,${alpha})`;
-          const fill = isUp ? `rgba(34,197,94,${alpha})` : `rgba(244,63,94,${alpha})`;
-
-          return (
-            <g key={i}>
-              {/* wick */}
-              <line
-                x1={wickX}
-                x2={wickX}
-                y1={y(d.h)}
-                y2={y(d.l)}
-                stroke={stroke}
-                strokeWidth={1}
-              />
-              {/* body */}
-              <rect
-                x={bodyX(i)}
-                width={cw}
-                y={by}
-                height={bh}
-                fill={fill}
-                rx={1.5}
-              />
-            </g>
-          );
-        })}
-
-        {/* time markers (start / end) */}
-        
-        <text x={pad} y={H - 4} fontSize="10" fill="#94a3b8">
-          {formatBrokerWall(
-            barOpenMs(data[0] as any, 0)
-          )}
-        </text>
-        <text x={W - pad} y={H - 4} fontSize="10" fill="#94a3b8" textAnchor="end">
-          {formatBrokerWall(
-            barOpenMs(data[data.length - 1] as any, 0)
-          )}
-        </text>
-
-      </svg>
-    </div>
-  </div>
-);
-}
-
-
 function MiniCandleChart({
   bars,
   broker,
@@ -754,10 +610,15 @@ function MiniCandleChart({
     c: number;
     complete?: boolean;
   }[];
-  broker?: any;
+  broker?: BrokerMeta;
   tfMs: number;
   height?: number;
-  pivots?: { t_open_ms: number; price: number; kind: "H" | "L"; confirmed: boolean }[];
+  pivots?: {
+    t_open_ms: number;
+    price: number;
+    kind: "H" | "L";
+    confirmed: boolean;
+  }[];
   showPivots?: boolean;
   maPreview?: { fast: number[]; slow: number[]; times: number[] };
 }) {
@@ -771,20 +632,19 @@ function MiniCandleChart({
     );
   }
 
-  // Detect decimals from actual price so EUR/USD gets 5, XAUUSD gets 2, etc.
-  const samplePrice =
-    bars[bars.length - 1]?.c ?? bars[0]?.c ?? 0;
+  // Detect decimals from actual price so EURUSD gets 5, XAUUSD gets 2, etc.
+  const samplePrice = bars[bars.length - 1]?.c ?? bars[0]?.c ?? 0;
   const dec = decimalsFromPrice(samplePrice);
 
+  const padL = 32;
+  const padR = 12;
+  const padT = 16;
+  const padB = 28;
 
-  const padL = 32,
-    padR = 12,
-    padT = 16,
-    padB = 28;
   const W = Math.max(600, bars.length * 6) + padL + padR;
   const H = height;
 
-  // fixed panel + gutter (so it never overlaps candles)
+  // keep a right gutter so pivots / MAs don’t hug the edge
   const PANEL_W = 148;
   const PANEL_MARGIN_R = 4;
   const PLOT_TO_PANEL_GAP = 16;
@@ -804,9 +664,9 @@ function MiniCandleChart({
   const y = (p: number) =>
     padT + (H - padT - padB) * (1 - (p - yMin) / yRange);
 
-  // --- hover state + helpers ---
+  // -------- hover state --------
   const [hover, setHover] = React.useState<null | { i: number; x: number }>(
-    null
+    null,
   );
 
   const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
@@ -814,13 +674,11 @@ function MiniCandleChart({
     const r = svg.getBoundingClientRect();
     const mx = e.clientX - r.left;
 
-    // ignore outside the plot area
     if (mx < padL || mx > W - plotRight) {
       setHover(null);
       return;
     }
 
-    // snap to nearest candle center
     let i = Math.round((mx - padL - xw / 2) / xw);
     i = Math.max(0, Math.min(bars.length - 1, i));
     const xc = padL + i * xw + xw / 2;
@@ -829,343 +687,317 @@ function MiniCandleChart({
 
   const onLeave = () => setHover(null);
 
+  
+  // -------- helper: format bar time to match MT5 row --------
+  const formatBarTime = (b: {
+    t_open_ms: number;
+    t_close_ms: number;
+    [k: string]: any;
+  }): string => {
+    const rawOpenMs = barOpenMs(
+      {
+        t_open_ms: b.t_open_ms,
+        t_close_ms: b.t_close_ms,
+        t: (b as any).t,
+      },
+      tfMs,
+    );
+    if (!rawOpenMs || !Number.isFinite(rawOpenMs)) return "—";
+
+    
+
+    // preview.t_open_ms is already broker wall-time ms ? format directly
+    return formatBrokerWall(rawOpenMs);
+  };
+
   return (
-    <div className="w-full overflow-x-auto rounded-xl border border-slate-800/60 bg-slate-950/60">
-      <svg
-        width={W}
-        height={H}
-        onMouseMove={onMove}
-        onMouseLeave={onLeave}
-        style={{ cursor: "crosshair", display: "block" }}
-      >
-        {/* top / bottom frame */}
-        <line
-          x1={padL}
-          y1={crisp(padT)}
-          x2={W - plotRight}
-          y2={crisp(padT)}
-          stroke="#1f2937"
-        />
-        <line
-          x1={padL}
-          y1={crisp(H - padB)}
-          x2={W - plotRight}
-          y2={crisp(H - padB)}
-          stroke="#1f2937"
-        />
+    <div className="w-full rounded-xl border border-slate-800/60 bg-slate-950/60">
+      {/* Header with active bar OHLC – stays visible while scrolling horizontally */}
+      {(() => {
+        const idx = hover ? hover.i : bars.length - 1;
+        const i = Math.max(0, Math.min(bars.length - 1, idx));
+        const b = bars[i];
+        if (!b) return null;
 
-        {/* y labels + horizontal guides */}
-        {[0, 0.5, 1].map((p, i) => {
-          const v = yMin + p * yRange;
-          const yv = y(v);
-          return (
-            <g key={i}>
-              <line
-                x1={padL}
-                y1={yv}
-                x2={W - plotRight}
-                y2={yv}
-                stroke="#111827"
-                opacity={0.5}
-              />
-              <text x={8} y={yv + 4} fill="#64748b" fontSize={10}>
-                {v.toFixed(dec)}
-              </text>
-            </g>
-          );
-        })}
+        const timeLabel = formatBarTime(b);
 
-        {/* candles */}
-        {bars.map((b, i) => {
-          const xc = padL + i * xw + xw / 2;
-          const bull = b.c >= b.o;
-          const color = bull ? "#22c55e" : "#ef4444";
+        return (
+          <div
+            className="
+              sticky top-0 left-0 z-20
+              flex flex-wrap items-center gap-x-6 gap-y-1
+              border-b border-slate-800/80
+              px-4 py-2
+              text-xs text-slate-300
+              bg-slate-950/80 backdrop-blur-sm
+            "
+          >
+            <span className="font-semibold text-slate-200">
+              Time: <span className="font-normal">{timeLabel}</span>
+            </span>
+            <span>O: {b.o.toFixed(dec)}</span>
+            <span>H: {b.h.toFixed(dec)}</span>
+            <span>L: {b.l.toFixed(dec)}</span>
+            <span>C: {b.c.toFixed(dec)}</span>
+          </div>
+        );
+      })()}
 
-          const yH = y(b.h),
-            yL = y(b.l),
-            yO = y(b.o),
-            yC = y(b.c);
-          const top = Math.min(yO, yC);
-          const h = Math.max(2, Math.abs(yO - yC));
+      <div className="overflow-x-auto">
+        <svg
+          width={W}
+          height={H}
+          onMouseMove={onMove}
+          onMouseLeave={onLeave}
+          style={{ cursor: "crosshair", display: "block" }}
+        >
+          {/* top / bottom frame */}
+          <line
+            x1={padL}
+            y1={crisp(padT)}
+            x2={W - plotRight}
+            y2={crisp(padT)}
+            stroke="#1f2937"
+          />
+          <line
+            x1={padL}
+            y1={crisp(H - padB)}
+            x2={W - plotRight}
+            y2={crisp(H - padB)}
+            stroke="#1f2937"
+          />
 
-          return (
-            <g key={i}>
-              <line
-                x1={xc}
-                x2={xc}
-                y1={yH}
-                y2={yL}
-                stroke={color}
-                strokeWidth={1}
-              />
-              <rect
-                x={xc - bodyW / 2}
-                y={top}
-                width={bodyW}
-                height={h}
-                fill={color}
-              />
-            </g>
-          );
-        })}
+          {/* y labels + guides */}
+          {[0, 0.5, 1].map((p, i) => {
+            const v = yMin + p * yRange;
+            const yv = y(v);
+            return (
+              <g key={i}>
+                <line
+                  x1={padL}
+                  y1={yv}
+                  x2={W - plotRight}
+                  y2={yv}
+                  stroke="#111827"
+                  opacity={0.5}
+                />
+                <text x={8} y={yv + 4} fill="#64748b" fontSize={10}>
+                  {v.toFixed(dec)}
+                </text>
+              </g>
+            );
+          })}
 
-        {/* --- ZigZag pivots overlay --- */}
-        {showPivots && Array.isArray(pivots) && pivots.length > 0 && (
-          <g>
-            {(() => {
-              const indexByOpen = new Map<number, number>();
-              bars.forEach((b, i) => indexByOpen.set(b.t_open_ms, i));
+          {/* candles */}
+          {bars.map((b, i) => {
+            const xc = padL + i * xw + xw / 2;
+            const bull = b.c >= b.o;
+            const color = bull ? "#22c55e" : "#ef4444";
 
-              // connector polyline
-              const points = pivots
-                .map((p) => {
-                  const i = indexByOpen.get(p.t_open_ms);
-                  if (i == null) return null;
-                  const xc = padL + i * xw + xw / 2;
-                  const yy = y(p.price);
-                  return `${xc},${yy}`;
-                })
-                .filter(Boolean)
-                .join(" ");
+            const yH = y(b.h);
+            const yL = y(b.l);
+            const yO = y(b.o);
+            const yC = y(b.c);
+            const top = Math.min(yO, yC);
+            const h = Math.max(2, Math.abs(yO - yC));
 
-              return (
-                <>
-                  <polyline
-                    fill="none"
-                    stroke="rgba(250,250,250,0.6)"
-                    strokeWidth={1}
-                    points={points}
-                  />
-                  {pivots.map((p, k) => {
+            return (
+              <g key={i}>
+                <line
+                  x1={xc}
+                  x2={xc}
+                  y1={yH}
+                  y2={yL}
+                  stroke={color}
+                  strokeWidth={1}
+                />
+                <rect
+                  x={xc - bodyW / 2}
+                  y={top}
+                  width={bodyW}
+                  height={h}
+                  fill={color}
+                />
+              </g>
+            );
+          })}
+
+          {/* ZigZag pivots overlay */}
+          {showPivots && Array.isArray(pivots) && pivots.length > 0 && (
+            <g>
+              {(() => {
+                const indexByOpen = new Map<number, number>();
+                bars.forEach((b, i) => indexByOpen.set(b.t_open_ms, i));
+
+                const points = pivots
+                  .map((p) => {
                     const i = indexByOpen.get(p.t_open_ms);
                     if (i == null) return null;
                     const xc = padL + i * xw + xw / 2;
                     const yy = y(p.price);
-                    const sz = 5;
-                    const up = p.kind === "H";
-                    const opacity = p.confirmed ? 1 : 0.6;
-                    const pts = up
-                      ? `${xc},${yy - sz} ${xc - sz},${yy + sz} ${
-                          xc + sz
-                        },${yy + sz}`
-                      : `${xc},${yy + sz} ${xc - sz},${yy - sz} ${
-                          xc + sz
-                        },${yy - sz}`;
-                    return (
-                      <polygon
-                        key={`pv-${k}`}
-                        points={pts}
-                        fill={up ? "#10b981" : "#ef4444"}
-                        opacity={opacity}
-                      />
-                    );
-                  })}
+                    return `${xc},${yy}`;
+                  })
+                  .filter(Boolean)
+                  .join(" ");
 
-                  {/* HH/HL/LH/LL labels */}
-                  {(() => {
-                    const labels: {
-                      k: number;
-                      tag: "HH" | "HL" | "LH" | "LL";
-                    }[] = [];
-                    let lastH: number | undefined;
-                    let lastL: number | undefined;
-
-                    pivots.forEach((p, k) => {
-                      if (p.kind === "H") {
-                        const tag =
-                          lastH == null
-                            ? "HH"
-                            : p.price > lastH
-                            ? "HH"
-                            : "LH";
-                        labels.push({ k, tag });
-                        lastH = p.price;
-                      } else {
-                        const tag =
-                          lastL == null
-                            ? "HL"
-                            : p.price > lastL
-                            ? "HL"
-                            : "LL";
-                        labels.push({ k, tag });
-                        lastL = p.price;
-                      }
-                    });
-
-                    return labels.map(({ k, tag }) => {
-                      const p = pivots[k];
+                return (
+                  <>
+                    <polyline
+                      fill="none"
+                      stroke="rgba(250,250,250,0.6)"
+                      strokeWidth={1}
+                      points={points}
+                    />
+                    {pivots.map((p, k) => {
                       const i = indexByOpen.get(p.t_open_ms);
                       if (i == null) return null;
                       const xc = padL + i * xw + xw / 2;
-                      const yy =
-                        y(p.price) + (p.kind === "H" ? -8 : 12); // above highs, below lows
-
+                      const yy = y(p.price);
+                      const sz = 5;
+                      const up = p.kind === "H";
+                      const opacity = p.confirmed ? 1 : 0.6;
+                      const pts = up
+                        ? `${xc},${yy - sz} ${xc - sz},${yy + sz} ${xc + sz},${
+                            yy + sz
+                          }`
+                        : `${xc},${yy + sz} ${xc - sz},${yy - sz} ${xc + sz},${
+                            yy - sz
+                          }`;
                       return (
-                        <text
-                          key={`pv-lbl-${k}`}
-                          x={xc}
-                          y={yy}
-                          textAnchor="middle"
-                          fontSize={10}
-                          fill="#cbd5e1"
-                          style={{ pointerEvents: "none" }}
-                        >
-                          {tag}
-                        </text>
+                        <polygon
+                          key={`pv-${k}`}
+                          points={pts}
+                          fill={up ? "#10b981" : "#ef4444"}
+                          opacity={opacity}
+                        />
                       );
-                    });
-                  })()}
-                </>
+                    })}
+
+                    {/* HH/HL/LH/LL labels */}
+                    {(() => {
+                      const labels: { k: number; tag: "HH" | "HL" | "LH" | "LL" }[] = [];
+                      let lastH: number | undefined;
+                      let lastL: number | undefined;
+
+                      pivots.forEach((p, k) => {
+                        if (p.kind === "H") {
+                          const tag =
+                            lastH == null
+                              ? "HH"
+                              : p.price > lastH
+                              ? "HH"
+                              : "LH";
+                          labels.push({ k, tag });
+                          lastH = p.price;
+                        } else {
+                          const tag =
+                            lastL == null
+                              ? "HL"
+                              : p.price > lastL
+                              ? "HL"
+                              : "LL";
+                          labels.push({ k, tag });
+                          lastL = p.price;
+                        }
+                      });
+
+                      return labels.map(({ k, tag }) => {
+                        const p = pivots[k];
+                        const i = indexByOpen.get(p.t_open_ms);
+                        if (i == null) return null;
+                        const xc = padL + i * xw + xw / 2;
+                        const yy = y(p.price) + (p.kind === "H" ? -8 : 12);
+
+                        return (
+                          <text
+                            key={`pv-lbl-${k}`}
+                            x={xc}
+                            y={yy}
+                            textAnchor="middle"
+                            fontSize={10}
+                            fill="#cbd5e1"
+                            style={{ pointerEvents: "none" }}
+                          >
+                            {tag}
+                          </text>
+                        );
+                      });
+                    })()}
+                  </>
+                );
+              })()}
+            </g>
+          )}
+
+          {/* MA preview overlays */}
+          {mp.fast.length > 0 && (
+            <path
+              d={(() => {
+                const xs: number[] = [];
+                const ysMa: number[] = [];
+                for (let i = 0; i < bars.length; i++) {
+                  const v = mp.fast[i];
+                  if (!Number.isFinite(v)) continue;
+                  const xc = padL + i * xw + xw / 2;
+                  xs.push(xc);
+                  ysMa.push(y(v));
+                }
+                return linePath(xs, ysMa);
+              })()}
+              stroke="#6366f1"
+              strokeWidth={1.2}
+              fill="none"
+            />
+          )}
+
+          {mp.slow.length > 0 && (
+            <path
+              d={(() => {
+                const xs: number[] = [];
+                const ysMa: number[] = [];
+                for (let i = 0; i < bars.length; i++) {
+                  const v = mp.slow[i];
+                  if (!Number.isFinite(v)) continue;
+                  const xc = padL + i * xw + xw / 2;
+                  xs.push(xc);
+                  ysMa.push(y(v));
+                }
+                return linePath(xs, ysMa);
+              })()}
+              stroke="#facc15"
+              strokeWidth={1.2}
+              fill="none"
+            />
+          )}
+
+          {/* hover crosshair only */}
+          {hover &&
+            (() => {
+              const i = Math.max(0, Math.min(bars.length - 1, hover.i));
+              const b = bars[i];
+              if (!b) return null;
+              const bull = b.c >= b.o;
+              return (
+                <g pointerEvents="none">
+                  <line
+                    x1={hover.x}
+                    y1={padT}
+                    x2={hover.x}
+                    y2={H - padB}
+                    stroke="#475569"
+                    strokeDasharray="3 3"
+                  />
+                  <circle
+                    cx={hover.x}
+                    cy={y(b.c)}
+                    r={2}
+                    fill={bull ? "#10b981" : "#f43f5e"}
+                  />
+                </g>
               );
             })()}
-          </g>
-        )}
-
-        {/* === MA preview overlays === */}
-        {mp.fast.length > 0 && (
-          <path
-            d={(() => {
-              const xs: number[] = [];
-              const ysMa: number[] = [];
-              for (let i = 0; i < bars.length; i++) {
-                const v = mp.fast[i];
-                if (!Number.isFinite(v)) continue;
-                const xc = padL + i * xw + xw / 2;
-                xs.push(xc);
-                ysMa.push(y(v));
-              }
-              return linePath(xs, ysMa);
-            })()}
-            stroke="#6366f1"
-            strokeWidth={1.2}
-            fill="none"
-          />
-        )}
-
-        {mp.slow.length > 0 && (
-          <path
-            d={(() => {
-              const xs: number[] = [];
-              const ysMa: number[] = [];
-              for (let i = 0; i < bars.length; i++) {
-                const v = mp.slow[i];
-                if (!Number.isFinite(v)) continue;
-                const xc = padL + i * xw + xw / 2;
-                xs.push(xc);
-                ysMa.push(y(v));
-              }
-              return linePath(xs, ysMa);
-            })()}
-            stroke="#facc15"
-            strokeWidth={1.2}
-            fill="none"
-          />
-        )}
-
-        
-        
-        {/* hover overlay (crosshair + fixed panel) */}
-{(() => {
-  try {
-    if (!bars.length) return null;
-
-    const idx = hover ? hover.i : bars.length - 1;
-    const i = Math.max(0, Math.min(bars.length - 1, idx));
-    const b = bars[i];
-    if (!b) return null;
-
-    const bull = b.c >= b.o;
-
-    const cross = hover ? (
-      <g pointerEvents="none">
-        <line
-          x1={hover.x}
-          y1={padT}
-          x2={hover.x}
-          y2={H - padB}
-          stroke="#475569"
-          strokeDasharray="3 3"
-        />
-        <circle
-          cx={hover.x}
-          cy={y(b.c)}
-          r={2}
-          fill={bull ? "#10b981" : "#f43f5e"}
-        />
-      </g>
-    ) : null;
-
-    // --- use bar OPEN in UTC, then format in broker TZ ---
-    // t_open_ms / t_close_ms are already broker wall-time ms ? no extra offset
-    const openMsWall = barOpenMs(
-      {
-        t_open_ms: (b as any).t_open_ms,
-        t_close_ms: (b as any).t_close_ms,
-        t: (b as any).t,
-      },
-      tfMs
-    );
-
-    const timeLabel =
-      openMsWall > 0 ? formatBrokerWall(openMsWall) : "—";
-
-
-    const panelLines = [
-      `Time: ${timeLabel}`,
-      `O: ${b.o.toFixed(dec)}`,
-      `H: ${b.h.toFixed(dec)}`,
-      `L: ${b.l.toFixed(dec)}`,
-      `C: ${b.c.toFixed(dec)}`,
-    ];
-
-    const panelPad = 10;
-    const lineH = 16;
-    const panelW = 180;
-    const panelH = panelPad * 2 + panelLines.length * lineH;
-
-    const fixedX = Math.max(padL + 8, W - padR - panelW - 12);
-    const fixedY = Math.max(padT + 8, 12);
-
-    const panel = (
-      <g transform={`translate(${fixedX},${fixedY})`} pointerEvents="none">
-        <rect
-          x={0}
-          y={0}
-          width={panelW}
-          height={panelH}
-          rx={10}
-          ry={10}
-          fill="rgba(2,6,23,.92)"
-          stroke="#334155"
-        />
-        {panelLines.map((t, k) => (
-          <text
-            key={k}
-            x={panelPad}
-            y={panelPad + (k + 1) * lineH - 4}
-            fill="#cbd5e1"
-            fontSize={12}
-            fontFamily="ui-sans-serif,system-ui"
-          >
-            {t}
-          </text>
-        ))}
-      </g>
-    );
-
-    return (
-      <>
-        {cross}
-        {panel}
-      </>
-    );
-  } catch (err) {
-    console.error("[Trend] hover overlay error", err);
-    return null;
-  }
-})()}
-
-      </svg>
+        </svg>
+      </div>
     </div>
   );
 }
@@ -1531,11 +1363,20 @@ useEffect(() => () => {
     }
 
 
+    
     // ---------- WARMING ----------
     if (j?.warming) {
       setNotice(j.message || "Warming up - awaiting bars from agent");
       setServer(null); // avoid stale preview
-      setLastUpdatedLabel(formatInBrokerTZ(serverNowMs, displayBroker));
+
+      // Prefer broker last closed candle close time; fallback to serverNow
+      const lastClosedCloseMs =
+        typeof j?.lastClosedTs === "number" ? j.lastClosedTs
+        : (typeof j?.lastClosedTS === "number" ? j.lastClosedTS : 0);
+      const lastUpdatedMs = lastClosedCloseMs || serverNowMs;
+
+      setLastUpdated(new Date(lastUpdatedMs));
+      setLastUpdatedLabel(formatInBrokerTZ(lastUpdatedMs, displayBroker));
       setUsingDevice(j?.usingDevice ?? null);
 
       let nextCloseMs =
@@ -1547,9 +1388,6 @@ useEffect(() => () => {
 
       // Optional verify (kept noop if disabled)
       try {
-        const lastClosedCloseMs =
-          typeof j?.lastClosedTs === "number" ? j.lastClosedTs
-          : (typeof j?.lastClosedTS === "number" ? j.lastClosedTS : 0);
         const lastClosedOpenMs = lastClosedCloseMs ? lastClosedCloseMs - tfMsLocal : 0;
         if (ENABLE_BROKER_VERIFY && lastClosedOpenMs) {
           await verifyLastBarAgainstBrokerSafely({
@@ -1568,12 +1406,21 @@ useEffect(() => () => {
       return;
     }
 
+    
     // ---------- NORMAL ----------
     setNotice(null);
     warmRetryMsRef.current = 5000;
 
-    setLastUpdatedLabel(formatInBrokerTZ(serverNowMs, displayBroker));
+    // Prefer broker last closed candle time; fallback to serverNow
+    const lastClosedCloseMs =
+      typeof j?.lastClosedTs === "number" ? j.lastClosedTs
+      : (typeof j?.lastClosedTS === "number" ? j.lastClosedTS : 0);
+    const lastUpdatedMs = lastClosedCloseMs || serverNowMs;
+
+    setLastUpdated(new Date(lastUpdatedMs));
+    setLastUpdatedLabel(formatInBrokerTZ(lastUpdatedMs, displayBroker));
     setUsingDevice(j?.usingDevice ?? null);
+
     let nextCloseMs =
       typeof j?.nextCloseTs === "number" ? j.nextCloseTs
       : (Math.floor(serverNowMs / tfMsLocal) + 1) * tfMsLocal;
@@ -1583,9 +1430,6 @@ useEffect(() => () => {
 
     // Optional verify
     try {
-      const lastClosedCloseMs =
-        typeof j?.lastClosedTs === "number" ? j.lastClosedTs
-        : (typeof j?.lastClosedTS === "number" ? j.lastClosedTS : 0);
       const lastClosedOpenMs = lastClosedCloseMs ? lastClosedCloseMs - tfMsLocal : 0;
       if (ENABLE_BROKER_VERIFY && lastClosedOpenMs) {
         await verifyLastBarAgainstBrokerSafely({
@@ -1812,7 +1656,7 @@ const tfMs = React.useMemo(() => {
 
   const lastSessionLabel =
     lastSessionTsMs != null
-      ? formatInBrokerTZ(lastSessionTsMs, brokerMeta)
+      ? formatBrokerWall(lastSessionTsMs)
       : server?.server_now_ms != null
       ? formatInBrokerTZ(server.server_now_ms, brokerMeta)
       : "—";
@@ -1845,7 +1689,10 @@ const tfMs = React.useMemo(() => {
           <div className="flex flex-col lg:flex-row items-start lg:items-center gap-4 justify-between">
             <div>
               <div className="inline-flex items-center gap-2 text-xs text-indigo-300/80 mb-2"><span className="h-1.5 w-1.5 rounded-full bg-indigo-400 animate-pulse"/>Live Trend Engine</div>
-              <h1 className="text-3xl font-semibold tracking-tight">Trend Insight <span className="text-slate-400">·</span> {cfg.trendTF.toUpperCase()}</h1>
+              <h1 className="text-3xl font-semibold tracking-tight">
+                Trend Insight - {cfg.trendTF.toUpperCase()}
+              </h1>
+
               <p className="text-slate-400 text-sm mt-1">Uses your settings below. Badge reflects the last closed {cfg.trendTF.toUpperCase()} bar.</p>
             </div>
             <div className="flex items-center gap-2">
@@ -1966,10 +1813,21 @@ const tfMs = React.useMemo(() => {
   })();
 
 
-  // 3) Format broker wall-time via offset-only helper
-  const lastUpdatedLabel = brokerMeta
-    ? formatInBrokerOffsetOnly(lastUpdatedMs, brokerMeta)
-    : "—";
+  
+  // 3) Convert to broker wall-clock and format
+  let wallMs = lastUpdatedMs;
+
+  // If we still don't have a timestamp, fall back to serverNow (UTC) + broker offset
+  if ((!wallMs || !Number.isFinite(wallMs)) && brokerMeta) {
+    const nowUtc = Number(server?.serverNow ?? Date.now());
+    wallMs = nowUtc + _offsetMs(brokerMeta); // _offsetMs is already defined above
+  }
+
+  const lastUpdatedLabel =
+    brokerMeta && wallMs && Number.isFinite(wallMs)
+      ? formatBrokerWall(wallMs) // ms is already broker wall-time here
+      : "—";
+
 
   return (
     <div className="mt-3 grid grid-cols-3 items-center text-xs">
@@ -2110,27 +1968,28 @@ const tfMs = React.useMemo(() => {
     </div>
   )}
 
-  <div className="mt-3 text-xs text-slate-500">
-    {server?.stale
-      ? "Snapshot is stale (market closed or agent paused)."
-      : "Includes forming bar when present; updates on TF close while Live is on."}
-  </div>
-
-  <div className="text-xs text-slate-500 mt-1">
-    {server?.nextCloseTs
-      ? `Next ${cfg.trendTF.toUpperCase()} close: ${formatInBrokerTZ(server.nextCloseTs, brokerMeta)}`
-      : "Scheduled for next closeâ€¦"}
-  </div>
-
-  <div className="mt-2 text-xs text-slate-400">
+    <div className="mt-2 text-xs text-slate-400">
     TF: {cfg.trendTF.toUpperCase()}
-    {previewBars.length > 0 ? (() => {
-      const from = formatInBrokerTZ(previewBars[0].t_open_ms, brokerMeta);
-      const last = previewBars[previewBars.length - 1];
-      const to   = last ? formatInBrokerTZ(last.t_close_ms, brokerMeta) : "";
-      return <> â€¢ Window: {from} Â· {to}</>;
-    })() : ""}
+    {previewBars.length > 0
+      ? (() => {
+          const first = previewBars[0];
+          const lastComplete =
+            [...previewBars].reverse().find((b) => b.complete) ??
+            previewBars[previewBars.length - 1];
+
+          const from = first
+            ? formatInBrokerTZ(first.t_open_ms, brokerMeta)
+            : "";
+          const to =
+            lastComplete && lastComplete.t_close_ms
+              ? formatInBrokerTZ(lastComplete.t_close_ms, brokerMeta)
+              : "";
+
+          return from && to ? <> • Window: {from} · {to}</> : null;
+        })()
+      : ""}
   </div>
+
 </Panel>
 
 
@@ -2141,43 +2000,86 @@ const tfMs = React.useMemo(() => {
 <div className="mt-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 items-stretch">
 
   {/* Card — Regime */}
-  <Panel
-    title="Regime"
-    right={<span className="text-xs text-slate-400">{cfg.ma.type} {cfg.ma.fast}/{cfg.ma.slow}</span>}
-    className="h-full"
-  >
-    <div className="grid grid-cols-2 gap-3">
-      <div className="col-span-2">
-        <label className="text-xs text-slate-400">MA Type</label>
-        <select
-          value={cfg.ma.type}
-          onChange={(e) => applySetting({ ...cfg, ma:{ ...cfg.ma, type:e.target.value } })}
-          className="xtl-select ctl-sm"
-        >
-          <option>EMA</option>
-          <option>SMA</option>
-        </select>
-      </div>
-      <div>
-        <label className="text-xs text-slate-400">Fast MA</label>
-        <input
-          type="number" min={5} max={100}
-          value={cfg.ma.fast}
-          onChange={(e) => applySetting({ ...cfg, ma:{ ...cfg.ma, fast:Number(e.target.value) } })}
-          className="xtl-number ctl-sm"
-        />
-      </div>
-      <div>
-        <label className="text-xs text-slate-400">Slow MA</label>
-        <input
-          type="number" min={50} max={400}
-          value={cfg.ma.slow}
-          onChange={(e) => applySetting({ ...cfg, ma:{ ...cfg.ma, slow:Number(e.target.value) } })}
-          className="xtl-number ctl-sm"
-        />
+<Panel
+  title="Regime"
+  right={
+    <span className="text-xs text-slate-400">
+      {cfg.ma.type} {cfg.ma.fast}/{cfg.ma.slow}
+    </span>
+  }
+  className="h-full"
+>
+  <div className="grid grid-cols-2 gap-3">
+    <div className="col-span-2">
+      <label className="text-xs text-slate-400">MA Type</label>
+      <select
+        value={cfg.ma.type}
+        onChange={(e) =>
+          applySetting({ ...cfg, ma: { ...cfg.ma, type: e.target.value } })
+        }
+        className="xtl-select ctl-sm"
+      >
+        <option>EMA</option>
+        <option>SMA</option>
+      </select>
+    </div>
+
+    <div>
+      <label className="text-xs text-slate-400">Fast MA</label>
+      <input
+        type="number"
+        min={5}
+        max={100}
+        value={cfg.ma.fast}
+        onChange={(e) =>
+          applySetting({
+            ...cfg,
+            ma: { ...cfg.ma, fast: Number(e.target.value) },
+          })
+        }
+        className="xtl-number ctl-sm"
+      />
+    </div>
+
+    <div>
+      <label className="text-xs text-slate-400">Slow MA</label>
+      <input
+        type="number"
+        min={50}
+        max={400}
+        value={cfg.ma.slow}
+        onChange={(e) =>
+          applySetting({
+            ...cfg,
+            ma: { ...cfg.ma, slow: Number(e.target.value) },
+          })
+        }
+        className="xtl-number ctl-sm"
+      />
+    </div>
+
+    {/* Legend: which color is which MA */}
+    <div className="col-span-2 text-[11px] text-slate-500 mt-1">
+      <div className="flex items-center gap-4">
+        <span className="flex items-center gap-1">
+          <span
+            className="inline-block w-3 h-3 rounded-full"
+            style={{ backgroundColor: "#6366f1" }}
+          />
+          <span>Fast MA (blue)</span>
+        </span>
+        <span className="flex items-center gap-1">
+          <span
+            className="inline-block w-3 h-3 rounded-full"
+            style={{ backgroundColor: "#facc15" }}
+          />
+          <span>Slow MA (yellow)</span>
+        </span>
       </div>
     </div>
-  </Panel>
+  </div>
+</Panel>
+
 
   {/* Card — Slope */}
   <Panel title="Slope" className="h-full">

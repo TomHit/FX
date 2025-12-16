@@ -23,6 +23,8 @@ import logging
 import hashlib
 from api.security import require_user_relaxed
 from api.trend import router as trend_router
+from api.strategy_endpoints import router as strategy_router
+
 
 try:
     from api.routes_admin import r as admin_router
@@ -160,6 +162,7 @@ app.include_router(predict_router)
 # All /user/mfa/* endpoints need a user session but should work before MFA is enabled.
 app.include_router(mfa_router, tags=["auth"], dependencies=[Depends(get_current_user_relaxed)])
 app.include_router(trend_router, tags=["trend"])
+app.include_router(strategy_router, tags=["strategy"])
 
 
 # --- Worker endpoints (device heartbeats, next job, etc.) ---

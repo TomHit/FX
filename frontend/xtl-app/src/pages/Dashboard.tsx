@@ -433,32 +433,39 @@ function brokerAbbrToIana(abbr?: string): string | undefined {
 export type Direction = "up" | "down" | "flat";
 export type Bias = "Strong Bullish" | "Bullish" | "Neutral" | "Bearish" | "Strong Bearish";
 
-export type InstrumentRow = {
+type InstrumentRow = {
   symbol: string;
   price: number;
   bias: Bias;
   short_term_score?: number;
   long_term_score?: number;
-  st_trend_label?: Bias;   // NEW: ST trend label from backend
-  ht_trend_label?: Bias; 
+  st_trend_label?: Bias;   // ST trend label from backend
+  ht_trend_label?: Bias;   // HT trend label from backend
   direction: Direction;
-  prob_up_1h: number; // 0..1
-  expected_move_pct_1h: number; // signed, +0.30 => up 0.30%
+  prob_up_1h: number;               // 0..1
+  expected_move_pct_1h: number;     // signed, +0.30 => up 0.30%
   target_price_1h: number;
   expected_move_pct_4h?: number;
   target_price_4h?: number;
-  reasons: string[];
-  confidence_band?: number; // ATR units
-  updated_broker_ts: number; // epoch ms
-  broker_tz_abbr: string; // e.g., "EET"
-  using_device: string; // device id
+
+  // reasons
+  reasons: string[];                // legacy / generic reasons (keep for compat)
+  reasons_h1?: string[];            // ST (1h) reasons
+  reasons_h4?: string[];            // HT (4h) reasons
+
+  confidence_band?: number;         // ATR units
+  updated_broker_ts: number;        // epoch ms
+  broker_tz_abbr: string;           // e.g., "EET"
+  using_device: string;             // device id
   broker_tz_offset_min?: number;
   tz_offset_min?: number;
-  decision?: "BUY" | "SELL" | "";
-  target_pips?: number;
-  
 
+  // ?? newly added fields used in target calc
+  decision?: "BUY" | "SELL" | "";   // backend decision for direction
+  target_pips?: number;             // may be pip-count OR price-delta
+  structure?: string;
 };
+
 
 // Map backend /trend/predict/all row -> InstrumentRow (defensive defaults)
 function mapApiRowToInstrument(r: any): InstrumentRow {
@@ -514,9 +521,22 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
     typeof r?.target_price_4h === "number" ? r.target_price_4h : undefined;
 
   // reasons: normalize to string[]
-  const reasons: string[] = Array.isArray(r?.reasons)
-    ? r.reasons.map(String)
-    : (r?.reason ? [String(r.reason)] : []);
+  // ST / HT reasons from backend (keep legacy "reasons" for compat)
+  const reasons_h1: string[] = Array.isArray(r?.reasons_h1)
+    ? r.reasons_h1.map(String)
+    : Array.isArray(r?.reasons)
+      ? r.reasons.map(String)
+      : (r?.reason ? [String(r.reason)] : []);
+
+  const reasons_h4: string[] = Array.isArray(r?.reasons_h4)
+    ? r.reasons_h4.map(String)
+    : [];
+
+  // legacy "reasons" field: prefer ST reasons, else HT, else empty
+  const reasons: string[] =
+    reasons_h1.length ? reasons_h1 :
+    (reasons_h4.length ? reasons_h4 : []);
+
 
   // broker/device meta if present
   const tz_off =
@@ -554,6 +574,8 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
     decision: typeof r?.decision === "string" ? (r.decision as any) : "",
     target_pips: typeof r?.target_pips === "number" ? r.target_pips : undefined,
     reasons,
+    reasons_h1,
+    reasons_h4,
     confidence_band: undefined,
     // Use server_now_ms or updated_broker_ts if provided; fallback null
     updated_broker_ts:
@@ -563,6 +585,7 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
     using_device: String(r?.using_device || ""),
     broker_tz_offset_min: tz_off,
     tz_offset_min: tz_off,
+    structure: r?.structure ? String(r.structure) : undefined,
   };
 }
 
@@ -710,73 +733,192 @@ const ReasonList: React.FC<{ reasons: string[] }> = ({ reasons }) => (
 );
 
 const InstCard: React.FC<{
-  row: InstrumentRow; showReasons: boolean; showTarget: boolean; livePrice?: number
-}> = ({ row, showReasons, showTarget, livePrice }) => {
-  const pill = biasToPill(row.bias);
-  const tzIANA = row.broker_tz_abbr === "EET" ? "Europe/Helsinki" : undefined; // demo mapping; replace with actual
-  const { time } = fmtTZ(row.updated_broker_ts, tzIANA || Intl.DateTimeFormat().resolvedOptions().timeZone);
+  row: InstrumentRow;
+  showReasons: boolean;
+  showTarget: boolean; // kept for API compatibility, not used directly
+  livePrice?: number;
+}> = ({ row, showReasons, livePrice }) => {
+  // --- Trend labels as Bias ---
+  const ht: Bias =
+    (row.ht_trend_label as Bias | undefined) ?? row.bias;
 
-  // simple “room” chip logic: majors =1%, XAU=1.5%
-  const absMove = Math.abs(row.expected_move_pct_1h || 0);
-  const roomThreshold = row.symbol.toUpperCase() === "XAUUSD" ? 1.5 : 1.0;
-  const hasRoom = absMove >= roomThreshold;
+  const stRaw =
+    row.st_trend_label ||
+    scoreToTrendLabel(row.short_term_score);
+
+  const st: Bias =
+    stRaw === "Strong Bullish" ||
+    stRaw === "Bullish" ||
+    stRaw === "Neutral" ||
+    stRaw === "Bearish" ||
+    stRaw === "Strong Bearish"
+      ? (stRaw as Bias)
+      : "Neutral";
+
+  const htPill = biasToPill(ht);
+  const stPill = biasToPill(st);
+
+  // --- Direction chip ---
+  const dirLabel =
+    row.direction === "up" ? "UP" :
+    row.direction === "down" ? "DOWN" : "FLAT";
+
+  const dirArrow =
+    row.direction === "up" ? "?" :
+    row.direction === "down" ? "?" : "•";
+
+  const dirClass =
+    row.direction === "up"
+      ? "bg-emerald-500/10 text-emerald-300 border-emerald-400/30"
+      : row.direction === "down"
+      ? "bg-rose-500/10 text-rose-300 border-rose-400/30"
+      : "bg-slate-500/10 text-slate-300 border-slate-400/30";
+
+  // --- ST / HT reasons, with structure + RVOL extracted as chips ---
+  const stReasonsAll = row.reasons_h1 || row.reasons || [];
+  const htReasons = row.reasons_h4 || [];
+
+  let structureLine: string | undefined;
+  let rvolLine: string | undefined;
+  const otherStReasons: string[] = [];
+
+  for (const line of stReasonsAll) {
+    const lower = line.toLowerCase();
+    if (!structureLine && lower.includes("structure")) {
+      structureLine = line;
+      continue;
+    }
+    if (!rvolLine && lower.includes("rvol")) {
+      rvolLine = line;
+      continue;
+    }
+    otherStReasons.push(line);
+  }
+
+  const fallbackStructure =
+    st.includes("Bullish") ? "bullish 1h structure" :
+    st.includes("Bearish") ? "bearish 1h structure" :
+    "neutral 1h structure";
+
+  const structureText =
+    row.structure && row.structure.trim().length > 0
+      ? row.structure
+      : (structureLine || fallbackStructure);
+
+  const { time } = fmtTZ(
+    row.updated_broker_ts,
+    row.broker_tz_abbr === "EET"
+      ? "Europe/Helsinki"
+      : Intl.DateTimeFormat().resolvedOptions().timeZone
+  );
+
+  // Accent ring based on direction
+  const accentRing =
+    row.direction === "up"
+      ? "ring-1 ring-emerald-500/40"
+      : row.direction === "down"
+      ? "ring-1 ring-rose-500/40"
+      : "ring-1 ring-slate-500/30";
 
   return (
-    <Card className="hover:translate-y-[1px] transition-transform">
-      <CardContent>
+    <Card className={`relative overflow-hidden hover:translate-y-[1px] transition-transform bg-gradient-to-b from-slate-950/80 to-slate-900/50 ${accentRing}`}>
+      {/* subtle top glow */}
+      <div className="pointer-events-none absolute inset-x-0 -top-10 h-16 bg-gradient-to-b from-emerald-400/10 via-transparent to-transparent" />
+
+      <CardContent className="relative">
+        {/* Header: symbol + price */}
         <div className="flex items-start justify-between">
-          <div>
-            <div className="text-sm text-slate-400">{row.symbol}</div>
-            <div className="mt-1 flex items-center gap-2">
-              <span className={pill.className}>
-                <span className="tabular-nums">{pill.text}</span>
-              </span>
-               {row.direction === "up" ? "UP" : row.direction === "down" ? "DOWN" : "FLAT"} {pill.arrow}
-              {hasRoom && (
-                <span className="inline-flex items-center rounded-full bg-amber-500/15 text-amber-300 border border-amber-400/30 px-2 py-0.5 text-[11px] ml-1">
-                  = {roomThreshold.toFixed(1)}% room
-                </span>
-              )}
+          <div className="text-sm text-slate-300 tracking-wide">
+            {row.symbol}
+          </div>
+          <div className="text-xl tabular-nums text-slate-50">
+            {Number.isFinite(livePrice as any)
+              ? fmtPrice(row.symbol, livePrice!, decimalsFromPrice(livePrice))
+              : "—"}
+          </div>
+        </div>
+
+        
+        {/* Trend row */}
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-2">
+              <span className={htPill.className}>{htPill.text}</span>
+              <span className="text-xs text-slate-400">HT Trend</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className={stPill.className}>{stPill.text}</span>
+              <span className="text-xs text-slate-400">ST Trend</span>
             </div>
           </div>
-          <div className="text-right">
-            <div className="text-xl tabular-nums">
-              {typeof livePrice === "number"
-                ? fmtPrice(row.symbol, livePrice, decimalsFromPrice(livePrice))
-                : "—"}
-            </div>
 
-            {showTarget && (
-              <div className="mt-1 text-xs text-slate-400">
-                1h Target{" "}
-                {Number.isFinite(row.expected_move_pct_1h as any)
-                  ? `${pctSym(row.expected_move_pct_1h, row.symbol)} -`
-                  : "—"}{" "}
-                <span className="ml-1 tabular-nums text-slate-200">
-                  {(() => {
-                    const t = calcTargetPrice(row as any);
-                    const base = (typeof livePrice === "number" ? livePrice : row.price) as number | undefined;
-                    return t != null ? fmtPrice(row.symbol, t, decimalsFromPrice(base)) : "—";
-                  })()}
-                </span>
+          <div className="ml-auto flex flex-col items-end">
+            <span
+              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${dirClass}`}
+            >
+              <span>{dirLabel}</span>
+            </span>
+          </div>
+        </div>
+
+  
+
+        {/* Key chips: structure + RVOL */}
+        <div className="mt-3 flex flex-wrap gap-2 text-[12px]">
+          <span className="inline-flex items-center rounded-full border border-slate-600/60 bg-slate-900/60 px-2 py-1 text-slate-200">
+            {structureText}
+          </span>
+          {rvolLine && (
+            <span className="inline-flex items-center rounded-full border border-amber-400/30 bg-amber-400/5 px-2 py-1 text-amber-200">
+              {rvolLine}
+            </span>
+          )}
+        </div>
+
+        {/* Divider */}
+        {showReasons && (otherStReasons.length || htReasons.length) && (
+          <div className="mt-4 border-t border-slate-700/60 pt-3 space-y-3">
+            {/* ST reasons */}
+            {otherStReasons.length > 0 && (
+              <div className="text-[13px] text-slate-200">
+                <div className="font-semibold mb-1">ST Reasons</div>
+                <ul className="space-y-1">
+                  {otherStReasons.slice(0, 3).map((r, i) => (
+                    <li key={i} className="flex items-start gap-2">
+                      <span className="mt-1 h-1.5 w-1.5 rounded-full bg-emerald-400/70" />
+                      <span>{r}</span>
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
 
-            <div className="mt-1 text-xs text-slate-400">
-              ProbUp{" "}
-              <span className="text-slate-200 tabular-nums">
-                {typeof row.prob_up_1h === "number" ? row.prob_up_1h.toFixed(2) : "—"}
-              </span>
-            </div>
-
+            {/* HT reasons */}
+            {htReasons.length > 0 && (
+              <div className="text-[13px] text-slate-300">
+                <div className="font-semibold mb-1">HT Reasons</div>
+                <ul className="space-y-1">
+                  {htReasons.slice(0, 3).map((r, i) => (
+                    <li key={i} className="flex items-start gap-2">
+                      <span className="mt-1 h-1.5 w-1.5 rounded-full bg-slate-500/80" />
+                      <span>{r}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
+        )}
+
+        {/* Updated time */}
+        <div className="mt-4 text-[11px] text-slate-500">
+          Updated {time}
         </div>
-        {showReasons && Array.isArray(row.reasons) && <ReasonList reasons={row.reasons} />}
-        <div className="mt-3 text-[11px] text-slate-500">Updated {time}</div>
       </CardContent>
     </Card>
   );
 };
+
 
 const TableView: React.FC<{
   rows: InstrumentRow[]; showReasons: boolean; showTarget: boolean;
@@ -794,7 +936,7 @@ const TableView: React.FC<{
 
 
   return (
-    <div className="overflow-x-auto rounded-2xl border border-slate-700/60">
+     <div className="overflow-x-auto rounded-2xl border border-slate-700/60 bg-slate-950/60 shadow-lg shadow-black/40">
       <table className="min-w-full divide-y divide-slate-700/60">
         <thead className="bg-slate-900/60 text-slate-300 text-xs">
           <tr>
@@ -1015,24 +1157,44 @@ const TableView: React.FC<{
         {r.prob_up_1h != null ? r.prob_up_1h.toFixed(2) : "—"}
       </td>
 
+      
       {/* Reasons */}
       <td className="px-4 py-3 text-slate-300">
-        {showReasons && Array.isArray(r.reasons) && r.reasons.length > 0 ? (
-          <div className="flex items-center gap-1">
-            {/* short preview, full text on hover via title */}
-            <span
-              className="truncate max-w-xs block"
-              title={r.reasons.join("; ")}
+        {showReasons ? (
+          <div className="text-xs space-y-1 max-w-xs">
+            {/* ST (1h) reasons */}
+            <div
+              className="truncate text-slate-200"
+              title={
+                (r.reasons_h1 && r.reasons_h1.join("; ")) ||
+                (r.reasons && r.reasons.join("; ")) ||
+                ""
+              }
             >
-              {r.reasons.slice(0, 2).join("; ")}
-            </span>
+              <span className="font-semibold">ST:</span>{" "}
+              {(() => {
+                const stList =
+                  (r.reasons_h1 && r.reasons_h1.length
+                    ? r.reasons_h1
+                    : r.reasons || []);
+                return stList.length
+                  ? stList.slice(0, 2).join("; ")
+                  : "—";
+              })()}
+            </div>
 
-            {/* +N badge if there are more reasons */}
-            {r.reasons.length > 2 && (
-              <span className="shrink-0 text-[11px] text-slate-400">
-                +{r.reasons.length - 2}
-              </span>
-            )}
+            {/* HT (4h) reasons */}
+            <div
+              className="truncate text-slate-400"
+              title={r.reasons_h4 && r.reasons_h4.length
+                ? r.reasons_h4.join("; ")
+                : ""}
+            >
+              <span className="font-semibold">HT:</span>{" "}
+              {r.reasons_h4 && r.reasons_h4.length
+                ? r.reasons_h4.slice(0, 2).join("; ")
+                : "—"}
+            </div>
           </div>
         ) : (
           "—"
@@ -1040,8 +1202,8 @@ const TableView: React.FC<{
       </td>
 
       {/* Updated (broker) */}
-      <td className="px-4 py-3 text-slate-400">{updatedTime}
-        {r.updated_broker_ts ? fmtBrokerTime(toMs(r.updated_broker_ts), rowOffsetMin) : "—"}
+      <td className="px-4 py-3 text-slate-400">
+        {updatedTime}
       </td>
 
       {/* Device */}
@@ -1064,23 +1226,22 @@ export default function PredictionMeter() {
   const [view, setView] = React.useState<"cards" | "table">("cards");
   const [showReasons, setShowReasons] = React.useState(true);
   const [showTarget, setShowTarget] = React.useState(true);
-  const [tf, setTf] = React.useState<TfLabel>("M15");
-  const [autoRefreshMin, setAutoRefreshMin] = React.useState<number>(15);
-  const { rows, error, lastRefreshAt, refetch } = usePredictRows(tf);
-  // [PATCH] Page-level broker offset in minutes (fallback 120 = UTC+02:00)
+
+  // Fixed timeframe – backend is effectively M15 here
+  const tf: TfLabel = "M15";
+  const { rows, error } = usePredictRows(tf);
+
+  // Page-level broker offset in minutes (fallback 120 = UTC+02:00)
   const brokerOffsetMin =
     (rows?.[0]?.broker_tz_offset_min as number | undefined) ??
     (rows?.[0]?.tz_offset_min as number | undefined) ??
     120;
 
   const [sort, setSort] = React.useState<"strength" | "prob" | "move" | "az">("strength");
-   
-  
-  // Live rows from backend (1-min auto)
-  const priceRefreshMs = autoRefreshMin > 0 ? autoRefreshMin * 60_000 : 0;
-  
-  const { prices, updatedAt: priceUpdatedAt, refetch: refetchPrices } = useLivePrices(priceRefreshMs);
-  
+
+  // Live prices auto-refresh (fixed interval, no UI control)
+  const priceRefreshMs = 60_000; // 1m polling for prices
+  const { prices, updatedAt: priceUpdatedAt } = useLivePrices(priceRefreshMs);
 
   // Sorted view of live rows
   const sortedRows = React.useMemo(() => {
@@ -1091,232 +1252,216 @@ export default function PredictionMeter() {
       case "prob":
         return arr.sort((a, b) => b.prob_up_1h - a.prob_up_1h);
       case "move":
-        return arr.sort((a, b) => Math.abs(b.expected_move_pct_1h) - Math.abs(a.expected_move_pct_1h));
+        return arr.sort(
+          (a, b) =>
+            Math.abs(b.expected_move_pct_1h) -
+            Math.abs(a.expected_move_pct_1h)
+        );
       case "az":
         return arr.sort((a, b) => a.symbol.localeCompare(b.symbol));
     }
   }, [rows, sort]);
 
-
   const brokerAbbr = sortedRows[0]?.broker_tz_abbr || "—";
   const device = sortedRows[0]?.using_device || "—";
 
-  // Header clock (chosen to be your local time for clarity; you can wire to broker tz later)
+  // Header clocks
   const now = useWallClock();
-  const londonTime = React.useMemo(() => new Intl.DateTimeFormat("en-GB", {
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "Europe/London"
-  }).format(now), [now]);
-  const nyTime = React.useMemo(() => new Intl.DateTimeFormat("en-GB", {
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "America/New_York"
-  }).format(now), [now]);
-  // Live Broker clock (derived from top row's broker_tz_abbr)
+  const londonTime = React.useMemo(
+    () =>
+      new Intl.DateTimeFormat("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+        timeZone: "Europe/London",
+      }).format(now),
+    [now]
+  );
+  const nyTime = React.useMemo(
+    () =>
+      new Intl.DateTimeFormat("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+        timeZone: "America/New_York",
+      }).format(now),
+    [now]
+  );
+
   const brokerTzIana = React.useMemo(
     () => brokerAbbrToIana(brokerAbbr),
     [brokerAbbr]
   );
 
   const brokerTime = React.useMemo(
-   () =>
-     new Intl.DateTimeFormat("en-GB", {
-       hour: "2-digit",
-       minute: "2-digit",
-       second: "2-digit",
-       hour12: false,
-       timeZone: brokerTzIana || Intl.DateTimeFormat().resolvedOptions().timeZone,
-     }).format(now),
-   [now, brokerTzIana]
+    () =>
+      new Intl.DateTimeFormat("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+        timeZone:
+          brokerTzIana || Intl.DateTimeFormat().resolvedOptions().timeZone,
+      }).format(now),
+    [now, brokerTzIana]
   );
+
   // [PATCH] Live broker clock based on numeric offset
   const brokerClock = useOffsetClock(brokerOffsetMin);
 
-
-
   return (
-  <div className="mx-auto max-w-7xl px-4 py-8">
-    {/* Header */}
-    <div className="flex flex-wrap items-center justify-between gap-4">
-      <div>
-        <h1 className="text-2xl font-semibold text-slate-100">XTL • AI-powered forecasts</h1>
-        <p className="mt-1 text-sm text-slate-400">
-          Broker: <span className="font-medium text-slate-200">{brokerAbbr ?? "—"}</span> ·
-          Device: <span className="font-mono text-slate-300">
-            {device ? `${device.slice(0, 8)}…` : "—"}
+    <div className="mx-auto max-w-7xl px-4 py-8">
+      {/* Header */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-100">
+            XTL AI-powered forecasts
+          </h1>
+        </div>
+        <div className="flex items-center gap-2 text-sm text-slate-300">
+          <span className="px-2 py-1 rounded-md bg-slate-800/60 border border-slate-700/60">
+            London {londonTime}
           </span>
-        </p>
-        <p className="mt-1 text-xs text-slate-500">
-          Intraday AI forecasts for FX & Gold. Use this with the main Dashboard (Opportunities = 1%) to plan entries only when there is real room to move.
-        </p>
+          <span className="px-2 py-1 rounded-md bg-slate-800/60 border border-slate-700/60">
+            New York {nyTime}
+          </span>
+          <span className="px-2 py-1 rounded-md bg-slate-800/60 border border-slate-700/60">
+            Broker {fmtUtcOffset(brokerOffsetMin)} {brokerClock}
+          </span>
+        </div>
       </div>
-      <div className="flex items-center gap-2 text-sm text-slate-300">
-        <span className="px-2 py-1 rounded-md bg-slate-800/60 border border-slate-700/60">London {londonTime}</span>
-        <span className="px-2 py-1 rounded-md bg-slate-800/60 border border-slate-700/60">New York {nyTime}</span>
-        <span className="px-2 py-1 rounded-md bg-slate-800/60 border border-slate-700/60">
-          Broker {fmtUtcOffset(brokerOffsetMin)} {brokerClock}
-        </span>
-      </div>
+
+      {/* Controls */}
+      <Card className="mt-4">
+        <CardContent className="flex flex-wrap items-center gap-4">
+          {/* Toggles */}
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 text-sm text-slate-300">
+              <input
+                type="checkbox"
+                className="accent-emerald-400"
+                checked={showReasons}
+                onChange={(e) => setShowReasons(e.target.checked)}
+              />
+              Show reasons
+            </label>
+            <label className="flex items-center gap-2 text-sm text-slate-300">
+              <input
+                type="checkbox"
+                className="accent-emerald-400"
+                checked={showTarget}
+                onChange={(e) => setShowTarget(e.target.checked)}
+              />
+              Show 1h target
+            </label>
+            <label className="flex items-center gap-2 text-sm text-slate-500">
+              <input type="checkbox" className="accent-emerald-400" disabled />
+              Confidence bands (later)
+            </label>
+          </div>
+
+          {/* View */}
+          {/* View + Sort (right side) */}
+<div className="flex items-center gap-6 text-sm ml-auto">
+  {/* View toggle */}
+  <div className="flex items-center gap-2">
+    <span className="text-slate-400">View</span>
+    <div className="inline-flex rounded-lg border border-slate-700/70 bg-slate-900/60 p-0.5">
+      <button
+        onClick={() => setView("cards")}
+        className={`px-3 py-1.5 rounded-md text-xs sm:text-sm transition-colors ${
+          view === "cards"
+            ? "bg-emerald-400/15 text-emerald-200 shadow-sm"
+            : "text-slate-300 hover:text-slate-100"
+        }`}
+      >
+        Overview
+      </button>
+      <button
+        onClick={() => setView("table")}
+        className={`px-3 py-1.5 rounded-md text-xs sm:text-sm transition-colors ${
+          view === "table"
+            ? "bg-emerald-400/15 text-emerald-200 shadow-sm"
+            : "text-slate-300 hover:text-slate-100"
+        }`}
+      >
+        Depth
+      </button>
     </div>
+  </div>
 
-    {/* TF Card Strip */}
-    <section className="mt-4 mb-2">
-      <TFStrip tf={tf} setTf={setTf} enabled={false} />
-    </section>
+  {/* Sort */}
+  <div className="flex items-center gap-2">
+    <span className="text-slate-400">Sort</span>
+    <select
+      value={sort}
+      onChange={(e) => setSort(e.target.value as any)}
+      className="bg-slate-900/60 border border-slate-700/60 text-slate-200 rounded-md px-2 py-1.5"
+    >
+      <option value="strength">Strength</option>
+      <option value="prob">ProbUp</option>
+      <option value="move">|ExpectedMove|</option>
+      <option value="az">A–Z</option>
+    </select>
+  </div>
+</div>
 
-    {/* Controls */}
-    <Card className="mt-4">
-      <CardContent className="flex flex-wrap items-center gap-4">
-        {/* Toggles */}
-        <div className="flex items-center gap-3">
-          <label className="flex items-center gap-2 text-sm text-slate-300">
-            <input
-              type="checkbox"
-              className="accent-emerald-400"
-              checked={showReasons}
-              onChange={(e) => setShowReasons(e.target.checked)}
-            />
-            Show reasons
-          </label>
-          <label className="flex items-center gap-2 text-sm text-slate-300">
-            <input
-              type="checkbox"
-              className="accent-emerald-400"
-              checked={showTarget}
-              onChange={(e) => setShowTarget(e.target.checked)}
-            />
-            Show 1h target
-          </label>
-          <label className="flex items-center gap-2 text-sm text-slate-500">
-            <input type="checkbox" className="accent-emerald-400" disabled />
-            Confidence bands (later)
-          </label>
+          </CardContent>
+          </Card>
+
+      {/* Content */}
+      {view === "cards" ? (
+        (() => {
+          const baseRows: InstrumentRow[] =
+            sortedRows && sortedRows.length
+              ? sortedRows
+              : prices
+              ? Object.keys(prices).map(
+                  (sym) => ({ symbol: sym } as InstrumentRow)
+                )
+              : [];
+
+          return (
+            <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-5">
+              {baseRows.map((r) => (
+                <InstCard
+                  key={r.symbol}
+                  row={r}
+                  showReasons={showReasons}
+                  showTarget={showTarget}
+                  livePrice={prices?.[r.symbol]?.price}
+                />
+              ))}
+            </div>
+          );
+        })()
+      ) : (
+        <div className="mt-6">
+          <TableView
+            rows={sortedRows}
+            showReasons={showReasons}
+            showTarget={showTarget}
+            prices={prices}
+            brokerOffsetMin={brokerOffsetMin}
+          />
         </div>
+      )}
 
-        {/* View */}
-        <div className="flex items-center gap-2 text-sm ml-auto">
-          <button
-            onClick={() => setView("cards")}
-            className={`px-3 py-1.5 rounded-md border ${
-              view === "cards"
-                ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
-                : "border-slate-700/60 bg-slate-800/60 text-slate-300"
-            }`}
-          >
-            Cards
-          </button>
-          <button
-            onClick={() => setView("table")}
-            className={`px-3 py-1.5 rounded-md border ${
-              view === "table"
-                ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
-                : "border-slate-700/60 bg-slate-800/60 text-slate-300"
-            }`}
-          >
-            Table
-          </button>
-        </div>
-
-        {/* Sort */}
-        <div className="flex items-center gap-2 text-sm">
-          <span className="text-slate-400">Sort</span>
-          <select
-            value={sort}
-            onChange={(e) => setSort(e.target.value as any)}
-            className="bg-slate-900/60 border border-slate-700/60 text-slate-200 rounded-md px-2 py-1.5"
-          >
-            <option value="strength">Strength</option>
-            <option value="prob">ProbUp</option>
-            <option value="move">|ExpectedMove|</option>
-            <option value="az">A?Z</option>
-          </select>
-        </div>
-
-        {/* TF + Auto refresh + Manual refresh */}
-        <div className="flex items-center gap-3 text-sm">
-          <span className="text-slate-400">TF</span>
-          <select
-            value={tf}
-            onChange={(e) => setTf(e.target.value as any)}
-            className="bg-slate-900/60 border border-slate-700/60 text-slate-200 rounded-md px-2 py-1.5"
-          >
-            <option value="M1">M1</option>
-            <option value="M5">M5</option>
-            <option value="M15">M15</option>
-            <option value="H1">H1</option>
-            <option value="H4">H4</option>
-          </select>
-
-          <span className="text-slate-400">Auto-refresh</span>
-          <select
-            value={autoRefreshMin}
-            onChange={(e) => setAutoRefreshMin(parseInt(e.target.value))}
-            className="bg-slate-900/60 border border-slate-700/60 text-slate-200 rounded-md px-2 py-1.5"
-          >
-            <option value={0}>Off</option>
-            <option value={1}>1m</option>
-            <option value={5}>5m</option>
-            <option value={10}>10m</option>
-            <option value={15}>15m</option>
-          </select>
-
-          <button
-            onClick={() => {
-              void refetch();
-              void refetchPrices();
-            }}
-            className="px-3 py-1.5 rounded-md border border-slate-700/60 bg-slate-800/60 text-slate-200 hover:bg-slate-800"
-          >
-            Refresh
-          </button>
-
-        </div>
-      </CardContent>
-    </Card>
-
-    {/* Content */}
-    {view === "cards" ? (() => {
-      const baseRows: InstrumentRow[] =
-        (sortedRows && sortedRows.length)
-          ? sortedRows
-          : (prices ? Object.keys(prices).map(sym => ({ symbol: sym } as InstrumentRow)) : []);
-
-      return (
-       <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-5">
-         {baseRows.map((r) => (
-           <InstCard
-             key={r.symbol}
-             row={r}
-             showReasons={showReasons}
-             showTarget={showTarget}
-             livePrice={prices?.[r.symbol]?.price}
-           />
-         ))}
-       </div>
-      );
-    })() : (
-      <div className="mt-6">
-        <TableView
-          rows={sortedRows}
-          showReasons={showReasons}
-          showTarget={showTarget}
-          prices={prices}
-          brokerOffsetMin={brokerOffsetMin}
-        />
-      </div>
-    )}
-
-    {/* Footer note + status */}
-    <p className="mt-6 text-xs text-slate-500">
-      
-    </p>
-    {error ? (
-     <p className="mt-4 text-sm text-rose-400">Error: {error}</p>
-    ) : (
-      <p className="mt-4 text-xs text-slate-500">
-        {priceUpdatedAt
-          ? `Price updated: ${new Date(priceUpdatedAt).toLocaleTimeString()}`
-          : "Waiting for live price…"}
-      </p>
-    )}
-
-     </div>
-);
+      {/* Footer note + status */}
+      <p className="mt-6 text-xs text-slate-500"></p>
+      {error ? (
+        <p className="mt-4 text-sm text-rose-400">Error: {error}</p>
+      ) : (
+        <p className="mt-4 text-xs text-slate-500">
+          {priceUpdatedAt
+            ? `Price updated: ${new Date(
+                priceUpdatedAt
+              ).toLocaleTimeString()}`
+            : "Waiting for live price…"}
+        </p>
+      )}
+    </div>
+  );
 }

@@ -1,71 +1,76 @@
 import React from "react";
 
-/* --------------------------
- * Small UI helpers
- * -------------------------- */
-
-const Card: React.FC<React.HTMLAttributes<HTMLDivElement>> = ({
-  className = "",
-  children,
-  ...rest
-}) => (
-  <div
-    className={`rounded-2xl border border-slate-700/60 bg-slate-800/60 shadow-sm backdrop-blur ${className}`}
-    {...rest}
-  >
-    {children}
-  </div>
-);
-
-const CardContent: React.FC<React.HTMLAttributes<HTMLDivElement>> = ({
-  className = "",
-  children,
-  ...rest
-}) => (
-  <div className={`p-5 ${className}`} {...rest}>
-    {children}
-  </div>
-);
-
-/* --------------------------
- * Types & mapping
- * -------------------------- */
+/**
+ * OpportunitiesDashboard.tsx
+ *
+ * Live H1 opportunities + recent alert history.
+ * Uses /trend/opportunities as the single backend source.
+ */
 
 type Direction = "up" | "down" | "flat";
 
+/**
+ * Raw API row coming from /trend/opportunities
+ */
 
 type ApiRow = {
   symbol: string;
 
-  // snapshot-side fields from /trend/opportunities
-  opp_direction?: string;              // "BUY" | "SELL" | "FLAT"
+  // Core opportunity fields
+  opp_direction?: string;              // "UP" | "DOWN"
+  direction?: string;                  // optional, for convenience
   opp_expected_move_pct_1h?: number;   // frozen expected move %
+  expected_move_pct_1h?: number;       // legacy / alt field
   alert_price_1h?: number;             // frozen entry / basis
+  basis_price_1h?: number;             // basis used for target calc
   target_price_1h?: number;            // frozen target
   alert_created_ms?: number;           // when this alert was created
-  last_status_ms?: number;             // last status update for this alert
-  prob_up?: number;
-  opp_score?: number;  
+  horizon_min?: number;                // usually 60
+  last_status_ms?: number;             // last status update
+  status?: string | null;              // "active" | "hit" | "expired" | ...
 
-  // NEW: extra fields that backend can send
-  p_up?: number;                       // older probability field
-  reasons?: string[] | string;         // reasons from backend
-  updated_broker_ms?: number;          // last broker-time update
-  using_device?: string | null;        // which device supplied the snap
+  // Prob / score
+  prob_up?: number | null;
+  p_up?: number | null;                // legacy prob field
+  opp_score?: number | null;
+  opp_confidence?: string | null;      // "high" | "medium" | ...
 
-  // fallback fields if something is missing (older shape / predict-all)
-  decision?: string;
-  expected_move_pct_1h?: number;
-  basis_price_1h?: number;
+  // Overall nearest SR (fallback)
+  sr_side?: string | null;             // "support" | "resistance" | ...
+  sr_dist_pct?: number | null;         // distance in %
+
+  // Per-timeframe SR (for richer reasons)
+  sr_h1_side?: string | null;
+  sr_h1_dist_pct?: number | null;
+  sr_h1_level?: number | null;
+  sr_h4_side?: string | null;
+  sr_h4_dist_pct?: number | null;
+  sr_h4_level?: number | null;
+
+  // Text reasons from backend
+  reasons?: string[] | string;
+  opp_reason?: string | null;
+
+  // Timestamps / device
+  updated_broker_ms?: number | null;
   server_now_ms?: number;
+  using_device?: string | null;
+
+  // Misc / legacy fields
+  decision?: string;                   // "BUY" | "SELL" | "ABSTAIN"
+  opp_delta_pct?: number | null;
+  opp_delta_thr?: number | null;
 };
 
 
+/**
+ * Raw history item from /trend/opportunities ("history" array).
+ */
 type ApiHistoryRow = {
   alert_time_ms?: number;
   symbol?: string;
-  direction?: string;           // "UP" / "DOWN"
-  decision?: string;            // "BUY" / "SELL" / "ABSTAIN"
+  direction?: string;            // "UP" / "DOWN"
+  decision?: string;             // "BUY" / "SELL" / "ABSTAIN"
   horizon_min?: number;
   expected_move_pct?: number;
   hit_target?: boolean | null;
@@ -74,54 +79,57 @@ type ApiHistoryRow = {
   time_to_target_min?: number | null;
 };
 
+/**
+ * Normalised row for UI.
+ */
 type OppRow = {
   symbol: string;
   direction: Direction;
   movePct: number;
   absMovePct: number;
-  basisPrice: number | null;     // stored basis / alert price
+  basisPrice: number | null;
   targetPrice: number | null;
   probUp: number | null;
-  oppScore: number | null; 
+  oppScore: number | null;
+  oppConfidence: string | null;
   reasons: string[];
   updatedBrokerMs: number | null;
   device: string | null;
-
-  // For alert lifecycle / history
-  alertTimeMs: number | null;    // when the opportunity was created
-  horizonMin: number | null;     // e.g. 60 for H1
+  alertTimeMs: number | null;
+  horizonMin: number | null;
+  srSide: string | null;
+  srDistPct: number | null;
+  srLabel: string | null;
+  status?: "active" | "hit" | "expired" | string | null;
 };
 
+/**
+ * Normalised history row.
+ */
 type HistoryRow = {
-  alertTimeMs: number;           // broker-time in ms
+  alertTimeMs: number;
   symbol: string;
   direction: Direction;
-  horizonMin: number;            // e.g. 60 for H1
-  expectedMovePct: number;       // signed
-
-  // For now these are optional; backend can fill later
+  horizonMin: number;
+  expectedMovePct: number;
+  status?: "hit" | "expired" | "active" | string | null;
   hitTarget?: boolean | null;
   realizedMovePct?: number | null;
   maxDrawdownPct?: number | null;
   timeToTargetMin?: number | null;
 };
 
-
-const API_BASE = (window as any).__PUBLIC_API_BASE__ || "/_api";
+const API_BASE =
+  (typeof window !== "undefined" &&
+    (window as any).__PUBLIC_API_BASE__) ||
+  "/_api";
 
 /* --------------------------
- * Hooks: live predict + prices
+ * Helpers
  * -------------------------- */
 
-function pipSize(sym: string): number {
-  const s = sym.toUpperCase();
-  if (s === "XAUUSD") return 0.1;
-  if (s.endsWith("JPY")) return 0.01;
-  return 0.0001;
-}
-
 function fmtPrice(sym: string, px: number | null | undefined): string {
-  if (!Number.isFinite(px as any)) return "—";
+  if (!Number.isFinite(px as any)) return "Â—";
   const s = sym.toUpperCase();
   const d = s === "XAUUSD" ? 2 : s.endsWith("JPY") ? 3 : 5;
   return (px as number).toFixed(d);
@@ -142,148 +150,227 @@ function fmtTime(ts: number | null): string {
   }
 }
 
+function fmtDirectionLabel(direction: Direction): string {
+  if (direction === "up") return "Bullish";
+  if (direction === "down") return "Bearish";
+  return "Flat";
+}
 
-// map API row -> OppRow (no filtering yet)
+function deriveDirection(raw: string | undefined | null): Direction {
+  const v = (raw || "").toUpperCase();
+  if (v === "BUY" || v === "UP" || v === "LONG") return "up";
+  if (v === "SELL" || v === "DOWN" || v === "SHORT") return "down";
+  return "flat";
+}
 
-// map API row -> OppRow (no filtering yet)
-
-// map API row -> OppRow (no filtering yet)
-
+/* --------------------------
+ * Normalisers
+ * -------------------------- */
 function mapApiRow(r: ApiRow): OppRow | null {
   if (!r?.symbol) return null;
 
-  // 1) Direction: prefer opportunity-specific direction, fall back to decision
-  const rawDir = (r.opp_direction || r.decision || "").toUpperCase();
-  let direction: Direction = "flat";
+  const direction = deriveDirection(
+    r.opp_direction || r.direction || r.decision
+  );
 
-  if (rawDir === "BUY" || rawDir === "UP") {
-    direction = "up";
-  } else if (rawDir === "SELL" || rawDir === "DOWN") {
-    direction = "down";
+  const movePctRaw =
+    r.opp_expected_move_pct_1h ??
+    r.expected_move_pct_1h ??
+    null;
+  const movePct = typeof movePctRaw === "number" ? movePctRaw : 0;
+  const absMovePct = Math.abs(movePct);
+
+  const basisPrice =
+    r.alert_price_1h ??
+    r.basis_price_1h ??
+    null;
+
+  const targetPrice = r.target_price_1h ?? null;
+
+  const probUp = r.prob_up ?? r.p_up ?? null;
+  const oppScore = r.opp_score ?? null;
+  const oppConfidence = r.opp_confidence ?? null;
+
+  // -------------------- reasons base --------------------
+  const reasons: string[] = [];
+
+  if (Array.isArray(r.reasons)) {
+    for (const x of r.reasons) {
+      if (!x) continue;
+      reasons.push(String(x));
+    }
+  } else if (typeof r.reasons === "string" && r.reasons.trim()) {
+    reasons.push(r.reasons.trim());
+  }
+  if (r.opp_reason && r.opp_reason.trim()) {
+    reasons.push(r.opp_reason.trim());
   }
 
-  // 2) Expected move (%): prefer frozen opportunity value, fall back to live
-  const move =
-    typeof r.opp_expected_move_pct_1h === "number"
-      ? r.opp_expected_move_pct_1h
-      : typeof r.expected_move_pct_1h === "number"
-      ? r.expected_move_pct_1h
-      : 0;
+  // -------------------- SR reasons (H1 / H4) --------------------
+  const srBits: string[] = [];
 
-  // 3) Basis / alert price
-  const basis =
-    typeof r.alert_price_1h === "number"
-      ? r.alert_price_1h
-      : typeof r.basis_price_1h === "number"
-      ? r.basis_price_1h
-      : null;
+  const normalizeSide = (side?: string | null) => {
+    if (!side) return null;
+    const s = side.toLowerCase();
+    if (s === "support") return "support";
+    if (s === "resistance") return "resistance";
+    return side;
+  };
 
-  // 4) Target price: standard 1h target from backend
-  const target =
-    typeof r.target_price_1h === "number" ? r.target_price_1h : null;
+  // H1 SR
+  if (
+    r.sr_h1_side &&
+    typeof r.sr_h1_level === "number" &&
+    typeof r.sr_h1_dist_pct === "number"
+  ) {
+    const side = normalizeSide(r.sr_h1_side) ?? r.sr_h1_side;
+    const lvlStr = fmtPrice(r.symbol, r.sr_h1_level);
+    srBits.push(
+      `H1 ${side} @ ${lvlStr} (${Math.abs(r.sr_h1_dist_pct).toFixed(2)}%)`
+    );
+  }
 
-  // 5) Probability: prefer prob_up (new)
-  const prob =
-    typeof (r as any).prob_up === "number"
-      ? (r as any).prob_up
-      : null;
-  const oppScore =
-    typeof (r as any).opp_score === "number"
-      ? (r as any).opp_score
-      : null;
+  // H4 SR
+  if (
+    r.sr_h4_side &&
+    typeof r.sr_h4_level === "number" &&
+    typeof r.sr_h4_dist_pct === "number"
+  ) {
+    const side = normalizeSide(r.sr_h4_side) ?? r.sr_h4_side;
+    const lvlStr = fmtPrice(r.symbol, r.sr_h4_level);
+    srBits.push(
+      `H4 ${side} @ ${lvlStr} (${Math.abs(r.sr_h4_dist_pct).toFixed(2)}%)`
+    );
+  }
 
-  // 6) Reasons array (if backend sends them)
-  const anyR: any = r as any;
-  const reasonsRaw = anyR.reasons;
-  const reasonsArray: string[] = Array.isArray(reasonsRaw)
-    ? reasonsRaw.map(String)
-    : reasonsRaw
-    ? [String(reasonsRaw)]
-    : [];
+  // Fallback to overall nearest SR if per-TF not available
+  if (
+    srBits.length === 0 &&
+    r.sr_side &&
+    typeof r.sr_dist_pct === "number"
+  ) {
+    const side = normalizeSide(r.sr_side) ?? r.sr_side;
+    srBits.push(
+      `SR ${side} (${Math.abs(r.sr_dist_pct).toFixed(2)}%)`
+    );
+  }
 
-  // 7) Updated time: prefer last_status_ms, else updated_broker_ms (if present)
-  const updatedMs =
-    typeof (r as any).last_status_ms === "number"
-      ? (r as any).last_status_ms
-      : typeof (r as any).updated_broker_ms === "number"
-      ? (r as any).updated_broker_ms
-      : null;
+  if (srBits.length > 0) {
+    reasons.push(...srBits);
+  }
 
-  // 8) Alert time & horizon – for now assume H1 horizon
-  const alertTimeMs =
-    typeof r.alert_created_ms === "number" ? r.alert_created_ms : null;
-  const horizonMin = 60;
+  // -------------------- de-duplicate reasons --------------------
+  const seen = new Set<string>();
+  const reasonsUnique = reasons.filter((txt) => {
+    const key = txt.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 
-  // 9) Build OppRow
+  // -------------------- SR badge (overall) --------------------
+  const rawSide = normalizeSide(r.sr_side);
+  const rawDist =
+    typeof r.sr_dist_pct === "number" ? Math.abs(r.sr_dist_pct) : null;
+
+  let srSide: string | null = null;
+  let srDistPct: number | null = null;
+  let srLabel: string | null = null;
+
+  if (rawSide) srSide = rawSide;
+  if (rawDist != null) srDistPct = rawDist;
+
+  if (srSide && srDistPct != null) {
+    const sidePretty =
+      srSide === "support"
+        ? "Support"
+        : srSide === "resistance"
+        ? "Resistance"
+        : srSide.charAt(0).toUpperCase() + srSide.slice(1);
+
+    srLabel = `${sidePretty} ~${srDistPct.toFixed(2)}% away`;
+  }
+
+  // -------------------- timestamps / misc --------------------
+  const updatedBrokerMs =
+    (typeof r.updated_broker_ms === "number" ? r.updated_broker_ms : undefined) ??
+    (typeof r.server_now_ms === "number" ? r.server_now_ms : undefined) ??
+    null;
+
+  const device = r.using_device ?? null;
+  const alertTimeMs = r.alert_created_ms ?? null;
+  const horizonMin =
+    typeof r.horizon_min === "number" ? r.horizon_min : 60; // default H1
+  const rawStatus = (r as any).status;
+  const normStatus =
+    typeof rawStatus === "string" ? rawStatus.toLowerCase() : rawStatus;
+
   return {
     symbol: r.symbol,
     direction,
-    movePct: move,
-    absMovePct: Math.abs(move),
-    basisPrice: basis,
-    targetPrice: target,
-    probUp: prob,
-    oppScore,	
-    reasons: reasonsArray,
-    updatedBrokerMs: updatedMs,
-    device: (r as any).using_device || null,
+    movePct,
+    absMovePct,
+    basisPrice,
+    targetPrice,
+    probUp,
+    oppScore,
+    oppConfidence,
+    reasons: reasonsUnique,
+    updatedBrokerMs,
+    device,
     alertTimeMs,
     horizonMin,
+    srSide,
+    srDistPct,
+    srLabel,
+    status: normStatus ?? null,
+
   };
 }
 
 
-function mapHistoryApiRow(r: ApiHistoryRow): HistoryRow | null {
-  if (!r || !r.symbol) return null;
+function mapHistoryRow(h: ApiHistoryRow): HistoryRow | null {
+  const symbol = (h.symbol || "").toUpperCase();
+  if (!symbol) return null;
 
-  const rawDir = (r.direction || r.decision || "").toUpperCase();
-  let direction: Direction = "flat";
-  if (rawDir === "BUY" || rawDir === "UP") direction = "up";
-  else if (rawDir === "SELL" || rawDir === "DOWN") direction = "down";
+  const dir = deriveDirection(h.direction || h.decision);
 
-  const alertTimeMs =
-    typeof r.alert_time_ms === "number" ? r.alert_time_ms : Date.now();
+  const alertTimeMs = (h as any).alert_time_ms ?? (h as any).alert_created_ms;
+  if (!alertTimeMs) return null;
 
-  const horizonMin =
-    typeof r.horizon_min === "number" && !Number.isNaN(r.horizon_min)
-      ? r.horizon_min
-      : 60;
-
+  const horizonMin = typeof h.horizon_min === "number" ? h.horizon_min : 60;
   const expectedMovePct =
-    typeof r.expected_move_pct === "number" ? r.expected_move_pct : 0;
-
-  const hitTarget =
-    typeof r.hit_target === "boolean" || r.hit_target === null
-      ? r.hit_target
-      : null;
-
-  const realizedMovePct =
-    typeof r.realized_move_pct === "number"
-      ? r.realized_move_pct
-      : undefined;
-
-  const maxDrawdownPct =
-    typeof r.max_drawdown_pct === "number"
-      ? r.max_drawdown_pct
-      : undefined;
-
-  const timeToTargetMin =
-    typeof r.time_to_target_min === "number"
-      ? r.time_to_target_min
-      : undefined;
+    typeof h.expected_move_pct === "number" ? h.expected_move_pct : 0;
 
   return {
+    symbol,
+    direction: dir,
     alertTimeMs,
-    symbol: r.symbol,
-    direction,
     horizonMin,
     expectedMovePct,
-    hitTarget,
-    realizedMovePct,
-    maxDrawdownPct,
-    timeToTargetMin,
+    status: h.hit_target === true
+      ? "hit"
+      : h.hit_target === false
+        ? "expired"
+        : "active",
+
+    hitTarget: h.hit_target,
+    realizedMovePct: h.realized_move_pct,
+    maxDrawdownPct: h.max_drawdown_pct,
+    timeToTargetMin: h.time_to_target_min,
   };
 }
+
+/* --------------------------
+ * Data hook
+ * -------------------------- */
+
+type ApiResponse = {
+  ok: boolean;
+  tf: string;
+  rows: ApiRow[];
+  history?: ApiHistoryRow[];
+};
 
 function useOpportunities() {
   const [rows, setRows] = React.useState<OppRow[]>([]);
@@ -291,515 +378,568 @@ function useOpportunities() {
   const [lastAt, setLastAt] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
-  // Keep first-seen opportunity per symbol frozen for this page session
-  // (symbol -> frozen OppRow snapshot)
+  // Keep first-seen opportunity per symbol frozen for this page session.
+  // We show frozen items until their H1 horizon is over (~60 minutes),
+  // even if backend temporarily returns rows: [].
   const frozenRef = React.useRef<Map<string, OppRow>>(new Map());
-  // Track if we already populated from backend history
-  const historyFromBackendRef = React.useRef(false);
 
-  const [toastRow, setToastRow] = React.useState<OppRow | null>(null);
+  // Optional: optimistic completions (used only if a frozen item expires client-side
+  // before backend returns it in history; backend should normally be the source of truth).
+  const completedRef = React.useRef<Map<string, HistoryRow>>(new Map());
 
-  /** ------------------------------
-   * Fetch opportunities once
-   * ------------------------------ */
-  const fetchOnce = React.useCallback(async () => {
+  const CACHE_ROWS_KEY = "xtl_opp_rows_cache_v1";
+  const CACHE_HIST_KEY = "xtl_opp_history_cache_v1";
+  const CACHE_AT_KEY = "xtl_opp_lastAt_cache_v1";
+
+  async function fetchOnce() {
     try {
       setError(null);
 
-      const url = `${API_BASE}/trend/opportunities?tf=M15&_=${Date.now()}`;
-      const res = await fetch(url, {
+      const res = await fetch(`${API_BASE}/trend/opportunities?tf=H1`, {
         credentials: "include",
-        cache: "no-store",
       });
 
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+        throw new Error("HTTP " + res.status);
       }
 
-      
-      const js = await res.json();
+      const js: ApiResponse = await res.json();
+      if (!js.ok) {
+        throw new Error(
+          (js as any).reason || "Backend reported error in /trend/opportunities"
+        );
+      }
 
-      // Live opportunities
-      const apiRows: ApiRow[] = Array.isArray(js?.rows) ? js.rows : [];
+      const mappedRows =
+        (js.rows || [])
+          .map(mapApiRow)
+          .filter((x): x is OppRow => x !== null)
+          .sort((a, b) => {
+            if (b.absMovePct !== a.absMovePct) return b.absMovePct - a.absMovePct;
+            const sa = a.oppScore ?? 0;
+            const sb = b.oppScore ?? 0;
+            return sb - sa;
+          });
 
-      // Backend-driven alert history
-      const apiHistoryRaw: ApiHistoryRow[] = Array.isArray(js?.history)
-        ? js.history
-        : [];
+      const mappedHistory =
+        (js.history || [])
+          .map(mapHistoryRow)
+          .filter((x): x is HistoryRow => x !== null)
+          .sort((a, b) => b.alertTimeMs - a.alertTimeMs);
 
-      const mappedHistory: HistoryRow[] = apiHistoryRaw
-        .map(mapHistoryApiRow)
-        .filter((h): h is HistoryRow => h !== null);
+      // Build a set of symbols that are already completed in history.
+      // When an opp completes, remove it from the live frozen list so it "moves" to history.
+      const completedSyms = new Set(
+        mappedHistory
+          .filter((h) => h.hitTarget === true || h.hitTarget === false)
+          .map((h) => h.symbol)
+      );
 
-      setHistory(mappedHistory);
-
-      const mapped: OppRow[] = [];
       const now = Date.now();
 
-     
+      // 1) Update / insert frozen snapshots from freshly mapped rows
+      for (const r of mappedRows) {
+        // If backend says it's already done, don't keep it in live.
+        if (r.status && r.status !== "active") {
+          frozenRef.current.delete(r.symbol);
+          continue;
+        }
 
+        // If it is in history as completed, remove from live.
+        if (completedSyms.has(r.symbol)) {
+          frozenRef.current.delete(r.symbol);
+          continue;
+        }
 
-      for (const r of apiRows) {
-        const m = mapApiRow(r);
-        if (!m) continue;
-
-        // Per-symbol threshold (“room” filter)
-        const sym = m.symbol.toUpperCase();
-        const thr = sym === "XAUUSD" ? 0.02 : 0.02; // temp low thresholds
-
-        if (m.absMovePct < thr) continue;
-
-        // If you later extend OppRow with alertTimeMs / horizonMin,
-        // seed them here (kept as any to avoid TS errors for now).
-        (m as any).alertTimeMs = (m as any).alertTimeMs ?? now;
-        (m as any).horizonMin = (m as any).horizonMin ?? 60;
-
-        mapped.push(m);
-      }
-
-      // Dedupe per symbol: keep the strongest absolute move
-      const bySymbol = new Map<string, OppRow>();
-      for (const r of mapped) {
-        const key = r.symbol.toUpperCase();
-        const existing = bySymbol.get(key);
-        if (!existing || r.absMovePct > existing.absMovePct) {
-          bySymbol.set(key, r);
+        const prev = frozenRef.current.get(r.symbol);
+        if (prev) {
+          const alertTimeMs = prev.alertTimeMs ?? r.alertTimeMs ?? now;
+          frozenRef.current.set(r.symbol, { ...prev, ...r, alertTimeMs });
+        } else {
+          const alertTimeMs = r.alertTimeMs ?? now;
+          frozenRef.current.set(r.symbol, { ...r, alertTimeMs });
         }
       }
 
-      const frozen = frozenRef.current;
-      
-      const newSymbols: OppRow[] = [];
-      // Freeze first-seen opportunities per symbol
-      for (const [sym, row] of bySymbol.entries()) {
-       if (!frozen.has(sym)) {
-         frozen.set(sym, row);
-         newSymbols.push(row);
-       } else {
-         // Update existing frozen row fields but keep original alertTimeMs / basis
-         const existing = frozen.get(sym)!;
-         existing.movePct = row.movePct;
-         existing.absMovePct = row.absMovePct;
-         existing.targetPrice = row.targetPrice;
-         existing.probUp = row.probUp;
-         existing.oppScore = row.oppScore;
-         existing.updatedBrokerMs = row.updatedBrokerMs;
-         existing.reasons = row.reasons;
-       }
-      }
+      // 2) Prune expired snapshots (default horizon 60 minutes) and (optionally) push to local history
+      for (const [sym, snap] of Array.from(frozenRef.current.entries())) {
+        if (completedSyms.has(sym)) {
+          frozenRef.current.delete(sym);
+          continue;
+        }
 
-      
+        const opened = snap.alertTimeMs ?? 0;
+        const horizonMin = snap.horizonMin ?? 60;
 
+        if (opened > 0 && now - opened >= horizonMin * 60_000) {
+          frozenRef.current.delete(sym);
 
-      
-
-      // 3) Toast only for first new symbol this poll
-      if (newSymbols.length > 0) {
-        setToastRow(newSymbols[0]);
-      }
-
-      // 4) Drop entries that have passed their horizon (e.g. 60 min)
-      const nowMs = Date.now();
-      for (const [sym, row] of frozen.entries()) {
-        if (row.alertTimeMs && row.horizonMin) {
-          const expiryMs = row.alertTimeMs + row.horizonMin * 60_000;
-          if (nowMs > expiryMs) {
-            frozen.delete(sym);
+          // optimistic expired history row (UI updates even if backend lags by one poll)
+          const key = `${sym}-${opened}`;
+          if (!completedRef.current.has(key)) {
+            completedRef.current.set(key, {
+              symbol: sym,
+              direction: snap.direction,
+              alertTimeMs: opened,
+              horizonMin,
+              expectedMovePct: snap.movePct ?? 0,
+              hitTarget: false,
+              realizedMovePct: null,
+              maxDrawdownPct: null,
+              timeToTargetMin: horizonMin,
+            });
           }
         }
       }
 
-      // 5) Visible rows = current frozen map, sorted by abs move
-      const nextRows = Array.from(frozen.values()).sort(
-        (a, b) => b.absMovePct - a.absMovePct
+      // 3) Final rows = all non-expired frozen snapshots, sorted
+      const frozenRows = Array.from(frozenRef.current.values()).sort((a, b) => {
+        if (b.absMovePct !== a.absMovePct) return b.absMovePct - a.absMovePct;
+        const sa = a.oppScore ?? 0;
+        const sb = b.oppScore ?? 0;
+        return sb - sa;
+      });
+
+      setRows(frozenRows);
+
+      // History = backend truth first, then local optimistic completions (only if missing)
+      const merged = new Map<string, HistoryRow>();
+      for (const h of mappedHistory) merged.set(`${h.symbol}-${h.alertTimeMs}`, h);
+      for (const [k, v] of completedRef.current.entries()) {
+        if (!merged.has(k)) merged.set(k, v);
+      }
+      const mergedHistory = Array.from(merged.values()).sort(
+        (a, b) => b.alertTimeMs - a.alertTimeMs
       );
 
-      setRows(nextRows);
-      setLastAt(Date.now());
-      
+      setHistory(mergedHistory);
+      setLastAt(now);
 
+      // Persist lightweight cache so navigating away/back doesn't look "blank"
+      try {
+        sessionStorage.setItem(CACHE_ROWS_KEY, JSON.stringify(frozenRows));
+        sessionStorage.setItem(CACHE_HIST_KEY, JSON.stringify(mergedHistory));
+        sessionStorage.setItem(CACHE_AT_KEY, String(now));
+      } catch {
+        // ignore storage failures
+      }
     } catch (e: any) {
-      setError(e?.message ?? "Failed to load opportunities");
+      console.error("[OppDashboard] fetch error", e);
+      setError(e?.message || String(e));
     }
+  }
+
+  React.useEffect(() => {
+    // Hydrate cached state immediately (helps when navigating away/back)
+    try {
+      const rawRows = sessionStorage.getItem(CACHE_ROWS_KEY);
+      const rawHist = sessionStorage.getItem(CACHE_HIST_KEY);
+      const rawAt = sessionStorage.getItem(CACHE_AT_KEY);
+
+      if (rawRows) {
+        const rr = JSON.parse(rawRows) as OppRow[];
+        if (Array.isArray(rr) && rr.length) {
+          setRows(rr);
+          frozenRef.current = new Map(rr.map((r) => [r.symbol, r]));
+        }
+      }
+      if (rawHist) {
+        const hh = JSON.parse(rawHist) as HistoryRow[];
+        if (Array.isArray(hh) && hh.length) setHistory(hh);
+      }
+      if (rawAt) {
+        const n = Number(rawAt);
+        if (Number.isFinite(n) && n > 0) setLastAt(n);
+      }
+    } catch {
+      // ignore
+    }
+
+    void fetchOnce();
+    const id = window.setInterval(() => void fetchOnce(), 15_000);
+    return () => window.clearInterval(id);
   }, []);
 
-  /** ------------------------------
-   * Polling – aligned roughly to the minute
-   * ------------------------------ */
-  React.useEffect(() => {
-    void fetchOnce();
-
-    let t: number | null = null;
-
-    const tick = async () => {
-      await fetchOnce();
-
-      // next call aligned to minute boundary, but at least 10s later
-      const now = Date.now();
-      const msToNextMinute = 60000 - (now % 60000);
-      const delay = Math.max(10000, msToNextMinute);
-
-      t = window.setTimeout(() => {
-        void tick();
-      }, delay);
-    };
-
-    t = window.setTimeout(() => {
-      void tick();
-    }, 60000);
-
-    return () => {
-      if (t !== null) {
-        window.clearTimeout(t);
-      }
-    };
-  }, [fetchOnce]);
-
-  /** ------------------------------
-   * Toast auto-hide after 8s
-   * ------------------------------ */
-  React.useEffect(() => {
-    if (!toastRow) return;
-    const id = window.setTimeout(() => setToastRow(null), 10000);
-    return () => window.clearTimeout(id);
-  }, [toastRow]);
-
-  return {
-    rows,
-    history,
-    lastAt,
-    error,
-    refetch: fetchOnce,
-    toastRow,
-    clearToast: () => setToastRow(null),
-  };
+  return { rows, history, lastAt, error, refetch: fetchOnce };
 }
 
-function OpportunitiesDashboard() {
-  const {
-    rows,
-    history,
-    lastAt,
-    error,
-    refetch,
-    toastRow,
-    clearToast,
-  } = useOpportunities();
+/* --------------------------
+ * Small UI primitives
+ * -------------------------- */
 
-  const hasRows = rows.length > 0;
-  const lastUpdatedLabel = lastAt
-    ? new Date(lastAt).toLocaleTimeString()
-    : "—";
+const Card: React.FC<React.HTMLAttributes<HTMLDivElement>> = ({
+  className = "",
+  children,
+  ...rest
+}) => (
+  <div
+    className={
+       "rounded-2xl border border-slate-800/70 bg-gradient-to-b from-slate-950/90 via-slate-900/90 to-slate-950/95 " +
+       "shadow-[0_18px_40px_rgba(0,0,0,0.55)] backdrop-blur-sm " +
+       className
+    }
+
+    {...rest}
+  >
+    {children}
+  </div>
+);
+
+const Pill: React.FC<{
+  color: "up" | "down" | "flat";
+  children: React.ReactNode;
+}> = ({ color, children }) => {
+  let base =
+    "inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium border";
+  if (color === "up") {
+    base += " border-emerald-400/60 bg-emerald-500/10 text-emerald-200";
+  } else if (color === "down") {
+    base += " border-rose-400/60 bg-rose-500/10 text-rose-200";
+  } else {
+    base += " border-slate-500/60 bg-slate-700/40 text-slate-200";
+  }
+  return <span className={base}>{children}</span>;
+};
+
+/* --------------------------
+ * Main component
+ * -------------------------- */
+
+function OpportunitiesDashboard() {
+  const { rows, history, lastAt, error, refetch } = useOpportunities();
+  const lastUpdatedLabel = lastAt ? fmtTime(lastAt) : "Â—";
 
   return (
-    <div className="mx-auto flex max-w-6xl flex-col gap-6 px-4 py-6">
-      {/* Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-            Opportunities
+    <div className="mx-auto flex max-w-6xl flex-col gap-5 px-3 pb-10 pt-4">
+      {/* Page header */}
+      <div className="rounded-2xl border border-slate-800/80 bg-gradient-to-r from-slate-950/95 via-slate-900/95 to-slate-950/95 px-5 py-4 shadow-[0_18px_40px_rgba(0,0,0,0.75)]">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <h1 className="text-xl font-semibold text-slate-50">
+                Live Opportunities
+              </h1>
+              {rows.length > 0 && (
+                <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
+                  {rows.length} active
+                </span>
+              )}
+            </div>
+            <p className="mt-1 max-w-xl text-xs text-slate-400">
+              High-conviction H1 moves filtered by room, trend, structure, SR,
+              volatility and macro tilt. When a rare setup appears, it will
+              show up here first.
+            </p>
           </div>
-          <div className="mt-1 text-lg font-semibold text-slate-50">
-            Live 1-hour model opportunities
-          </div>
-          <div className="mt-1 text-xs text-slate-400">
-            Filtered by expected move and model confidence. Updated every
-            minute.
-          </div>
-        </div>
 
-        <div className="flex items-center gap-3">
-          <div className="text-xs text-slate-400">
-            Last updated:{" "}
-            <span className="font-medium text-slate-200">
-              {lastUpdatedLabel}
-            </span>
+          <div className="flex items-end gap-4">
+            <div className="text-[11px] leading-tight text-slate-400">
+              <div className="text-slate-500">Last updated</div>
+              <div className="font-medium text-slate-100">
+                {lastUpdatedLabel}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => void refetch()}
+              className="inline-flex items-center gap-1 rounded-full border border-slate-500/70 bg-slate-900/80 px-3 py-1.5 text-xs font-medium text-slate-50 shadow-sm shadow-black/40 hover:border-slate-300 hover:bg-slate-800 active:scale-[0.97]"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_0_4px_rgba(34,197,94,0.45)]" />
+              Refresh
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => void refetch()}
-            className="inline-flex items-center rounded-full border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-100 hover:border-slate-400 hover:bg-slate-700"
-          >
-            Refresh
-          </button>
         </div>
       </div>
 
       {error && (
-        <div className="rounded-2xl border border-rose-600/60 bg-rose-900/40 px-4 py-2 text-xs text-rose-100">
+        <div className="rounded-2xl border border-rose-700/80 bg-rose-950/80 px-4 py-2 text-xs text-rose-100 shadow-md shadow-black/50">
           Error: {error}
         </div>
       )}
 
-      {/* Live opportunities grid */}
-      <Card className="mt-2 relative">
-        <CardContent>
-          <div className="mb-3 flex items-center justify-between gap-2">
-            <div>
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Live Opportunities
-              </div>
-              <div className="mt-1 text-sm text-slate-200">
-                H1 forecast filtered by minimum room and direction.
-              </div>
+      {/* Live opportunities */}
+      <Card>
+        <div className="flex items-center justify-between border-b border-slate-800/80 px-4 py-3">
+          <div>
+            <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-400">
+              H1 Opportunities
+            </div>
+            <div className="mt-0.5 text-[11px] text-slate-500">
+              Sorted by{" "}
+              <span className="font-medium text-slate-200">room</span> (|move %|)
+              then{" "}
+              <span className="font-medium text-slate-200">score</span>.
             </div>
           </div>
-
-          {/* Toast anchored to this card (top-right), stays 10s via useEffect */}
-          {toastRow && (
-            <div className="pointer-events-none absolute right-4 top-4 z-40">
-              <div className="pointer-events-auto flex max-w-md items-start gap-3 rounded-2xl border border-slate-600 bg-slate-900/95 px-4 py-3 shadow-lg">
-                <div className="mt-0.5 h-2 w-2 flex-shrink-0 rounded-full bg-emerald-400" />
-                <div className="flex-1">
-                  <div className="text-xs font-semibold uppercase tracking-wide text-emerald-300">
-                    New opportunity
-                  </div>
-                  <div className="mt-1 text-sm text-slate-50">
-                    {toastRow.symbol}{" "}
-                    {toastRow.direction === "up"
-                      ? "- Long room"
-                      : "- Short room"}{" "}
-                    {toastRow.movePct >= 0 ? "+" : ""}
-                    {toastRow.movePct.toFixed(2)}% toward{" "}
-                    {toastRow.targetPrice != null
-                      ? fmtPrice(toastRow.symbol, toastRow.targetPrice)
-                      : "target"}
-                    .
-                  </div>
-                  {toastRow.reasons && toastRow.reasons.length > 0 && (
-                    <div className="mt-1 text-xs text-slate-400">
-                      {toastRow.reasons.join(" · ")}
-                    </div>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => clearToast()}
-                  className="ml-2 inline-flex h-6 w-6 items-center justify-center rounded-full text-slate-400 hover:bg-slate-700 hover:text-slate-100"
-                >
-                  ×
-                </button>
-              </div>
-            </div>
-          )}
-
-          {!hasRows ? (
-            <div className="rounded-2xl bg-slate-900/60 px-4 py-6 text-sm text-slate-400">
-              No opportunities detected right now. The meter will light up when
-              the model finds enough room and alignment.
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="min-w-full text-sm text-slate-100">
-                <thead className="border-b border-slate-700 text-xs text-slate-300">
-                  <tr>
-                    <th className="py-2 pr-4 text-left">Pair</th>
-                    <th className="py-2 pr-4 text-left">Direction</th>
-                    <th className="py-2 pr-4 text-left">Alert price</th>
-                    <th className="py-2 pr-4 text-left">Target (1h)</th>
-                    <th className="py-2 pr-4 text-left">Expected move %</th>
-                    <th className="py-2 pr-4 text-left">ProbUp</th>
-                    <th className="py-2 pr-4 text-left">Score</th>
-                    <th className="py-2 pr-4 text-left">Last updated</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.length === 0 ? (
-                    <tr>
-                      <td
-                        colSpan={8}
-                        className="py-4 pr-4 text-sm text-slate-400"
-                      >
-                        No current opportunities meeting the room & confidence
-                        filter. When the model finds fresh room, they will
-                        appear here and a toast will pop in the top-right.
-                      </td>
-                    </tr>
-                  ) : (
-                    rows.map((r) => {
-                      const dirLabel =
-                        r.direction === "up"
-                          ? "Bullish"
-                          : r.direction === "down"
-                          ? "Bearish"
-                          : "Flat";
-
-                      const dirBadgeClass =
-                        r.direction === "up"
-                          ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/40"
-                          : r.direction === "down"
-                          ? "bg-rose-500/10 text-rose-300 border-rose-500/40"
-                          : "bg-slate-700/40 text-slate-200 border-slate-600/60";
-
-                      return (
-                        <tr
-                          key={r.symbol}
-                          className="border-b border-slate-800/80 last:border-0"
-                        >
-                          <td className="py-2 pr-4 font-medium">
-                            {r.symbol}
-                          </td>
-
-                          <td className="py-2 pr-4">
-                            <span
-                              className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${dirBadgeClass}`}
-                            >
-                              {dirLabel}
-                            </span>
-                          </td>
-
-                          <td className="py-2 pr-4">
-                            {fmtPrice(r.symbol, r.basisPrice ?? null)}
-                          </td>
-
-                          <td className="py-2 pr-4">
-                            {fmtPrice(r.symbol, r.targetPrice)}
-                          </td>
-
-                          <td className="py-2 pr-4">
-                            {`${r.movePct >= 0 ? "+" : ""}${r.movePct.toFixed(
-                              2
-                            )}%`}
-                          </td>
-
-                          <td className="py-2 pr-4">
-                            {r.probUp != null
-                              ? `${(r.probUp * 100).toFixed(0)}%`
-                              : ""}
-                          </td>
-                          <td className="py-2 pr-4">
-                            {r.oppScore != null
-                              ? r.oppScore.toFixed(1)
-                              : "—"}
-                          </td>
-
-                          <td className="py-2 pr-4">
-                            {fmtTime(r.updatedBrokerMs)}
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Alert History */}
-      <Card className="mt-4">
-        <CardContent>
-          <div className="flex items-center justify-between gap-2">
-            <div>
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Alert History
-              </div>
-              <div className="mt-1 text-sm text-slate-200">
-                Past opportunities with hit / miss and realized performance.
-              </div>
-            </div>
+          <div className="hidden text-[11px] text-slate-500 md:block">
+            Score blends trend, structure, SR distance, RVOL, ATR and macro
+            tilt.
           </div>
+        </div>
 
-          <div className="mt-4 overflow-x-auto">
-            <table className="min-w-full text-sm text-slate-100">
-              <thead className="border-b border-slate-700 text-xs text-slate-300">
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-separate border-spacing-0 text-xs">
+            <thead>
+              <tr className="bg-slate-950/80 text-[11px] uppercase tracking-wide text-slate-400">
+                <th className="sticky left-0 z-10 bg-slate-950/90 px-4 py-2 text-left">
+                  Symbol
+                </th>
+                <th className="px-3 py-2 text-left">Direction</th>
+                <th className="px-3 py-2 text-right">Move (H1)</th>
+                <th className="px-3 py-2 text-right">Basis</th>
+                <th className="px-3 py-2 text-right">Target</th>
+                <th className="px-3 py-2 text-right">Room</th>
+                <th className="px-3 py-2 text-right">Score</th>
+                <th className="px-3 py-2 text-right">Prob</th>
+                <th className="px-3 py-2 text-left">Reasons</th>
+                <th className="px-3 py-2 text-right">Created</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 ? (
                 <tr>
-                  <th className="py-2 pr-4 text-left">Alert time</th>
-                  <th className="py-2 pr-4 text-left">Pair</th>
-                  <th className="py-2 pr-4 text-left">Direction</th>
-                  <th className="py-2 pr-4 text-left">Horizon</th>
-                  <th className="py-2 pr-4 text-left">Expected move %</th>
-                  <th className="py-2 pr-4 text-left">Hit target?</th>
-                  <th className="py-2 pr-4 text-left">Realized move %</th>
-                  <th className="py-2 pr-4 text-left">Max drawdown %</th>
-                  <th className="py-2 pr-4 text-left">Time to target</th>
+                  <td
+                    colSpan={10}
+                    className="px-4 py-7 text-center text-xs text-slate-400"
+                  >
+                    No active opportunities have passed the room & confidence
+                    gates yet. When a genuinely asymmetric H1 setup appears, it
+                    will land here.
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {history.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={9}
-                      className="py-4 pr-4 text-sm text-slate-400"
+              ) : (
+                rows.map((r, idx) => {
+                  const sym = r.symbol.toUpperCase();
+                  const dirLabel = fmtDirectionLabel(r.direction);
+                  const dirColor: "up" | "down" | "flat" = r.direction;
+
+                  const moveStr =
+                    r.movePct === 0
+                      ? "0.00%"
+                      : (r.movePct > 0 ? "+" : "") + r.movePct.toFixed(2) + "%";
+
+                  const roomStr = r.absMovePct.toFixed(2) + "%";
+                  const scoreStr =
+                    r.oppScore != null ? r.oppScore.toFixed(1) : "Â—";
+                  const probStr =
+                    r.probUp != null
+                      ? (r.probUp * 100).toFixed(0)+"%"
+                      : "Â—";
+
+                  const reasons = r.reasons.slice(0, 3);
+
+                  // simple visual bar for score 0Â–100
+                  const scoreNorm = Math.max(
+                    0,
+                    Math.min(100, (r.oppScore ?? 0) * 1.0)
+                  );
+                  const barWidth = scoreNorm.toFixed(0) + "%";
+
+                  const rowBg =
+                    idx % 2 === 0
+                      ? "bg-slate-950/50"
+                      : "bg-slate-900/40";
+
+                  return (
+                    <tr
+                      key={sym + "-" + (r.alertTimeMs ?? "na")}
+                      className={rowBg + " border-b border-slate-900/80 hover:bg-slate-800/60"}
                     >
-                      No alert history yet for this session. Once opportunities
-                      hit target or expire, they will appear here.
-                    </td>
-                  </tr>
-                ) : (
-                  history.map((h) => {
-                    const dirLabel =
-                      h.direction === "up"
-                        ? "UP"
-                        : h.direction === "down"
-                        ? "DOWN"
-                        : "FLAT";
-
-                    const horizonLabel =
-                      h.horizonMin >= 60
-                        ? `H${h.horizonMin / 60}`
-                        : `${h.horizonMin}m`;
-
-                    return (
-                      <tr
-                        key={`${h.alertTimeMs}-${h.symbol}-${dirLabel}`}
-                        className="border-b border-slate-800/80 last:border-0"
-                      >
-                        <td className="py-2 pr-4 text-slate-300">
-                          {fmtTime(h.alertTimeMs)}
-                        </td>
-                        <td className="py-2 pr-4 font-medium">
-                          {h.symbol}
-                        </td>
-                        <td className="py-2 pr-4">{dirLabel}</td>
-                        <td className="py-2 pr-4">{horizonLabel}</td>
-                        <td className="py-2 pr-4">
-                          {`${
-                            h.expectedMovePct >= 0 ? "+" : ""
-                          }${h.expectedMovePct.toFixed(2)}%`}
-                        </td>
-                        <td className="py-2 pr-4">
-                          {h.hitTarget == null ? (
-                            <span className="rounded-full bg-slate-700/60 px-2 py-0.5 text-xs text-slate-300">
-                              N/A
-                            </span>
-                          ) : h.hitTarget ? (
-                            <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-300">
-                              Yes
-                            </span>
-                          ) : (
-                            <span className="rounded-full bg-rose-500/10 px-2 py-0.5 text-xs text-rose-300">
-                              No
+                      <td className="sticky left-0 z-10 bg-inherit px-4 py-2 text-sm font-semibold text-slate-50">
+                        {sym}
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center gap-2">
+                          <Pill color={dirColor}>{dirLabel}</Pill>
+                          {r.oppConfidence && (
+                            <span className="rounded-full bg-slate-900/80 px-2 py-0.5 text-[10px] font-medium text-slate-300">
+                              {r.oppConfidence}
                             </span>
                           )}
-                        </td>
-                        <td className="py-2 pr-4">
-                          {typeof h.realizedMovePct === "number"
-                            ? `${
-                                h.realizedMovePct >= 0 ? "+" : ""
-                              }${h.realizedMovePct.toFixed(2)}%`
-                            : "—"}
-                        </td>
-                        <td className="py-2 pr-4">
-                          {typeof h.maxDrawdownPct === "number"
-                            ? `${h.maxDrawdownPct.toFixed(2)}%`
-                            : "—"}
-                        </td>
-                        <td className="py-2 pr-4">
-                          {h.hitTarget &&
-                          typeof h.timeToTargetMin === "number"
-                            ? `${h.timeToTargetMin.toFixed(0)} min`
-                            : "—"}
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-slate-50">
+                        {moveStr}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-slate-200">
+                        {fmtPrice(sym, r.basisPrice)}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-slate-200">
+                        {fmtPrice(sym, r.targetPrice)}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-slate-200">
+                        {roomStr}
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <div className="flex flex-col items-end gap-1">
+                          <span className="tabular-nums text-slate-100">
+                            {scoreStr}
+                          </span>
+                          <div className="h-1.5 w-16 overflow-hidden rounded-full bg-slate-800">
+                            <div
+                              className="h-full rounded-full bg-gradient-to-r from-emerald-400 via-emerald-300 to-amber-300"
+                              style={{ width: barWidth }}
+                            />
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-slate-200">
+                        {probStr}
+                      </td>
+                      
+                      <td className="px-3 py-2">
+                        <div className="flex flex-col gap-1">
+                          {reasons.length === 0 ? (
+                            <span className="text-[11px] text-slate-500">
+                              Model + macro blend
+                            </span>
+                          ) : (
+                            <div className="flex max-w-xs flex-wrap gap-1">
+                              {reasons.map((txt, i) => (
+                                <span
+                                  key={i}
+                                  className="rounded-full bg-slate-900/90 px-2 py-0.5 text-[10px] text-slate-200"
+                                >
+                                  {txt}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+
+                          {r.srLabel && (
+                            <span className="inline-flex items-center rounded-full border border-sky-500/60 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-100">
+                              SR: {r.srLabel}
+                            </span>
+                          )}
+                        </div>
+                      </td>
+
+                      <td className="px-3 py-2 text-right text-[11px] text-slate-400">
+                        {fmtTime(r.alertTimeMs)}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {/* History */}
+      <Card>
+        <div className="flex items-center justify-between border-b border-slate-800/80 px-4 py-3">
+          <div>
+            <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-400">
+              Alert History
+            </div>
+            <div className="mt-0.5 text-[11px] text-slate-500">
+              Completed H1 opportunities Â– hit, missed or expired.
+            </div>
           </div>
-        </CardContent>
+          <div className="text-[11px] text-slate-500">
+            Last{" "}
+            <span className="font-medium text-slate-200">
+              {history.length || 0}
+            </span>{" "}
+            alerts
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-separate border-spacing-0 text-xs">
+            <thead>
+              <tr className="bg-slate-950/80 text-[11px] uppercase tracking-wide text-slate-400">
+                <th className="px-4 py-2 text-left">When</th>
+                <th className="px-3 py-2 text-left">Symbol</th>
+                <th className="px-3 py-2 text-left">Direction</th>
+                <th className="px-3 py-2 text-right">Move (H1)</th>
+                <th className="px-3 py-2 text-right">Result</th>
+                <th className="px-3 py-2 text-right">Max DD</th>
+                <th className="px-3 py-2 text-right">Time to target</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={7}
+                    className="px-4 py-6 text-center text-xs text-slate-400"
+                  >
+                    No completed opportunities tracked yet. As alerts hit target
+                    or expire, they will show up here with realized move and
+                    drawdown.
+                  </td>
+                </tr>
+              ) : (
+                history.map((h, idx) => {
+                  const dirLabel = fmtDirectionLabel(h.direction);
+                  const moveStr =
+                    h.expectedMovePct === 0
+                      ? "0.00%"
+                      : (h.expectedMovePct > 0 ? "+" : "") + h.expectedMovePct.toFixed(2) + "%";
+
+
+                  let resultLabel = "Pending";
+                  let resultClass = "text-slate-300";
+                  if (h.hitTarget === true) {
+                    resultLabel = "Hit target";
+                    resultClass = "text-emerald-300";
+                  } else if (h.hitTarget === false) {
+                    resultLabel = "Expired / missed";
+                    resultClass = "text-rose-300";
+                  }
+
+                  const ddStr =
+                    typeof h.maxDrawdownPct === "number"
+                      ? h.maxDrawdownPct.toFixed(2) + "%"
+                      : "Â—";
+
+                  const tttStr =
+                    typeof h.timeToTargetMin === "number"
+                      ? h.timeToTargetMin.toFixed(0) + " min"
+                      : "Â—";
+
+                  const rowBg =
+                    idx % 2 === 0
+                      ? "bg-slate-950/40"
+                      : "bg-slate-900/40";
+
+                  return (
+                    <tr
+                      key={h.symbol + "-" + h.alertTimeMs}
+                      className={rowBg + " border-b border-slate-900/80 hover:bg-slate-800/60"}
+                    >
+                      <td className="px-4 py-2 text-[11px] text-slate-400">
+                        {fmtTime(h.alertTimeMs)}
+                      </td>
+                      <td className="px-3 py-2 text-sm font-medium text-slate-50">
+                        {h.symbol}
+                      </td>
+                      <td className="px-3 py-2">
+                        <Pill color={h.direction}>{dirLabel}</Pill>
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-slate-50">
+                        {moveStr}
+                      </td>
+                      <td
+                        className={"px-3 py-2 text-right text-[11px] font-medium " + resultClass}
+                      >
+                        {resultLabel}
+                      </td>
+                      <td className="px-3 py-2 text-right text-[11px] text-slate-300">
+                        {ddStr}
+                      </td>
+                      <td className="px-3 py-2 text-right text-[11px] text-slate-300">
+                        {tttStr}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
       </Card>
     </div>
   );
