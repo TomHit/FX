@@ -21,6 +21,8 @@ from pathlib import Path
 import xgboost as xgb
 from api.macro_state import get_macro_snapshot
 import csv
+from datetime import datetime, timezone
+
 from api.trend.infer_rt import (
     predict_next_hour,
     predict_next_4h,
@@ -32,7 +34,7 @@ from .trend_sr import summarize_sr_multi_tf
 from api.trend.infer_tth import predict_tth
 from openai import OpenAI
 client = OpenAI()
-
+router = APIRouter(prefix="/trend")
 
 log = logging.getLogger("xtl.trend")
 
@@ -132,23 +134,17 @@ def _extract_tf_sr(sr_summary: dict | None, tf_key: str) -> dict[str, float | st
 
 
 def _room_thr_h1(sym: str) -> float:
-    """
-    Per-symbol 1h opportunity threshold.
-    If symbol not listed, default to 1.0% so nothing explodes.
-    """
+    # default fallback for 1h room (percent)
     if not sym:
-        return 1.0
-    return float(ROOM_THRESHOLDS_H1.get(sym.upper(), 1.0))
+        return 0.23
+    return float(ROOM_THRESHOLDS_H1.get(sym.upper(), 0.23))
 
 
 def _room_thr_h4(sym: str) -> float:
-    """
-    Per-symbol 4h "structure" threshold.
-    If symbol not listed, fall back to its own H1 threshold.
-    """
+    # default fallback for 4h structure (percent)
     if not sym:
-        return 1.0
-    return float(ROOM_THRESHOLDS_H4.get(sym.upper(), _room_thr_h1(sym)))
+        return 0.40
+    return float(ROOM_THRESHOLDS_H4.get(sym.upper(), 0.40))
 
 
 # Where we keep per-symbol frozen H1 opportunity snapshots in Redis
@@ -167,220 +163,235 @@ def _opp_snapshot_key(sym: str, opp_dir: str) -> str:
     return f"{OPP_SNAPSHOT_PREFIX}:{s}:{d}"
 
 
-def _freeze_or_snapshot_opp(sym: str, row: dict[str, Any], now_ms: int) -> dict[str, Any]:
+def _freeze_or_snapshot_opp(sym: str, row: dict, now_ms: int) -> dict:
     """
-    Takes an opportunity row and ensures:
-    - Stable alert_created_ms / alert_id for 1 hour horizon
-    - Live snapshot in Redis per symbol/direction
-    - Alert history entry in ALERT_HASH_PREFIX + ALERT_INDEX_KEY
-    - Moves to 'expired' after 1 hour and stops returning in 'rows'
+    Maintain a stable opportunity snapshot per symbol+direction in Redis.
+
+    - Source of truth for MANUAL trading
+    - Entry / TP / SL are frozen and cost-aware
     """
 
-    sym_u = (sym or "").upper()
-    opp_dir = (row.get("opp_direction") or row.get("direction") or "").upper()
-    if opp_dir not in ("UP", "DOWN"):
-        # no direction = nothing to freeze
-        row["status"] = row.get("status") or "none"
+    sym_u = (sym or "").upper().strip()
+    if not sym_u:
         return row
 
-    snap_key = _opp_snapshot_key(sym_u, opp_dir)
-
-    # Helper to safely json-load snapshot fields
-    def _snap_get(d: dict[str, Any], key: str, default=None):
-        v = d.get(key)
-        if v is None:
+    def _sj(x, default=None):
+        if x is None:
             return default
+        if isinstance(x, (bytes, bytearray)):
+            x = x.decode("utf-8", "ignore")
         try:
-            return json.loads(v)
+            return json.loads(x)
         except Exception:
-            return v
+            return x
 
-    # Try to load existing snapshot
-    snap = {}
-    try:
-        snap = R.hgetall(snap_key) or {}
-    except Exception:
-        snap = {}
+    def _hgetall_json(key: str) -> dict:
+        raw = R.hgetall(key) or {}
+        out = {}
+        for k, v in raw.items():
+            if isinstance(k, (bytes, bytearray)):
+                k = k.decode("utf-8", "ignore")
+            out[str(k)] = _sj(v)
+        return out
 
-    # --------------------------------------------------
-    # Existing snapshot: check status / horizon
-    # --------------------------------------------------
-    if snap:
-        status = _snap_get(snap, "status", "active") or "active"
-        alert_ms = int(_snap_get(snap, "alert_created_ms", now_ms) or now_ms)
-        horizon_min = _snap_get(snap, "horizon_min", 60)
+    # ---------------- config knobs ----------------
+    horizon_min_default = int(os.getenv("XTL_OPP_HORIZON_MIN", "60"))
+
+    # ---- trade economics (manual trading safety) ----
+    tp_fraction = float(os.getenv("XTL_OPP_TP_FRACTION", "0.35"))             # 35% of forecast
+    min_net_edge_pct = float(os.getenv("XTL_OPP_MIN_NET_EDGE_PCT", "0.06"))   # costs+slippage
+    min_rrr = float(os.getenv("XTL_OPP_MIN_RRR", "1.3"))
+
+    # ---------------- direction normalize ----------------
+    want_dir = (row.get("opp_direction") or row.get("direction") or "").upper()
+    if want_dir not in ("UP", "DOWN"):
+        dec = str(row.get("decision") or "").upper()
+        want_dir = "UP" if dec == "BUY" else "DOWN" if dec == "SELL" else ""
+
+    if want_dir == "UP":
+        row["decision"] = "BUY"
+    elif want_dir == "DOWN":
+        row["decision"] = "SELL"
+
+    # ---------------- horizon window ----------------
+    horizon_min = horizon_min_default
+    horizon_ms = horizon_min * 60_000
+
+    def _live_px_from_row(r: dict):
+        lp = r.get("last_price") or r.get("price") or r.get("last_close") or r.get("lastClose") or r.get("mid")
+        return float(lp) if isinstance(lp, (int, float)) else None
+
+    # ---------------- EXISTING ACTIVE SNAPSHOT ----------------
+    for d in ("UP", "DOWN"):
+        snap_key = _opp_snapshot_key(sym_u, d)
+        snap = _hgetall_json(snap_key)
+        if not snap:
+            continue
+
+        st = str(snap.get("status") or "active").lower()
+        if st not in ("active", "new", "open"):
+            continue
+
+        # inject last_price (best effort)
+        lp = _live_px_from_row(row or {})
+        if lp is not None:
+            snap["last_price"] = float(lp)
+
+        # IMPORTANT: evaluate using decoded snap (not raw hgetall)
         try:
-            horizon_ms = int(float(horizon_min) * 60_000)
+            _evaluate_alert_outcome(sym_u, snap, row or {}, now_ms)
         except Exception:
-            horizon_ms = 60 * 60_000
+            pass
 
-        expire_ts = _snap_get(snap, "opp_expire_ts")
-        if not isinstance(expire_ts, (int, float)):
-            expire_ts = alert_ms + horizon_ms
+        # reload after evaluator
+        snap = _hgetall_json(snap_key)
+        if not snap:
+            continue
 
-        alert_id = _snap_get(snap, "alert_id")
-
-        # If already final, just mirror status into row and do NOT show in live list
-        if status in ("hit", "expired"):
-            row["status"] = status
-            return row
-
-        # Time-based expiry: after 1 hour, mark as expired + move to history
-        if now_ms >= int(expire_ts):
-            if alert_id:
-                try:
-                    _mark_alert_expired(alert_id, now_ms)
-                except Exception:
-                    pass
+        st2 = str(snap.get("status") or "").lower()
+        if st2 in ("hit", "expired"):
             try:
-                R.hset(
-                    snap_key,
-                    mapping={
+                _delete_live_snapshot(sym_u, d)
+            except Exception:
+                pass
+            continue
+
+        # -------- hard expire guard (prevents ACTIVE stuck at 0m) --------
+        try:
+            exp_ts = snap.get("opp_expire_ts")
+            exp_ts = int(exp_ts) if isinstance(exp_ts, (int, float)) else 0
+        except Exception:
+            exp_ts = 0
+
+        if not exp_ts:
+            try:
+                created = snap.get("alert_created_ms")
+                created = int(created) if isinstance(created, (int, float)) else 0
+            except Exception:
+                created = 0
+            if created:
+                exp_ts = created + horizon_ms
+
+        if exp_ts and now_ms >= exp_ts:
+            try:
+                aid = str(snap.get("alert_id") or snap.get("opp_id") or "").strip()
+                if aid:
+                    key = f"{ALERT_HASH_PREFIX}{aid}"
+                    R.hset(key, mapping={
                         "status": json.dumps("expired"),
-                        "opp_expire_ts": json.dumps(int(expire_ts)),
-                    },
-                )
+                        "hit_target": json.dumps(False),
+                        "expired_ts": json.dumps(now_ms),
+                        "last_status_ms": json.dumps(now_ms),
+                    })
             except Exception:
                 pass
 
-            # Don't return as active
-            row["status"] = "expired"
-            return row
+            try:
+                R.hset(snap_key, mapping={
+                    "status": json.dumps("expired"),
+                    "expired_ts": json.dumps(now_ms),
+                    "last_status_ms": json.dumps(now_ms),
+                })
+            except Exception:
+                pass
 
-        # Still active ? reuse stable fields from snapshot
-        # Still active ? reuse stable fields from snapshot
-        row["status"] = "active"
-        row.setdefault("alert_created_ms", alert_ms)
-        row.setdefault("alert_id", alert_id)
+            try:
+                _delete_live_snapshot(sym_u, d)
+            except Exception:
+                pass
+            continue
 
-        # --- Horizon (TTH-driven, NOT hard-coded) ---
-        # Prefer snapshot horizon if present, otherwise keep computed horizon_min
-        snap_horizon = _snap_get(snap, "horizon_min")
-        if snap_horizon is not None:
-            row.setdefault("horizon_min", int(snap_horizon))
-        else:
-            row.setdefault("horizon_min", int(horizon_min))
+        # still active ? return frozen
+        out = dict(snap)
+        lp2 = _live_px_from_row(row or {})
+        if lp2 is not None:
+            out["last_price"] = float(lp2)
 
-        # --- Basis / Target ---
-        # New canonical fields (time-agnostic)
-        basis = _snap_get(snap, "basis_price")
-        target = (
-            _snap_get(snap, "target_price")        # preferred (new)
-            or _snap_get(snap, "target_price_1h")  # backward compatibility
-        )
+        out["server_now_ms"] = int(now_ms)
+        out["decision"] = "BUY" if d == "UP" else "SELL"
+        out["opp_direction"] = d
+        return out
 
-        if basis is not None:
-            row.setdefault("basis_price", basis)
-            # legacy field (do not use for logic)
-            row.setdefault("basis_price_1h", basis)
-
-        if target is not None:
-            row.setdefault("target_price", target)
-            # legacy field (do not use for logic)
-            row.setdefault("target_price_1h", target)
-
-        # --- Expiry (derived from horizon, NOT fixed 1h) ---
-        row.setdefault(
-            "opp_expire_ts",
-            row["alert_created_ms"] + int(row["horizon_min"]) * 60_000
-        )
-
+    # ---------------- CREATE NEW SNAPSHOT ----------------
+    if want_dir not in ("UP", "DOWN"):
+        row["status"] = "filtered"
         return row
 
+    # ---- basis price (ENTRY) ----
+    basis = None
+    for k in ("alert_price_1h", "basis_price_1h", "basis_price", "last_price", "price", "last_close", "lastClose", "mid"):
+        v = row.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            basis = float(v)
+            break
 
-    # --------------------------------------------------
-    # No existing snapshot ? create a fresh alert
-    # --------------------------------------------------
-    try:
-        basis_f = float(row.get("basis_price_1h") or row.get("basis_price") or 0.0)
-    except Exception:
-        basis_f = 0.0
+    pct_1h = row.get("expected_move_pct_1h") or row.get("expected_move_pct")
+    if not isinstance(pct_1h, (int, float)) or basis is None:
+        row["status"] = "filtered"
+        return row
 
-    try:
-        move_f = float(row.get("expected_move_pct_1h") or row.get("opp_expected_move_pct_1h") or 0.0)
-    except Exception:
-        move_f = 0.0
+    # ---- COST-AWARE TP / SL ----
+    forecast_pct = abs(float(pct_1h))               # %
+    candidate_tp_pct = forecast_pct * tp_fraction
+    trade_tp_pct = max(candidate_tp_pct, min_net_edge_pct)
+    trade_tp_pct = min(trade_tp_pct, forecast_pct * 0.8)
 
-    try:
-        target_f = basis_f * (1.0 + move_f / 100.0)
-    except Exception:
-        target_f = basis_f
+    if trade_tp_pct < min_net_edge_pct:
+        row["status"] = "filtered"
+        return row
 
-    tth = predict_tth(sym_u)
-    # ---------- TTH HARD GATE ----------
-    if not isinstance(tth, dict) or not tth.get("ok"):
-        return None
+    dir_sign = +1 if want_dir == "UP" else -1
+    target = basis * (1.0 + dir_sign * trade_tp_pct / 100.0)
+    sl_pct = trade_tp_pct / min_rrr
+    stop_loss = basis * (1.0 - dir_sign * sl_pct / 100.0)
 
-    p_dir = max(float(tth.get("p_up", 0.0) or 0.0), float(tth.get("p_down", 0.0) or 0.0))
-    if p_dir < 0.65:
-        return None
+    # ---- SNAPSHOT ----
+    # IMPORTANT: horizon is from creation time, NOT hour bucket
+    open_ts = int(now_ms)
+    opp_id = f"{sym_u}-H1-{want_dir}-{open_ts}"
 
-
-
-    horizon_min = int(tth["horizon_min"])
-    horizon_ms = horizon_min * 60_000
-    expire_ts = alert_ms + horizon_ms
-
-
-    alert_id = f"{sym_u}-{alert_ms}-{opp_dir}"
-
-    # Store back onto row for UI
-    row["alert_created_ms"] = alert_ms
-    row["horizon_min"] = horizon_min
-    row["status"] = "active"
-    row["basis_price_1h"] = basis_f
-    row["target_price_1h"] = target_f
-    row["alert_id"] = alert_id
-
-    # ---- 1) Save into alert history hash/index (for history section) ----
-    try:
-        payload = {
-            "symbol": sym_u,
-            "direction": opp_dir,
-            "opp_direction": opp_dir,
-            "alert_id": alert_id,
-            "alert_created_ms": alert_ms,
-            "horizon_min": horizon_min,
-            "opp_expire_ts": int(expire_ts),
-            "basis_price": basis_f,
-            "alert_price_1h": basis_f,
-            "target_price_1h": target_f,
-            "expected_move_pct": move_f,
-            "expected_move_pct_1h": move_f,
-            "opp_expected_move_pct_1h": move_f,
-            "status": "active",
-            "p_up": row.get("p_up"),
-        }
-        _save_alert_snapshot(sym_u, payload)
-    except Exception as e:
-        log.warning("[OPP] _save_alert_snapshot failed sym=%s dir=%s err=%r", sym_u, opp_dir, e)
-
-    # ---- 2) Live per-symbol snapshot for this horizon -------------------
-    snap_payload = {
-        "symbol": sym_u,
-        "direction": opp_dir,
-        "opp_direction": opp_dir,
-        "alert_created_ms": alert_ms,
-        "basis_price": basis_f,
-        "alert_price_1h": basis_f,
-        "opp_expected_move_pct_1h": move_f,
-        "target_price_1h": target_f,
+    snap = dict(row)
+    snap.update({
         "status": "active",
-        "horizon_min": horizon_min,
-        "opp_expire_ts": expire_ts,
-        "alert_id": alert_id,
-    }
+        "opp_id": opp_id,
+        "alert_id": row.get("alert_id") or opp_id,
+        "alert_created_ms": int(now_ms),
+
+        "horizon_min": int(horizon_min),
+        "opp_open_ts": int(open_ts),
+        "opp_expire_ts": int(open_ts + horizon_ms),
+
+        # ENTRY / TP / SL
+        "basis_price_1h": float(basis),
+        "alert_price_1h": float(basis),
+        "target_price_1h": float(target),
+        "stop_loss_1h": float(stop_loss),
+
+        # economics
+        "forecast_move_pct_1h": float(pct_1h),
+        "trade_tp_pct_1h": float(trade_tp_pct) * (1.0 if want_dir == "UP" else -1.0),
+        "rrr": round(abs(trade_tp_pct / sl_pct), 2),
+
+        "opp_direction": want_dir,
+        "decision": "BUY" if want_dir == "UP" else "SELL",
+        "server_now_ms": int(now_ms),
+    })
+
+    snap_key = _opp_snapshot_key(sym_u, want_dir)
 
     try:
-        mapping = {k: json.dumps(v) for k, v in snap_payload.items()}
-        R.hset(snap_key, mapping=mapping)
+        alert_id = _save_alert_snapshot(sym_u, snap)
+        snap["alert_id"] = alert_id
     except Exception:
-        # snapshot is UX; do not break endpoint
         pass
 
-    return row
+    try:
+        R.hset(snap_key, mapping={k: json.dumps(v) for k, v in snap.items()})
+        R.expire(snap_key, int((horizon_ms / 1000) + 3600))
+    except Exception:
+        pass
 
-
+    return snap
 
 import json as _json
 
@@ -781,22 +792,25 @@ ALERT_INDEX_KEY = "xtl:trend:opp:h1:index"
 
 def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
     sym = (symbol or payload.get("symbol") or "").upper()
-    direction = str(
-        payload.get("opp_direction") or payload.get("direction") or ""
-    ).upper()
+    direction = str(payload.get("opp_direction") or payload.get("direction") or "").upper()
+    if direction not in ("UP", "DOWN"):
+        direction = "NA"
+
+    # Ensure direction fields exist for downstream logic
+    payload.setdefault("symbol", sym)
+    payload.setdefault("opp_direction", direction)
+    payload.setdefault("direction", direction)
 
     alert_id = str(payload.get("alert_id") or "").strip()
 
     if not alert_id:
         ts = int(payload.get("alert_created_ms") or int(time.time() * 1000))
-        alert_id = f"{ts}:{sym}:{direction or 'NA'}"
+        alert_id = f"{ts}:{sym}:{direction}"
         payload["alert_id"] = alert_id
 
-    # ? REQUIRED
     if "alert_created_ms" not in payload:
         payload["alert_created_ms"] = int(time.time() * 1000)
 
-    # ? RECOMMENDED
     if "status" not in payload:
         payload["status"] = "active"
 
@@ -873,11 +887,13 @@ def _load_opp_history(limit: int = 50) -> list[dict[str, Any]]:
             )
         except Exception:
             decoded["alert_time_ms"] = 0
+        decoded["alertTimeMs"] = decoded["alert_time_ms"]
 
         # expected_move_pct (distance only; legacy fields allowed)
         try:
             decoded["expected_move_pct"] = float(
-                decoded.get("expected_move_pct")
+                decoded.get("trade_tp_pct_1h")
+                or decoded.get("expected_move_pct")
                 or decoded.get("expected_move_pct_1h")
                 or decoded.get("opp_expected_move_pct_1h")
                 or 0.0
@@ -919,10 +935,13 @@ def _load_opp_history(limit: int = 50) -> list[dict[str, Any]]:
                 decoded["hit_target"] = False
             else:
                 decoded["hit_target"] = None
+        decoded["hitTarget"] = decoded.get("hit_target")
+
 
         # only completed alerts in history
         if decoded["status"] not in ("hit", "expired"):
             continue
+        decoded["status"] = str(decoded.get("status") or "").lower()
 
         # defaults
         decoded.setdefault("realized_move_pct", None)
@@ -2731,34 +2750,88 @@ def trend_opportunities(
     """
     Live opportunities feed.
 
-    Logic:
-    - Primary trigger is H1 expected move (expected_move_pct_1h).
-    - H4 expected move (expected_move_pct_4h) is used as confirmation / filter.
-
-    Combinations:
-
-    1) |H1| < H1_threshold
-       -> no opportunity, even if H4 is big.
-
-    2) |H1| >= H1_threshold and sign(H1) == sign(H4) and |H4| >= H4_threshold
-       -> opportunity, opp_confidence = "high".
-
-    3) |H1| >= H1_threshold and sign(H1) == sign(H4) but |H4| < H4_threshold
-       -> opportunity, opp_confidence = "medium".
-
-    4) |H1| >= H1_threshold and H4 missing
-       -> opportunity, opp_confidence = "high" if |H1| is much bigger than
-          threshold, else "medium".
-
-    5) |H1| >= H1_threshold and sign(H1) != sign(H4)
-       -> drop (no opportunity) - we do not want countertrend / chop.
-
-    This does not represent trade signals, only "room to move".
+    OPPT rules (as per UI requirement):
+    - Create only from forecast-based trigger.
+    - Once created, keep visible until HIT or EXPIRED.
+    - No "bias flip" auto-expire here (to avoid 5-10 min flip noise).
+    - Weekend: do NOT create new opps.
     """
 
     tfu = (tf or "M15").upper()
+    now_ms = int(_time.time() * 1000)
 
-    # Reuse main prediction logic (H1/H4 model + structure + macro)
+    # ---------- helpers ----------
+    def _sym_list(s: str) -> list[str]:
+        out = []
+        for x in (s or "").split(","):
+            xx = x.strip().upper()
+            if xx:
+                out.append(xx)
+        return out
+
+    def _json_load_maybe(x):
+        if x is None:
+            return None
+        if isinstance(x, (bytes, bytearray)):
+            x = x.decode("utf-8", "ignore")
+        try:
+            return json.loads(x)
+        except Exception:
+            return x
+
+    def _redis_hash_to_dict(h: dict) -> dict:
+        out = {}
+        for k, v in (h or {}).items():
+            kk = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
+            vv = v.decode("utf-8", "ignore") if isinstance(v, (bytes, bytearray)) else v
+            out[kk] = _json_load_maybe(vv)
+        return out
+
+    def _load_active_snapshots(symbols_csv: str) -> list[dict]:
+        res = []
+        for sym in _sym_list(symbols_csv):
+            for d in ("UP", "DOWN"):
+                snap_key = _opp_snapshot_key(sym, d)
+                snap = R.hgetall(snap_key)
+                if not snap:
+                    continue
+
+                # evaluate HIT/EXPIRED and cleanup if needed
+                try:
+                    _evaluate_alert_outcome(sym, snap, {}, now_ms)
+                except Exception:
+                    pass
+
+                # re-read (may have been deleted)
+                snap = R.hgetall(snap_key)
+                if not snap:
+                    continue
+
+                status = str(_json_load_maybe(snap.get(b"status") if isinstance(next(iter(snap.keys())), bytes) else snap.get("status")) or "active").lower()
+                if status in ("active", "new", "open"):
+                    row = _redis_hash_to_dict(snap)
+                    row.setdefault("update_tf", tfu)
+                    row.setdefault("server_now_ms", now_ms)
+                    res.append(row)
+        return res
+
+    # ---------- weekend rule: NO NEW opportunities ----------
+    utc_weekday = datetime.now(timezone.utc).weekday()  # 0=Mon ... 5=Sat 6=Sun
+    is_weekend = utc_weekday >= 5
+
+    # Always sweep (so HIT/EXPIRED snapshots are cleaned)
+    try:
+        _sweep_opp_snapshots(symbols, now_ms)
+    except Exception:
+        pass
+
+    if is_weekend and not debug_force:
+        # show only active snapshots + history; do NOT call predict_all (no new creation)
+        history = _load_opp_history(limit=50)
+        rows = _load_active_snapshots(symbols)
+        return {"ok": True, "tf": tfu, "rows": rows, "history": history}
+
+    # ---------- Reuse main prediction logic ----------
     base = predict_all(
         tf=tfu,
         symbols=symbols,
@@ -2769,53 +2842,57 @@ def trend_opportunities(
 
     if not isinstance(base, dict):
         return {"ok": False, "reason": "predict_all_not_dict"}
-
     if not base.get("ok", True):
-        # Bubble underlying reason (e.g. models not loaded, no_data, etc.)
         return base
 
     rows_in = base.get("rows") or []
     opp_rows: list[dict[str, Any]] = []
     debug_pool: list[dict[str, Any]] = []
 
-
-    now_ms = int(_time.time() * 1000)
-    _sweep_opp_snapshots(symbols, now_ms)
-    st_thr = 0.35   # H1 threshold (%)
-    ht_thr = 0.70   # H4 confirm threshold (%)
-
-    if loose:
-        st_thr = 0.06
-        ht_thr = 0.12
+    # loose mode tweaks your thresholds indirectly via your _room_thr_* functions
+    # (if you want loose to affect those functions, keep it there; otherwise leave as-is)
+    # We'll keep your existing loose toggles on top-level thresholds where you used them earlier:
+    # NOTE: actual gating uses thr1/thr4 from _room_thr_h1/_room_thr_h4.
 
     for row in rows_in:
         sym = str(row.get("symbol") or "").upper()
         if not sym:
             continue
-        # --- DEBUG FORCE: always emit test opportunities even if models are flat/missing ---
+        # ---- attach a live-ish price for UI + hit detection ----
+        lp = (
+            row.get("last_price")
+            or row.get("price")
+            or row.get("mid")
+            or row.get("lastClose")
+            or row.get("last_close")
+            or row.get("close")
+        )
+        if isinstance(lp, (int, float)):
+            row["last_price"] = float(lp)
+
+
+        # --- DEBUG FORCE: emit fabricated opp candidates (no snapshot writes) ---
         if debug_force and debug_top > 0:
             thr1 = _room_thr_h1(sym)
             thr4 = _room_thr_h4(sym)
 
-            # derive direction from any available field; default BUY
             dec = str(row.get("decision") or row.get("opp_direction") or row.get("direction") or "BUY").upper()
             s = 1 if dec in ("BUY", "UP", "LONG") else -1
 
-            # fabricate moves just above thresholds so it looks realistic
-            m1 = float(s) * max(thr1, st_thr) * 1.6
-            m4 = float(s) * max(thr4, ht_thr) * 1.6
+            m1 = float(s) * max(thr1, 0.01) * 1.6
+            m4 = float(s) * max(thr4, 0.01) * 1.6
 
             out = dict(row)
             out["expected_move_pct_1h"] = m1
             out["expected_move_pct_4h"] = m4
 
-            now_ms_local = int(_time.time() * 1000)
             hour_ms = 60 * 60 * 1000
-            bucket_open_ts = (now_ms_local // hour_ms) * hour_ms
+            bucket_open_ts = (now_ms // hour_ms) * hour_ms
 
             opp_dir = "UP" if s > 0 else "DOWN"
             out["opp_id"] = f"{sym}-H1-{opp_dir}-{bucket_open_ts}"
             out["opp_direction"] = opp_dir
+            out["decision"] = "BUY" if opp_dir == "UP" else "SELL"
             out["opp_confidence"] = "high"
             out["opp_horizon"] = "H1"
             out["opp_open_ts"] = bucket_open_ts
@@ -2825,22 +2902,19 @@ def trend_opportunities(
             out["opp_score"] = 99.0
             out["opp_reason"] = "DEBUG_FORCE (fabricated opportunity for UI testing)"
             out.setdefault("update_tf", tfu)
-            out.setdefault("server_now_ms", now_ms_local)
+            out.setdefault("server_now_ms", now_ms)
 
-            # IMPORTANT: do NOT write snapshots in debug force (keeps it clean)
             debug_pool.append(out)
             continue
-
 
         thr1 = _room_thr_h1(sym)
         thr4 = _room_thr_h4(sym)
 
-        # Extract H1 / H4 expected move (%)
+        # Extract H1/H4 expected move (%)
         try:
             m1 = float(row.get("expected_move_pct_1h"))
         except (TypeError, ValueError):
             m1 = None
-
         try:
             m4 = float(row.get("expected_move_pct_4h"))
         except (TypeError, ValueError):
@@ -2849,179 +2923,120 @@ def trend_opportunities(
         s1 = _sign(m1)
         s4 = _sign(m4)
 
-        # --------------------------------------------------
-        # 0) Enrich raw row with useful features (RVOL/ATR/spread)
-        #     so both _compute_opp_score and the UI can use them.
-        # --------------------------------------------------
+        # --- Enrich H1 features for scoring/UI (optional) ---
         extra_h1 = row.get("extra_h1") or {}
-        feats_h1 = (
-            extra_h1.get("features")
-            if isinstance(extra_h1.get("features"), dict)
-            else extra_h1
-        )
+        feats_h1 = extra_h1.get("features") if isinstance(extra_h1.get("features"), dict) else extra_h1
         if isinstance(feats_h1, dict):
             rv = feats_h1.get("feat_rvol15")
             if isinstance(rv, (int, float)):
                 row["feat_rvol15"] = float(rv)
-
             atr_bp = feats_h1.get("feat_atr_bp")
             if isinstance(atr_bp, (int, float)):
                 row["feat_atr_bp"] = float(atr_bp)
-
             sp_bp = feats_h1.get("feat_spread_bp") or feats_h1.get("spread_bp")
             if isinstance(sp_bp, (int, float)):
                 row["spread_bp"] = float(sp_bp)
 
         # --------------------------------------------------
-        # 1) Check if we already have an ACTIVE snapshot
-        #    (so we keep showing it even if room shrinks)
+        # 1) If ACTIVE snapshot exists, keep it visible until HIT/EXPIRED
         # --------------------------------------------------
         has_active_snapshot = False
         active_snap_row: dict[str, Any] | None = None
-
         try:
-           for d in ("UP", "DOWN"):
-               snap_key = _opp_snapshot_key(sym, d)
-               snap = R.hgetall(snap_key)
-               if not snap:
-                   continue
+            for d in ("UP", "DOWN"):
+                snap_key = _opp_snapshot_key(sym, d)
+                snap = R.hgetall(snap_key)
+                if not snap:
+                    continue
 
-               _evaluate_alert_outcome(sym, snap, row, now_ms)
+                _evaluate_alert_outcome(sym, snap, row, now_ms)
 
-               raw_status = snap.get("status")
-               if raw_status is None:
-                   status = "active"
-               else:
-                   if isinstance(raw_status, bytes):
-                       raw_status = raw_status.decode("utf-8", "ignore")
-                   try:
-                       status = json.loads(raw_status)
-                   except Exception:
-                       status = str(raw_status)
+                # re-read after evaluation (may be deleted)
+                snap = R.hgetall(snap_key)
+                if not snap:
+                    continue
 
-               status = str(status).lower()
-
-               if status in ("active", "new", "open"):
-                   has_active_snapshot = True
-
-                   # convert redis hash -> dict
-                   snap_row = {}
-                   for k, v in snap.items():
-                       kk = k.decode() if isinstance(k, bytes) else k
-                       vv = v.decode() if isinstance(v, bytes) else v
-                       try:
-                          snap_row[kk] = json.loads(vv)
-                       except Exception:
-                          snap_row[kk] = vv
-
-                   active_snap_row = snap_row
-                   break
+                status = str(_json_load_maybe(snap.get(b"status") if isinstance(next(iter(snap.keys())), bytes) else snap.get("status")) or "active").lower()
+                if status in ("active", "new", "open"):
+                    has_active_snapshot = True
+                    active_snap_row = _redis_hash_to_dict(snap)
+                    break
         except Exception:
             has_active_snapshot = False
             active_snap_row = None
 
-        # --------------------------------------------------
-        # 2) Primary trigger: H1 must have enough room
-        #    BUT ONLY IF there is NO active snapshot.
-        #    If a snapshot is already open, we keep the
-        #    row visible until it hits or expires.
-        # --------------------------------------------------
         if has_active_snapshot and active_snap_row:
             active_snap_row.setdefault("update_tf", tfu)
             active_snap_row.setdefault("server_now_ms", now_ms)
 
-            # optional live price refresh
             lp = row.get("last_price") or row.get("price")
             if isinstance(lp, (int, float)):
-                active_snap_row["last_price"] = lp
+                active_snap_row["last_price"] = float(lp)
 
             opp_rows.append(active_snap_row)
             continue
 
-        if (not has_active_snapshot) and (
-            not isinstance(m1, (int, float)) or s1 == 0 or abs(m1) < thr1
-        ):
+        # Weekend rule: do NOT open new ones (but can show existing above)
+        if is_weekend:
             continue
 
-        
-        # --- Layer A: prediction delta gate -------------------------------
-        # Only surface a fresh opportunity if the forecast actually changed
-        # enough compared to the last seen 1h move for this symbol.
+        # --------------------------------------------------
+        # 2) New opportunity gate: H1 room must pass threshold
+        # --------------------------------------------------
+        if (not isinstance(m1, (int, float))) or s1 == 0 or abs(m1) < thr1:
+            continue
 
+        # --- prediction delta gate (optional anti-spam) ---
         delta_pct = None
         delta_thr = _delta_thr_h1(sym, thr1)
-
-        # If m1 is missing/non-numeric (can happen when we keep a row due to an active snapshot),
-        # skip delta tracking/gating safely.
         if isinstance(m1, (int, float)):
             try:
                 key = PRED_DELTA_KEY_FMT % sym
-                prev_str = R.get(key)
-
-                if prev_str is not None:
+                prev = R.get(key)
+                if isinstance(prev, (bytes, bytearray)):
+                    prev = prev.decode("utf-8", "ignore")
+                if prev is not None:
                     try:
-                        prev_val = float(prev_str)
+                        prev_val = float(prev)
                         delta_pct = abs(float(m1) - prev_val)
                     except (TypeError, ValueError):
                         delta_pct = None
-
-                # Always update stored value for next call; 90-minute TTL is enough
                 R.set(key, f"{float(m1):.6f}", ex=90 * 60)
-
             except Exception:
-                # Redis issues must not break the endpoint
                 delta_pct = None
 
-        # If we have a previous forecast and the change is too small,
-        # do not treat this as a new opportunity.
-        if delta_pct is not None and delta_pct < delta_thr and not has_active_snapshot:
+        if delta_pct is not None and delta_pct < delta_thr:
             continue
 
-
-        # Base direction from H1
+        # --------------------------------------------------
+        # 3) H4 confirmation logic
+        # --------------------------------------------------
         opp_dir = "UP" if s1 > 0 else "DOWN"
         opp_conf = "medium"
         h4_agree: bool | None = None
 
-        # --- Combine with H4 when available (structure confirmation) ---
         if isinstance(m4, (int, float)) and s4 != 0:
             if s1 == s4:
-                # Same direction -> confirmation
                 h4_agree = True
-
-                # Strong confirm = H4 also has decent room
-                if abs(m4) >= thr4:
-                    opp_conf = "high"
-                else:
-                    opp_conf = "medium"
+                opp_conf = "high" if abs(m4) >= thr4 else "medium"
             else:
-                # H4 conflicts with H1 -> drop this entirely (no opportunity)
+                # conflict => drop
                 continue
         else:
-            # No usable H4 -> rely purely on H1 magnitude for confidence
-            if abs(m1) >= 1.5 * thr1:
-                opp_conf = "high"
-            else:
-                opp_conf = "medium"
+            opp_conf = "high" if abs(m1) >= 1.5 * thr1 else "medium"
 
-        # --- Overall opportunity score (room + trend + confidence + SR/RVOL/etc) ---
         opp_score = _compute_opp_score(sym, row, m1, thr1)
 
-        # Once an alert is opened, keep it visible until it hits or the 1h window expires.
-        # Once an alert is opened, keep it visible until it hits or the 1h window expires.
-        # DEBUG: if nothing qualifies, allow returning top candidates for UI testing
-        if opp_score < OPP_SCORE_MIN and not has_active_snapshot:
+        if opp_score < OPP_SCORE_MIN:
             if debug_top > 0 and (debug_force or loose):
                 out_dbg = dict(row)
-
                 hour_ms = 60 * 60 * 1000
                 bucket_open_ts = (now_ms // hour_ms) * hour_ms
                 opp_open_ts = bucket_open_ts
                 opp_expire_ts = bucket_open_ts + hour_ms
-                opp_id = f"{sym}-H1-{('UP' if s1 > 0 else 'DOWN')}-{opp_open_ts}"
-
-                out_dbg["opp_id"] = opp_id
-                out_dbg["opp_direction"] = "UP" if s1 > 0 else "DOWN"
+                out_dbg["opp_id"] = f"{sym}-H1-{opp_dir}-{opp_open_ts}"
+                out_dbg["opp_direction"] = opp_dir
+                out_dbg["decision"] = "BUY" if opp_dir == "UP" else "SELL"
                 out_dbg["opp_confidence"] = opp_conf
                 out_dbg["opp_horizon"] = "H1"
                 out_dbg["opp_h4_agree"] = h4_agree
@@ -3030,54 +3045,39 @@ def trend_opportunities(
                 out_dbg["opp_min_room_h1"] = thr1
                 out_dbg["opp_min_room_h4"] = thr4
                 out_dbg["opp_score"] = round(float(opp_score), 1)
-
-                # Tag as debug so UI can render clearly; do NOT snapshot/history
                 out_dbg["debug_only"] = True
                 out_dbg["status"] = "debug"
                 out_dbg["opp_reason"] = out_dbg.get("opp_reason") or "debug candidate (below OPP_SCORE_MIN)"
-
                 debug_pool.append(out_dbg)
             continue
 
-
-        # --- Construct enriched opportunity row for UI + logging ------------
-        out = dict(row)  # start from predict_all row
-
-        # Use a 1h bucket so the opportunity ID is stable within that hour
+        # --------------------------------------------------
+        # 4) Build opportunity row
+        # --------------------------------------------------
+        out = dict(row)
         hour_ms = 60 * 60 * 1000
         bucket_open_ts = (now_ms // hour_ms) * hour_ms
-
-        # When opportunity appears (open) = start of that hour bucket
         opp_open_ts = bucket_open_ts
-
-        # Expiry = one hour after bucket open (logical H1 horizon)
         opp_expire_ts = bucket_open_ts + hour_ms
-
-        # Deterministic ID: symbol + horizon + direction + hour-bucket
         opp_id = f"{sym}-H1-{opp_dir}-{opp_open_ts}"
 
         out["opp_id"] = opp_id
-        out["opp_direction"] = opp_dir            # "UP" / "DOWN"
-        out["opp_confidence"] = opp_conf          # "high" / "medium"
+        out["opp_direction"] = opp_dir
+        out["decision"] = "BUY" if opp_dir == "UP" else "SELL"
+        out["opp_confidence"] = opp_conf
         out["opp_horizon"] = "H1"
-        out["opp_h4_agree"] = h4_agree            # True / False / None
+        out["opp_h4_agree"] = h4_agree
         out["opp_open_ts"] = opp_open_ts
         out["opp_expire_ts"] = opp_expire_ts
         out["opp_min_room_h1"] = thr1
         out["opp_min_room_h4"] = thr4
         out["opp_score"] = round(float(opp_score), 1)
 
-        
-        
-        # --- SR summary for UI (H1 + H4 nearest zones) --------------------
+        # SR summary (same as your code)
         sr = row.get("sr")
         if isinstance(sr, dict):
 
             def _attach_tf(tf_key: str, side_key: str, dist_key: str, level_key: str) -> None:
-                """
-                Attach nearest SR info for a given TF key (e.g. 'H1', 'H4')
-                into the outgoing row as side/dist/level fields.
-                """
                 zone = sr.get(tf_key) or {}
                 if isinstance(zone, dict):
                     nearest = zone.get("nearest") or zone.get("nearest_zone") or zone
@@ -3091,74 +3091,45 @@ def trend_opportunities(
                 level = nearest.get("level")
 
                 if kind:
-                    out[side_key] = kind          # e.g. "support" / "resistance"
+                    out[side_key] = kind
                 if isinstance(dist_pct, (int, float)):
                     out[dist_key] = float(dist_pct)
                 if isinstance(level, (int, float)):
                     out[level_key] = float(level)
 
-            # Per-TF SR: H1 + H4 (if present in sr)
             _attach_tf("H1", "sr_h1_side", "sr_h1_dist_pct", "sr_h1_level")
             _attach_tf("H4", "sr_h4_side", "sr_h4_dist_pct", "sr_h4_level")
 
-            # Legacy overall nearest (for generic use / scoring)
             nearest = sr.get("nearest") or sr.get("nearest_zone") or {}
             if isinstance(nearest, dict):
                 kind = (nearest.get("kind") or nearest.get("side") or "").lower()
                 if kind:
-                    out["sr_side"] = kind  # e.g. "support" / "resistance"
+                    out["sr_side"] = kind
                 dist_pct = nearest.get("distance_pct") or nearest.get("dist_pct")
                 if isinstance(dist_pct, (int, float)):
                     out["sr_dist_pct"] = float(dist_pct)
 
-
-        # Expose prediction delta so UI / logs can show how "fresh" it is
         if delta_pct is not None:
             out["opp_delta_pct"] = delta_pct
             out["opp_delta_thr"] = delta_thr
 
-        # Small textual summary for debugging / UI
-        tag_bits: list[str] = []
-        tag_bits.append(f"H1 move {m1:.3f}% (thr {thr1:.3f}%)")
-        if isinstance(m4, (int, float)):
-            tag_bits.append(f"H4 move {m4:.3f}% (thr {thr4:.3f}%)")
-            if h4_agree:
-                tag_bits.append("H1+H4 aligned")
-            else:
-                tag_bits.append("H1/H4 conflict")
-        tag_bits.append(f"opp_direction={opp_dir}")
-        tag_bits.append(f"opp_confidence={opp_conf}")
-        out.setdefault("opp_reason", "; ".join(tag_bits))
-
-        # Ensure time fields exist for UI refresh, even if predict_all stubbed
+        out.setdefault("opp_reason", f"H1 {m1:.3f}% thr {thr1:.3f}%; H4 {m4:.3f}% thr {thr4:.3f}%")
         out.setdefault("update_tf", tfu)
         out.setdefault("server_now_ms", now_ms)
 
-        # Freeze / update alert snapshot (status, hit/expired, etc.)
+        # freeze snapshot (keeps it visible until hit/expired)
         out = _freeze_or_snapshot_opp(sym, out, now_ms)
-        status = (out.get("status") or "active")
-        status = (str(status) or "").strip().lower()
+        status = str(out.get("status") or "active").strip().lower()
         if status in ("active", "new", "open"):
-           opp_rows.append(out)
-
-
-        
+            opp_rows.append(out)
 
     history = _load_opp_history(limit=50)
-    # If no real opportunities, return debug candidates for UI testing
+
     if (not opp_rows) and debug_top > 0 and debug_pool:
         debug_pool.sort(key=lambda x: float(x.get("opp_score") or 0.0), reverse=True)
         opp_rows = debug_pool[:debug_top]
 
-    
-
-    return {
-        "ok": True,
-        "tf": tfu,
-        "rows": opp_rows,
-        "history": history,
-    }
-
+    return {"ok": True, "tf": tfu, "rows": opp_rows, "history": history}
 
 
 @router.get("/opportunities/history")
@@ -5696,50 +5667,93 @@ def predict_4h_debug(
 def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
     """
     Evaluates whether an opportunity HIT target or EXPIRED.
-    Snapshot values from Redis are JSON-encoded (and often bytes).
-    Direction is UP/DOWN (not BUY/SELL).
+
+    - Direction is UP/DOWN (not BUY/SELL)
+    - Close snapshot ONLY when hit OR expired (time)
+    - Works even if alert_id is missing (uses opp_id as fallback)
+    - Computes target from trade_tp_pct_1h / expected_move_pct_1h if target_price_1h is missing
     """
 
     def _sj(key: str, default=None):
         v = snap.get(key)
         if v is None:
+            try:
+                v = snap.get(key.encode("utf-8"))
+            except Exception:
+                v = None
+        if v is None:
             return default
         if isinstance(v, (bytes, bytearray)):
             v = v.decode("utf-8", "ignore")
+        if isinstance(v, (int, float, bool, dict, list)):
+            return v
         try:
             return json.loads(v)
         except Exception:
             return v
 
-    direction = (_sj("opp_direction") or _sj("direction") or "").upper()
+    sym_u = (sym or "").upper()
+
+    direction = str((_sj("opp_direction") or _sj("direction") or "")).upper()
     if direction not in ("UP", "DOWN"):
         return
 
     alert_id = _sj("alert_id")
-    if not alert_id:
-        return
+    opp_id = _sj("opp_id") or _sj("oppId") or _sj("id")
+    has_alert = bool(alert_id)
 
+    # basis
+    basis = None
+    for k in ("alert_price_1h", "basis_price_1h", "basis_price", "alert_price", "basisPrice"):
+        try:
+            v = _sj(k)
+            if isinstance(v, (int, float)) and float(v) > 0:
+                basis = float(v)
+                break
+        except Exception:
+            pass
+
+    # target (prefer explicit)
+    target = None
+    for k in ("target_price_1h", "target_price", "targetPrice"):
+        try:
+            v = _sj(k)
+            if isinstance(v, (int, float)) and float(v) > 0:
+                target = float(v)
+                break
+        except Exception:
+            pass
+
+    # move pct (prefer trade_tp_pct_1h)
+    move_pct_1h = None
+    for k in ("trade_tp_pct_1h", "expected_move_pct_1h", "expected_move_pct", "move_pct_1h"):
+        try:
+            v = _sj(k)
+            if isinstance(v, (int, float)):
+                move_pct_1h = float(v)
+                break
+        except Exception:
+            pass
+
+    # times
     try:
-        target = float(_sj("target_price_1h"))
+        opp_open_ts = int(_sj("opp_open_ts") or 0)
     except Exception:
-        target = None
-
+        opp_open_ts = 0
     try:
-        basis = float(_sj("alert_price_1h") or _sj("basis_price"))
+        opp_expire_ts = int(_sj("opp_expire_ts") or 0)
     except Exception:
-        basis = None
-
+        opp_expire_ts = 0
     try:
         alert_ms = int(_sj("alert_created_ms") or 0)
     except Exception:
         alert_ms = 0
-
     try:
         horizon_min = int(_sj("horizon_min") or 60)
     except Exception:
         horizon_min = 60
 
-    # last_price preference: snapshot -> row -> basis
+    # last_price: snap -> row -> basis
     last_price = None
     try:
         lp = _sj("last_price")
@@ -5748,8 +5762,12 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
     except Exception:
         last_price = None
 
-    if last_price is None and isinstance(row.get("last_close"), (int, float)):
-        last_price = float(row["last_close"])
+    if last_price is None:
+        for rk in ("last_price", "price", "lastClose", "last_close", "mid", "close", "bid", "ask"):
+            v = row.get(rk)
+            if isinstance(v, (int, float)):
+                last_price = float(v)
+                break
 
     if last_price is None and isinstance(basis, (int, float)):
         last_price = float(basis)
@@ -5761,12 +5779,17 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
     if isinstance(basis, (int, float)) and basis:
         realized_move_pct = (last_price - basis) / basis * 100.0
 
-    sym_u = (sym or "").upper()
     snap_key = _opp_snapshot_key(sym_u, direction)
 
-    # HIT
+    # compute target if missing
+    if target is None and isinstance(basis, (int, float)) and basis and isinstance(move_pct_1h, (int, float)):
+        pct = float(move_pct_1h) / 100.0
+        pct_abs = abs(pct)
+        target = basis * (1.0 + pct_abs) if direction == "UP" else basis * (1.0 - pct_abs)
+
+    # ---------------- HIT ----------------
     hit = False
-    if isinstance(target, (int, float)):
+    if isinstance(target, (int, float)) and target and last_price:
         if direction == "UP" and last_price >= target:
             hit = True
         elif direction == "DOWN" and last_price <= target:
@@ -5774,19 +5797,46 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
 
     if hit:
         try:
-            _mark_alert_hit(alert_id, realized_move_pct, now_ms)
+            if has_alert:
+                _mark_alert_hit(alert_id, realized_move_pct, now_ms)
 
-            key = f"{ALERT_HASH_PREFIX}{alert_id}"
-            extra = {
+                key = f"{ALERT_HASH_PREFIX}{alert_id}"
+                extra = {
+                    "status": json.dumps("hit"),
+                    "hit_target": json.dumps(True),
+                    "hit_ts": json.dumps(now_ms),
+                    "last_status_ms": json.dumps(now_ms),
+                    "time_to_target_min": json.dumps((now_ms - alert_ms) / 60000.0 if alert_ms else None),
+                    "last_price": json.dumps(last_price),
+                }
+                if realized_move_pct is not None:
+                    extra["realized_move_pct"] = json.dumps(realized_move_pct)
+
+                # IMPORTANT: ensure indexed snapshot exists as HIT (NOT active)
+                try:
+                    _save_alert_snapshot(sym_u, {
+                        "alert_id": alert_id,
+                        "symbol": sym_u,
+                        "opp_direction": direction,
+                        "direction": direction,
+                        "alert_created_ms": alert_ms or now_ms,
+                        "status": "hit",
+                        "hit_target": True,
+                        "hit_ts": now_ms,
+                        "last_status_ms": now_ms,
+                    })
+                except Exception:
+                    pass
+
+                R.hset(key, mapping=extra)
+
+            # update live snapshot status too
+            R.hset(snap_key, mapping={
                 "status": json.dumps("hit"),
-                "hit_target": json.dumps(True),
                 "hit_ts": json.dumps(now_ms),
-                "time_to_target_min": json.dumps((now_ms - alert_ms) / 60000.0 if alert_ms else None),
+                "last_status_ms": json.dumps(now_ms),
                 "last_price": json.dumps(last_price),
-            }
-            R.hset(key, mapping=extra)
-
-            R.hset(snap_key, mapping={"status": json.dumps("hit")})
+            })
         except Exception:
             pass
 
@@ -5796,24 +5846,56 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
             pass
         return
 
-    # EXPIRED
-    if alert_ms and (now_ms - alert_ms >= horizon_min * 60_000):
+    # ---------------- EXPIRED ----------------
+    expired = False
+    if opp_expire_ts and now_ms >= opp_expire_ts:
+        expired = True
+    else:
+        base_ms = alert_ms or opp_open_ts
+        if base_ms and (now_ms - base_ms >= horizon_min * 60_000):
+            expired = True
+
+    if expired:
         try:
-            _mark_alert_expired(alert_id, now_ms)
+            if has_alert:
+                _mark_alert_expired(alert_id, now_ms)
 
-            key = f"{ALERT_HASH_PREFIX}{alert_id}"
-            extra = {
+                key = f"{ALERT_HASH_PREFIX}{alert_id}"
+                extra = {
+                    "status": json.dumps("expired"),
+                    "hit_target": json.dumps(False),
+                    "expired_ts": json.dumps(now_ms),
+                    "last_status_ms": json.dumps(now_ms),
+                    "time_to_target_min": json.dumps(float(horizon_min)),
+                    "last_price": json.dumps(last_price),
+                }
+                if realized_move_pct is not None:
+                    extra["realized_move_pct"] = json.dumps(realized_move_pct)
+
+                # IMPORTANT: ensure indexed snapshot exists as EXPIRED (NOT active)
+                try:
+                    _save_alert_snapshot(sym_u, {
+                        "alert_id": alert_id,
+                        "symbol": sym_u,
+                        "opp_direction": direction,
+                        "direction": direction,
+                        "alert_created_ms": alert_ms or now_ms,
+                        "status": "expired",
+                        "hit_target": False,
+                        "expired_ts": now_ms,
+                        "last_status_ms": now_ms,
+                    })
+                except Exception:
+                    pass
+
+                R.hset(key, mapping=extra)
+
+            R.hset(snap_key, mapping={
                 "status": json.dumps("expired"),
-                "hit_target": json.dumps(False),
                 "expired_ts": json.dumps(now_ms),
-                "time_to_target_min": json.dumps(float(horizon_min)),
+                "last_status_ms": json.dumps(now_ms),
                 "last_price": json.dumps(last_price),
-            }
-            if realized_move_pct is not None:
-                extra["realized_move_pct"] = json.dumps(realized_move_pct)
-            R.hset(key, mapping=extra)
-
-            R.hset(snap_key, mapping={"status": json.dumps("expired")})
+            })
         except Exception:
             pass
 
