@@ -145,6 +145,242 @@ function DownloadAgentRow() {
   );
 }
 
+
+const DISCORD_INVITE_URL: string =
+  ((import.meta as any)?.env?.VITE_DISCORD_INVITE_URL as string) ||
+  (typeof (window as any) !== "undefined" ? (window as any).__XTL_DISCORD_INVITE_URL__ : "") ||
+  "";
+
+type DiscordConnectState = "not_connected" | "connected";
+
+function getDiscordState(): DiscordConnectState {
+  try {
+    const v = localStorage.getItem("xtl:discord:connected");
+    return v === "1" ? "connected" : "not_connected";
+  } catch {
+    return "not_connected";
+  }
+}
+
+function setDiscordState(s: DiscordConnectState) {
+  try {
+    localStorage.setItem("xtl:discord:connected", s === "connected" ? "1" : "0");
+  } catch {
+    // ignore
+  }
+}
+
+function DiscordAlertsCard() {
+  const [state, setState] = React.useState<DiscordConnectState>(() => getDiscordState());
+
+  const inviteOk = Boolean(DISCORD_INVITE_URL && DISCORD_INVITE_URL.startsWith("http"));
+
+  const inviteHost = React.useMemo(() => {
+    if (!inviteOk) return "";
+    try {
+      return new URL(DISCORD_INVITE_URL).host;
+    } catch {
+      return "";
+    }
+  }, [inviteOk]);
+
+  function openInvite() {
+    if (!inviteOk) return;
+    window.open(DISCORD_INVITE_URL, "_blank", "noopener,noreferrer");
+  }
+
+  const ExternalIcon = (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+      className="opacity-90"
+    >
+      <path
+        d="M14 3h7v7"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M10 14L21 3"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M21 14v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h6"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        opacity="0.8"
+      />
+    </svg>
+  );
+
+  const CheckIcon = (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      className="mt-0.5 text-emerald-300"
+      aria-hidden="true"
+    >
+      <path
+        d="M20 6L9 17l-5-5"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+
+  return (
+    <div className="rounded-2xl border border-slate-700 bg-slate-800/60 p-6 shadow">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-medium text-slate-100">Real-Time Trade Alerts</h2>
+          <p className="mt-1 text-sm text-slate-400">
+            Get BUY/SELL entry alerts, target hits and expiry updates instantly via Discord (free).
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span
+            className={cx(
+              "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold",
+              state === "connected"
+                ? "bg-emerald-500/15 text-emerald-200 ring-1 ring-emerald-400/30"
+                : "bg-slate-700/40 text-slate-200 ring-1 ring-slate-600/40"
+            )}
+          >
+            <span
+              className={cx(
+                "h-2 w-2 rounded-full",
+                state === "connected" ? "bg-emerald-400" : "bg-slate-400"
+              )}
+            />
+            {state === "connected" ? "Connected" : "Not connected"}
+          </span>
+        </div>
+      </div>
+
+      <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <div className="rounded-xl border border-slate-700 bg-slate-900/40 p-4">
+          <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+            You&apos;ll receive
+          </div>
+          <ul className="mt-3 space-y-2 text-sm text-slate-200">
+            <li className="flex gap-2">
+              {CheckIcon}
+              <span>
+                Entry alert with <b>Entry / TP / SL</b>
+              </span>
+            </li>
+            <li className="flex gap-2">
+              {CheckIcon}
+              <span>
+                Updates: <b>Hit</b> / <b>Expired</b>
+              </span>
+            </li>
+            <li className="flex gap-2">
+              {CheckIcon}
+              <span>Read-only channels (no spam)</span>
+            </li>
+          </ul>
+          <p className="mt-3 text-xs text-slate-400">
+            We never read your messages or post on your behalf.
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-slate-700 bg-slate-900/40 p-4">
+          <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+            How to connect
+          </div>
+          <ol className="mt-3 list-decimal space-y-2 pl-5 text-sm text-slate-200">
+            <li>
+              Click <b>{state === "connected" ? "Open Discord" : "Connect Discord"}</b> to join our server.
+              {inviteOk && inviteHost && (
+                <span className="ml-2 inline-flex items-center rounded-full border border-slate-600/60 bg-slate-800/40 px-2 py-0.5 text-[11px] font-semibold text-slate-200">
+                  {inviteHost}
+                </span>
+              )}
+            </li>
+            <li>If you don&apos;t have an account, Discord will prompt you to create one (free).</li>
+            {inviteOk && <li>After joining, come back and click <b>Mark as connected</b>.</li>}
+          </ol>
+
+          {!inviteOk && (
+            <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              Discord invite URL not configured. Set{" "}
+              <code className="text-amber-100">VITE_DISCORD_INVITE_URL</code> or{" "}
+              <code className="text-amber-100">window.__XTL_DISCORD_INVITE_URL__</code>.
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-xl border border-slate-700 bg-slate-900/40 p-4">
+          <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Actions</div>
+
+          <div className="mt-3 flex flex-col gap-2">
+            {/* ONE primary button that always opens the invite/server */}
+            <button
+              onClick={openInvite}
+              disabled={!inviteOk}
+              className={cx(
+                "inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold shadow-sm",
+                inviteOk
+                  ? "bg-indigo-600 text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                  : "bg-slate-700/60 text-slate-300 cursor-not-allowed"
+              )}
+            >
+              <span>{state === "connected" ? "Open Discord" : "Connect Discord"}</span>
+              {inviteOk && ExternalIcon}
+            </button>
+
+            {/* Secondary button: local state only */}
+            {state !== "connected" ? (
+              inviteOk ? (
+                <button
+                  onClick={() => {
+                    setDiscordState("connected");
+                    setState("connected");
+                  }}
+                  className="inline-flex items-center justify-center rounded-xl border border-slate-600 bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 hover:bg-slate-700"
+                >
+                  Mark as connected
+                </button>
+              ) : null
+            ) : (
+              <button
+                onClick={() => {
+                  setDiscordState("not_connected");
+                  setState("not_connected");
+                }}
+                className="inline-flex items-center justify-center rounded-xl border border-slate-600 bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 hover:bg-slate-700"
+                title="Resets only the onboarding status on this browser"
+              >
+                Reset status
+              </button>
+            )}
+          </div>
+
+          <p className="mt-3 text-xs text-slate-400">
+            Tip: keep Discord installed on mobile for instant push notifications.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Onboarding() {
   const [loading, setLoading] = React.useState(false);
   const [devices, setDevices] = React.useState<Device[]>([]);
@@ -188,7 +424,7 @@ export default function Onboarding() {
       </p>
 
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Card 1 — Download the Agent */}
+        {/* Card 1  Download the Agent */}
         <div className="rounded-2xl border border-slate-700 bg-slate-800/60 p-6 shadow">
           <h2 className="text-lg font-medium text-slate-100">Download the Agent</h2>
 
@@ -211,7 +447,7 @@ export default function Onboarding() {
           </div>
         </div>
 
-        {/* Card 2 — This Device (only most recent device) */}
+        {/* Card 2  This Device (only most recent device) */}
         <div className="rounded-2xl border border-slate-700 bg-slate-800/60 p-6 shadow">
           <div className="flex items-start justify-between gap-4">
             <h2 className="text-lg font-medium text-slate-100">This Device</h2>
@@ -289,6 +525,12 @@ export default function Onboarding() {
           </div>
         </div>
       </div>
+
+      {/* Card 3  Real-Time Alerts (Discord) */}
+      <div className="mt-6">
+        <DiscordAlertsCard />
+      </div>
+
     </div>
   );
 }

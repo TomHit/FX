@@ -1,5 +1,64 @@
 import React from "react";
 
+type LivePrice = { price: number; lastTs: number };
+
+function useLivePrices(refreshMs: number = 30_000) {
+  const [prices, setPrices] = React.useState<Record<string, LivePrice>>({});
+  const [updatedAt, setUpdatedAt] = React.useState<number | null>(null);
+
+  const refetch = React.useCallback(async () => {
+    try {
+      const url = `/_api/trend/price/all?tf=M1&_=${Date.now()}`;
+      const res = await fetch(url, { credentials: "include", cache: "no-store" });
+      if (!res.ok) return;
+      const js = await res.json();
+      const map: Record<string, LivePrice> = {};
+      if (Array.isArray(js?.rows)) {
+        for (const r of js.rows) {
+          if (r?.symbol && typeof r?.price === "number" && typeof r?.lastTs === "number") {
+            map[String(r.symbol).toUpperCase()] = { price: r.price, lastTs: r.lastTs };
+          }
+        }
+      }
+      setPrices(map);
+      setUpdatedAt(Date.now());
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  React.useEffect(() => {
+    let t: number | null = null;
+    const tick = async () => {
+      await refetch();
+      t = window.setTimeout(tick, refreshMs);
+    };
+    void tick();
+
+    const onVis = () => { if (document.visibilityState === "visible") void refetch(); };
+    const onFocus = () => void refetch();
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVis);
+
+    return () => {
+      if (t) window.clearTimeout(t);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [refetch, refreshMs]);
+
+  return { prices, updatedAt, refetch };
+}
+
+function outcomeTimeMs(r: any): number | null {
+  const st = String(r?.status || "").toLowerCase();
+  if (st === "hit") return typeof r?.hitTsMs === "number" ? r.hitTsMs : null;
+  if (st === "expired") return typeof r?.expiredTsMs === "number" ? r.expiredTsMs : null;
+  // fallback: use updatedMs if backend didn�t provide explicit hit/expired ts
+  return typeof r?.updatedMs === "number" ? r.updatedMs : null;
+}
+
+
 /**
  * OpportunitiesDashboard.tsx
  *
@@ -60,6 +119,23 @@ type ApiRow = {
   decision?: string;                   // "BUY" | "SELL" | "ABSTAIN"
   opp_delta_pct?: number | null;
   opp_delta_thr?: number | null;
+
+  // Strategy-side signal (optional; may be absent)
+  signal?: string | null;             // e.g., "BUY", "SELL", "BUY@1234.5"
+  signal_text?: string | null;        // UI-friendly text
+  signal_price?: number | null;
+  signal_ts_ms?: number | null;
+  // Frozen entry metadata (backend persists in alert snapshot)
+  entry_triggered?: boolean | null;
+  entry_signal?: string | null;     // "BUY" | "SELL"
+  entry_reason?: string | null;
+  entry_ts_ms?: number | null;      // when entry triggered
+  entry_price?: number | null;      // frozen entry price
+  hit_ts_ms?: number | null;
+  expired_ts_ms?: number | null;
+  updated_ms?: number | null;
+ 
+
 };
 
 
@@ -68,15 +144,29 @@ type ApiRow = {
  */
 type ApiHistoryRow = {
   alert_time_ms?: number;
+  alert_created_ms?: number;
   symbol?: string;
   direction?: string;            // "UP" / "DOWN"
   decision?: string;             // "BUY" / "SELL" / "ABSTAIN"
   horizon_min?: number;
+
   expected_move_pct?: number;
-  hit_target?: boolean | null;
   realized_move_pct?: number | null;
   max_drawdown_pct?: number | null;
   time_to_target_min?: number | null;
+  hit_target?: boolean | null;
+
+  // Optional outcome/status timestamps (if backend provides)
+  status?: string | null;
+  hit_ts_ms?: number | null;
+  expired_ts_ms?: number | null;
+  updated_ms?: number | null;
+
+  // Optional frozen entry meta (if backend provides in history)
+  entry_signal?: string | null;     // "BUY"/"SELL"
+  entry_ts_ms?: number | null;
+  entry_price?: number | null;
+  signal_text?: string | null;      // fallback label
 };
 
 /**
@@ -100,7 +190,22 @@ type OppRow = {
   srSide: string | null;
   srDistPct: number | null;
   srLabel: string | null;
-  status?: "active" | "hit" | "expired" | string | null;
+  
+
+  signalText?: string | null;
+  signalPrice?: number | null;
+  signalTsMs?: number | null;
+  entryTriggered?: boolean | null;
+  entrySignal?: string | null;
+  entryReason?: string | null;
+  entryTsMs?: number | null;
+  entryPrice?: number | null;
+  hitTsMs?: number | null;
+  expiredTsMs?: number | null;
+  updatedMs?: number | null;
+  status?: string | null;
+
+
 };
 
 /**
@@ -112,11 +217,21 @@ type HistoryRow = {
   direction: Direction;
   horizonMin: number;
   expectedMovePct: number;
+
   status?: "hit" | "expired" | "active" | string | null;
   hitTarget?: boolean | null;
   realizedMovePct?: number | null;
   maxDrawdownPct?: number | null;
   timeToTargetMin?: number | null;
+
+  // NEW: optional entry/outcome meta used by History UI
+  entrySignal?: string | null;
+  signalText?: string | null;
+  entryPrice?: number | null;
+  entryTsMs?: number | null;
+  hitTsMs?: number | null;
+  expiredTsMs?: number | null;
+  updatedMs?: number | null;
 };
 
 const API_BASE =
@@ -129,7 +244,7 @@ const API_BASE =
  * -------------------------- */
 
 function fmtPrice(sym: string, px: number | null | undefined): string {
-  if (!Number.isFinite(px as any)) return "";
+  if (!Number.isFinite(px as any)) return "—";
   const s = sym.toUpperCase();
   const d = s === "XAUUSD" ? 2 : s.endsWith("JPY") ? 3 : 5;
   return (px as number).toFixed(d);
@@ -305,6 +420,93 @@ function mapApiRow(r: ApiRow): OppRow | null {
   const normStatus =
     typeof rawStatus === "string" ? rawStatus.toLowerCase() : rawStatus;
 
+  // Prefer backend-provided signal_text/signal, else derive from decision/direction
+  const backendSignalText =
+    (typeof (r as any).signal_text === "string" && (r as any).signal_text.trim())
+      ? (r as any).signal_text.trim()
+      : (typeof (r as any).signal === "string" && (r as any).signal.trim())
+        ? (r as any).signal.trim()
+        : null;
+
+  const decisionU = String((r as any).decision || "").toUpperCase();
+  const dirFallback =
+    decisionU === "BUY" || decisionU === "SELL"
+      ? decisionU
+      : (direction === "up" ? "BUY" : direction === "down" ? "SELL" : "");
+
+  const derivedSignalText =
+    dirFallback
+      ? (typeof basisPrice === "number"
+          ? `${dirFallback} @ ${fmtPrice(r.symbol, basisPrice)}`
+          : dirFallback)
+      : null;
+
+  const signalText = backendSignalText ?? derivedSignalText;
+
+
+  const signalPrice =
+    typeof (r as any).signal_price === "number"
+      ? (r as any).signal_price
+      : null;
+
+  const signalTsMs =
+    typeof (r as any).signal_ts_ms === "number"
+      ? (r as any).signal_ts_ms
+      : null;
+  // -------- entry metadata (preferred when present) --------
+  const entryTriggered =
+    typeof (r as any).entry_triggered === "boolean" ? (r as any).entry_triggered : null;
+
+  const entrySignal =
+    typeof (r as any).entry_signal === "string" ? String((r as any).entry_signal).toUpperCase() : null;
+
+  const entryReason =
+    typeof (r as any).entry_reason === "string" ? (r as any).entry_reason : null;
+
+  const entryTsMs =
+    typeof (r as any).entry_ts_ms === "number" ? (r as any).entry_ts_ms : null;
+
+  const entryPrice =
+    typeof (r as any).entry_price === "number" ? (r as any).entry_price : null;
+
+  // If entry has triggered, make Signal column deterministic:
+  // show BUY/SELL + frozen entry price, and use entry_ts_ms as signal timestamp.
+  const finalSignalText =
+    entryTriggered && (entrySignal === "BUY" || entrySignal === "SELL")
+      ? (typeof entryPrice === "number"
+          ? `${entrySignal} @ ${fmtPrice(r.symbol, entryPrice)}`
+          : entrySignal)
+      : signalText;
+
+  const finalSignalPrice =
+    entryTriggered && typeof entryPrice === "number"
+      ? entryPrice
+      : signalPrice;
+
+  const finalSignalTsMs =
+    entryTriggered && typeof entryTsMs === "number"
+      ? entryTsMs
+      : signalTsMs;
+  
+
+  const hitTsMs =
+    typeof (r as any).hit_ts_ms === "number"
+      ? (r as any).hit_ts_ms
+      : (typeof (r as any).hit_ts === "number" ? (r as any).hit_ts : null);
+
+  const expiredTsMs =
+    typeof (r as any).expired_ts_ms === "number"
+      ? (r as any).expired_ts_ms
+      : (typeof (r as any).expired_ts === "number" ? (r as any).expired_ts : null);
+
+  const updatedMs =
+    typeof (r as any).updated_ms === "number"
+      ? (r as any).updated_ms
+      : null;
+
+
+  
+
   return {
     symbol: r.symbol,
     direction,
@@ -324,6 +526,21 @@ function mapApiRow(r: ApiRow): OppRow | null {
     srDistPct,
     srLabel,
     status: normStatus ?? null,
+    signalText: finalSignalText,
+    signalPrice: finalSignalPrice,
+    signalTsMs: finalSignalTsMs,
+
+    entryTriggered,
+    entrySignal,
+    entryReason,
+    entryTsMs,
+    entryPrice,
+
+    hitTsMs,
+    expiredTsMs,
+    updatedMs,
+
+
 
   };
 }
@@ -339,8 +556,16 @@ function mapHistoryRow(h: ApiHistoryRow): HistoryRow | null {
   if (!alertTimeMs) return null;
 
   const horizonMin = typeof h.horizon_min === "number" ? h.horizon_min : 60;
-  const expectedMovePct =
-    typeof h.expected_move_pct === "number" ? h.expected_move_pct : 0;
+  const expectedMovePct = typeof h.expected_move_pct === "number" ? h.expected_move_pct : 0;
+
+  const status =
+    typeof h.status === "string"
+      ? h.status.toLowerCase()
+      : h.hit_target === true
+        ? "hit"
+        : h.hit_target === false
+          ? "expired"
+          : "active";
 
   return {
     symbol,
@@ -348,16 +573,21 @@ function mapHistoryRow(h: ApiHistoryRow): HistoryRow | null {
     alertTimeMs,
     horizonMin,
     expectedMovePct,
-    status: h.hit_target === true
-      ? "hit"
-      : h.hit_target === false
-        ? "expired"
-        : "active",
 
+    status,
     hitTarget: h.hit_target,
     realizedMovePct: h.realized_move_pct,
     maxDrawdownPct: h.max_drawdown_pct,
     timeToTargetMin: h.time_to_target_min,
+
+    // NEW: optional fields if backend sends them
+    entrySignal: typeof h.entry_signal === "string" ? String(h.entry_signal).toUpperCase() : null,
+    signalText: typeof h.signal_text === "string" ? h.signal_text : null,
+    entryPrice: typeof h.entry_price === "number" ? h.entry_price : null,
+    entryTsMs: typeof h.entry_ts_ms === "number" ? h.entry_ts_ms : null,
+    hitTsMs: typeof h.hit_ts_ms === "number" ? h.hit_ts_ms : null,
+    expiredTsMs: typeof h.expired_ts_ms === "number" ? h.expired_ts_ms : null,
+    updatedMs: typeof h.updated_ms === "number" ? h.updated_ms : null,
   };
 }
 
@@ -374,6 +604,7 @@ type ApiResponse = {
 
 function useOpportunities() {
   const [rows, setRows] = React.useState<OppRow[]>([]);
+  const { prices: livePrices } = useLivePrices(30_000);
   const [history, setHistory] = React.useState<HistoryRow[]>([]);
   const [lastAt, setLastAt] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -385,13 +616,15 @@ function useOpportunities() {
 
   // Optional: optimistic completions (used only if a frozen item expires client-side
   // before backend returns it in history; backend should normally be the source of truth).
-  const completedRef = React.useRef<Map<string, HistoryRow>>(new Map());
+  // Note: we no longer expire client-side; completion should come from backend status/history.
 
   const CACHE_ROWS_KEY = "xtl_opp_rows_cache_v1";
   const CACHE_HIST_KEY = "xtl_opp_history_cache_v1";
   const CACHE_AT_KEY = "xtl_opp_lastAt_cache_v1";
 
   async function fetchOnce() {
+    const now = Date.now();
+
     try {
       setError(null);
 
@@ -427,15 +660,14 @@ function useOpportunities() {
           .filter((x): x is HistoryRow => x !== null)
           .sort((a, b) => b.alertTimeMs - a.alertTimeMs);
 
-      // Build a set of symbols that are already completed in history.
-      // When an opp completes, remove it from the live frozen list so it "moves" to history.
-      const completedSyms = new Set(
+      // Completed alerts keyed by (symbol + alertTimeMs), NOT just symbol.
+      const completedKeys = new Set(
         mappedHistory
           .filter((h) => h.hitTarget === true || h.hitTarget === false)
-          .map((h) => h.symbol)
+          .map((h) => `${h.symbol}:${h.alertTimeMs ?? 0}`)
       );
 
-      const now = Date.now();
+      const rowKey = (r: OppRow) => `${r.symbol}:${r.alertTimeMs ?? 0}`;
 
       // 1) Update / insert frozen snapshots from freshly mapped rows
       for (const r of mappedRows) {
@@ -445,8 +677,8 @@ function useOpportunities() {
           continue;
         }
 
-        // If it is in history as completed, remove from live.
-        if (completedSyms.has(r.symbol)) {
+        // Only remove if THIS SAME alert instance is completed
+        if (completedKeys.has(rowKey(r))) {
           frozenRef.current.delete(r.symbol);
           continue;
         }
@@ -461,38 +693,14 @@ function useOpportunities() {
         }
       }
 
-      // 2) Prune expired snapshots (default horizon 60 minutes) and (optionally) push to local history
-      for (const [sym, snap] of Array.from(frozenRef.current.entries())) {
-        if (completedSyms.has(sym)) {
+      // 2) Prune only those already completed in backend history.
+      for (const [sym, existing] of Array.from(frozenRef.current.entries())) {
+        if (completedKeys.has(`${sym}:${existing.alertTimeMs ?? 0}`)) {
           frozenRef.current.delete(sym);
-          continue;
-        }
-
-        const opened = snap.alertTimeMs ?? 0;
-        const horizonMin = snap.horizonMin ?? 60;
-
-        if (opened > 0 && now - opened >= horizonMin * 60_000) {
-          frozenRef.current.delete(sym);
-
-          // optimistic expired history row (UI updates even if backend lags by one poll)
-          const key = `${sym}-${opened}`;
-          if (!completedRef.current.has(key)) {
-            completedRef.current.set(key, {
-              symbol: sym,
-              direction: snap.direction,
-              alertTimeMs: opened,
-              horizonMin,
-              expectedMovePct: snap.movePct ?? 0,
-              hitTarget: false,
-              realizedMovePct: null,
-              maxDrawdownPct: null,
-              timeToTargetMin: horizonMin,
-            });
-          }
         }
       }
 
-      // 3) Final rows = all non-expired frozen snapshots, sorted
+      // 3) Final rows = all frozen snapshots, sorted
       const frozenRows = Array.from(frozenRef.current.values()).sort((a, b) => {
         if (b.absMovePct !== a.absMovePct) return b.absMovePct - a.absMovePct;
         const sa = a.oppScore ?? 0;
@@ -502,23 +710,14 @@ function useOpportunities() {
 
       setRows(frozenRows);
 
-      // History = backend truth first, then local optimistic completions (only if missing)
-      const merged = new Map<string, HistoryRow>();
-      for (const h of mappedHistory) merged.set(`${h.symbol}-${h.alertTimeMs}`, h);
-      for (const [k, v] of completedRef.current.entries()) {
-        if (!merged.has(k)) merged.set(k, v);
-      }
-      const mergedHistory = Array.from(merged.values()).sort(
-        (a, b) => b.alertTimeMs - a.alertTimeMs
-      );
-
-      setHistory(mergedHistory);
+      // History = backend truth.
+      setHistory(mappedHistory);
       setLastAt(now);
 
       // Persist lightweight cache so navigating away/back doesn't look "blank"
       try {
         sessionStorage.setItem(CACHE_ROWS_KEY, JSON.stringify(frozenRows));
-        sessionStorage.setItem(CACHE_HIST_KEY, JSON.stringify(mergedHistory));
+        sessionStorage.setItem(CACHE_HIST_KEY, JSON.stringify(mappedHistory));
         sessionStorage.setItem(CACHE_AT_KEY, String(now));
       } catch {
         // ignore storage failures
@@ -528,7 +727,6 @@ function useOpportunities() {
       setError(e?.message || String(e));
     }
   }
-
   React.useEffect(() => {
     // Hydrate cached state immediately (helps when navigating away/back)
     try {
@@ -607,7 +805,8 @@ const Pill: React.FC<{
 
 function OpportunitiesDashboard() {
   const { rows, history, lastAt, error, refetch } = useOpportunities();
-  const lastUpdatedLabel = lastAt ? fmtTime(lastAt) : "";
+  const livePrices = useLivePrices(30_000);
+  const lastUpdatedLabel = lastAt ? fmtTime(lastAt) : "—";
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5 px-3 pb-10 pt-4">
@@ -685,9 +884,12 @@ function OpportunitiesDashboard() {
                   Symbol
                 </th>
                 <th className="px-3 py-2 text-left">Direction</th>
-                <th className="px-3 py-2 text-right">Move (H1)</th>
+                <th className="px-3 py-2 text-right">Live</th>
                 <th className="px-3 py-2 text-right">Basis</th>
                 <th className="px-3 py-2 text-right">Target</th>
+                <th className="px-3 py-2 text-right">Time left</th>
+                <th className="px-3 py-2 text-left">Signal</th>
+                <th className="px-3 py-2 text-right">Status</th>
                 <th className="px-3 py-2 text-right">Room</th>
                 <th className="px-3 py-2 text-right">Score</th>
                 <th className="px-3 py-2 text-right">Prob</th>
@@ -699,7 +901,7 @@ function OpportunitiesDashboard() {
               {rows.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={10}
+                    colSpan={13}
                     className="px-4 py-7 text-center text-xs text-slate-400"
                   >
                     No active opportunities have passed the room & confidence
@@ -713,18 +915,47 @@ function OpportunitiesDashboard() {
                   const dirLabel = fmtDirectionLabel(r.direction);
                   const dirColor: "up" | "down" | "flat" = r.direction;
 
-                  const moveStr =
-                    r.movePct === 0
-                      ? "0.00%"
-                      : (r.movePct > 0 ? "+" : "") + r.movePct.toFixed(2) + "%";
+                  const horizonMin = typeof r.horizonMin === "number" ? r.horizonMin : 60;
+                  const horizonMs = horizonMin * 60_000;
+                  const timeLeftMs =
+                    typeof r.alertTimeMs === "number" ? (r.alertTimeMs + horizonMs - Date.now()) : null;
+                  const timeLeftText =
+                    timeLeftMs == null
+                      ? "—"
+                      : (timeLeftMs <= 0
+                          ? "0m"
+                          : `${Math.ceil(timeLeftMs / 60_000)}m`);
 
-                  const roomStr = r.absMovePct.toFixed(2) + "%";
+                  const statusText =
+                    typeof r.status === "string" && r.status
+                      ? r.status.toUpperCase()
+                      : "ACTIVE";
+                  const lp =
+                    livePrices?.prices?.[sym]?.price ??                    
+                    (typeof (r as any).last_price === "number" ? (r as any).last_price : null) ??
+                    (typeof (r as any).mid === "number" ? (r as any).mid : null) ??                      
+                    r.basisPrice;
+                      
+
+                  const liveStr = fmtPrice(sym, typeof lp === "number" ? lp : null);
+
+                  let distToTargetStr = "—";
+                  if (
+                    typeof lp === "number" &&
+                    typeof r.targetPrice === "number" &&
+                    typeof r.basisPrice === "number" &&
+                    r.basisPrice > 0
+                  ) {
+                    const distPct = Math.abs((r.targetPrice - lp) / r.basisPrice) * 100.0;
+                    distToTargetStr = distPct.toFixed(2) + "%";
+                  }
+const roomStr = r.absMovePct.toFixed(2) + "%";
                   const scoreStr =
-                    r.oppScore != null ? r.oppScore.toFixed(1) : "";
+                    r.oppScore != null ? r.oppScore.toFixed(1) : "—";
                   const probStr =
                     r.probUp != null
                       ? (r.probUp * 100).toFixed(0)+"%"
-                      : "";
+                      : "—";
 
                   const reasons = r.reasons.slice(0, 3);
 
@@ -758,14 +989,47 @@ function OpportunitiesDashboard() {
                           )}
                         </div>
                       </td>
-                      <td className="px-3 py-2 text-right tabular-nums text-slate-50">
-                        {moveStr}
-                      </td>
+                      <td className="px-3 py-3 text-right">
+                    <div className="font-medium">{liveStr}</div>
+                    <div className="mt-0.5 text-xs text-slate-400">{distToTargetStr} to target</div>
+                  </td>
                       <td className="px-3 py-2 text-right tabular-nums text-slate-200">
                         {fmtPrice(sym, r.basisPrice)}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums text-slate-200">
                         {fmtPrice(sym, r.targetPrice)}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-slate-200">
+                        {timeLeftText}
+                      </td>
+                      <td className="px-3 py-2">
+                        {r.signalText ? (
+                          <div className="flex flex-col gap-0.5">
+                            <span className="inline-flex items-center rounded-full border border-slate-700/70 bg-slate-900/60 px-2 py-0.5 text-[10px] font-semibold text-slate-200">
+                              {r.signalText}
+                            </span>
+
+                            {typeof r.signalTsMs === "number" && r.signalTsMs > 0 && (
+                              <span className="text-[10px] text-slate-400">
+                                Triggered: {fmtTime(r.signalTsMs)}
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-[11px] text-slate-500">�</span>
+                        )}
+                      </td>
+
+                      <td className="px-3 py-2 text-right">
+                        <span className={
+                          statusText === "HIT"
+                            ? "rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200"
+                            : statusText === "EXPIRED"
+                              ? "rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-200"
+                              : "rounded-full bg-slate-800/80 px-2 py-0.5 text-[10px] font-semibold text-slate-200"
+                        }>
+                          {statusText}
+                        </span>
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums text-slate-200">
                         {roomStr}
@@ -827,121 +1091,167 @@ function OpportunitiesDashboard() {
       </Card>
 
       {/* History */}
-      <Card>
-        <div className="flex items-center justify-between border-b border-slate-800/80 px-4 py-3">
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-400">
-              Alert History
-            </div>
-            <div className="mt-0.5 text-[11px] text-slate-500">
-              Completed H1 opportunities  hit, missed or expired.
-            </div>
-          </div>
-          <div className="text-[11px] text-slate-500">
-            Last{" "}
-            <span className="font-medium text-slate-200">
-              {history.length || 0}
-            </span>{" "}
-            alerts
-          </div>
-        </div>
-
-        <div className="overflow-x-auto">
-          <table className="min-w-full border-separate border-spacing-0 text-xs">
-            <thead>
-              <tr className="bg-slate-950/80 text-[11px] uppercase tracking-wide text-slate-400">
-                <th className="px-4 py-2 text-left">When</th>
-                <th className="px-3 py-2 text-left">Symbol</th>
-                <th className="px-3 py-2 text-left">Direction</th>
-                <th className="px-3 py-2 text-right">Move (H1)</th>
-                <th className="px-3 py-2 text-right">Result</th>
-                <th className="px-3 py-2 text-right">Max DD</th>
-                <th className="px-3 py-2 text-right">Time to target</th>
-              </tr>
-            </thead>
-            <tbody>
-              {history.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={7}
-                    className="px-4 py-6 text-center text-xs text-slate-400"
-                  >
-                    No completed opportunities tracked yet. As alerts hit target
-                    or expire, they will show up here with realized move and
-                    drawdown.
-                  </td>
-                </tr>
-              ) : (
-                history.map((h, idx) => {
-                  const dirLabel = fmtDirectionLabel(h.direction);
-                  const moveStr =
-                    h.expectedMovePct === 0
-                      ? "0.00%"
-                      : (h.expectedMovePct > 0 ? "+" : "") + h.expectedMovePct.toFixed(2) + "%";
-
-
-                  let resultLabel = "Pending";
-                  let resultClass = "text-slate-300";
-                  if (h.hitTarget === true) {
-                    resultLabel = "Hit target";
-                    resultClass = "text-emerald-300";
-                  } else if (h.hitTarget === false) {
-                    resultLabel = "Expired / missed";
-                    resultClass = "text-rose-300";
-                  }
-
-                  const ddStr =
-                    typeof h.maxDrawdownPct === "number"
-                      ? h.maxDrawdownPct.toFixed(2) + "%"
-                      : "";
-
-                  const tttStr =
-                    typeof h.timeToTargetMin === "number"
-                      ? h.timeToTargetMin.toFixed(0) + " min"
-                      : "";
-
-                  const rowBg =
-                    idx % 2 === 0
-                      ? "bg-slate-950/40"
-                      : "bg-slate-900/40";
-
-                  return (
-                    <tr
-                      key={h.symbol + "-" + h.alertTimeMs}
-                      className={rowBg + " border-b border-slate-900/80 hover:bg-slate-800/60"}
-                    >
-                      <td className="px-4 py-2 text-[11px] text-slate-400">
-                        {fmtTime(h.alertTimeMs)}
-                      </td>
-                      <td className="px-3 py-2 text-sm font-medium text-slate-50">
-                        {h.symbol}
-                      </td>
-                      <td className="px-3 py-2">
-                        <Pill color={h.direction}>{dirLabel}</Pill>
-                      </td>
-                      <td className="px-3 py-2 text-right tabular-nums text-slate-50">
-                        {moveStr}
-                      </td>
-                      <td
-                        className={"px-3 py-2 text-right text-[11px] font-medium " + resultClass}
-                      >
-                        {resultLabel}
-                      </td>
-                      <td className="px-3 py-2 text-right text-[11px] text-slate-300">
-                        {ddStr}
-                      </td>
-                      <td className="px-3 py-2 text-right text-[11px] text-slate-300">
-                        {tttStr}
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </Card>
+<Card>
+  <div className="flex items-center justify-between border-b border-slate-800/80 px-4 py-3">
+    <div>
+      <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-400">
+        Alert History
+      </div>
+      <div className="mt-0.5 text-[11px] text-slate-500">
+        Completed H1 opportunities � hit or expired.
+      </div>
     </div>
+    <div className="text-[11px] text-slate-500">
+      Last{" "}
+      <span className="font-medium text-slate-200">
+        {history.length || 0}
+      </span>{" "}
+      alerts
+    </div>
+  </div>
+
+  <div className="overflow-x-auto">
+    <table className="min-w-full border-separate border-spacing-0 text-xs">
+      <thead>
+        <tr className="bg-slate-950/80 text-[11px] uppercase tracking-wide text-slate-400">
+          <th className="px-4 py-2 text-left">When</th>
+          <th className="px-3 py-2 text-left">Symbol</th>
+          <th className="px-3 py-2 text-left">Entry</th>
+          <th className="px-3 py-2 text-right">Live</th>
+          <th className="px-3 py-2 text-right">Outcome</th>
+          <th className="px-3 py-2 text-right">Max DD</th>
+          <th className="px-3 py-2 text-right">Time to target</th>
+        </tr>
+      </thead>
+      <tbody>
+        {history.length === 0 ? (
+          <tr>
+            <td
+              colSpan={7}
+              className="px-4 py-6 text-center text-xs text-slate-400"
+            >
+              No completed opportunities tracked yet.
+            </td>
+          </tr>
+        ) : (
+          history.map((h, idx) => {
+            const rowBg =
+              idx % 2 === 0
+                ? "bg-slate-950/40"
+                : "bg-slate-900/40";
+
+            // -------- Entry display --------
+            const entrySig = h.entrySignal || h.signalText || "�";
+            const entryPrice =
+              typeof h.entryPrice === "number"
+                ? fmtPrice(h.symbol, h.entryPrice)
+                : null;
+
+            // -------- Outcome display --------
+            const status = String(h.status || "").toLowerCase();
+            const isHit = status === "hit";
+            const outcomeLabel = isHit ? "HIT" : "EXPIRED";
+            const outcomeClass = isHit
+              ? "text-emerald-300"
+              : "text-rose-300";
+
+            const outcomeTs =
+              typeof h.hitTsMs === "number"
+                ? h.hitTsMs
+                : typeof h.expiredTsMs === "number"
+                ? h.expiredTsMs
+                : null;
+
+            const ddStr =
+              typeof h.maxDrawdownPct === "number"
+                ? h.maxDrawdownPct.toFixed(2) + "%"
+                : "�";
+
+            const tttStr =
+              typeof h.timeToTargetMin === "number"
+                ? h.timeToTargetMin.toFixed(0) + " min"
+                : "�";
+
+            return (
+              <tr
+                key={h.symbol + "-" + h.alertTimeMs}
+                className={
+                  rowBg +
+                  " border-b border-slate-900/80 hover:bg-slate-800/60"
+                }
+              >
+                {/* When */}
+                <td className="px-4 py-2 text-[11px] text-slate-400">
+                  {fmtTime(h.alertTimeMs)}
+                </td>
+
+                {/* Symbol */}
+                <td className="px-3 py-2 text-sm font-medium text-slate-50">
+                  {h.symbol}
+                </td>
+
+                {/* Entry */}
+                <td className="px-3 py-2">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="inline-flex w-fit items-center rounded-full border border-slate-700/70 bg-slate-900/60 px-2 py-0.5 text-[10px] font-semibold text-slate-200">
+                      {entrySig}
+                      {entryPrice ? ` @ ${entryPrice}` : ""}
+                    </span>
+                    {typeof h.entryTsMs === "number" && (
+                      <span className="text-[10px] text-slate-400">
+                        Entry: {fmtTime(h.entryTsMs)}
+                      </span>
+                    )}
+                  </div>
+                </td>
+
+                {/* Live / Move */}
+                <td className="px-3 py-2 text-right tabular-nums text-slate-50">
+                  {typeof h.realizedMovePct === "number"
+                    ? (h.realizedMovePct > 0 ? "+" : "") +
+                      h.realizedMovePct.toFixed(2) +
+                      "%"
+                    : (h.expectedMovePct > 0 ? "+" : "") +
+                      h.expectedMovePct.toFixed(2) +
+                      "%"}
+                </td>
+
+                {/* Outcome */}
+                <td
+                  className={
+                    "px-3 py-2 text-right text-[11px] font-medium " +
+                    outcomeClass
+                  }
+                >
+                  <div className="flex flex-col items-end gap-0.5">
+                    <span>{outcomeLabel}</span>
+                    {typeof outcomeTs === "number" && (
+                      <span className="text-[10px] text-slate-400">
+                        {fmtTime(outcomeTs)}
+                      </span>
+                    )}
+                  </div>
+                </td>
+
+                {/* Max DD */}
+                <td className="px-3 py-2 text-right text-[11px] text-slate-300">
+                  {ddStr}
+                </td>
+
+                {/* Time to target */}
+                <td className="px-3 py-2 text-right text-[11px] text-slate-300">
+                  {tttStr}
+                </td>
+              </tr>
+            );
+          })
+        )}
+      </tbody>
+    </table>
+  </div>
+</Card>
+
+</div>
   );
 }
 

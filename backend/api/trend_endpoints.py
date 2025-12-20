@@ -22,7 +22,7 @@ import xgboost as xgb
 from api.macro_state import get_macro_snapshot
 import csv
 from datetime import datetime, timezone
-
+from api.entry_logic import entry_decision_m1
 from api.trend.infer_rt import (
     predict_next_hour,
     predict_next_4h,
@@ -30,7 +30,7 @@ from api.trend.infer_rt import (
     pull_latest_h4,
 )
 from .trend_sr import summarize_sr_multi_tf
-
+from api.security import require_user_relaxed
 from api.trend.infer_tth import predict_tth
 from openai import OpenAI
 client = OpenAI()
@@ -152,6 +152,15 @@ def _room_thr_h4(sym: str) -> float:
 # Where we keep per-symbol frozen H1 opportunity snapshots in Redis
 OPP_SNAPSHOT_PREFIX = "xtl:trend:opp:h1"
 
+def _uid_from_user(user) -> str | None:
+    if not user:
+        return None
+    return (
+        getattr(user, "id", None)
+        or getattr(user, "user_id", None)
+        or getattr(user, "uid", None)
+    )
+
 
 def _opp_snapshot_key(sym: str, opp_dir: str) -> str:
     s = (sym or "").upper()
@@ -218,8 +227,20 @@ def _freeze_or_snapshot_opp(sym: str, row: dict, now_ms: int) -> dict:
     horizon_ms = horizon_min * 60_000
 
     def _live_px_from_row(r: dict):
-        lp = r.get("last_price") or r.get("price") or r.get("last_close") or r.get("lastClose") or r.get("mid")
-        return float(lp) if isinstance(lp, (int, float)) else None
+        lp = (
+            r.get("last_price")
+            or r.get("live")          # <-- ADD
+            or r.get("live_price")    # <-- ADD
+            or r.get("price")
+            or r.get("last_close")
+            or r.get("lastClose")
+            or r.get("mid")
+        )
+        try:
+            return float(lp)
+        except Exception:
+            return None
+
 
     # ---------------- EXISTING ACTIVE SNAPSHOT ----------------
     for d in ("UP", "DOWN"):
@@ -689,6 +710,149 @@ log.info(f"[TREND]  module={__file__}")
 log.info(f"[TREND] REDIS_URL={REDIS_URL}")
 
 # --------------------------
+# DISCORD WEBHOOK (alerts)
+# --------------------------
+# Put this in /etc/xauapi.env (recommended):
+#   DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/...."
+DISCORD_WEBHOOK_URL = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
+
+def _discord_dedupe_key(event: str, k: str) -> str:
+    kk = (k or "").strip()
+    if not kk:
+        kk = "na"
+    return f"xtl:discord:sent:{event}:{kk}"
+
+def _discord_should_send(event: str, k: str, ttl_sec: int = 24 * 3600) -> bool:
+    """
+    Return True only once per (event,k) in ttl window.
+    Uses Redis SET NX EX to dedupe.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        return False
+    try:
+        dk = _discord_dedupe_key(event, k)
+        ok = R.set(dk, "1", nx=True, ex=int(ttl_sec))
+        return bool(ok)
+    except Exception:
+        # If Redis fails, default to NOT sending (avoid spam)
+        return False
+
+def _discord_post(content: str, embeds: list[dict] | None = None) -> None:
+    """
+    Fire-and-forget Discord webhook post.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        return
+    payload = {"content": (content or "").strip()[:1900]}
+    if embeds:
+        payload["embeds"] = embeds
+    try:
+        httpx.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5.0)
+    except Exception as e:
+        log.warning("[DISCORD] post failed err=%r", e)
+
+def _fmt_px(x) -> str:
+    try:
+        return f"{float(x):,.3f}"
+    except Exception:
+        return "NA"
+
+def _discord_notify_entry(row: dict) -> None:
+    """
+    Send ENTRY notification to Discord (with @everyone).
+    De-duped via Redis so it fires only once per alert.
+    """
+
+    sym = str(row.get("symbol") or "").upper().strip()
+    sig = str(row.get("entry_signal") or "").upper().strip()
+    if sig not in ("BUY", "SELL"):
+        return
+
+    # Stable alert key for dedupe
+    alert_key = (
+        str(row.get("alert_id") or "").strip()
+        or str(row.get("opp_id") or "").strip()
+        or f"{sym}:{sig}:{int(row.get('alert_created_ms') or row.get('opp_open_ts') or 0)}"
+    )
+
+    # Dedupe for 48 hours
+    if not _discord_should_send("entry", alert_key, ttl_sec=48 * 3600):
+        return
+
+    entry_px = (
+        row.get("entry_price")
+        or row.get("last_price")
+        or row.get("basis_price")
+        or row.get("basis_price_1h")
+    )
+
+    tp = row.get("target_price") or row.get("target_price_1h")
+    sl = row.get("sl_price")  # may be None for now
+
+    reason = str(
+        row.get("entry_reason")
+        or row.get("signal_reason")
+        or "signal_triggered"
+    )
+
+    # Time (UTC, consistent for all users)
+    ts_ms = int(row.get("entry_ts_ms") or time.time() * 1000)
+    ts_utc = time.strftime("%H:%M UTC", time.gmtime(ts_ms / 1000))
+
+    msg = (
+        f"@everyone ?? **ENTRY {sig} — {sym}**\n\n"
+        f"?? Time: `{ts_utc}`\n"
+        f"?? Timeframe: `{row.get('tf', 'NA')}`\n\n"
+        f"Entry: `{_fmt_px(entry_px)}`\n"
+        f"Target: `{_fmt_px(tp)}`\n"
+        f"Stop Loss: `{_fmt_px(sl) if sl is not None else 'TBD'}`\n\n"
+        f"Reason: `{reason}`\n"
+        f"Alert ID: `{alert_key}`\n\n"
+        f"?? Manual trade — manage risk accordingly."
+    )
+
+    _discord_post(msg)
+
+def _discord_notify_outcome(event: str, payload: dict) -> None:
+    """
+    event: 'hit' | 'expired'
+    payload: data from _evaluate_alert_outcome
+    """
+    sym = str(payload.get("symbol") or "").upper().strip() or "NA"
+    direction = str(payload.get("opp_direction") or payload.get("direction") or "").upper().strip()
+    status = str(payload.get("status") or event).lower()
+
+    alert_key = (
+        str(payload.get("alert_id") or "").strip()
+        or str(payload.get("opp_id") or "").strip()
+        or f"{sym}:{direction}:{int(payload.get('alert_created_ms') or 0)}"
+    )
+
+    if not _discord_should_send(status, alert_key, ttl_sec=7 * 24 * 3600):
+        return
+
+    last_px = payload.get("last_price")
+    rmove = payload.get("realized_move_pct")
+
+    emoji = "??" if status == "hit" else "?"
+    entry_sig = payload.get("entry_signal") or payload.get("entry_signal".upper())
+    entry_px = payload.get("entry_price")
+
+    extra = ""
+    if entry_sig in ("BUY", "SELL") and entry_px is not None:
+        extra = f"\nEntry: `{entry_sig}` @ `{_fmt_px(entry_px)}`"
+
+    msg = (
+        f"{emoji} **{status.upper()}** — **{sym}** ({direction})\n"
+        f"Last: `{_fmt_px(last_px)}`\n"
+        f"Move: `{(float(rmove) if isinstance(rmove,(int,float)) else 0.0):+.2f}%`"
+        f"{extra}\n"
+        f"Alert: `{alert_key}`"
+    )
+    _discord_post(msg)
+
+
+# --------------------------
 # BOT STATE (per-user, Redis)
 # --------------------------
 
@@ -817,11 +981,45 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
     key = f"{ALERT_HASH_PREFIX}{alert_id}"
 
     try:
+        # ---------- NEW: protect frozen entry metadata ----------
+        if payload.get("entry_triggered"):
+            existing = R.hgetall(key) or {}
+
+            def _get_existing(k):
+                v = existing.get(k.encode() if isinstance(k, str) else k)
+                if v is None:
+                    return None
+                try:
+                    return json.loads(v)
+                except Exception:
+                    return None
+
+            # Do NOT overwrite once set
+            payload["entry_triggered"] = True
+            payload["entry_signal"] = (
+                payload.get("entry_signal")
+                or _get_existing("entry_signal")
+            )
+            payload["entry_reason"] = (
+                payload.get("entry_reason")
+                or _get_existing("entry_reason")
+            )
+            payload["entry_ts_ms"] = (
+                payload.get("entry_ts_ms")
+                or _get_existing("entry_ts_ms")
+            )
+            payload["entry_price"] = (
+                payload.get("entry_price")
+                or _get_existing("entry_price")
+            )
+        # ---------- END NEW ----------
+
         mapping = {k: json.dumps(v) for k, v in payload.items()}
         R.hset(key, mapping=mapping)
         R.lrem(ALERT_INDEX_KEY, 0, alert_id)
         R.lpush(ALERT_INDEX_KEY, alert_id)
         R.ltrim(ALERT_INDEX_KEY, 0, 99)
+
     except Exception as e:
         log.warning("[OPP] _save_alert_snapshot failed id=%s err=%r", alert_id, e)
 
@@ -948,6 +1146,20 @@ def _load_opp_history(limit: int = 50) -> list[dict[str, Any]]:
         decoded.setdefault("max_drawdown_pct", None)
         decoded.setdefault("expired_ts", None)
         decoded.setdefault("hit_ts", None)
+        # ---------- NEW: normalize entry + outcome fields for UI ----------
+        # entry meta (frozen when entry triggers)
+        decoded.setdefault("entry_triggered", False)
+        decoded.setdefault("entry_signal", None)
+        decoded.setdefault("entry_reason", None)
+        decoded.setdefault("entry_ts_ms", decoded.get("entry_ts_ms") or decoded.get("entry_ts"))
+        decoded.setdefault("entry_price", decoded.get("entry_price"))
+
+        # outcome timestamps (ms aliases)
+        decoded.setdefault("hit_ts_ms", decoded.get("hit_ts_ms") or decoded.get("hit_ts"))
+        decoded.setdefault("expired_ts_ms", decoded.get("expired_ts_ms") or decoded.get("expired_ts"))
+        decoded.setdefault("updated_ms", decoded.get("updated_ms") or decoded.get("last_status_ms"))
+        # ---------- END NEW ----------
+
 
         out.append(decoded)
 
@@ -2024,7 +2236,7 @@ def price_all(
     broker = None
 
     # 0) resolve which device to use
-    user_id = getattr(user, "user_id", None) if user else None
+    user_id = _uid_from_user(user)
     pinned_device = device or x_device_id or getattr(user, "device_id", None) or getattr(user, "deviceId", None)
     device_used = None
 
@@ -2177,7 +2389,7 @@ def predict_all(
     syms = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
 
     # prefer user's device if present; fall back to freshest-any for OHLC snapshots
-    user_id = getattr(user, "user_id", None) if user else None
+    user_id = _uid_from_user(user)
     now_ms = int(_time.time() * 1000)
 
     # ---- imports kept inside to avoid startup import failures ----
@@ -2646,7 +2858,7 @@ def build_commentary_payload(row: dict) -> dict:
 def trend_commentary(
     symbol: str,
     tf: str = "H1",
-    user = Depends(require_auth_optional),
+    user = Depends(require_user_relaxed),
 ):
     
     """
@@ -2735,6 +2947,17 @@ def call_llm_commentary(payload: dict) -> str:
     return resp.choices[0].message.content.strip()
 
 
+
+@router.get("/opportunities/history")
+def opportunities_history(limit: int = 100):
+    """
+    TEMP: history via CSV is deprecated.
+    Frontend now uses in-session history only.
+    This endpoint returns an empty list to keep compatibility.
+    """
+    return {"ok": True, "rows": []}
+
+
 @router.get("/opportunities")
 def trend_opportunities(
     tf: str = "M15",
@@ -2745,7 +2968,7 @@ def trend_opportunities(
     debug_force: bool = Query(False),
     debug_top: int = Query(0, ge=0, le=10),
     debug_persist: bool = Query(False),
-    user = Depends(require_auth_optional),
+    user=Depends(require_auth_optional),
 ):
     """
     Live opportunities feed.
@@ -2787,32 +3010,393 @@ def trend_opportunities(
             out[kk] = _json_load_maybe(vv)
         return out
 
-    def _load_active_snapshots(symbols_csv: str) -> list[dict]:
-        res = []
-        for sym in _sym_list(symbols_csv):
-            for d in ("UP", "DOWN"):
-                snap_key = _opp_snapshot_key(sym, d)
-                snap = R.hgetall(snap_key)
-                if not snap:
+    def _json_load_twice(x):
+        y = _json_load_maybe(x)
+        if isinstance(y, str):
+            y2 = _json_load_maybe(y)
+            return y2
+        return y
+
+
+    # ---------- auth gate (entry logic requires login) ----------
+    def _uid_from_user(u):
+        try:
+           return getattr(u, "id", None) or getattr(u, "user_id", None) or getattr(u, "uid", None)
+        except Exception:
+           return None
+
+    uid_for_entry = _uid_from_user(user)
+    auth_ok = bool(uid_for_entry)
+
+    # ---------- load CLOSED M1 candles from user snapshot (agent pushed) ----------
+    # ---------- load CLOSED M1 candles from user snapshot (agent pushed) ----------
+    def _get_closed_m1(sym: str) -> list[dict]:
+        """
+        Reads CLOSED M1 bars pushed by agent.
+        Primary:
+          xtl:trend:snap:{uid}:{SYMBOL}:M1
+
+        Fallback (when user snapshot missing):
+          xtl:ohlc:snap:{device_id}:{SYMBOL}:M1
+          (and hydrate user snapshot so entry gate stays stable)
+
+        Returns list of {o,h,l,c} dicts (entry_logic compatible).
+        """
+        try:
+            uid = _uid_from_user(user)
+            if not uid:
+                return []
+
+            sym_u = (sym or "").upper().strip()
+            if not sym_u:
+                return []
+
+            key_user = f"xtl:trend:snap:{uid}:{sym_u}:M1"
+            raw = R.get(key_user)
+
+            # ---------- fallback + hydrate from device M1 snapshot ----------
+            if not raw:
+                dev = ""
+                try:
+                    dev = (x_device_id or device or "").strip()
+                except Exception:
+                    dev = ""
+
+                # Prefer leader device
+                if not dev:
+                    try:
+                        leader = _json_load_twice(R.get(f"xtl:user:{uid}:trend:leader")) or {}
+                        if isinstance(leader, dict):
+                            dev = (
+                                leader.get("device_id")
+                                or leader.get("id")
+                                or leader.get("device")
+                                or ""
+                            ).strip()
+                        elif isinstance(leader, str):
+                            dev = leader.strip()
+                    except Exception:
+                        dev = ""
+
+                # Fallback to any registered device
+                if not dev:
+                    try:
+                        ds = list(R.smembers(f"xtl:user:{uid}:devices") or [])
+                        if ds:
+                            d0 = ds[0]
+                            if isinstance(d0, (bytes, bytearray)):
+                                d0 = d0.decode("utf-8", "ignore")
+                            dev = str(d0).strip()
+                    except Exception:
+                        dev = ""
+
+                # Read device snapshot and hydrate user snapshot
+                if dev:
+                    try:
+                        raw2 = R.get(f"xtl:ohlc:snap:{dev}:{sym_u}:M1")
+                        if raw2:
+                            try:
+                                R.setex(key_user, 3600, raw2)
+                            except Exception:
+                                pass
+                            raw = raw2
+                    except Exception:
+                        pass
+            # ---------- end fallback + hydrate ----------
+
+            js = _json_load_twice(raw) if raw else None
+            if not isinstance(js, dict):
+                return []
+
+            bars = js.get("bars") or []
+            if not isinstance(bars, list):
+                return []
+
+            out: list[dict] = []
+            for b in bars:
+                if not isinstance(b, dict):
+                    continue
+                if not b.get("complete", True):
+                    continue
+                try:
+                    out.append(
+                        {
+                            "o": float(b["o"]),
+                            "h": float(b["h"]),
+                            "l": float(b["l"]),
+                            "c": float(b["c"]),
+                        }
+                    )
+                except Exception:
                     continue
 
-                # evaluate HIT/EXPIRED and cleanup if needed
+            return out[-60:]
+        except Exception:
+            return []
+
+   
+
+    def _force_hydrate_m1(sym: str) -> None:
+        if not auth_ok:
+            return
+        try:
+           uid = _uid_from(user)
+           if not uid:
+               return
+
+           sym_u = (sym or "").upper().strip()
+           if not sym_u:
+               return
+
+           user_key = f"xtl:trend:snap:{uid}:{sym_u}:M1"
+           if R.exists(user_key):
+               return
+
+           leader = _json_load_twice(R.get(f"xtl:user:{uid}:trend:leader")) or {}
+           dev = ""
+           if isinstance(leader, dict):
+               dev = (leader.get("device_id") or "").strip()
+
+           if not dev:
+               return
+
+           raw = R.get(f"xtl:ohlc:snap:{dev}:{sym_u}:M1")
+           if raw:
+               R.setex(user_key, 3600, raw)
+        except Exception:
+           pass
+
+
+    def _attach_entry_1m(row: dict) -> None:
+        try:
+            sym = str(row.get("symbol") or "").upper()
+            if not sym:
+                return
+            if not auth_ok:
+                row["entry_1m"] = {"ok": False, "reason": "auth_required"}
+                row["signal"] = "WAIT"
+                row["signal_reason"] = "auth_required"
+                return             
+
+            direction = str(
+                row.get("decision")
+                or row.get("opp_direction")
+                or row.get("direction")
+                or ""
+            ).upper()
+
+            if direction in ("UP", "BUY"):
+                direction = "BUY"
+            elif direction in ("DOWN", "SELL"):
+                direction = "SELL"
+            else:
+                row["entry_1m"] = {"ok": False, "reason": "bad_direction"}
+                row["signal"] = "WAIT"
+                row["signal_reason"] = "bad_direction"
+                return
+            _force_hydrate_m1(sym)
+            candles = _get_closed_m1(sym)
+            if len(candles) < 8:
+                row["entry_1m"] = {"ok": False, "reason": "need_8_bars"}
+                row["signal"] = "WAIT"
+                row["signal_reason"] = "need_8_bars"
+                return
+            # --- TEST MODE: relax M1 entry gating so you can test BUY/SELL + target hit ---
+            
+            # Default behavior remains unchanged unless you pass profiles["_active"]="TEST"
+            profiles = {
+                "_active": "TEST",
+                "DEFAULT": {
+                    "max_age_min": 120,
+                    "min_remaining_tp_frac": 0.15,
+                    "max_traveled_tp_frac": 0.70,
+
+                    "impulse_range_mult": 1.10,
+                    "impulse_body_frac": 0.40,
+                    "impulse_min_tp_frac": 0.04,
+
+                    "pullback_min": 0.08,
+                    "pullback_max": 0.65,
+                    "pullback_reject": 0.80,
+
+                    "prefer_mode": "MOMENTUM",
+                    "use_break_trigger": False,
+                },
+                "XAUUSD": {"spread_tp_mult": 1.6, "body_spread_mult": 0.9},
+                "USDJPY": {"spread_tp_mult": 1.6, "body_spread_mult": 0.9},
+                "EURUSD": {"spread_tp_mult": 1.6, "body_spread_mult": 0.9},
+            }
+
+            row["entry_1m"] = entry_decision_m1(
+                sym=sym,
+                direction=direction,
+                basis_price=float(row.get("basis_price") or row.get("basis_price_1h") or row.get("alert_price_1h") or 0.0),
+                target_price=float(row.get("target_price") or row.get("target_price_1h") or 0.0),
+                alert_created_ms=int(row.get("alert_created_ms") or row.get("opp_open_ts") or 0),
+                now_ms=now_ms,
+                candles=candles,
+                spread=None,
+                profiles=profiles,
+            )
+
+            e = row.get("entry_1m") or {}
+            if bool(e.get("ok")):
+                row["signal"] = direction
+                row["signal_reason"] = str(e.get("reason") or "entry_ok")
+            else:
+                row["signal"] = "WAIT"
+                row["signal_reason"] = str(e.get("reason") or "entry_wait")
+
+        except Exception as e:
+            row["entry_1m"] = {"ok": False, "reason": f"exc:{type(e).__name__}"}
+            row["signal"] = "WAIT"
+            row["signal_reason"] = f"exc:{type(e).__name__}"
+
+    def _set_signal_from_entry(row: dict) -> None:
+        """
+        Manual trading signal:
+        - WAIT until entry gate triggers (entry_1m.ok True)
+        - Once it triggers BUY/SELL, keep that same BUY/SELL until HIT or EXPIRED
+          (no flip back to WAIT)
+        - Freeze entry meta: entry_ts_ms, entry_price
+        """
+        # If snapshot already has a frozen entry signal, honor it.
+        # This must be persisted in the snapshot (entry_triggered/entry_signal).
+        # Use server_now_ms if present, else current time
+        try:
+            now_ms = int(row.get("server_now_ms") or 0)
+        except Exception:
+            now_ms = 0
+        if now_ms <= 0:
+            try:
+               now_ms = int(time.time() * 1000)
+            except Exception:
+               now_ms = 0
+        try:
+           if bool(row.get("entry_triggered")):
+               sig0 = str(row.get("entry_signal") or "").upper()
+               if sig0 in ("BUY", "SELL"):
+                   row["signal"] = sig0
+                   row["signal_text"] = sig0
+                   row["signal_reason"] = str(row.get("entry_reason") or "entry_triggered")
+                   return
+        except Exception:
+           pass
+
+        # If auth is required and entry was blocked upstream, keep it explicit.
+        ed = row.get("entry_1m") or {}
+        if isinstance(ed, dict) and str(ed.get("reason") or "") == "auth_required":
+            row["signal"] = "WAIT"
+            row["signal_text"] = "LOGIN"
+            row["signal_reason"] = "auth_required"
+            return
+
+        # If entry gate says OK, emit BUY/SELL and FREEZE it (persist fields into snapshot)
+        if isinstance(ed, dict) and ed.get("ok") is True:
+            dec = str(
+                row.get("decision")          # BUY/SELL if present
+                or row.get("opp_direction")  # UP/DOWN
+                or row.get("direction")      # Bullish/Bearish sometimes
+                or ""
+            ).upper()
+
+            if dec in ("UP", "LONG", "BULLISH", "BULL"):
+                dec = "BUY"
+            elif dec in ("DOWN", "SHORT", "BEARISH", "BEAR"):
+                dec = "SELL"
+
+            sig = dec if dec in ("BUY", "SELL") else "WAIT"
+            row["signal"] = sig
+            row["signal_text"] = sig
+            row["signal_reason"] = f"ENTRY_OK:{ed.get('mode') or 'NA'}:{ed.get('entry_trigger') or 'NA'}"
+
+            # ---- FREEZE entry result on the snapshot ----
+            if sig in ("BUY", "SELL"):
+                row["entry_triggered"] = True
+                row["entry_signal"] = sig
+                row["entry_reason"] = row["signal_reason"]
+                row["entry_ts_ms"] = int(now_ms) if now_ms > 0 else int(time.time() * 1000)
+                # best-effort entry price (prefer live price fields, then basis)
+                ep = (
+                    row.get("last_price")
+                    or row.get("live")
+                    or row.get("live_price")
+                    or row.get("price")
+                    or row.get("mid")
+                    or row.get("lastClose")
+                    or row.get("basis_price")
+                    or row.get("basis_price_1h")
+                )
                 try:
-                    _evaluate_alert_outcome(sym, snap, {}, now_ms)
+                    row["entry_price"] = float(ep)
+                except Exception:
+                    row["entry_price"] = None
+                # --- DISCORD: notify entry once (deduped) ---
+                try:
+                    _discord_notify_entry(row)
                 except Exception:
                     pass
 
-                # re-read (may have been deleted)
+            return
+
+        # Not triggered yet -> WAIT
+        row["signal"] = "WAIT"
+        row["signal_text"] = "WAIT"
+        row["signal_reason"] = ed.get("reason") if isinstance(ed, dict) else "no_entry"
+
+
+
+    def _load_active_snapshots(symbols_csv: str) -> list[dict]:
+        res = []
+        user_id = _uid_from_user(user)
+        pinned_device = device or x_device_id
+
+        for sym in _sym_list(symbols_csv):
+            sym_u = (sym or "").upper().strip()
+            if not sym_u:
+                continue
+
+            for d in ("UP", "DOWN"):
+                snap_key = _opp_snapshot_key(sym_u, d)
                 snap = R.hgetall(snap_key)
                 if not snap:
                     continue
 
-                status = str(_json_load_maybe(snap.get(b"status") if isinstance(next(iter(snap.keys())), bytes) else snap.get("status")) or "active").lower()
+                # Build row FIRST so outcome checker can use live-ish price
+                row0 = _redis_hash_to_dict(snap)
+                row0.setdefault("symbol", sym_u)
+
+                # attach a live price for HIT detection (prefer last closed M1 close)
+                lp = _last_closed_m1_price(sym_u, user_id, pinned_device, now_ms)
+                if lp is not None:
+                    row0["last_price"] = lp
+                    row0["live_price"] = lp
+
+                # evaluate HIT/EXPIRED and cleanup if needed
+                try:
+                    _evaluate_alert_outcome(sym_u, snap, row0, now_ms)
+                except Exception:
+                    pass
+
+                snap = R.hgetall(snap_key)
+                if not snap:
+                    continue
+
+                any_key = next(iter(snap.keys()))
+                status_val = snap.get(b"status") if isinstance(any_key, (bytes, bytearray)) else snap
+                status = str(_json_load_maybe(status_val) or "active").lower()
+
                 if status in ("active", "new", "open"):
                     row = _redis_hash_to_dict(snap)
                     row.setdefault("update_tf", tfu)
                     row.setdefault("server_now_ms", now_ms)
+
+                    _force_hydrate_m1(row.get("symbol"))
+                    _attach_entry_1m(row)
+                    _set_signal_from_entry(row)
+
                     res.append(row)
+
         return res
 
     # ---------- weekend rule: NO NEW opportunities ----------
@@ -2849,15 +3433,11 @@ def trend_opportunities(
     opp_rows: list[dict[str, Any]] = []
     debug_pool: list[dict[str, Any]] = []
 
-    # loose mode tweaks your thresholds indirectly via your _room_thr_* functions
-    # (if you want loose to affect those functions, keep it there; otherwise leave as-is)
-    # We'll keep your existing loose toggles on top-level thresholds where you used them earlier:
-    # NOTE: actual gating uses thr1/thr4 from _room_thr_h1/_room_thr_h4.
-
     for row in rows_in:
         sym = str(row.get("symbol") or "").upper()
         if not sym:
             continue
+
         # ---- attach a live-ish price for UI + hit detection ----
         lp = (
             row.get("last_price")
@@ -2869,7 +3449,6 @@ def trend_opportunities(
         )
         if isinstance(lp, (int, float)):
             row["last_price"] = float(lp)
-
 
         # --- DEBUG FORCE: emit fabricated opp candidates (no snapshot writes) ---
         if debug_force and debug_top > 0:
@@ -2903,6 +3482,10 @@ def trend_opportunities(
             out["opp_reason"] = "DEBUG_FORCE (fabricated opportunity for UI testing)"
             out.setdefault("update_tf", tfu)
             out.setdefault("server_now_ms", now_ms)
+
+            # attach entry + signal in debug too (helps UI)
+            _attach_entry_1m(out)
+            _set_signal_from_entry(out)
 
             debug_pool.append(out)
             continue
@@ -2956,7 +3539,10 @@ def trend_opportunities(
                 if not snap:
                     continue
 
-                status = str(_json_load_maybe(snap.get(b"status") if isinstance(next(iter(snap.keys())), bytes) else snap.get("status")) or "active").lower()
+                any_key = next(iter(snap.keys()))
+                status_val = snap.get(b"status") if isinstance(any_key, (bytes, bytearray)) else snap.get("status")
+                status = str(_json_load_maybe(status_val) or "active").lower()
+
                 if status in ("active", "new", "open"):
                     has_active_snapshot = True
                     active_snap_row = _redis_hash_to_dict(snap)
@@ -2969,9 +3555,12 @@ def trend_opportunities(
             active_snap_row.setdefault("update_tf", tfu)
             active_snap_row.setdefault("server_now_ms", now_ms)
 
-            lp = row.get("last_price") or row.get("price")
-            if isinstance(lp, (int, float)):
-                active_snap_row["last_price"] = float(lp)
+            lp2 = row.get("last_price") or row.get("price")
+            if isinstance(lp2, (int, float)):
+                active_snap_row["last_price"] = float(lp2)
+
+            _attach_entry_1m(active_snap_row)
+            _set_signal_from_entry(active_snap_row)
 
             opp_rows.append(active_snap_row)
             continue
@@ -3048,6 +3637,12 @@ def trend_opportunities(
                 out_dbg["debug_only"] = True
                 out_dbg["status"] = "debug"
                 out_dbg["opp_reason"] = out_dbg.get("opp_reason") or "debug candidate (below OPP_SCORE_MIN)"
+                out_dbg.setdefault("update_tf", tfu)
+                out_dbg.setdefault("server_now_ms", now_ms)
+
+                _attach_entry_1m(out_dbg)
+                _set_signal_from_entry(out_dbg)
+
                 debug_pool.append(out_dbg)
             continue
 
@@ -3117,6 +3712,9 @@ def trend_opportunities(
         out.setdefault("update_tf", tfu)
         out.setdefault("server_now_ms", now_ms)
 
+        _attach_entry_1m(out)
+        _set_signal_from_entry(out)
+
         # freeze snapshot (keeps it visible until hit/expired)
         out = _freeze_or_snapshot_opp(sym, out, now_ms)
         status = str(out.get("status") or "active").strip().lower()
@@ -3130,18 +3728,6 @@ def trend_opportunities(
         opp_rows = debug_pool[:debug_top]
 
     return {"ok": True, "tf": tfu, "rows": opp_rows, "history": history}
-
-
-@router.get("/opportunities/history")
-def opportunities_history(limit: int = 100):
-    """
-    TEMP: history via CSV is deprecated.
-    Frontend now uses in-session history only.
-    This endpoint returns an empty list to keep compatibility.
-    """
-    return {"ok": True, "rows": []}
-
-
 
 
 @router.get("/predict/health")
@@ -3403,7 +3989,7 @@ class BotStateResp(BaseModel):
 
 @router.get("/bot/state", response_model=BotStateResp)
 def get_bot_state(user = Depends(require_auth_optional)):
-    user_id = getattr(user, "user_id", None) if user else None
+    user_id = _uid_from_user(user)
     if not user_id:
         raise HTTPException(status_code=401, detail="Login required")
 
@@ -3413,7 +3999,7 @@ def get_bot_state(user = Depends(require_auth_optional)):
 
 @router.post("/bot/state", response_model=BotStateResp)
 def update_bot_state(payload: BotStateUpdate, user = Depends(require_auth_optional)):
-    user_id = getattr(user, "user_id", None) if user else None
+    user_id = _uid_from_user(user)
     if not user_id:
         raise HTTPException(status_code=401, detail="Login required")
 
@@ -5579,7 +6165,7 @@ def predict_4h_debug(
     Debug helper: compare H4 model move_pct vs recent H4 realised volatility.
     """
     sym = (symbol or "EURUSD").upper()
-    user_id = getattr(user, "user_id", None) if user else None
+    user_id = _uid_from_user(user)
 
     # 1) Get the latest H4 bars from snap (same mechanism as other endpoints)
     snap, broker = _read_freshest_snap_for_user_or_any(user_id, sym, "H4")
@@ -5692,6 +6278,26 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
         except Exception:
             return v
 
+    def _entry_meta_from_snap() -> dict:
+        """
+        Pull frozen entry metadata so it survives into history.
+        """
+        def _pick(key: str, default=None):
+            v = _sj(key, None)
+            if v is None and isinstance(row, dict):
+                v = row.get(key)
+            return v if v is not None else default
+
+        return {
+            "entry_triggered": bool(_pick("entry_triggered", False)),
+            "entry_signal": _pick("entry_signal", None),
+            "entry_reason": _pick("entry_reason", None),
+            "entry_ts_ms": _pick("entry_ts_ms", None),
+            "entry_price": _pick("entry_price", None),
+        }
+
+    # ------------------------------------------------------------------
+
     sym_u = (sym or "").upper()
 
     direction = str((_sj("opp_direction") or _sj("direction") or "")).upper()
@@ -5699,71 +6305,46 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
         return
 
     alert_id = _sj("alert_id")
-    opp_id = _sj("opp_id") or _sj("oppId") or _sj("id")
     has_alert = bool(alert_id)
 
-    # basis
+    # ---------------- basis ----------------
     basis = None
     for k in ("alert_price_1h", "basis_price_1h", "basis_price", "alert_price", "basisPrice"):
-        try:
-            v = _sj(k)
-            if isinstance(v, (int, float)) and float(v) > 0:
-                basis = float(v)
-                break
-        except Exception:
-            pass
+        v = _sj(k)
+        if isinstance(v, (int, float)) and v > 0:
+            basis = float(v)
+            break
 
-    # target (prefer explicit)
+    # ---------------- target ----------------
     target = None
     for k in ("target_price_1h", "target_price", "targetPrice"):
-        try:
-            v = _sj(k)
-            if isinstance(v, (int, float)) and float(v) > 0:
-                target = float(v)
-                break
-        except Exception:
-            pass
+        v = _sj(k)
+        if isinstance(v, (int, float)) and v > 0:
+            target = float(v)
+            break
 
-    # move pct (prefer trade_tp_pct_1h)
+    # ---------------- move pct ----------------
     move_pct_1h = None
     for k in ("trade_tp_pct_1h", "expected_move_pct_1h", "expected_move_pct", "move_pct_1h"):
-        try:
-            v = _sj(k)
-            if isinstance(v, (int, float)):
-                move_pct_1h = float(v)
-                break
-        except Exception:
-            pass
+        v = _sj(k)
+        if isinstance(v, (int, float)):
+            move_pct_1h = float(v)
+            break
 
-    # times
-    try:
-        opp_open_ts = int(_sj("opp_open_ts") or 0)
-    except Exception:
-        opp_open_ts = 0
-    try:
-        opp_expire_ts = int(_sj("opp_expire_ts") or 0)
-    except Exception:
-        opp_expire_ts = 0
-    try:
-        alert_ms = int(_sj("alert_created_ms") or 0)
-    except Exception:
-        alert_ms = 0
-    try:
-        horizon_min = int(_sj("horizon_min") or 60)
-    except Exception:
-        horizon_min = 60
+    # ---------------- times ----------------
+    alert_ms = int(_sj("alert_created_ms") or 0)
+    opp_open_ts = int(_sj("opp_open_ts") or 0)
+    opp_expire_ts = int(_sj("opp_expire_ts") or 0)
+    horizon_min = int(_sj("horizon_min") or 60)
 
-    # last_price: snap -> row -> basis
+    # ---------------- last price ----------------
     last_price = None
-    try:
-        lp = _sj("last_price")
-        if isinstance(lp, (int, float)):
-            last_price = float(lp)
-    except Exception:
-        last_price = None
+    lp = _sj("last_price")
+    if isinstance(lp, (int, float)):
+        last_price = float(lp)
 
     if last_price is None:
-        for rk in ("last_price", "price", "lastClose", "last_close", "mid", "close", "bid", "ask"):
+        for rk in ("last_price", "price", "lastClose", "close", "mid", "bid", "ask"):
             v = row.get(rk)
             if isinstance(v, (int, float)):
                 last_price = float(v)
@@ -5775,21 +6356,21 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
     if last_price is None:
         last_price = 0.0
 
+    # ---------------- compute realized move ----------------
     realized_move_pct = None
-    if isinstance(basis, (int, float)) and basis:
+    if basis:
         realized_move_pct = (last_price - basis) / basis * 100.0
 
     snap_key = _opp_snapshot_key(sym_u, direction)
 
-    # compute target if missing
-    if target is None and isinstance(basis, (int, float)) and basis and isinstance(move_pct_1h, (int, float)):
-        pct = float(move_pct_1h) / 100.0
-        pct_abs = abs(pct)
-        target = basis * (1.0 + pct_abs) if direction == "UP" else basis * (1.0 - pct_abs)
+    # ---------------- compute target if missing ----------------
+    if target is None and basis and move_pct_1h is not None:
+        pct = abs(move_pct_1h) / 100.0
+        target = basis * (1.0 + pct) if direction == "UP" else basis * (1.0 - pct)
 
-    # ---------------- HIT ----------------
+    # ======================== HIT ========================
     hit = False
-    if isinstance(target, (int, float)) and target and last_price:
+    if target and last_price:
         if direction == "UP" and last_price >= target:
             hit = True
         elif direction == "DOWN" and last_price <= target:
@@ -5800,37 +6381,31 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
             if has_alert:
                 _mark_alert_hit(alert_id, realized_move_pct, now_ms)
 
-                key = f"{ALERT_HASH_PREFIX}{alert_id}"
-                extra = {
-                    "status": json.dumps("hit"),
-                    "hit_target": json.dumps(True),
-                    "hit_ts": json.dumps(now_ms),
-                    "last_status_ms": json.dumps(now_ms),
-                    "time_to_target_min": json.dumps((now_ms - alert_ms) / 60000.0 if alert_ms else None),
-                    "last_price": json.dumps(last_price),
+                payload = {
+                    "alert_id": alert_id,
+                    "symbol": sym_u,
+                    "opp_direction": direction,
+                    "direction": direction,
+                    "alert_created_ms": alert_ms or now_ms,
+                    "status": "hit",
+                    "hit_target": True,
+                    "hit_ts": now_ms,
+                    "hit_ts_ms": now_ms,
+                    "last_status_ms": now_ms,
+                    "updated_ms": now_ms,
+                    "time_to_target_min": (now_ms - alert_ms) / 60000.0 if alert_ms else None,
+                    "last_price": last_price,
+                    "realized_move_pct": realized_move_pct,
                 }
-                if realized_move_pct is not None:
-                    extra["realized_move_pct"] = json.dumps(realized_move_pct)
-
-                # IMPORTANT: ensure indexed snapshot exists as HIT (NOT active)
+                payload.update(_entry_meta_from_snap())
+                _save_alert_snapshot(sym_u, payload)
+                # --- DISCORD: HIT notification (deduped) ---
                 try:
-                    _save_alert_snapshot(sym_u, {
-                        "alert_id": alert_id,
-                        "symbol": sym_u,
-                        "opp_direction": direction,
-                        "direction": direction,
-                        "alert_created_ms": alert_ms or now_ms,
-                        "status": "hit",
-                        "hit_target": True,
-                        "hit_ts": now_ms,
-                        "last_status_ms": now_ms,
-                    })
+                    _discord_notify_outcome("hit", payload)
                 except Exception:
                     pass
 
-                R.hset(key, mapping=extra)
 
-            # update live snapshot status too
             R.hset(snap_key, mapping={
                 "status": json.dumps("hit"),
                 "hit_ts": json.dumps(now_ms),
@@ -5840,55 +6415,45 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
         except Exception:
             pass
 
-        try:
-            _delete_live_snapshot(sym_u, direction)
-        except Exception:
-            pass
+        _delete_live_snapshot(sym_u, direction)
         return
 
-    # ---------------- EXPIRED ----------------
+    # ====================== EXPIRED ======================
     expired = False
     if opp_expire_ts and now_ms >= opp_expire_ts:
         expired = True
-    else:
-        base_ms = alert_ms or opp_open_ts
-        if base_ms and (now_ms - base_ms >= horizon_min * 60_000):
-            expired = True
+    elif alert_ms and (now_ms - alert_ms >= horizon_min * 60_000):
+        expired = True
 
     if expired:
         try:
             if has_alert:
                 _mark_alert_expired(alert_id, now_ms)
 
-                key = f"{ALERT_HASH_PREFIX}{alert_id}"
-                extra = {
-                    "status": json.dumps("expired"),
-                    "hit_target": json.dumps(False),
-                    "expired_ts": json.dumps(now_ms),
-                    "last_status_ms": json.dumps(now_ms),
-                    "time_to_target_min": json.dumps(float(horizon_min)),
-                    "last_price": json.dumps(last_price),
+                payload = {
+                    "alert_id": alert_id,
+                    "symbol": sym_u,
+                    "opp_direction": direction,
+                    "direction": direction,
+                    "alert_created_ms": alert_ms or now_ms,
+                    "status": "expired",
+                    "hit_target": False,
+                    "expired_ts": now_ms,
+                    "expired_ts_ms": now_ms,
+                    "last_status_ms": now_ms,
+                    "updated_ms": now_ms,
+                    "time_to_target_min": float(horizon_min),
+                    "last_price": last_price,
+                    "realized_move_pct": realized_move_pct,
                 }
-                if realized_move_pct is not None:
-                    extra["realized_move_pct"] = json.dumps(realized_move_pct)
-
-                # IMPORTANT: ensure indexed snapshot exists as EXPIRED (NOT active)
+                payload.update(_entry_meta_from_snap())
+                _save_alert_snapshot(sym_u, payload)
+                # --- DISCORD: EXPIRED  notification (deduped) ---
                 try:
-                    _save_alert_snapshot(sym_u, {
-                        "alert_id": alert_id,
-                        "symbol": sym_u,
-                        "opp_direction": direction,
-                        "direction": direction,
-                        "alert_created_ms": alert_ms or now_ms,
-                        "status": "expired",
-                        "hit_target": False,
-                        "expired_ts": now_ms,
-                        "last_status_ms": now_ms,
-                    })
+                    _discord_notify_outcome("expired", payload)
                 except Exception:
                     pass
 
-                R.hset(key, mapping=extra)
 
             R.hset(snap_key, mapping={
                 "status": json.dumps("expired"),
@@ -5899,8 +6464,5 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
         except Exception:
             pass
 
-        try:
-            _delete_live_snapshot(sym_u, direction)
-        except Exception:
-            pass
+        _delete_live_snapshot(sym_u, direction)
         return
