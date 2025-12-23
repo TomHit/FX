@@ -24,7 +24,7 @@ import hashlib
 from api.security import require_user_relaxed
 from api.trend import router as trend_router
 from api.strategy_endpoints import router as strategy_router
-
+from api.routes_preview import router as preview_router
 
 try:
     from api.routes_admin import r as admin_router
@@ -157,6 +157,7 @@ app.include_router(oidc_router, tags=["auth"])            # /auth/oidc/*
 app.include_router(google_oidc_router, tags=["auth"])     # /auth/oidc/google/*
 app.include_router(devices_router, prefix="")
 app.include_router(predict_router)
+app.include_router(preview_router) 
 
 # --- Logged-in but MFA NOT required (for enrollment) ---
 # All /user/mfa/* endpoints need a user session but should work before MFA is enabled.

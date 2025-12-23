@@ -54,7 +54,8 @@ function outcomeTimeMs(r: any): number | null {
   const st = String(r?.status || "").toLowerCase();
   if (st === "hit") return typeof r?.hitTsMs === "number" ? r.hitTsMs : null;
   if (st === "expired") return typeof r?.expiredTsMs === "number" ? r.expiredTsMs : null;
-  // fallback: use updatedMs if backend didn’t provide explicit hit/expired ts
+  if (st === "sl_hit") return typeof (r as any)?.slHitTsMs === "number" ? (r as any).slHitTsMs : (typeof (r as any)?.sl_hit_ts_ms === "number" ? (r as any).sl_hit_ts_ms : null);
+  // fallback: use updatedMs if backend didnt provide explicit hit/expired ts
   return typeof r?.updatedMs === "number" ? r.updatedMs : null;
 }
 
@@ -83,6 +84,10 @@ type ApiRow = {
   alert_price_1h?: number;             // frozen entry / basis
   basis_price_1h?: number;             // basis used for target calc
   target_price_1h?: number;            // frozen target
+  stop_loss_1h?: number;              // frozen SL (baseline)
+  tp_price?: number | null;           // frozen TP at entry (alias)
+  sl_price?: number | null;           // frozen SL at entry (alias)
+  sl_hit_ts_ms?: number | null;
   alert_created_ms?: number;           // when this alert was created
   horizon_min?: number;                // usually 60
   last_status_ms?: number;             // last status update
@@ -179,6 +184,10 @@ type OppRow = {
   absMovePct: number;
   basisPrice: number | null;
   targetPrice: number | null;
+  tpPrice: number | null;
+  slPrice: number | null;
+  tpPriceOrig: number | null;
+  slPriceOrig: number | null;
   probUp: number | null;
   oppScore: number | null;
   oppConfidence: string | null;
@@ -244,7 +253,7 @@ const API_BASE =
  * -------------------------- */
 
 function fmtPrice(sym: string, px: number | null | undefined): string {
-  if (!Number.isFinite(px as any)) return "â€”";
+  if (!Number.isFinite(px as any)) return "—";
   const s = sym.toUpperCase();
   const d = s === "XAUUSD" ? 2 : s.endsWith("JPY") ? 3 : 5;
   return (px as number).toFixed(d);
@@ -300,7 +309,26 @@ function mapApiRow(r: ApiRow): OppRow | null {
     r.basis_price_1h ??
     null;
 
-  const targetPrice = r.target_price_1h ?? null;
+
+const targetPrice = r.target_price_1h ?? null;
+
+const tpPrice =
+  (typeof r.tp_price === "number" ? r.tp_price : null) ??
+  (typeof r.target_price_1h === "number" ? r.target_price_1h : null);
+
+const slPrice =
+  (typeof r.sl_price === "number" ? r.sl_price : null) ??
+  (typeof r.stop_loss_1h === "number" ? r.stop_loss_1h : null)
+const tpPriceOrig =
+  (typeof (r as any).tp_price_orig === "number" ? (r as any).tp_price_orig : null) ??
+  (typeof r.target_price_1h === "number" ? r.target_price_1h : null);
+
+const slPriceOrig =
+  (typeof (r as any).sl_price_orig === "number" ? (r as any).sl_price_orig : null) ??
+  (typeof (r as any).stop_loss_1h === "number" ? (r as any).stop_loss_1h : null);
+
+;
+
 
   const probUp = r.prob_up ?? r.p_up ?? null;
   const oppScore = r.opp_score ?? null;
@@ -514,6 +542,10 @@ function mapApiRow(r: ApiRow): OppRow | null {
     absMovePct,
     basisPrice,
     targetPrice,
+    tpPrice,
+    slPrice,
+    tpPriceOrig,
+    slPriceOrig,
     probUp,
     oppScore,
     oppConfidence,
@@ -806,7 +838,7 @@ const Pill: React.FC<{
 function OpportunitiesDashboard() {
   const { rows, history, lastAt, error, refetch } = useOpportunities();
   const livePrices = useLivePrices(30_000);
-  const lastUpdatedLabel = lastAt ? fmtTime(lastAt) : "â€”";
+  const lastUpdatedLabel = lastAt ? fmtTime(lastAt) : "—";
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5 px-3 pb-10 pt-4">
@@ -886,7 +918,8 @@ function OpportunitiesDashboard() {
                 <th className="px-3 py-2 text-left">Direction</th>
                 <th className="px-3 py-2 text-right">Live</th>
                 <th className="px-3 py-2 text-right">Basis</th>
-                <th className="px-3 py-2 text-right">Target</th>
+                <th className="px-3 py-2 text-right">TP</th>
+                <th className="px-3 py-2 text-right">SL</th>
                 <th className="px-3 py-2 text-right">Time left</th>
                 <th className="px-3 py-2 text-left">Signal</th>
                 <th className="px-3 py-2 text-right">Status</th>
@@ -901,7 +934,7 @@ function OpportunitiesDashboard() {
               {rows.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={13}
+                    colSpan={14}
                     className="px-4 py-7 text-center text-xs text-slate-400"
                   >
                     No active opportunities have passed the room & confidence
@@ -921,7 +954,7 @@ function OpportunitiesDashboard() {
                     typeof r.alertTimeMs === "number" ? (r.alertTimeMs + horizonMs - Date.now()) : null;
                   const timeLeftText =
                     timeLeftMs == null
-                      ? "â€”"
+                      ? "—"
                       : (timeLeftMs <= 0
                           ? "0m"
                           : `${Math.ceil(timeLeftMs / 60_000)}m`);
@@ -939,27 +972,28 @@ function OpportunitiesDashboard() {
 
                   const liveStr = fmtPrice(sym, typeof lp === "number" ? lp : null);
 
-                  let distToTargetStr = "â€”";
+                  let distToTargetStr = "—";
                   if (
                     typeof lp === "number" &&
-                    typeof r.targetPrice === "number" &&
+                    typeof (r.tpPrice ?? r.targetPrice) === "number" &&
                     typeof r.basisPrice === "number" &&
                     r.basisPrice > 0
                   ) {
-                    const distPct = Math.abs((r.targetPrice - lp) / r.basisPrice) * 100.0;
+                    const tp0 = (r.tpPrice ?? r.targetPrice) as number;
+                    const distPct = Math.abs((tp0 - lp) / r.basisPrice) * 100.0;
                     distToTargetStr = distPct.toFixed(2) + "%";
                   }
 const roomStr = r.absMovePct.toFixed(2) + "%";
                   const scoreStr =
-                    r.oppScore != null ? r.oppScore.toFixed(1) : "â€”";
+                    r.oppScore != null ? r.oppScore.toFixed(1) : "—";
                   const probStr =
                     r.probUp != null
                       ? (r.probUp * 100).toFixed(0)+"%"
-                      : "â€”";
+                      : "—";
 
                   const reasons = r.reasons.slice(0, 3);
 
-                  // simple visual bar for score 0Â–100
+                  // simple visual bar for score 0?100
                   const scoreNorm = Math.max(
                     0,
                     Math.min(100, (r.oppScore ?? 0) * 1.0)
@@ -997,7 +1031,48 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
                         {fmtPrice(sym, r.basisPrice)}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums text-slate-200">
-                        {fmtPrice(sym, r.targetPrice)}
+                        {(() => {
+                          const tp = r.tpPrice ?? r.targetPrice;
+                          const tpOrig = (r as any).tpPriceOrig ?? r.targetPrice;
+                          const main = fmtPrice(sym, tp);
+                          const orig = fmtPrice(sym, tpOrig);
+                          const showOrig =
+                            typeof tp === "number" &&
+                            typeof tpOrig === "number" &&
+                            Math.abs(tp - tpOrig) > 1e-9;
+                          return (
+                            <div className="flex flex-col items-end">
+                              <div>{main}</div>
+                              {showOrig ? (
+                                <div className="text-[10px] text-slate-500">
+                                  orig {orig}
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })()}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-slate-200">
+                        {(() => {
+                          const sl = r.slPrice;
+                          const slOrig = (r as any).slPriceOrig ?? sl;
+                          const main = fmtPrice(sym, sl);
+                          const orig = fmtPrice(sym, slOrig);
+                          const showOrig =
+                            typeof sl === "number" &&
+                            typeof slOrig === "number" &&
+                            Math.abs(sl - slOrig) > 1e-9;
+                          return (
+                            <div className="flex flex-col items-end">
+                              <div>{main}</div>
+                              {showOrig ? (
+                                <div className="text-[10px] text-slate-500">
+                                  orig {orig}
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })()}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums text-slate-200">
                         {timeLeftText}
@@ -1016,7 +1091,7 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
                             )}
                           </div>
                         ) : (
-                          <span className="text-[11px] text-slate-500">—</span>
+                          <span className="text-[11px] text-slate-500"></span>
                         )}
                       </td>
 
@@ -1098,7 +1173,7 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
         Alert History
       </div>
       <div className="mt-0.5 text-[11px] text-slate-500">
-        Completed H1 opportunities – hit or expired.
+        Completed H1 opportunities  hit or expired.
       </div>
     </div>
     <div className="text-[11px] text-slate-500">
@@ -1141,7 +1216,7 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
                 : "bg-slate-900/40";
 
             // -------- Entry display --------
-            const entrySig = h.entrySignal || h.signalText || "—";
+            const entrySig = h.entrySignal || h.signalText || "";
             const entryPrice =
               typeof h.entryPrice === "number"
                 ? fmtPrice(h.symbol, h.entryPrice)
@@ -1165,12 +1240,12 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
             const ddStr =
               typeof h.maxDrawdownPct === "number"
                 ? h.maxDrawdownPct.toFixed(2) + "%"
-                : "—";
+                : "";
 
             const tttStr =
               typeof h.timeToTargetMin === "number"
                 ? h.timeToTargetMin.toFixed(0) + " min"
-                : "—";
+                : "";
 
             return (
               <tr

@@ -46,6 +46,118 @@ log.info(f"[TREND] ENABLE_H4_MODEL={ENABLE_H4_MODEL}")
 REG_PATH = Path("/opt/xauapi/api/trend/models/xgb_reg.json")
 CLS_PATH = Path("/opt/xauapi/api/trend/models/xgb_cls.json")
 
+# --------------------------
+# Discord webhook (optional)
+# --------------------------
+# Set in /etc/xauapi.env (or systemd EnvironmentFile):
+#   DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/...."
+# If not set, Discord notifications are simply skipped.
+DISCORD_WEBHOOK_URL = (os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("XTL_DISCORD_WEBHOOK_URL") or "").strip()
+
+def _fmt_price(x: Any) -> str:
+    try:
+        v = float(x)
+    except Exception:
+        return "NA"
+    # Keep reasonable precision across FX + XAU
+    if abs(v) >= 1000:
+        return f"{v:.2f}"
+    if abs(v) >= 100:
+        return f"{v:.3f}"
+    return f"{v:.5f}"
+
+def _discord_post(content: str) -> bool:
+    """Best-effort Discord webhook post. Never raises."""
+    if not DISCORD_WEBHOOK_URL:
+        return False
+    try:
+        import urllib.request
+        data = json.dumps({"content": content}).encode("utf-8")
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            _ = resp.read()
+        return True
+    except Exception:
+        return False
+
+def _discord_entry_msg(sym: str, sig: str, entry_price: Any, tp_price: Any, sl_price: Any, ts_ms: int, reason: str | None = None) -> str:
+    ts_s = ""
+    try:
+        if ts_ms:
+            ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_ms / 1000.0))
+    except Exception:
+        ts_s = ""
+    parts = [
+        f"**{sym}** - **{sig}**",
+        f"Entry: `{_fmt_price(entry_price)}`",
+        f"TP: `{_fmt_price(tp_price)}`",
+        f"SL: `{_fmt_price(sl_price)}`",
+    ]
+    if ts_s:
+        parts.append(f"Time: `{ts_s}`")
+    if reason:
+        parts.append(f"Reason: `{reason}`")
+    return " | ".join(parts)
+
+def _discord_status_msg(sym: str, status: str, last_price: Any, realized_move_pct: Any, ts_ms: int) -> str:
+    ts_s = ""
+    try:
+        if ts_ms:
+            ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_ms / 1000.0))
+    except Exception:
+        ts_s = ""
+    st = status.upper()
+    parts = [
+        f"**{sym}** - **{st}**",
+        f"Last: `{_fmt_price(last_price)}`",
+    ]
+    try:
+        if realized_move_pct is not None:
+            parts.append(f"Move: `{float(realized_move_pct):+.2f}%`")
+    except Exception:
+        pass
+    if ts_s:
+        parts.append(f"Time: `{ts_s}`")
+    return " | ".join(parts)
+
+def _log_trade_outcome(payload: dict) -> None:
+    """
+    Append a compact outcome record into Redis for quick stats.
+    Keeps last N outcomes per day.
+    """
+    try:
+        sym = str(payload.get("symbol") or "").upper().strip() or "NA"
+        status = str(payload.get("status") or "").lower().strip() or "na"
+        uid = str(payload.get("user_id") or payload.get("uid") or "global")
+        day = time.strftime("%Y%m%d", time.gmtime(int(payload.get("updated_ms") or payload.get("hit_ts_ms") or payload.get("expired_ts_ms") or payload.get("sl_hit_ts_ms") or time.time()*1000)/1000.0))
+        key = f"xtl:outcomes:{uid}:{day}"
+
+        rec = {
+            "ts_ms": int(payload.get("updated_ms") or payload.get("hit_ts_ms") or payload.get("expired_ts_ms") or payload.get("sl_hit_ts_ms") or time.time()*1000),
+            "symbol": sym,
+            "status": status,  # hit | sl_hit | expired
+            "direction": str(payload.get("opp_direction") or payload.get("direction") or ""),
+            "entry_signal": payload.get("entry_signal"),
+            "entry_price": payload.get("entry_price"),
+            "tp_price": payload.get("tp_price"),
+            "sl_price": payload.get("sl_price"),
+            "last_price": payload.get("last_price"),
+            "realized_move_pct": payload.get("realized_move_pct"),
+            "alert_id": payload.get("alert_id"),
+        }
+
+        R.rpush(key, json.dumps(rec))
+        # keep last 2000 records/day
+        R.ltrim(key, -2000, -1)
+        # expire in 14 days
+        R.expire(key, 14 * 24 * 3600)
+    except Exception:
+        pass
 
 
 # --- Opportunity thresholds & helpers (H1 + H4) ---
@@ -715,6 +827,7 @@ log.info(f"[TREND] REDIS_URL={REDIS_URL}")
 # Put this in /etc/xauapi.env (recommended):
 #   DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/...."
 DISCORD_WEBHOOK_URL = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
+DISCORD_MENTION_EVERYONE = (os.getenv("XTL_DISCORD_MENTION_EVERYONE") or "1").strip().lower() in ("1","true","yes","on")
 
 def _discord_dedupe_key(event: str, k: str) -> str:
     kk = (k or "").strip()
@@ -800,7 +913,7 @@ def _discord_notify_entry(row: dict) -> None:
     ts_utc = time.strftime("%H:%M UTC", time.gmtime(ts_ms / 1000))
 
     msg = (
-        f"@everyone ?? **ENTRY {sig} — {sym}**\n\n"
+        f"@everyone ?? **ENTRY {sig} - {sym}**\n\n"
         f"?? Time: `{ts_utc}`\n"
         f"?? Timeframe: `{row.get('tf', 'NA')}`\n\n"
         f"Entry: `{_fmt_px(entry_px)}`\n"
@@ -808,19 +921,19 @@ def _discord_notify_entry(row: dict) -> None:
         f"Stop Loss: `{_fmt_px(sl) if sl is not None else 'TBD'}`\n\n"
         f"Reason: `{reason}`\n"
         f"Alert ID: `{alert_key}`\n\n"
-        f"?? Manual trade — manage risk accordingly."
+        f"?? Manual trade - manage risk accordingly."
     )
 
     _discord_post(msg)
 
 def _discord_notify_outcome(event: str, payload: dict) -> None:
     """
-    event: 'hit' | 'expired'
+    event: 'hit' | 'expired' | 'sl_hit'
     payload: data from _evaluate_alert_outcome
     """
     sym = str(payload.get("symbol") or "").upper().strip() or "NA"
     direction = str(payload.get("opp_direction") or payload.get("direction") or "").upper().strip()
-    status = str(payload.get("status") or event).lower()
+    status = str(payload.get("status") or event).lower().strip()
 
     alert_key = (
         str(payload.get("alert_id") or "").strip()
@@ -828,24 +941,51 @@ def _discord_notify_outcome(event: str, payload: dict) -> None:
         or f"{sym}:{direction}:{int(payload.get('alert_created_ms') or 0)}"
     )
 
+    # Dedup by final status + alert key
     if not _discord_should_send(status, alert_key, ttl_sec=7 * 24 * 3600):
         return
 
     last_px = payload.get("last_price")
     rmove = payload.get("realized_move_pct")
 
-    emoji = "??" if status == "hit" else "?"
-    entry_sig = payload.get("entry_signal") or payload.get("entry_signal".upper())
-    entry_px = payload.get("entry_price")
+    if status == "hit":
+        emoji = "??"
+        title = "HIT"
+    elif status in ("sl_hit", "stop", "stopped", "stop_loss"):
+        emoji = "??"
+        title = "SL HIT"
+    else:
+        emoji = "?"
+        title = status.upper() if status else "UPDATE"
 
-    extra = ""
+    entry_sig = str(payload.get("entry_signal") or "").upper().strip()
+    entry_px = payload.get("entry_price")
+    tp_px = payload.get("tp_price")
+    sl_px = payload.get("sl_price")
+
+    extra_lines = []
     if entry_sig in ("BUY", "SELL") and entry_px is not None:
-        extra = f"\nEntry: `{entry_sig}` @ `{_fmt_px(entry_px)}`"
+        extra_lines.append(f"Entry: `{entry_sig}` @ `{_fmt_px(entry_px)}`")
+    if tp_px is not None:
+        extra_lines.append(f"TP: `{_fmt_px(tp_px)}`")
+    if sl_px is not None:
+        extra_lines.append(f"SL: `{_fmt_px(sl_px)}`")
+
+    extra = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
+
+    move_val = 0.0
+    try:
+        if isinstance(rmove, (int, float)):
+            move_val = float(rmove)
+    except Exception:
+        move_val = 0.0
+
+    mention = "@everyone " if (DISCORD_MENTION_EVERYONE and status in ("hit","sl_hit")) else ""
 
     msg = (
-        f"{emoji} **{status.upper()}** — **{sym}** ({direction})\n"
+        f"{mention}{emoji} **{title}** - **{sym}** ({direction})\n"
         f"Last: `{_fmt_px(last_px)}`\n"
-        f"Move: `{(float(rmove) if isinstance(rmove,(int,float)) else 0.0):+.2f}%`"
+        f"Move: `{move_val:+.2f}%`"
         f"{extra}\n"
         f"Alert: `{alert_key}`"
     )
@@ -1012,6 +1152,20 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
                 payload.get("entry_price")
                 or _get_existing("entry_price")
             )
+            payload["tp_price"] = (
+                payload.get("tp_price")
+                or _get_existing("tp_price")
+            )
+            payload["sl_price"] = (
+                payload.get("sl_price")
+                or _get_existing("sl_price")
+            )
+            payload["discord_entry_sent"] = (
+                payload.get("discord_entry_sent")
+                or _get_existing("discord_entry_sent")
+                or False
+            )
+
         # ---------- END NEW ----------
 
         mapping = {k: json.dumps(v) for k, v in payload.items()}
@@ -2840,7 +2994,7 @@ def build_commentary_payload(row: dict) -> dict:
             "h1": row.get("reasons_h1", []) or [],
             "h4": row.get("reasons_h4", []) or [],
         },
-        # keep this as “hint text only” until you wire real SR numbers
+        # keep this as Â“hint text onlyÂ” until you wire real SR numbers
         "support_resistance_hint": {
             "support": "near recent intraday lows",
             "resistance": "near prior supply zone",
@@ -3331,13 +3485,136 @@ def trend_opportunities(
                     row["entry_price"] = float(ep)
                 except Exception:
                     row["entry_price"] = None
-                # --- DISCORD: notify entry once (deduped) ---
+
+                # ---- TP / SL (freeze at entry; re-anchor ONCE at entry, then freeze) ----
+                # Preserve original model levels for transparency (UI/history)
+                tp_orig = row.get("target_price_1h") or row.get("target_price")
+                sl_orig = row.get("stop_loss_1h") or row.get("stop_loss") or row.get("stop_loss_price")
+
                 try:
-                    _discord_notify_entry(row)
+                    tp_orig = float(tp_orig) if tp_orig is not None else None
                 except Exception:
-                    pass
+                    tp_orig = None
+                try:
+                    sl_orig = float(sl_orig) if sl_orig is not None else None
+                except Exception:
+                    sl_orig = None
+
+                row["tp_price_orig"] = tp_orig
+                row["sl_price_orig"] = sl_orig
+
+                # Entry price (must be real live price at trigger time)
+                try:
+                    ep0 = float(row.get("entry_price")) if row.get("entry_price") is not None else None
+                except Exception:
+                    ep0 = None
+
+                # Basis used by forecast/model (for remaining-move computation)
+                basis0 = (
+                    row.get("basis_price_1h")
+                    or row.get("basis_price")
+                    or (row.get("raw") or {}).get("lastClose")
+                    or (row.get("raw") or {}).get("basis_price_1h")
+                )
+                try:
+                    basis0 = float(basis0) if basis0 is not None else None
+                except Exception:
+                    basis0 = None
+
+                # Default: keep original TP/SL if we cannot compute safely
+                tp = tp_orig
+                sl = sl_orig
+
+                # --- Late-entry gate + re-anchoring ---
+                # If price already travelled most of the forecast move, either:
+                # (a) reject entry (recommended), or (b) re-anchor TP to remaining move and set SL by RRR.
+                late_min_rem_ratio = None
+                try:
+                    late_min_rem_ratio = float(os.getenv("XTL_LATE_ENTRY_MIN_REMAIN_RATIO", "0.30"))
+                except Exception:
+                    late_min_rem_ratio = 0.30
+
+                # Set to 0.0 to disable late-entry rejection in testing
+                late_reject_enabled = late_min_rem_ratio > 0.0
+
+                # RRR used to compute SL from adjusted TP distance
+                try:
+                    rrr = float(os.getenv("XTL_ENTRY_RRR", "1.20"))
+                except Exception:
+                    rrr = 1.20
+                if rrr <= 0:
+                    rrr = 1.20
+
+                # Optional minimum remaining move (absolute price units)
+                try:
+                    min_rem_abs = float(os.getenv("XTL_LATE_ENTRY_MIN_REMAIN_ABS", "0.0"))
+                except Exception:
+                    min_rem_abs = 0.0
+
+                if ep0 is not None and basis0 is not None and tp_orig is not None and sig in ("BUY", "SELL"):
+                    # total/used/remaining move toward original target
+                    if sig == "BUY":
+                        total_move = tp_orig - basis0
+                        used_move = ep0 - basis0
+                    else:
+                        total_move = basis0 - tp_orig
+                        used_move = basis0 - ep0
+
+                    # Guardrails
+                    if total_move is None or total_move <= 0:
+                        total_move = 0.0
+                    if used_move is None:
+                        used_move = 0.0
+
+                    rem = max(total_move - used_move, 0.0)
+                    rem_ratio = (rem / total_move) if total_move > 0 else 0.0
+
+                    row["move_total"] = total_move
+                    row["move_used"] = used_move
+                    row["move_remaining"] = rem
+                    row["move_remaining_ratio"] = rem_ratio
+
+                    # Late-entry rejection (prevents chasing when almost no room left)
+                    if late_reject_enabled and (rem_ratio < late_min_rem_ratio or rem < min_rem_abs):
+                        row["signal"] = "WAIT"
+                        row["signal_text"] = "WAIT"
+                        row["signal_reason"] = "late_entry"
+                        row["late_entry_reject"] = True
+                        row["late_entry_min_rem_ratio"] = late_min_rem_ratio
+                        # Do NOT freeze entry meta if we reject
+                        return
+
+                    # Re-anchor TP to the remaining move (honest: smaller TP if you enter late)
+                    if rem > 0:
+                        tp = (ep0 + rem) if sig == "BUY" else (ep0 - rem)
+
+                        # Compute SL from desired RRR (risk = reward/rrr)
+                        reward = abs(tp - ep0)
+                        risk = (reward / rrr) if rrr > 0 else reward
+
+                        # Optional minimum SL distance (absolute)
+                        try:
+                            min_sl_abs = float(os.getenv("XTL_ENTRY_MIN_SL_ABS", "0.0"))
+                        except Exception:
+                            min_sl_abs = 0.0
+                        if risk < min_sl_abs:
+                            risk = min_sl_abs
+
+                        sl = (ep0 - risk) if sig == "BUY" else (ep0 + risk)
+
+                # Persist for UI + lifecycle checks (frozen at entry)
+                row["tp_price"] = tp
+                row["sl_price"] = sl
+
+                # ---- Discord notify (best-effort, once) ----
+                _maybe_discord_entry(row=row, sig=sig, tp=tp, sl=sl, now_ms=now_ms)
 
             return
+
+
+                
+
+            
 
         # Not triggered yet -> WAIT
         row["signal"] = "WAIT"
@@ -3728,6 +4005,63 @@ def trend_opportunities(
         opp_rows = debug_pool[:debug_top]
 
     return {"ok": True, "tf": tfu, "rows": opp_rows, "history": history}
+
+
+@router.get("/opportunities/stats")
+def opportunities_stats(
+    day: str | None = None,
+    user = Depends(require_auth_optional),
+):
+    """
+    Returns counts of hit/sl_hit/expired for the day (UTC) from Redis outcomes list.
+    day format: YYYYMMDD (UTC). default=today UTC.
+    """
+    try:
+        uid = _uid_from(user) if user else None
+    except Exception:
+        uid = None
+
+    uid = str(uid or "global")
+    if not day:
+        day = time.strftime("%Y%m%d", time.gmtime())
+
+    key = f"xtl:outcomes:{uid}:{day}"
+    items = R.lrange(key, 0, -1) or []
+
+    counts = {"hit": 0, "sl_hit": 0, "expired": 0, "other": 0}
+    by_symbol: dict[str, dict] = {}
+
+    for s in items:
+        try:
+            rec = json.loads(s)
+        except Exception:
+            continue
+
+        st = str(rec.get("status") or "").lower().strip() or "other"
+        if st not in counts:
+            st = "other"
+        counts[st] += 1
+
+        sym = str(rec.get("symbol") or "NA")
+        if sym not in by_symbol:
+            by_symbol[sym] = {"hit": 0, "sl_hit": 0, "expired": 0, "other": 0}
+        by_symbol[sym][st] = by_symbol[sym].get(st, 0) + 1
+
+    total = sum(counts.values())
+
+    # rough win rate = hits / (hits + sl_hit) ignoring expired
+    denom = counts["hit"] + counts["sl_hit"]
+    win_rate = (counts["hit"] / denom) if denom > 0 else None
+
+    return {
+        "ok": True,
+        "day": day,
+        "uid": uid,
+        "total_closed": total,
+        "counts": counts,
+        "win_rate_vs_sl": win_rate,
+        "by_symbol": by_symbol,
+    }
 
 
 @router.get("/predict/health")
@@ -6252,10 +6586,11 @@ def predict_4h_debug(
 
 def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
     """
-    Evaluates whether an opportunity HIT target or EXPIRED.
+    Evaluates whether an opportunity HIT target, SL-HIT (stop loss), or EXPIRED.
 
-    - Direction is UP/DOWN (not BUY/SELL)
-    - Close snapshot ONLY when hit OR expired (time)
+    - Direction is UP/DOWN (not BUY/SELL) for target-hit evaluation
+    - SL-HIT is evaluated using entry_signal BUY/SELL + sl_price
+    - Close snapshot ONLY when hit OR sl_hit OR expired (time)
     - Works even if alert_id is missing (uses opp_id as fallback)
     - Computes target from trade_tp_pct_1h / expected_move_pct_1h if target_price_1h is missing
     """
@@ -6294,11 +6629,16 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
             "entry_reason": _pick("entry_reason", None),
             "entry_ts_ms": _pick("entry_ts_ms", None),
             "entry_price": _pick("entry_price", None),
+            "tp_price": _pick("tp_price", None),
+            "sl_price": _pick("sl_price", None),
+            "discord_entry_sent": _pick("discord_entry_sent", None),
         }
 
     # ------------------------------------------------------------------
 
-    sym_u = (sym or "").upper()
+    sym_u = (sym or "").upper().strip()
+    if not sym_u:
+        return
 
     direction = str((_sj("opp_direction") or _sj("direction") or "")).upper()
     if direction not in ("UP", "DOWN"):
@@ -6333,7 +6673,7 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
 
     # ---------------- times ----------------
     alert_ms = int(_sj("alert_created_ms") or 0)
-    opp_open_ts = int(_sj("opp_open_ts") or 0)
+    opp_open_ts = int(_sj("opp_open_ts") or 0)  # kept for compatibility (unused below)
     opp_expire_ts = int(_sj("opp_expire_ts") or 0)
     horizon_min = int(_sj("horizon_min") or 60)
 
@@ -6343,7 +6683,7 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
     if isinstance(lp, (int, float)):
         last_price = float(lp)
 
-    if last_price is None:
+    if last_price is None and isinstance(row, dict):
         for rk in ("last_price", "price", "lastClose", "close", "mid", "bid", "ask"):
             v = row.get(rk)
             if isinstance(v, (int, float)):
@@ -6356,11 +6696,6 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
     if last_price is None:
         last_price = 0.0
 
-    # ---------------- compute realized move ----------------
-    realized_move_pct = None
-    if basis:
-        realized_move_pct = (last_price - basis) / basis * 100.0
-
     snap_key = _opp_snapshot_key(sym_u, direction)
 
     # ---------------- compute target if missing ----------------
@@ -6368,13 +6703,161 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
         pct = abs(move_pct_1h) / 100.0
         target = basis * (1.0 + pct) if direction == "UP" else basis * (1.0 - pct)
 
-    # ======================== HIT ========================
+    # ---------------- compute realized move (basis-based, for legacy) ----------------
+    realized_move_pct = None
+    if basis:
+        try:
+            realized_move_pct = (float(last_price) - float(basis)) / float(basis) * 100.0
+        except Exception:
+            realized_move_pct = None
+
+    # ====================== SL-HIT (Stop Loss) ======================
+    # SL-HIT uses entry meta (BUY/SELL + sl_price), not UP/DOWN.
+    meta = _entry_meta_from_snap()
+
+    sl_hit = False
+    sl_price = None
+    entry_sig = None
+    entry_price = None
+
+    try:
+        if bool(meta.get("entry_triggered")):
+            entry_sig = str(meta.get("entry_signal") or "").upper().strip()
+            entry_price = meta.get("entry_price", None)
+            sl_price = meta.get("sl_price", None)
+
+            lp0 = float(last_price) if last_price is not None else None
+            sl0 = float(sl_price) if sl_price is not None else None
+
+            if lp0 is not None and sl0 is not None and entry_sig in ("BUY", "SELL"):
+                # BUY: stopped when price <= SL
+                if entry_sig == "BUY" and lp0 <= sl0:
+                    sl_hit = True
+                # SELL: stopped when price >= SL
+                elif entry_sig == "SELL" and lp0 >= sl0:
+                    sl_hit = True
+    except Exception:
+        sl_hit = False
+
+    if sl_hit:
+        try:
+            # Build payload similar to HIT/EXPIRED
+            payload = {
+                "alert_id": alert_id,
+                "symbol": sym_u,
+                "opp_direction": direction,
+                "direction": direction,
+                "alert_created_ms": alert_ms or now_ms,
+                "status": "sl_hit",
+                "hit_target": False,
+                "sl_hit": True,
+                "sl_hit_ts": now_ms,
+                "sl_hit_ts_ms": now_ms,
+                "last_status_ms": now_ms,
+                "updated_ms": now_ms,
+                "last_price": last_price,
+            }
+            payload.update(meta)
+
+            # realized move pct from ENTRY (directional for BUY/SELL)
+            try:
+                ep = meta.get("entry_price")
+                ep = float(ep) if ep is not None else None
+                lp0 = float(last_price)
+                if ep and ep > 0:
+                    move = ((lp0 - ep) / ep) * 100.0
+                    if str(meta.get("entry_signal") or "").upper() == "SELL":
+                        move = -move
+                    payload["realized_move_pct"] = float(move)
+                else:
+                    payload["realized_move_pct"] = None
+            except Exception:
+                payload["realized_move_pct"] = None
+
+            # mark alert stopped (optional)
+            try:
+                if has_alert:
+                    # If you don't have a dedicated function, keep it as a no-op.
+                    # (Safe) store status update in Redis hash below anyway.
+                    pass
+            except Exception:
+                pass
+
+            _save_alert_snapshot(sym_u, payload)
+            _log_trade_outcome(payload)
+
+
+            # If you want the same deduped notifier style as HIT/EXPIRED:
+            try:
+                _discord_notify_outcome("sl_hit", payload)
+            except Exception:
+                pass
+
+            
+
+            # update live snapshot status (optional, for immediate UI)
+            try:
+                R.hset(snap_key, mapping={
+                    "status": json.dumps("sl_hit"),
+                    "sl_hit_ts": json.dumps(now_ms),
+                    "last_status_ms": json.dumps(now_ms),
+                    "last_price": json.dumps(last_price),
+                })
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+        _delete_live_snapshot(sym_u, direction)
+        return
+    # ====================== TP-HIT (Take Profit) ======================
+    # TP-HIT uses entry meta (BUY/SELL + tp_price), not UP/DOWN.
+    tp_hit = False
+    tp_price = None
+
+    try:
+        if bool(meta.get("entry_triggered")):
+            tp_price = meta.get("tp_price", None)
+
+            lp0 = float(last_price) if last_price is not None else None
+            tp0 = float(tp_price) if tp_price is not None else None
+
+            if lp0 is not None and tp0 is not None and entry_sig in ("BUY", "SELL"):
+                # BUY: TP hit when price >= TP
+                if entry_sig == "BUY" and lp0 >= tp0:
+                    tp_hit = True
+                # SELL: TP hit when price <= TP
+                if entry_sig == "SELL" and lp0 <= tp0:
+                    tp_hit = True
+    except Exception:
+        tp_hit = False
+
+    # If entry-triggered TP was hit, treat as overall HIT and freeze target to tp_price.
+    if tp_hit:
+        try:
+            if tp_price is not None:
+                target = float(tp_price)
+        except Exception:
+            pass
+
+
+    # ======================== HIT (Target) ========================
     hit = False
-    if target and last_price:
-        if direction == "UP" and last_price >= target:
-            hit = True
-        elif direction == "DOWN" and last_price <= target:
-            hit = True
+
+    # If entry-triggered, TP hit is based on BUY/SELL + tp_price (deterministic).
+    if bool(meta.get("entry_triggered")):
+        hit = bool(tp_hit)
+    else:
+        if target and last_price:
+            try:
+                if direction == "UP" and float(last_price) >= float(target):
+                    hit = True
+                elif direction == "DOWN" and float(last_price) <= float(target):
+                    hit = True
+            except Exception:
+                hit = False
+
 
     if hit:
         try:
@@ -6389,6 +6872,9 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
                     "alert_created_ms": alert_ms or now_ms,
                     "status": "hit",
                     "hit_target": True,
+                    "tp_hit": bool(tp_hit),
+                    "tp_hit": tp_hit,
+                    "tp_price": tp_price,
                     "hit_ts": now_ms,
                     "hit_ts_ms": now_ms,
                     "last_status_ms": now_ms,
@@ -6397,14 +6883,16 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
                     "last_price": last_price,
                     "realized_move_pct": realized_move_pct,
                 }
-                payload.update(_entry_meta_from_snap())
+                payload.update(meta)
                 _save_alert_snapshot(sym_u, payload)
+                _log_trade_outcome(payload)
+
+
                 # --- DISCORD: HIT notification (deduped) ---
                 try:
                     _discord_notify_outcome("hit", payload)
                 except Exception:
                     pass
-
 
             R.hset(snap_key, mapping={
                 "status": json.dumps("hit"),
@@ -6415,15 +6903,20 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
         except Exception:
             pass
 
+      
+
         _delete_live_snapshot(sym_u, direction)
         return
 
     # ====================== EXPIRED ======================
     expired = False
-    if opp_expire_ts and now_ms >= opp_expire_ts:
-        expired = True
-    elif alert_ms and (now_ms - alert_ms >= horizon_min * 60_000):
-        expired = True
+    try:
+        if opp_expire_ts and now_ms >= opp_expire_ts:
+            expired = True
+        elif alert_ms and (now_ms - alert_ms >= horizon_min * 60_000):
+            expired = True
+    except Exception:
+        expired = False
 
     if expired:
         try:
@@ -6446,14 +6939,15 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
                     "last_price": last_price,
                     "realized_move_pct": realized_move_pct,
                 }
-                payload.update(_entry_meta_from_snap())
+                payload.update(meta)
                 _save_alert_snapshot(sym_u, payload)
-                # --- DISCORD: EXPIRED  notification (deduped) ---
+                _log_trade_outcome(payload)
+
+                # --- DISCORD: EXPIRED notification (deduped) ---
                 try:
                     _discord_notify_outcome("expired", payload)
                 except Exception:
                     pass
-
 
             R.hset(snap_key, mapping={
                 "status": json.dumps("expired"),
@@ -6463,6 +6957,8 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
             })
         except Exception:
             pass
+
+       
 
         _delete_live_snapshot(sym_u, direction)
         return
