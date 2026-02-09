@@ -1,11 +1,119 @@
+
+
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# --- EARLY MS NORMALIZER (must be above any circular imports) ---
+def _to_ms_any(x) -> int:
+    """
+    Normalize epoch-ish values to milliseconds.
+    Safe under partial/circular imports (no external deps).
+    Accepts sec/ms/us/ns.
+    """
+    try:
+        xi = int(x or 0)
+    except Exception:
+        return 0
+    if xi <= 0:
+        return 0
+    # ns -> ms
+    if xi >= 1_000_000_000_000_000_000:
+        return xi // 1_000_000
+    # us -> ms
+    if xi >= 1_000_000_000_000_000:
+        return xi // 1_000
+    # ms
+    if xi >= 1_000_000_000_000:
+        return xi
+    # sec -> ms
+    return xi * 1000
 
+def _pick_last_closed_bar_from_bars(bars_in, now_ms: int, tf_ms: int):
+    """
+    Return (c, p) where:
+      c = last safely CLOSED bar (dict)
+      p = previous bar (dict)
+    bars_in is expected newest last (sorted), but we still walk backward robustly.
+
+    Supports both schemas:
+      - close-time bars: {"t_close_ms": <ms>, "complete": true}
+      - open-time bars:  {"t": <sec>, ...}  -> close computed as (t*1000 + tf_ms)
+    """
+    if not isinstance(bars_in, list) or len(bars_in) < 2:
+        return None, None
+
+    now_ms = int(now_ms or 0)
+    tf_ms = int(tf_ms or 0) or (60 * 60 * 1000)
+
+    # ---- inline to-ms (avoid any global rebind/closure surprises) ----
+    def _to_ms(v):
+        try:
+            if v is None:
+                t_ms = 0
+            elif isinstance(v, (int, float)):
+                t_ms = int(v)
+            else:
+                sv = str(v).strip()
+                t_ms = int(float(sv)) if sv else 0
+
+            # normalize units -> ms
+            if 0 < t_ms < 10_000_000_000:              # seconds
+                t_ms *= 1000
+            elif t_ms > 10_000_000_000_000_000:        # ns
+                t_ms //= 1_000_000
+            elif t_ms > 10_000_000_000_000:            # us
+                t_ms //= 1000
+            return int(t_ms)
+        except Exception:
+            return 0
+
+    for i in range(len(bars_in) - 1, 0, -1):
+        b = bars_in[i]
+        if not isinstance(b, dict):
+            continue
+
+        # ignore explicit forming bar
+        if b.get("complete") is False:
+            continue
+
+        # 1) prefer close-time fields
+        t_close_raw = b.get("t_close_ms") or b.get("tCloseMs") or b.get("tClose") or b.get("t_close")
+        t_close_ms = _to_ms(t_close_raw)
+
+        # 2) else compute close from open-time fields (t usually in seconds)
+        if t_close_ms <= 0:
+            t_open_raw = b.get("t") or b.get("time") or b.get("ts")
+            t_open_ms = _to_ms(t_open_raw)
+            if t_open_ms > 0:
+                t_close_ms = int(t_open_ms + tf_ms)
+
+        # 3) final fallback (legacy)
+        if t_close_ms <= 0:
+            t_raw = (
+                b.get("t_close_ms") or b.get("tClose") or b.get("t_close") or b.get("ts")
+                or b.get("t") or b.get("time") or 0
+            )
+            t_close_ms = _to_ms(t_raw)
+
+        if t_close_ms <= 0:
+            continue
+
+        # must be safely closed (tiny buffer)
+        if t_close_ms > now_ms - max(5_000, int(0.05 * tf_ms)):
+            continue
+
+        # too stale => treat as missing (RETURN TUPLE)
+        if (now_ms - t_close_ms) > int(3.0 * tf_ms):
+            return None, None
+
+        return b, bars_in[i - 1]
+
+    return None, None
 
 from typing import Literal, List, Tuple, Optional, Any, Dict
 from fastapi import APIRouter, HTTPException, Depends, Query, Request, Header
 from pydantic import BaseModel, Field, validator
+from api.pulse import build_pulse
 import os
 import json
 import time as _time
@@ -17,10 +125,12 @@ import math
 import httpx
 from .db import db
 from fastapi.responses import JSONResponse
+import traceback
 from pathlib import Path
 import xgboost as xgb
 from api.macro_state import get_macro_snapshot
 import csv
+import pandas as pd
 from datetime import datetime, timezone
 from api.entry_logic import entry_decision_m1
 from api.trend.infer_rt import (
@@ -30,21 +140,35 @@ from api.trend.infer_rt import (
     pull_latest_h4,
 )
 from .trend_sr import summarize_sr_multi_tf
-from api.security import require_user_relaxed
 from api.trend.infer_tth import predict_tth
-from openai import OpenAI
-client = OpenAI()
 router = APIRouter(prefix="/trend")
 
 log = logging.getLogger("xtl.trend")
 
-# --- H4 model toggle (default OFF to avoid slow path/504s) ---
-ENABLE_H4_MODEL = os.getenv("ENABLE_H4_MODEL", "false").lower() == "true"
-log.info(f"[TREND] ENABLE_H4_MODEL={ENABLE_H4_MODEL}")
+# ---- LOAD MARKER (TEMP) ----
+try:
+    import hashlib, inspect
+    _src = open(__file__, "rb").read()
+    _sha = hashlib.sha1(_src).hexdigest()[:12]
+    log.error("TREND_ENDPOINTS_LOADED file=%s sha=%s pick_line=%s to_ms_line=%s",
+              __file__, _sha,
+              getattr(_pick_last_closed_bar_from_bars, "__code__", None).co_firstlineno if hasattr(_pick_last_closed_bar_from_bars, "__code__") else None,
+              getattr(_to_ms_any, "__code__", None).co_firstlineno if hasattr(_to_ms_any, "__code__") else None)
+except Exception as _e:
+    try:
+        log.error("TREND_ENDPOINTS_LOADED marker_failed err=%s", _e)
+    except Exception:
+        pass
+# ---- /LOAD MARKER ----
 
 
 REG_PATH = Path("/opt/xauapi/api/trend/models/xgb_reg.json")
 CLS_PATH = Path("/opt/xauapi/api/trend/models/xgb_cls.json")
+# --- Optional OpenAI (commentary only). NEVER fail module import if missing ---
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # type: ignore
 
 # --------------------------
 # Discord webhook (optional)
@@ -65,6 +189,16 @@ def _fmt_price(x: Any) -> str:
     if abs(v) >= 100:
         return f"{v:.3f}"
     return f"{v:.5f}"
+
+import os
+
+def is_h4_enabled() -> bool:
+    return str(os.getenv("ENABLE_H4_MODEL", "0")).strip().lower() in (
+        "1", "true", "yes", "y", "on"
+    )
+
+ENABLE_H4_MODEL = is_h4_enabled()
+log.info(f"[TREND] ENABLE_H4_MODEL={ENABLE_H4_MODEL}")
 
 def _discord_post(content: str) -> bool:
     """Best-effort Discord webhook post. Never raises."""
@@ -125,6 +259,44 @@ def _discord_status_msg(sym: str, status: str, last_price: Any, realized_move_pc
         parts.append(f"Time: `{ts_s}`")
     return " | ".join(parts)
 
+
+_LASTGOOD_H1_KEY = "xtl:trend:lastgood:h1:{sym}"
+_LASTGOOD_H4_KEY = "xtl:trend:lastgood:h4:{sym}"
+
+def _rg_lastgood(sym: str, scope: str) -> dict | None:
+    try:
+        k = (_LASTGOOD_H1_KEY if scope == "H1" else _LASTGOOD_H4_KEY).format(sym=sym)
+        raw = R.get(k)
+        if not raw:
+            return None
+        d = json.loads(raw) if isinstance(raw, str) else None
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+def _rs_lastgood(sym: str, scope: str, pr: dict, ttl_sec: int = 3600) -> None:
+    try:
+        k = (_LASTGOOD_H1_KEY if scope == "H1" else _LASTGOOD_H4_KEY).format(sym=sym)
+        R.setex(k, int(ttl_sec), json.dumps(pr, default=str))
+    except Exception:
+        pass
+
+def _is_transient_insufficient(pr: dict) -> bool:
+    """
+    True for temporary model failures we should NOT show to UI if we have last-good.
+    Examples: insufficient_data, h1_not_loaded, missing frames, etc.
+    """
+    try:
+        if not isinstance(pr, dict):
+            return False
+        if bool(pr.get("ok", False)):
+            return False
+        r = str(pr.get("reason") or pr.get("detail") or "").lower()
+        return ("insufficient" in r) or ("not_loaded" in r) or ("missing" in r)
+    except Exception:
+        return False
+
+
 def _log_trade_outcome(payload: dict) -> None:
     """
     Append a compact outcome record into Redis for quick stats.
@@ -158,6 +330,641 @@ def _log_trade_outcome(payload: dict) -> None:
         R.expire(key, 14 * 24 * 3600)
     except Exception:
         pass
+def _json_load_maybe(x):
+    if x is None:
+        return None
+    if isinstance(x, (bytes, bytearray)):
+        x = x.decode("utf-8", "ignore")
+    try:
+        return json.loads(x)
+    except Exception:
+        return x
+
+def _json_load_twice(x):
+    y = _json_load_maybe(x)
+    if isinstance(y, str):
+        return _json_load_maybe(y)
+    return y
+
+def _pick_entry_sr_levels(
+    sr: dict,
+    px: float | None,
+    top_n: int = 4,
+    atr: float | None = None,
+    
+) -> dict:
+    """
+    Entry SR selection (price-aware) 
+
+    Primary selection (strict):
+      SUPPORT (below px): H1 supports_near -> H1 supports_major -> H4 supports_near -> H4 supports_major
+      RESIST (above px):  H1 resist_near   -> H1 resist_major   -> H4 resist_near   -> H4 resist_major
+      Fallback: flipped levels.
+
+    Schema support:
+      - Works with BOTH {supports_near/supports_major/resistances_near/resistances_major}
+        and legacy {supports/resistances}
+
+    Band logic (for UI + gating):
+      
+      - collects levels that fall inside [px-band_w, px+band_w]
+      - includes flipped levels inside band too
+    """
+
+    out = {
+        "entry_support": None,
+        "entry_support_tf": None,
+        "entry_support_kind": None,
+        "entry_support_near_levels": [],
+        "entry_support_major_levels": [],
+        "entry_support_flipped_levels": [],
+
+        "entry_resistance": None,
+        "entry_resistance_tf": None,
+        "entry_resistance_kind": None,
+        "entry_resistance_near_levels": [],
+        "entry_resistance_major_levels": [],
+        "entry_resistance_flipped_levels": [],
+
+        
+    }
+
+    if not isinstance(sr, dict) or not sr:
+        return out
+
+    try:
+        px0 = float(px) if px is not None else None
+    except Exception:
+        px0 = None
+    if not px0 or px0 <= 0:
+        return out
+
+    top_n = max(0, int(top_n))
+
+    
+
+    # ---------- helpers ----------
+    def _levels_from_bucket(xs) -> list[float]:
+        """Accepts list[dict{'level':...}] or list[float]."""
+        vals: list[float] = []
+        for x in xs or []:
+            try:
+                if isinstance(x, dict):
+                    v = x.get("level")
+                else:
+                    v = x
+                if v is None:
+                    continue
+                vals.append(float(v))
+            except Exception:
+                continue
+        return vals
+
+    def _get_levels(tf_obj: dict, *keys: str) -> list[float]:
+        vals: list[float] = []
+        if not isinstance(tf_obj, dict):
+            return vals
+        for k in keys:
+            vals += _levels_from_bucket(tf_obj.get(k) or [])
+        # unique
+        return sorted(set(vals))
+
+    def _below_levels(levels: list[float]) -> list[float]:
+        vals = sorted({v for v in levels if v < px0}, reverse=True)  # nearest below first
+        return vals[:top_n]
+
+    def _above_levels(levels: list[float]) -> list[float]:
+        vals = sorted({v for v in levels if v > px0})  # nearest above first
+        return vals[:top_n]
+
+    
+
+    # flipped:
+    # - resistances now BELOW px can behave like support after reclaim
+    # - supports now ABOVE px can behave like resistance after breakdown
+    def _flipped_support_from_res(tf_obj: dict) -> list[float]:
+        levels = _get_levels(tf_obj, "resistances_major", "resistances_near", "resistances")
+        return _below_levels(levels)
+
+    def _flipped_res_from_supp(tf_obj: dict) -> list[float]:
+        levels = _get_levels(tf_obj, "supports_major", "supports_near", "supports")
+        return _above_levels(levels)
+
+    # ---------- pull tf objects ----------
+    h1 = sr.get("h1") if isinstance(sr.get("h1"), dict) else {}
+    h4 = sr.get("h4") if isinstance(sr.get("h4"), dict) else {}
+
+    # ---------- strict candidates (prefer near/major if present, else fall back to legacy) ----------
+    h1_supp_near_levels_all  = _get_levels(h1, "supports_near", "supports")
+    h1_supp_major_levels_all = _get_levels(h1, "supports_major", "supports")
+
+    h4_supp_near_levels_all  = _get_levels(h4, "supports_near", "supports")
+    h4_supp_major_levels_all = _get_levels(h4, "supports_major", "supports")
+
+    h1_res_near_levels_all   = _get_levels(h1, "resistances_near", "resistances")
+    h1_res_major_levels_all  = _get_levels(h1, "resistances_major", "resistances")
+
+    h4_res_near_levels_all   = _get_levels(h4, "resistances_near", "resistances")
+    h4_res_major_levels_all  = _get_levels(h4, "resistances_major", "resistances")
+
+    h1_supp_near  = _below_levels(h1_supp_near_levels_all)
+    h1_supp_major = _below_levels(h1_supp_major_levels_all)
+    h4_supp_near  = _below_levels(h4_supp_near_levels_all)
+    h4_supp_major = _below_levels(h4_supp_major_levels_all)
+
+    h1_res_near   = _above_levels(h1_res_near_levels_all)
+    h1_res_major  = _above_levels(h1_res_major_levels_all)
+    h4_res_near   = _above_levels(h4_res_near_levels_all)
+    h4_res_major  = _above_levels(h4_res_major_levels_all)
+
+    # ---------- flipped ----------
+    h1_flip_supp = _flipped_support_from_res(h1)
+    h4_flip_supp = _flipped_support_from_res(h4)
+    h1_flip_res  = _flipped_res_from_supp(h1)
+    h4_flip_res  = _flipped_res_from_supp(h4)
+
+
+    # -------------------------
+    # SUPPORT ladder (strict first)
+    # -------------------------
+    if h1_supp_near:
+        out["entry_support_tf"] = "H1"
+        out["entry_support_kind"] = "near"
+        out["entry_support_near_levels"] = h1_supp_near
+        out["entry_support_major_levels"] = h1_supp_major
+        out["entry_support"] = h1_supp_near[0]
+    elif h1_supp_major:
+        out["entry_support_tf"] = "H1"
+        out["entry_support_kind"] = "major"
+        out["entry_support_near_levels"] = h1_supp_near
+        out["entry_support_major_levels"] = h1_supp_major
+        out["entry_support"] = h1_supp_major[0]
+    elif h4_supp_near:
+        out["entry_support_tf"] = "H4"
+        out["entry_support_kind"] = "near"
+        out["entry_support_near_levels"] = h4_supp_near
+        out["entry_support_major_levels"] = h4_supp_major
+        out["entry_support"] = h4_supp_near[0]
+    elif h4_supp_major:
+        out["entry_support_tf"] = "H4"
+        out["entry_support_kind"] = "major"
+        out["entry_support_near_levels"] = h4_supp_near
+        out["entry_support_major_levels"] = h4_supp_major
+        out["entry_support"] = h4_supp_major[0]
+    else:
+        # fallback: flipped supports (H1 then H4)
+        if h1_flip_supp:
+            out["entry_support_tf"] = "H1"
+            out["entry_support_kind"] = "flipped"
+            out["entry_support"] = h1_flip_supp[0]
+        elif h4_flip_supp:
+            out["entry_support_tf"] = "H4"
+            out["entry_support_kind"] = "flipped"
+            out["entry_support"] = h4_flip_supp[0]
+        
+
+    # -------------------------
+    # RESISTANCE ladder (strict first)
+    # -------------------------
+    if h1_res_near:
+        out["entry_resistance_tf"] = "H1"
+        out["entry_resistance_kind"] = "near"
+        out["entry_resistance_near_levels"] = h1_res_near
+        out["entry_resistance_major_levels"] = h1_res_major
+        out["entry_resistance"] = h1_res_near[0]
+    elif h1_res_major:
+        out["entry_resistance_tf"] = "H1"
+        out["entry_resistance_kind"] = "major"
+        out["entry_resistance_near_levels"] = h1_res_near
+        out["entry_resistance_major_levels"] = h1_res_major
+        out["entry_resistance"] = h1_res_major[0]
+    elif h4_res_near:
+        out["entry_resistance_tf"] = "H4"
+        out["entry_resistance_kind"] = "near"
+        out["entry_resistance_near_levels"] = h4_res_near
+        out["entry_resistance_major_levels"] = h4_res_major
+        out["entry_resistance"] = h4_res_near[0]
+    elif h4_res_major:
+        out["entry_resistance_tf"] = "H4"
+        out["entry_resistance_kind"] = "major"
+        out["entry_resistance_near_levels"] = h4_res_near
+        out["entry_resistance_major_levels"] = h4_res_major
+        out["entry_resistance"] = h4_res_major[0]
+    else:
+        # fallback: flipped resistances (H1 then H4)
+        if h1_flip_res:
+            out["entry_resistance_tf"] = "H1"
+            out["entry_resistance_kind"] = "flipped"
+            out["entry_resistance"] = h1_flip_res[0]
+        elif h4_flip_res:
+            out["entry_resistance_tf"] = "H4"
+            out["entry_resistance_kind"] = "flipped"
+            out["entry_resistance"] = h4_flip_res[0]
+        
+
+    # -------------------------
+    # flipped lists aligned to chosen TF (UI/debug)
+    # -------------------------
+    supp_tf = out.get("entry_support_tf")
+    res_tf  = out.get("entry_resistance_tf")
+
+    if supp_tf == "H1":
+        out["entry_support_flipped_levels"] = h1_flip_supp or []
+    elif supp_tf == "H4":
+        out["entry_support_flipped_levels"] = h4_flip_supp or []
+    else:
+        out["entry_support_flipped_levels"] = h1_flip_supp or h4_flip_supp or []
+
+    if res_tf == "H1":
+        out["entry_resistance_flipped_levels"] = h1_flip_res or []
+    elif res_tf == "H4":
+        out["entry_resistance_flipped_levels"] = h4_flip_res or []
+    else:
+        out["entry_resistance_flipped_levels"] = h1_flip_res or h4_flip_res or []
+
+    return out
+
+
+def _disable_tp_sl_fields(r: dict) -> None:
+    if not isinstance(r, dict):
+        return
+    r["tp_price"] = None
+    r["sl_price"] = None
+    r["target_price"] = None
+    r["target_price_1h"] = None
+    r["stop_loss"] = None
+    r["stop_loss_1h"] = None
+
+
+
+def _snap_key(dev: str, sym: str, tf: str) -> str:
+    dev = str(dev or "").strip().strip('"').strip("'").replace("\n", "").replace("\r", "")
+    sym = str(sym or "").upper().strip()
+    tf  = str(tf or "").upper().strip()
+    return f"xtl:ohlc:snap:{dev}:{sym}:{tf}"
+
+
+def _load_device_h1_bars(sym: str, dev_id: str) -> tuple[list[dict], str]:
+    """
+    Hard source of truth for H1 gate:
+    - reads ONLY device-scoped key
+    - supports STRING or HASH storage (via _snap_get_raw_json)
+    - returns normalized + sorted bars (ms)
+    """
+    sym_u = (sym or "").upper().strip()
+    dev = (dev_id or "").strip()
+    if not sym_u or not dev:
+        return [], ""
+
+    key = f"xtl:ohlc:snap:{dev}:{sym_u}:H1"
+    raw = _snap_get_raw_json(key)
+    if not raw:
+        return [], key
+
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return [], key
+
+    bars = None
+    if isinstance(obj, dict):
+        bars = obj.get("bars") or obj.get("ohlc")
+    elif isinstance(obj, list):
+        bars = obj
+
+    bars = bars if isinstance(bars, list) else []
+    if not bars:
+        return [], key
+
+    try:
+        nb = _normalize_snap_bars_to_ms(bars, 60 * 60 * 1000)
+    except Exception:
+        nb = bars
+
+    # enforce sort by close time
+    out = []
+    for b in (nb or []):
+        if not isinstance(b, dict):
+            continue
+        if not all(k in b for k in ("o", "h", "l", "c")):
+            continue
+        tcm = b.get("t_close_ms") or b.get("tClose") or b.get("t") or 0
+        try:
+            tcm = int(tcm)
+        except Exception:
+            tcm = 0
+        if 0 < tcm < 10_000_000_000:
+            tcm *= 1000
+        b["t_close_ms"] = int(tcm)
+        out.append(b)
+
+    out.sort(key=lambda x: int(x.get("t_close_ms") or 0))
+    return out, key
+
+def _get_sr_bundle(sym: str, prefer_dev: str | None = None, return_src: bool = False):
+    """
+    SR bundle getter:
+      - Prefer Redis cache: last_good -> last
+      - If missing: compute from OHLC snaps (H1/H4) and write caches.
+      - IMPORTANT: if prefer_dev is provided, try device-scoped OHLC snaps from that device first.
+    Returns:
+      - dict (default)
+      - OR (dict, src_str) if return_src=True
+    """
+    src = None
+    try:
+        sym_u = (sym or "").upper().strip()
+        if not sym_u:
+            return ({}, "empty_symbol") if return_src else {}
+
+        # 1) prefer last_good, fallback to last
+        for k in (f"xtl:sr:bundle:last_good:{sym_u}", f"xtl:sr:bundle:last:{sym_u}"):
+            try:
+                raw = R.get(k)
+            except Exception:
+                raw = None
+            if not raw:
+                continue
+            js = _json_load_twice(raw)
+            if isinstance(js, dict) and js:
+                src = f"cache:{k}"
+                return (js, src) if return_src else js
+
+        # helper: read TF bars from a given device
+        def _read_tf_bars_from_dev(dev_id: str, tfu: str):
+            snap_key = f"xtl:ohlc:snap:{dev_id}:{sym_u}:{tfu}"
+            try:
+                raw = R.get(snap_key)
+
+                # DEBUG: ensure we can see what's going on
+                if not raw:
+                    return None, snap_key, "raw=None"
+
+                try:
+                    s = _json_load_twice(raw)
+                except Exception as e:
+                    return None, snap_key, f"json_exc:{type(e).__name__}:{e}"
+
+                if not isinstance(s, dict):
+                    return None, snap_key, f"json_not_dict:{type(s).__name__}"
+
+                bars = s.get("bars") or s.get("ohlc")
+                if not isinstance(bars, list) or not bars:
+                    return None, snap_key, f"bars_missing_or_empty:{type(bars).__name__}"
+
+                try:
+                    tf_ms = 60 * 60 * 1000 if tfu == "H1" else 4 * 60 * 60 * 1000
+                    nb = _normalize_snap_bars_to_ms(bars, tf_ms)
+                    if isinstance(nb, tuple):
+                        nb = nb[0]
+                except Exception as e:
+                    return None, snap_key, f"norm_exc:{type(e).__name__}:{e}"
+
+                if not isinstance(nb, list) or not nb:
+                    return None, snap_key, "norm_empty"
+
+                return nb, snap_key, "ok"
+
+            except Exception as e:
+                return None, snap_key, f"exc:{type(e).__name__}:{e}"
+        # 2A) Try preferred device first (THIS is the key fix)
+        pd = (prefer_dev or "").strip()
+        if pd:
+            h1_bars, h1_key, h1_dbg = _read_tf_bars_from_dev(pd, "H1")
+            h4_bars, h4_key, h4_dbg = _read_tf_bars_from_dev(pd, "H4")
+            if (isinstance(h1_bars, list) and h1_bars) or (isinstance(h4_bars, list) and h4_bars):
+                # build df-ish via existing converters you already use elsewhere
+                try:
+                    h1_df = _rows_to_df(h1_bars) if h1_bars else None
+                except Exception:
+                    h1_df = None
+                try:
+                    h4_df = _rows_to_df(h4_bars) if h4_bars else None
+                except Exception:
+                    h4_df = None
+
+                # price: try live price from that same device (consistent)
+                px = None
+                try:
+                    px, _ts = _get_live_price(sym_u, pd)
+                    px = float(px) if isinstance(px, (int, float)) else None
+                except Exception:
+                    px = None
+
+                pip_factor = 0.01 if sym_u == "XAUUSD" else (0.01 if sym_u.endswith("JPY") else 0.0001)
+                b = summarize_sr_multi_tf(
+                    symbol=sym_u,
+                    price=px,
+                    h4_df=_to_hlc(h4_df),
+                    h1_df=_to_hlc(h1_df),
+                    pip_factor=float(pip_factor),
+                    cache=R,
+                    cache_ttl_sec=900,
+                    good_ttl_sec=7 * 24 * 3600,
+                )
+                if isinstance(b, dict) and b:
+                    src = f"compute:prefer_dev:{pd}|h1={h1_key}|h4={h4_key}"
+                    return (b, src) if return_src else b
+                # if preferred device had bars but SR still empty, keep going to fallback
+                src = f"compute_empty:prefer_dev:{pd}|h1={h1_key}|h4={h4_key}"
+
+        # 2B) Fallback: Pick an online device (best heartbeat)
+        dev = None
+        try:
+            best_dev = None
+            best_hb = -1
+            for key in R.scan_iter("device:dev_*"):
+                try:
+                    h = R.hgetall(key) or {}
+                except Exception:
+                    h = {}
+                if not h:
+                    continue
+
+                status = h.get(b"status") or h.get("status")
+                if isinstance(status, (bytes, bytearray)):
+                    status = status.decode("utf-8", "ignore")
+                if (status or "").strip().lower() != "online":
+                    continue
+
+                hb = h.get(b"last_heartbeat_ms") or h.get("last_heartbeat_ms")
+                if isinstance(hb, (bytes, bytearray)):
+                    hb = hb.decode("utf-8", "ignore").strip()
+                try:
+                    hb_i = int(hb) if hb not in (None, "") else -1
+                except Exception:
+                    hb_i = -1
+
+                key_s = key.decode("utf-8", "ignore") if isinstance(key, (bytes, bytearray)) else str(key)
+                dev_id = key_s.replace("device:", "").strip()
+
+                if hb_i > best_hb:
+                    best_hb = hb_i
+                    best_dev = dev_id
+
+            dev = best_dev
+        except Exception:
+            dev = None
+
+        if not dev:
+            src = src or "no_online_device"
+            return ({}, src) if return_src else {}
+
+        h1_bars, h1_key, h1_dbg = _read_tf_bars_from_dev(dev, "H1")
+        h4_bars, h4_key, h4_dbg = _read_tf_bars_from_dev(dev, "H4")
+
+        if not ((isinstance(h1_bars, list) and h1_bars) or (isinstance(h4_bars, list) and h4_bars)):
+            src = f"no_bars:any_dev:{dev}|h1={h1_key}|h1dbg={h1_dbg}|h4={h4_key}|h4dbg={h4_dbg}"
+            return ({}, src) if return_src else {}
+
+        try:
+            h1_df = _rows_to_df(h1_bars) if h1_bars else None
+        except Exception:
+            h1_df = None
+        try:
+            h4_df = _rows_to_df(h4_bars) if h4_bars else None
+        except Exception:
+            h4_df = None
+
+        px = None
+        try:
+            px, _ts = _get_live_price(sym_u, dev)
+            px = float(px) if isinstance(px, (int, float)) else None
+        except Exception:
+            px = None
+
+        pip_factor = 0.01 if sym_u == "XAUUSD" else (0.01 if sym_u.endswith("JPY") else 0.0001)
+        b = summarize_sr_multi_tf(
+            symbol=sym_u,
+            price=px,
+            h4_df=_to_hlc(h4_df),
+            h1_df=_to_hlc(h1_df),
+            pip_factor=float(pip_factor),
+            cache=R,
+            cache_ttl_sec=900,
+            good_ttl_sec=7 * 24 * 3600,
+        )
+        if isinstance(b, dict) and b:
+            src = f"compute:any_dev:{dev}|h1={h1_key}|h4={h4_key}"
+            return (b, src) if return_src else b
+
+        src = f"compute_empty:any_dev:{dev}|h1={h1_key}|h4={h4_key}"
+        return ({}, src) if return_src else {}
+
+    except Exception as e:
+        src = f"exc:{type(e).__name__}:{e}"
+        return ({}, src) if return_src else {}
+
+
+
+def _get_closed_h1_bars(sym: str, dev: str | None) -> list[dict]:
+    try:
+        sym_u = (sym or "").upper().strip()
+        dev = (dev or "").strip()
+        if not sym_u or not dev:
+            return []
+
+        key = f"xtl:ohlc:snap:{dev}:{sym_u}:H1"
+
+        js = None
+
+        # 1) Try string JSON
+        try:
+            raw = R.get(key)
+            js = _json_load_twice(raw) if raw else None
+        except Exception:
+            js = None
+
+        # 2) If not JSON, try hash payload (HGETALL)
+        if not isinstance(js, dict):
+            try:
+                h = R.hgetall(key) or {}
+                # decode bytes -> str + json
+                d = {}
+                for k, v in h.items():
+                    if isinstance(k, (bytes, bytearray)):
+                        k = k.decode("utf-8", "ignore")
+                    if isinstance(v, (bytes, bytearray)):
+                        v = v.decode("utf-8", "ignore")
+                    d[str(k)] = _json_load_twice(v)
+                js = d if d else None
+            except Exception:
+                js = None
+
+        if not isinstance(js, dict):
+            return []
+
+        bars = js.get("bars") or js.get("ohlc") or []
+        if not isinstance(bars, list):
+            return []
+
+        out = []
+        for b in bars:
+            if not isinstance(b, dict):
+                continue
+
+            # keep only CLOSED bars
+            if b.get("complete") is False:
+                continue
+
+            try:
+                o = b.get("o") if b.get("o") is not None else b.get("open")
+                h = b.get("h") if b.get("h") is not None else b.get("high")
+                l = b.get("l") if b.get("l") is not None else b.get("low")
+                c = b.get("c") if b.get("c") is not None else b.get("close")
+                if o is None or h is None or l is None or c is None:
+                    continue
+
+                t_open = b.get("t_open_ms") or b.get("tOpen") or 0
+                t_close = b.get("t_close_ms") or b.get("tClose") or b.get("t") or 0
+
+                # if `t` is seconds, convert to ms
+                try:
+                    if isinstance(t_close, (int, float)) and 0 < float(t_close) < 10_000_000_000:
+                        t_close = int(float(t_close) * 1000)
+                except Exception:
+                    pass
+
+                out.append(
+                    {
+                        "t_open_ms": int(t_open) if t_open else 0,
+                        "t_close_ms": int(t_close) if t_close else 0,
+                        "o": float(o),
+                        "h": float(h),
+                        "l": float(l),
+                        "c": float(c),
+                        "complete": True,
+                    }
+                )
+            except Exception:
+                continue
+
+        return out
+    except Exception:
+        return []
+
+def _atr14_from_hlc(bars: list[dict]) -> float | None:
+    try:
+        if not isinstance(bars, list) or len(bars) < 20:
+            return None
+
+        trs = []
+        prev_c = None
+        for b in bars:
+            h = float(b["h"]); l = float(b["l"]); c = float(b["c"])
+            if prev_c is None:
+                tr = h - l
+            else:
+                tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            trs.append(tr)
+            prev_c = c
+
+        if len(trs) < 14:
+            return None
+
+        return float(sum(trs[-14:]) / 14.0)
+    except Exception:
+        return None
 
 
 # --- Opportunity thresholds & helpers (H1 + H4) ---
@@ -181,13 +988,2500 @@ ROOM_THRESHOLDS_H4: dict[str, float] = {
     "USDCHF": 0.03,
     "USDCAD": 0.03,
 }
+def _bars_to_hlc(bars: list[dict]) -> list[dict]:
+    out = []
+    if not isinstance(bars, list):
+        return out
+    for b in bars:
+        if not isinstance(b, dict):
+            continue
+        if not b.get("complete", True):
+            continue
+
+        def _pick(*keys):
+            for k in keys:
+                v = b.get(k)
+                if isinstance(v, (int, float)):
+                    return float(v)
+            return None
+
+        h = _pick("h", "high", "H")
+        l = _pick("l", "low", "L")
+        c = _pick("c", "close", "C")
+        if h is None or l is None or c is None:
+            continue
+        out.append({"h": h, "l": l, "c": c})
+    return out
+
+
+# ==========================================================
+# FINAL STRATEGY CONFIG (easy to tweak)
+# ==========================================================
+ZONE_ATR_WIDTH = float(os.getenv("XTL_ZONE_ATR_WIDTH", "0.15"))
+ZONE_MIN_PIPS  = float(os.getenv("XTL_ZONE_MIN_PIPS", "8")) / 10000
+MOVE_AWAY_ATR  = float(os.getenv("XTL_MOVE_AWAY_ATR", "0.25"))
+
+MAX_TAP_BARS    = int(os.getenv("XTL_MAX_TAP_BARS", "20"))
+MAX_TAP2_AGE_MS = int(os.getenv("XTL_MAX_TAP2_AGE_MS", str(12 * 60 * 60 * 1000)))  # 
+
+# Maximum number of distinct "fresh" taps we allow on a zone before considering it weakened.
+# Allow 1/2/3 taps; >3 taps => block.
+MAX_TAPS = int(os.getenv("XTL_MAX_TAPS", "3"))
+
+# ==========================================================
+# ZONE AGING (H1 bars)
+# ==========================================================
+ZONE_MAX_AGE_BARS       = int(os.getenv("XTL_ZONE_MAX_AGE_BARS", "30"))
+ZONE_AGE_PENALTY_AFTER = int(os.getenv("XTL_ZONE_AGE_PENALTY_AFTER", "15"))
+
+# ==========================================================
+# VOLUME CONFIRMATION
+# ==========================================================
+VOL_LOOKBACK      = int(os.getenv("XTL_VOL_LOOKBACK", "20"))
+VOL_MIN_MULT      = float(os.getenv("XTL_VOL_MIN_MULT", "1.20"))
+VOL_BLOCK_IF_FAIL = os.getenv("XTL_VOL_BLOCK_IF_FAIL", "0") == "1"
+
+# ==========================================================
+# SESSION WEIGHTING
+# ==========================================================
+SESSION_BOOST_LONDON = float(os.getenv("XTL_SESSION_BOOST_LONDON", "1.15"))
+SESSION_BOOST_NY     = float(os.getenv("XTL_SESSION_BOOST_NY", "1.20"))
+SESSION_PENALTY_ASIA = float(os.getenv("XTL_SESSION_PENALTY_ASIA", "0.85"))
+
+def _sweep_break_state(
+    *,
+    direction: str,            # "BUY" or "SELL"
+    bars: list[dict],          # closed bars, newest last
+    zone_low: float,
+    zone_high: float,
+    zone_level: float,
+    atr: float,
+    soft_wick_atr: float = 0.15,
+    hard_close_atr: float = 0.10,
+    hard_break_atr: float = 0.35,
+    max_soft_bars: int = 3,
+    hard_close_bars: int = 2,
+) -> dict:
+    d = (direction or "").upper()
+    if not bars or atr is None or atr <= 0:
+        return {"state": "OK", "reclaimed": False, "hard_break": False, "details": {"reason": "no_bars_or_atr"}}
+
+    tol_soft = soft_wick_atr * atr
+    tol_close = hard_close_atr * atr
+    tol_hard = hard_break_atr * atr
+
+    tail = bars[-max(5, max_soft_bars + 2):]
+
+    def _get(b, k):
+        v = b.get(k)
+        return float(v) if isinstance(v, (int, float)) else None
+
+    # last close
+    last_c = _get(tail[-1], "c")
+    if last_c is None:
+        return {"state": "OK", "reclaimed": False, "hard_break": False, "details": {"reason": "no_last_close"}}
+
+    # common reclaim predicate (inside band + correct side of level)
+    def _reclaim_ok(c: float) -> bool:
+        inside = (c >= zone_low) and (c <= zone_high)
+        if not inside:
+            return False
+        if d == "BUY":
+            return c >= zone_level
+        return c <= zone_level
+
+    # ================= BUY =================
+    if d == "BUY":
+        # HARD BREAK: deep low below zone_low - tol_hard
+        for b in tail[-max_soft_bars:]:
+            lo = _get(b, "l")
+            if lo is not None and lo < (zone_low - tol_hard):
+                return {"state": "HARD_BREAK", "reclaimed": False, "hard_break": True, "details": {"why": "deep_below_zone", "lo": lo}}
+
+        # HARD BREAK: consecutive closes below zone_low - tol_close
+        consec = 0
+        for b in reversed(tail):
+            c = _get(b, "c")
+            if c is None:
+                continue
+            if c < (zone_low - tol_close):
+                consec += 1
+                if consec >= hard_close_bars:
+                    return {"state": "HARD_BREAK", "reclaimed": False, "hard_break": True, "details": {"why": "consec_break_closes", "n": consec}}
+            else:
+                break
+
+        # detect sweep (wick below zone_low in last max_soft_bars)
+        sweep_depth = 0.0
+        swept = False
+        for b in tail[-max_soft_bars:]:
+            lo = _get(b, "l")
+            if lo is not None and lo < zone_low:
+                swept = True
+                sweep_depth = max(sweep_depth, zone_low - lo)
+
+        if not swept:
+            return {"state": "OK", "reclaimed": False, "hard_break": False, "details": {"why": "no_sweep"}}
+
+        # if sweep too deep beyond hard tolerance => treat as HARD_BREAK
+        if sweep_depth > tol_hard:
+            return {"state": "HARD_BREAK", "reclaimed": False, "hard_break": True, "details": {"why": "sweep_beyond_hard", "sweep_depth": sweep_depth, "tol_hard": tol_hard}}
+
+        # reclaimed?
+        if _reclaim_ok(last_c):
+            return {"state": "OK", "reclaimed": True, "hard_break": False, "details": {"sweep_depth": sweep_depth, "tol_soft": tol_soft, "deep_sweep": bool(sweep_depth > tol_soft)}}
+
+        return {"state": "WAIT_RECLAIM", "reclaimed": False, "hard_break": False, "details": {"sweep_depth": sweep_depth, "tol_soft": tol_soft}}
+
+    # ================= SELL =================
+    # HARD BREAK: deep high above zone_high + tol_hard
+    for b in tail[-max_soft_bars:]:
+        hi = _get(b, "h")
+        if hi is not None and hi > (zone_high + tol_hard):
+            return {"state": "HARD_BREAK", "reclaimed": False, "hard_break": True, "details": {"why": "deep_above_zone", "hi": hi}}
+
+    # HARD BREAK: consecutive closes above zone_high + tol_close
+    consec = 0
+    for b in reversed(tail):
+        c = _get(b, "c")
+        if c is None:
+            continue
+        if c > (zone_high + tol_close):
+            consec += 1
+            if consec >= hard_close_bars:
+                return {"state": "HARD_BREAK", "reclaimed": False, "hard_break": True, "details": {"why": "consec_break_closes", "n": consec}}
+        else:
+            break
+
+    # detect sweep (wick above zone_high)
+    sweep_depth = 0.0
+    swept = False
+    for b in tail[-max_soft_bars:]:
+        hi = _get(b, "h")
+        if hi is not None and hi > zone_high:
+            swept = True
+            sweep_depth = max(sweep_depth, hi - zone_high)
+
+    if not swept:
+        return {"state": "OK", "reclaimed": False, "hard_break": False, "details": {"why": "no_sweep"}}
+
+    if sweep_depth > tol_hard:
+        return {"state": "HARD_BREAK", "reclaimed": False, "hard_break": True, "details": {"why": "sweep_beyond_hard", "sweep_depth": sweep_depth, "tol_hard": tol_hard}}
+
+    if _reclaim_ok(last_c):
+        return {"state": "OK", "reclaimed": True, "hard_break": False, "details": {"sweep_depth": sweep_depth, "tol_soft": tol_soft, "deep_sweep": bool(sweep_depth > tol_soft)}}
+
+    return {"state": "WAIT_RECLAIM", "reclaimed": False, "hard_break": False, "details": {"sweep_depth": sweep_depth, "tol_soft": tol_soft}}
+
+def _bos_confirmed(
+    *,
+    direction: str,      # "BUY" or "SELL"
+    bars: list[dict],    # closed bars, newest last
+    lookback: int = 10,
+    require_close: bool = True,
+) -> dict:
+    """
+    Returns: {"ok": bool, "level": float|None, "why": str}
+    BUY: close breaks above prior swing high
+    SELL: close breaks below prior swing low
+    """
+    d = (direction or "").upper()
+    if not bars or len(bars) < (lookback + 2):
+        return {"ok": False, "level": None, "why": "need_more_bars"}
+
+    tail = bars[-(lookback + 2):]
+    prev = tail[:-1]
+    last = tail[-1]
+
+    def _f(b, k):
+        v = b.get(k)
+        return float(v) if isinstance(v, (int, float)) else None
+
+    highs = [ _f(b,"h") for b in prev if _f(b,"h") is not None ]
+    lows  = [ _f(b,"l") for b in prev if _f(b,"l") is not None ]
+    if not highs or not lows:
+        return {"ok": False, "level": None, "why": "bad_bar_fields"}
+
+    ref_high = max(highs)
+    ref_low  = min(lows)
+
+    c = _f(last, "c")
+    h = _f(last, "h")
+    l = _f(last, "l")
+    if c is None:
+        return {"ok": False, "level": None, "why": "no_last_close"}
+
+    if d == "BUY":
+        broke = (c > ref_high) if require_close else ((h is not None) and (h > ref_high))
+        return {"ok": bool(broke), "level": ref_high, "why": "close_break_high" if require_close else "wick_break_high"}
+    else:
+        broke = (c < ref_low) if require_close else ((l is not None) and (l < ref_low))
+        return {"ok": bool(broke), "level": ref_low, "why": "close_break_low" if require_close else "wick_break_low"}
+
+def _tp_structure_exit(
+    *,
+    sym_u: str,
+    entry_sig: str,       # "BUY" | "SELL"
+    bars: list[dict],     # closed bars, newest last
+    now_ms: int,
+) -> dict:
+    """
+    Structure TP (both sides), stateful:
+      1) Detect BOS in trade direction -> ARM tp_state in Redis
+      2) Require >= MIN_BARS_AFTER_BOS closed bars after BOS
+      3) Then exit on exhaustion (2-bar reversal)
+
+    Returns: {"ok": bool, "reason": str|None, "meta": dict}
+    """
+    sig = (entry_sig or "").upper().strip()
+    if sig not in ("BUY", "SELL"):
+        return {"ok": False, "reason": None, "meta": {}}
+
+    if not bars or len(bars) < 15:
+        return {"ok": False, "reason": None, "meta": {"why": "need_more_bars"}}
+
+    # how many closed bars must pass after BOS before we allow exhaustion exit
+    try:
+        min_after = int(os.getenv("XTL_TP_MIN_BARS_AFTER_BOS", "1"))
+    except Exception:
+        min_after = 1
+    if min_after < 1:
+        min_after = 1
+
+    # try to use timestamps if present
+    def _tclose(b):
+        try:
+            v = b.get("t_close_ms") or b.get("tClose") or b.get("t")
+            return int(v) if v is not None else 0
+        except Exception:
+            return 0
+
+    # Load tp state
+    st = _load_tp_state(sym_u, sig)
+    armed = bool(st.get("armed"))
+    bos_tclose = int(st.get("bos_t_close_ms") or 0)
+    bos_level = st.get("bos_level")
+
+    # ------------------------------
+    # Step-1: BOS arm (only once)
+    # ------------------------------
+    if not armed:
+        bos = _bos_confirmed(direction=sig, bars=bars, lookback=10, require_close=True)
+        if not isinstance(bos, dict) or not bos.get("ok"):
+            return {"ok": False, "reason": None, "meta": {"why": "waiting_bos", "wait": True, "ui_state": "WAIT", "bos": bos}}
+
+        # freeze BOS at current last closed bar
+        t_last = _tclose(bars[-1]) or int(now_ms)
+        st2 = {
+            "armed": True,
+            "bos_level": float(bos.get("level")) if isinstance(bos.get("level"), (int, float)) else None,
+            "bos_why": str(bos.get("why") or ""),
+            "bos_t_close_ms": int(t_last),
+            "armed_ts_ms": int(now_ms),
+        }
+        _save_tp_state(sym_u, sig, st2)
+
+        # IMPORTANT: do NOT allow exhaustion on same cycle as arm
+        return {"ok": False, "reason": None, "meta": {"why": "bos_armed", "wait": True, "ui_state": "WAIT", "bos": bos, "tp_state": st2}}
+
+
+    # ------------------------------
+    # Step-2: require bars after BOS
+    # ------------------------------
+    bars_after = 0
+    if bos_tclose > 0:
+        for b in bars:
+            if _tclose(b) > bos_tclose:
+                bars_after += 1
+    else:
+        # fallback if no timestamps: count evaluator checks
+        try:
+            bars_after = int(st.get("checks_after_bos") or 0)
+        except Exception:
+            bars_after = 0
+        bars_after += 1
+        st["checks_after_bos"] = bars_after
+        _save_tp_state(sym_u, sig, st)
+
+    if bars_after < min_after:
+        return {
+            "ok": False,
+            "reason": None,
+            "meta": {
+                "why": "waiting_after_bos",
+                "bars_after": bars_after,
+                "min_after": min_after,
+                "bos_level": bos_level,
+            },
+        }
+
+    # ------------------------------
+    # Step-3: exhaustion exit
+    # ------------------------------
+    try:
+        c2 = float(bars[-1].get("c"))
+        c1 = float(bars[-2].get("c"))
+        c0 = float(bars[-3].get("c"))
+    except Exception:
+        return {"ok": False, "reason": None, "meta": {"why": "bad_close_fields"}}
+
+    if sig == "BUY":
+        exhausted = (c2 < c1) and (c1 < c0)
+    else:
+        exhausted = (c2 > c1) and (c1 > c0)
+
+    if exhausted:
+        # Clear tp state once we decide to exit
+        _clear_tp_state(sym_u, sig)
+        return {
+            "ok": True,
+            "reason": "tp_structure_exhaust",
+            "meta": {
+                "bos_level": bos_level,
+                "bos_t_close_ms": bos_tclose,
+                "bars_after_bos": bars_after,
+                "c2": c2, "c1": c1, "c0": c0,
+                "server_now_ms": int(now_ms),
+            },
+        }
+
+    return {
+        "ok": False,
+        "reason": None,
+        "meta": {
+            "why": "no_exhaust",
+            "bos_level": bos_level,
+            "bars_after_bos": bars_after,
+            "min_after": min_after,
+        },
+    }
+
+def _zone_reversal_gate(
+    *,
+    sym: str,
+    direction: str,   
+    row_h1: dict,
+    sr: dict | None,
+    now_ms: int,
+    tf_tag: str = "H1",
+    pinned_device: str | None = None,
+    debug_gate: bool = False,
+    x_device_id: str | None = None,
+) -> tuple[bool, dict]:
+    """
+    Final opportunity gate:
+    - Resolve zone (SR -> fallback -> provisional)
+    - Require SECOND TAP + reversal candle
+    - Maintain tap state in Redis
+
+    Added:
+      5A) Soft sweep vs hard break (do NOT kill on sweep; kill on hard break)
+      5B) BOS double-check (H1 + optional M15 if provided)
+      6)  Volume confirmation
+      7)  Session weighting
+      8)  Zone aging
+      9)  Final confidence
+    """
+    
+
+    cl = None
+    opn = None
+    hi = None
+    lo = None
+
+    direction = str(direction or "").upper().strip()
+    if direction not in ("BUY", "SELL"):
+        return False, {"reason": "bad_direction"}
+
+    sym_u = (sym or "").upper().strip()
+    zone_tf = str(tf_tag or "H1").upper()
+
+
+    
+    # -------------------------------
+    # 0) Load H1 bars (prefer attached; else backfill from Redis snap)
+    # -------------------------------
+    bars = row_h1.get("bars") or row_h1.get("ohlc") or []
+    if not isinstance(bars, list):
+        bars = []
+
+    x_device_id_hdr = (x_device_id or "").strip()
+    if (not x_device_id_hdr) and pinned_device:
+        x_device_id_hdr = str(pinned_device).strip()
+    dev = str((x_device_id_hdr or pinned_device or x_device_id or "")).strip()
+
+    dbg_src = None
+    dbg_err = None
+
+    if len(bars) < 2 and sym_u:
+        try:
+            js = None
+            bars_any = None
+
+            # 1) try deterministic device (header first)
+            if dev:
+                js, _ = _read_snap_for_device(dev, sym_u, "H1", header_device=x_device_id_hdr)
+                dbg_src = f"read_snap_for_device:{dev}"
+
+                # --- FIX: if helper returned empty/invalid, do direct GET of STRING snap ---
+                try:
+                    if isinstance(js, dict):
+                        bars_any = js.get("bars")
+                        if not isinstance(bars_any, list):
+                            bars_any = js.get("ohlc")
+
+                    if not (isinstance(bars_any, list) and len(bars_any) >= 2):
+                        R0 = _r()
+                        k0_dev = x_device_id_hdr or dev
+                        k0 = f"xtl:ohlc:snap:{k0_dev}:{sym_u}:H1"
+                        raw0 = R0.get(k0)  # STRING JSON
+                        js0 = _json_load_twice(raw0) if raw0 else None
+                        if isinstance(js0, dict):
+                            js = js0
+                            dbg_src = (dbg_src or "") + f" | direct_get_string_snap:{k0_dev}"
+
+                    # recompute bars_any after js replacement
+                    if isinstance(js, dict):
+                        bars_any = js.get("bars")
+                        if not isinstance(bars_any, list):
+                            bars_any = js.get("ohlc")
+
+                except Exception as e:
+                    dbg_err = (dbg_err or "") + f" | direct_get:{type(e).__name__}:{e}"
+
+                if debug_gate:
+                    try:
+                        R0 = _r()
+                        ck = getattr(getattr(R0, "connection_pool", None), "connection_kwargs", {}) or {}
+                        k_dbg_dev = x_device_id_hdr or dev
+                        k_dbg = f"xtl:ohlc:snap:{k_dbg_dev}:{sym_u}:H1"
+
+                        t_dbg = R0.type(k_dbg)
+                        if isinstance(t_dbg, (bytes, bytearray)):
+                            t_dbg = t_dbg.decode("utf-8", "ignore")
+                        t_dbg = str(t_dbg or "").lower()
+
+                        dbg_src = (
+                            (dbg_src or "")
+                            + f" | redis={ck.get('host')}:{ck.get('port')}/db{ck.get('db')}"
+                            + f" | key={k_dbg} | type={t_dbg}"
+                        )
+
+                        if isinstance(js, dict):
+                            ba = js.get("bars")
+                            if not isinstance(ba, list):
+                                ba = js.get("ohlc")
+
+                            bn = len(ba) if isinstance(ba, list) else -1
+                            k0 = (
+                                list(ba[0].keys())
+                                if isinstance(ba, list) and ba and isinstance(ba[0], dict)
+                                else None
+                            )
+                            dbg_src = (dbg_src or "") + f" | bars_any_n={bn} | bar0_keys={k0}"
+                        else:
+                            dbg_src = (dbg_src or "") + " | snap_decode=None"
+
+                    except Exception as e:
+                        dbg_err = (dbg_err or "") + f" | redis_dbg:{type(e).__name__}:{e}"
+
+            # 3) Normalize + attach to row_h1
+            if isinstance(bars_any, list) and len(bars_any) >= 2:
+                norm = []
+                tf_ms = int(TF_MS.get(tf_tag.upper(), 60 * 60 * 1000))
+
+                def _get(b, *keys):
+                    for k in keys:
+                        v = b.get(k) if isinstance(b, dict) else None
+                        if v is not None:
+                            return v
+                    return None
+
+                for b in bars_any:
+                    if not isinstance(b, dict):
+                        continue
+                    try:
+                        t = _get(b, "t", "ts", "time")
+                        if t is None:
+                            t_open_ms = _get(b, "t_open_ms")
+                            if not isinstance(t_open_ms, (int, float)) or t_open_ms <= 0:
+                                continue
+                            t_open_ms = int(t_open_ms)
+                            t_close_ms = _get(b, "t_close_ms")
+                            if not isinstance(t_close_ms, (int, float)) or t_close_ms <= 0:
+                                t_close_ms = t_open_ms + tf_ms
+                            else:
+                                t_close_ms = int(t_close_ms)
+                        else:
+                            t_open_ms = _to_ms_any(int(t))
+                            if t_open_ms <= 0:
+                                continue
+                            t_close_ms = t_open_ms + tf_ms
+
+                        o_ = _get(b, "o", "open")
+                        h_ = _get(b, "h", "high")
+                        l_ = _get(b, "l", "low")
+                        c_ = _get(b, "c", "close")
+                        if o_ is None or h_ is None or l_ is None or c_ is None:
+                            continue
+
+                        norm.append({
+                            "t_open_ms": int(t_open_ms),
+                            "t_close_ms": int(t_close_ms),
+                            "o": float(o_), "h": float(h_), "l": float(l_), "c": float(c_),
+                            "v": _get(b, "v", "volume"),
+                            "complete": bool(b.get("complete", True)),
+                        })
+                    except Exception:
+                        continue
+
+                norm.sort(key=lambda x: int(x.get("t_close_ms") or 0))
+                if len(norm) >= 2:
+                    bars = norm
+                    row_h1["bars"] = bars
+
+        except Exception as e:
+            dbg_err = (dbg_err or "") + f" | snap_read:{type(e).__name__}:{e}"
+
+    
+
+    # HARD FAIL EARLY if still no bars
+    if len(bars) < 2:
+        meta = {
+            "reason": "no_h1_bars",
+            "bars_n": len(bars),
+            "dev": dev,
+            "sym": sym_u,
+        }
+        if debug_gate:
+            meta["dbg_h1_src"] = dbg_src
+            meta["dbg_h1_err"] = dbg_err
+        return False, meta
+
+
+    def _pick_side_level(sr: dict, px: float, direction: str):
+        def _levels(tf, key):
+            return [
+                float(x["level"]) for x in (tf.get(key) or [])
+                if isinstance(x, dict) and "level" in x
+            ]
+
+        order = ["h1", "h4"]
+        kinds = ["supports_near", "supports_major"] if direction == "BUY" \
+            else ["resistances_near", "resistances_major"]
+
+        for tfk in order:
+            tf = sr.get(tfk) or {}
+            for k in kinds:
+                lvls = _levels(tf, k)
+                if direction == "BUY":
+                    below = [v for v in lvls if v < px]
+                    if below:
+                        return max(below), tfk.upper()
+                else:
+                    above = [v for v in lvls if v > px]
+                    if above:
+                        return min(above), tfk.upper()
+
+        return None, None
+
+    def _bar_f(b: dict, *keys, default=None):
+        for k in keys:
+            if isinstance(b, dict) and k in b and b.get(k) is not None:
+                return b.get(k)
+        return default
+    # -------------------------------
+    # 0B) Pick last safely CLOSED bar + define OHLC (cl/o/h/l) ONCE
+    # -------------------------------
+    try:
+        tf_ms = int(TF_MS.get(str(tf_tag or "H1").upper(), 60 * 60 * 1000))
+    except Exception:
+        tf_ms = 60 * 60 * 1000
+
+    try:
+        c, p = _pick_last_closed_bar_from_bars(bars, int(now_ms), int(tf_ms))
+    except Exception:
+        c, p = None, None
+
+    if not isinstance(c, dict) or not isinstance(p, dict):
+        return False, {"reason": "no_h1_closed_bar", "bars_n": int(len(bars)), "stage": "H1_PICK"}
+
+    try:
+        o = float(_bar_f(c, "o", "open"))
+        h = float(_bar_f(c, "h", "high"))
+        l = float(_bar_f(c, "l", "low"))
+        cl = float(_bar_f(c, "c", "close"))
+    except Exception:
+        return False, {
+            "reason": "bad_h1_ohlc",
+            "stage": "H1_PICK",
+            "keys": list(c.keys()) if isinstance(c, dict) else None,
+        }
+    
+    # -------------------------------
+    # 0C) Reference price for SR/zone selection
+    # -------------------------------
+    # IMPORTANT: Zone selection must use the freshest price available, otherwise
+    # we can pick a wrong-side / outdated level (especially on fast moves).
+
+    px = None
+    px_src = None
+    px_ts_ms = None
+
+    # 0C-1) Try to read a live price from Redis (device-scoped)
+    try:
+        if pinned_device:
+            pkey = f"xtl:price:{pinned_device}:{sym_u}"
+            rawp = R.get(pkey)
+            if rawp:
+                try:
+                    j = _json_load_twice(rawp)
+                except Exception:
+                    j = None
+
+                if isinstance(j, dict):
+                    # accept common field names
+                    for k in ("price", "p", "last", "mid", "bid", "ask"):
+                        if j.get(k) is not None:
+                            try:
+                                px = float(j.get(k))
+                                px_src = f"redis:{pkey}:{k}"
+                                break
+                            except Exception:
+                                pass
+                    # timestamp (optional)
+                    for tk in ("ts_ms", "t_ms", "ts", "t"):
+                        if j.get(tk) is not None:
+                            try:
+                                v = int(j.get(tk))
+                                # if seconds -> convert
+                                px_ts_ms = v * 1000 if v < 10_000_000_000 else v
+                                break
+                            except Exception:
+                                pass
+                else:
+                    # raw numeric string
+                    try:
+                        px = float(rawp)
+                        px_src = f"redis:{pkey}:raw"
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 0C-2) Fallback to last CLOSED close
+    if px is None:
+        try:
+            px = float(cl)
+            px_src = "h1_close"
+        except Exception:
+            px = None
+            px_src = None
+
+    # Always surface what we used in debug output
+    #try:
+    #    debug_out["price"] = float(px) if px is not None else None
+    #    debug_out["price_src"] = px_src
+    #    debug_out["price_ts_ms"] = int(px_ts_ms) if px_ts_ms is not None else None
+    #except Exception:
+    #    pass
+    # NOTE: debug_out is created later (after tap persistence).
+    # We'll attach price fields right after debug_out is built.
+
+
+
+
+    # --- Freshness guard (block only if stale, not TTL) ---
+    # --- Freshness guard (block only if stale, not TTL) ---
+    if isinstance(bars, list) and len(bars) >= 2:
+        try:
+            tf_ms0 = int(TF_MS.get(tf_tag.upper(), 60 * 60 * 1000))
+
+            c = bars[-1]
+            if isinstance(c, dict) and (c.get("complete") is False):
+                c = bars[-2]
+
+            # 1) Prefer snap-level lastClosedTs (ms)
+            # 1) DO NOT trust snap-level lastClosedTs unless it is sane
+            last_close = 0
+            try:
+                lc0 = int((row_h1 or {}).get("lastClosedTs") or 0)
+                # accept only if it is not in the future and not absurdly old
+                if 0 < lc0 <= int(now_ms):
+                    last_close = lc0
+            except Exception:
+                last_close = 0
+
+
+            # 2) Else prefer normalized bar close
+            if last_close <= 0 and isinstance(c, dict):
+                last_close = int(c.get("t_close_ms") or 0)
+
+            # 3) Else infer from normalized open
+            if last_close <= 0 and isinstance(c, dict):
+                t_open_ms = int(c.get("t_open_ms") or 0)
+                if t_open_ms > 0:
+                    last_close = t_open_ms + tf_ms0
+
+            # 4) Else infer from raw 't' seconds/ms
+            if last_close <= 0 and isinstance(c, dict):
+                t_raw = int(c.get("t") or 0)
+                if t_raw > 0:
+                    t_open_ms = _to_ms_any(t_raw)
+                    if t_open_ms > 0:
+                        last_close = t_open_ms + tf_ms0
+
+            age_ms = int(now_ms - last_close) if last_close > 0 else 0
+
+            max_age_ms = 3 * tf_ms0
+            utc_weekday = datetime.now(timezone.utc).weekday()
+            is_weekend = utc_weekday >= 5
+            if is_weekend:
+                 max_age_ms = 72 * 60 * 60 * 1000
+
+            if last_close > 0 and age_ms > max_age_ms:
+                meta = {
+                    "reason": "stale_h1",
+                    "blocked": True,
+                    "dev": dev,
+                    "sym": sym_u,
+                    "bars_n": int(len(bars)),
+                    "age_ms": int(age_ms),
+                    "tf_ms": int(tf_ms0),
+                    "max_age_ms": int(max_age_ms),
+                    "last_close_ms": int(last_close),
+                    "is_weekend": bool(is_weekend),
+                }
+                if debug_gate:
+                    meta["dbg_h1_src"] = dbg_src
+                    meta["dbg_h1_err"] = dbg_err
+                return False, meta
+
+        except Exception as e:
+            dbg_err = (dbg_err or "") + f" | stale_chk:{type(e).__name__}:{e}"
+
+
+
+
+    # -------------------------------
+    # 1) Resolve ATR (feature -> fallback compute)
+    # -------------------------------
+    atr = None
+    extra_h1 = row_h1.get("extra_h1") or {}
+    feats = extra_h1.get("features") if isinstance(extra_h1.get("features"), dict) else extra_h1
+    try:
+        atr = feats.get("feat_atr")
+    except Exception:
+        atr = None
+
+    if not isinstance(atr, (int, float)) or atr <= 0:
+        try:
+            ATR_LEN = int(os.getenv("XTL_ATR_LEN", "14"))
+        except Exception:
+            ATR_LEN = 14
+
+        try:
+            bars_for_atr = []
+            for b in (bars or []):
+                if not isinstance(b, dict):
+                    continue
+                if b.get("complete", True) is False:
+                    continue
+                try:
+                    h0 = float(_bar_f(b, "h", "high"))
+                    l0 = float(_bar_f(b, "l", "low"))
+                    c0 = float(_bar_f(b, "c", "close"))
+                    bars_for_atr.append({"h": h0, "l": l0, "c": c0})
+                except Exception:
+                    continue
+
+            if len(bars_for_atr) >= (ATR_LEN + 1):
+                trs = []
+                start = len(bars_for_atr) - ATR_LEN
+                for i in range(start, len(bars_for_atr)):
+                    cur = bars_for_atr[i]
+                    prev_c = bars_for_atr[i - 1]["c"]
+                    tr = max(
+                        cur["h"] - cur["l"],
+                        abs(cur["h"] - prev_c),
+                        abs(cur["l"] - prev_c),
+                    )
+                    trs.append(float(tr))
+                atr = sum(trs) / max(len(trs), 1)
+        except Exception:
+            atr = None
+
+    if not isinstance(atr, (int, float)) or atr <= 0:
+        return False, {"reason": "no_atr", "bars_n": len(bars)}
+
+    atr = float(atr)
+
+    # zone half-width
+    zone_half = max(float(ZONE_ATR_WIDTH) * atr, float(ZONE_MIN_PIPS))
+
+    # -------------------------------
+    # 2) Resolve zone (SR -> fallback -> provisional)
+    # -------------------------------
+    zone = None
+    zone_type = None
+    zone_tf = None
+
+    try:
+        if isinstance(sr, dict):
+            lvl, zone_tf = _pick_side_level(sr, px, direction)
+
+            # If SR missing, DO NOT hard-fail; allow fallback provisional zone.
+            if isinstance(lvl, (int, float)):
+                lvl = float(lvl)
+
+                if direction == "BUY":
+                    # support must be <= reference price
+                    if px is not None and lvl <= float(px):
+                        zone = {"level": lvl, "low": lvl - zone_half, "high": lvl + zone_half, "tf": zone_tf}
+                        zone_type = "SR_CONFIRMED"
+                else:
+                    # resistance must be >= reference price
+                    if px is not None and lvl >= float(px):
+                        zone = {"level": lvl, "low": lvl - zone_half, "high": lvl + zone_half, "tf": zone_tf}
+                        zone_type = "SR_CONFIRMED"
+
+            # If SR picker chose a zone but did not provide TF, infer from bundle keys
+            if zone and not zone_tf:
+                try:
+                    # sr keys are expected to be {"h1": {...}, "h4": {...}}
+                    if isinstance(sr.get("h4"), dict):
+                        zone_tf = "H4" if (sr.get("h4") or {}) else None
+                    if not zone_tf and isinstance(sr.get("h1"), dict):
+                        zone_tf = "H1" if (sr.get("h1") or {}) else None
+                except Exception:
+                    pass
+
+            if zone_type == "SR_CONFIRMED" and not zone_tf:
+                zone_tf = str(tf_tag or "H1").upper()
+
+    except Exception:
+        pass
+
+
+    if not zone:
+        try:
+            tail = [b for b in bars[-30:] if isinstance(b, dict)]
+            if len(tail) >= 10:
+                if direction == "BUY":
+                    lvl = min(float(_bar_f(b, "l", "low")) for b in tail if _bar_f(b, "l", "low") is not None)
+                else:
+                    lvl = max(float(_bar_f(b, "h", "high")) for b in tail if _bar_f(b, "h", "high") is not None)
+                zone = {"level": float(lvl), "low": float(lvl) - zone_half, "high": float(lvl) + zone_half, "tf": str(tf_tag or "H1").upper()}
+                zone_type = "ZONE_PROVISIONAL"
+        except Exception:
+            pass
+
+    if not zone:
+        return False, {"reason": "no_zone"}
+    # --- ensure zone_tf always exists (single source of truth for “what TF created this zone”) ---
+    try:
+        # preserve zone_tf if already set (e.g., from _pick_side_level)
+        if not zone_tf and isinstance(zone, dict):
+            zone_tf = zone.get("tf") or zone.get("zone_tf") or zone.get("tf_tag")
+
+        if not zone_tf:
+            zone_tf = str(tf_tag or "H1").upper()
+
+        if isinstance(zone, dict):
+            zone["tf"] = str(zone_tf).upper()
+
+    except Exception:
+        pass
+
+
+    
+    
+   	
+    # ==========================================================
+    # 5A) SOFT SWEEP vs HARD BREAK
+    # ==========================================================
+    try:
+        SWEEP_ATR = float(os.getenv("XTL_SWEEP_ATR", "0.25"))
+    except Exception:
+        SWEEP_ATR = 0.25
+
+    try:
+        HARD_BREAK_ATR = float(os.getenv("XTL_HARD_BREAK_ATR", "0.60"))
+    except Exception:
+        HARD_BREAK_ATR = 0.60
+
+    try:
+        RECLAIM_MAX_BARS = int(os.getenv("XTL_RECLAIM_MAX_BARS", "3"))
+    except Exception:
+        RECLAIM_MAX_BARS = 3
+
+    try:
+        RECLAIM_TIGHTEN_ATR = float(os.getenv("XTL_RECLAIM_TIGHTEN_ATR", "0.35"))
+    except Exception:
+        RECLAIM_TIGHTEN_ATR = 0.35
+    
+
+    def _break_state_close_only(cl_val: float) -> tuple[str, dict]:
+        zl = float(zone["low"])
+        zh = float(zone["high"])
+        zlv = float(zone["level"])
+        buf_sweep = float(SWEEP_ATR) * atr
+        buf_hard = float(HARD_BREAK_ATR) * atr
+
+        if direction == "BUY":
+            if cl_val < zl:
+                if cl_val >= (zl - buf_sweep):
+                    return "SWEEP", {"side": "DOWN", "cl": cl_val, "edge": zl, "buf": buf_sweep}
+            if cl_val < (zl - buf_hard):
+                return "HARD_BREAK", {"side": "DOWN", "cl": cl_val, "edge": zl, "buf": buf_hard}
+        else:
+            if cl_val > zh:
+                if cl_val <= (zh + buf_sweep):
+                    return "SWEEP", {"side": "UP", "cl": cl_val, "edge": zh, "buf": buf_sweep}
+                if cl_val > (zh + buf_hard):
+                    return "HARD_BREAK", {"side": "UP", "cl": cl_val, "edge": zh, "buf": buf_hard}
+
+        return "OK", {"cl": cl_val, "zone_low": zl, "zone_high": zh, "zone_level": zlv}
+    
+    def _pick_zone_from_sr(sr_all: dict, direction: str, cl: float, atr: float) -> dict | None:
+        if not isinstance(sr_all, dict):
+            return None
+
+        # Accept BOTH shapes:
+        # A) full SR payload: {"h1": {...}, "h4": {...}, ...}
+        # B) TF-sliced payload: {"supports":[...], "resistances":[...], ...}
+        sr_tf = None
+        picked_tf = None
+
+        # TF-sliced shape
+        if isinstance(sr_all, dict) and (
+            ("supports" in sr_all) or ("resistances" in sr_all) or
+            ("supports_major" in sr_all) or ("resistances_major" in sr_all) or
+            ("supports_near" in sr_all) or ("resistances_near" in sr_all)
+        ):
+            sr_tf = sr_all
+            picked_tf = str(tf_tag or "H1").upper()
+        else:
+            # Full payload -> prefer H1, fallback H4
+            if isinstance(sr_all.get("h1"), dict):
+                sr_tf = sr_all["h1"]
+                picked_tf = "H1"
+            elif isinstance(sr_all.get("h4"), dict):
+                sr_tf = sr_all["h4"]
+                picked_tf = "H4"
+            else:
+                return None
+
+        if not isinstance(sr_tf, dict):
+            return None
+
+        supp  = sr_tf.get("supports_near") or sr_tf.get("support_near") or []
+        supp2 = sr_tf.get("supports_major") or sr_tf.get("supports") or []
+        res   = sr_tf.get("resistances_near") or sr_tf.get("resistance_near") or []
+        res2  = sr_tf.get("resistances_major") or sr_tf.get("resistances") or []
+
+        def _as_items(a):
+            out = []
+            for x in (a or []):
+                try:
+                    if isinstance(x, dict):
+                        lv = float(x.get("level"))
+                        out.append({
+                            "level": lv,
+                            "touches": int(x.get("touches") or 0),
+                            "strength": float(x.get("strength") or 0),
+                            "sr_score": float(x.get("sr_score") or 0),
+                        })
+                    else:
+                        lv = float(x)
+                        out.append({
+                            "level": lv,
+                            "touches": 0,
+                            "strength": 0.0,
+                            "sr_score": 0.0,
+                        })
+                except Exception:
+                    pass
+            return out
+
+        def _is_strong(it: dict) -> bool:
+            try:
+                thr_strength = int(os.getenv("XTL_STRONG_ZONE_STRENGTH", "8"))
+                thr_touches  = int(os.getenv("XTL_STRONG_ZONE_TOUCHES", "4"))
+                thr_score    = float(os.getenv("XTL_STRONG_ZONE_SR_SCORE", "9"))
+                return (
+                    float(it.get("strength") or 0) >= thr_strength
+                    or int(it.get("touches") or 0) >= thr_touches
+                    or float(it.get("sr_score") or 0) >= thr_score
+                )
+            except Exception:
+                return False
+
+
+        if direction == "SELL":
+            cands = _as_items(res) + _as_items(res2)
+            cands = [it for it in cands if it["level"] > cl]
+            if not cands:
+                return None
+
+            # nearest above price, then stronger levels
+            cands.sort(key=lambda it: (
+                it["level"],
+                -float(it.get("strength", 0)),
+                -float(it.get("sr_score", 0)),
+                -int(it.get("touches", 0))
+            ))
+            pick = cands[0]
+
+        else:  # BUY
+            cands = _as_items(supp) + _as_items(supp2)
+            cands = [it for it in cands if it["level"] < cl]
+            if not cands:
+                return None
+
+            # nearest below price, then stronger levels
+            cands.sort(key=lambda it: (
+                -it["level"],
+                -float(it.get("strength", 0)),
+                -float(it.get("sr_score", 0)),
+                -int(it.get("touches", 0))
+            ))
+            pick = cands[0]
+
+        half = max(atr * ZONE_ATR_WIDTH, ZONE_MIN_PIPS)
+
+        return {
+            "level": float(pick["level"]),
+            "low": float(pick["level"] - half),
+            "high": float(pick["level"] + half),
+            "type": "SR_CONFIRMED",
+            "tf": picked_tf,
+
+            # --- NEW META (for strong old zone logic) ---
+            "touches": int(pick.get("touches") or 0),
+            "strength": float(pick.get("strength") or 0.0),
+            "sr_score": float(pick.get("sr_score") or 0.0),
+            "is_strong": bool(_is_strong(pick)),
+        }
+
+    def _attach_zone_strength_meta(zone: dict, sr_all: dict) -> None:
+        """
+        For ZONE_PROVISIONAL / flipped zones: find nearest SR dict item and attach
+        touches/strength/sr_score/is_strong so bootstrap-days can expand.
+        """
+        if not isinstance(zone, dict) or not isinstance(sr_all, dict):
+            return
+        try:
+            zlvl = float(zone.get("level") or 0.0)
+        except Exception:
+            return
+
+        # pick TF slice (prefer H1 then H4)
+        tf_obj = None
+        if isinstance(sr_all.get("h1"), dict):
+            tf_obj = sr_all["h1"]
+        elif isinstance(sr_all.get("h4"), dict):
+            tf_obj = sr_all["h4"]
+        elif any(k in sr_all for k in ("supports", "resistances", "supports_near", "resistances_near", "supports_major", "resistances_major")):
+            tf_obj = sr_all
+
+        if not isinstance(tf_obj, dict):
+            return
+
+        buckets = []
+        for k in ("supports_near","supports_major","supports","resistances_near","resistances_major","resistances"):
+            xs = tf_obj.get(k) or []
+            if isinstance(xs, list) and xs:
+                buckets.append(xs)
+
+        best = None
+        best_d = None
+
+        for x in xs:
+            # allow dict items OR raw float levels
+            if isinstance(x, dict):
+                lv0 = x.get("level")
+                if lv0 is None:
+                    continue
+                try:
+                    lv = float(lv0)
+                except Exception:
+                    continue
+                meta_src = x  # may contain touches/strength/sr_score
+            else:
+                # raw float level list
+                try:
+                    lv = float(x)
+                except Exception:
+                    continue
+                meta_src = None  # no meta available
+
+
+                d = abs(lv - zlvl)
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = {"level": lv} if meta_src is None else meta_src
+
+        if not isinstance(best, dict) or best_d is None:
+            return
+
+        # only accept if "close enough" to represent the same SR level
+        tol = None
+        try:
+            tol = abs(float(zone.get("high")) - float(zone.get("level")))
+            if not tol or tol <= 0:
+                tol = None
+        except Exception:
+            tol = None
+
+        if tol is None:
+            try:
+                tol = float(os.getenv("XTL_ZONE_META_MATCH_TOL", "2.0"))
+            except Exception:
+                tol = 2.0
+
+        if best_d <= tol:
+            zone["touches"] = int(best.get("touches") or 0)
+            zone["strength"] = float(best.get("strength") or 0.0)
+            zone["sr_score"] = float(best.get("sr_score") or 0.0)
+
+            try:
+                thr_strength = int(os.getenv("XTL_STRONG_ZONE_STRENGTH", "8"))
+            except Exception:
+                thr_strength = 8
+            try:
+                thr_touches = int(os.getenv("XTL_STRONG_ZONE_TOUCHES", "4"))
+            except Exception:
+                thr_touches = 4
+            try:
+                thr_score = float(os.getenv("XTL_STRONG_ZONE_SR_SCORE", "9"))
+            except Exception:
+                thr_score = 9.0
+
+            zone["is_strong"] = (
+                float(zone.get("strength") or 0) >= thr_strength
+                or int(zone.get("touches") or 0) >= thr_touches
+                or float(zone.get("sr_score") or 0) >= thr_score
+            )
+
+    
+    # ---- If zone is wrong side / too far, replace it ----
+    try:
+        cl_val = float(cl)
+    except Exception:
+        cl_val = None
+
+    # Prefer live/last price for zone side validation; fall back to last closed close
+    try:
+        ref_px = float(px)
+    except Exception:
+        ref_px = cl_val
+    # --- FORCE pick zone from SR based on live price (prevents stale SR_CONFIRMED zone) ---
+    if ref_px is not None and isinstance(sr, dict):
+        z_force = _pick_zone_from_sr(sr, direction, ref_px, float(atr or 0.0))
+        if z_force:
+            zone = z_force
+
+    if ref_px is not None and isinstance(sr, dict) and isinstance(zone, dict):
+        far = float(MOVE_AWAY_ATR) * float(atr or 0.0)
+
+        try:
+            zl = float(zone.get("low"))
+            zh = float(zone.get("high"))
+        except Exception:
+            zl = None
+            zh = None
+
+        if zl is not None and zh is not None:
+
+            # --- HARD GUARD: do not proceed with wrong-side zone ---
+            # --- HARD GUARD: truly wrong-side zone (allow when price is INSIDE the zone) ---
+            # BUY support is wrong-side only if the whole zone is ABOVE price
+            if direction == "BUY" and zl > ref_px:
+                return False, {
+                    "reason": "zone_wrong_side_buy",
+                    "stage": "ZONE_VALIDATE",
+                    "blocked": False,
+                    "price": float(ref_px),
+                    "zone": zone,
+                }
+
+            # SELL resistance is wrong-side only if the whole zone is BELOW price
+            if direction == "SELL" and zh < ref_px:
+                return False, {
+                    "reason": "zone_wrong_side_sell",
+                    "stage": "ZONE_VALIDATE",
+                    "blocked": False,
+                    "price": float(ref_px),
+                    "zone": zone,
+                }
+
+
+            if direction == "SELL":
+                # Resistance must be ABOVE current price
+                wrong_side = (zh < ref_px)
+                too_far    = (zl > ref_px + far) if far > 0 else False
+
+                
+                if wrong_side or too_far:
+                    # Try to re-pick using SR at current live price
+                    z2 = _pick_zone_from_sr(sr, "SELL", ref_px, atr)
+                    if z2:
+                        zone = z2
+                        try:
+                            zone_tf = str(z2.get("tf") or zone_tf or tf_tag or "H1").upper()
+                        except Exception:
+                            pass
+                    else:
+                        # IMPORTANT: do NOT fail/return just because zone is far.
+                        # If SR has a nearest_resistance above price, keep current zone and wait for tap+reversal.
+                        nr = None
+                        try:
+                            nr = float(sr.get("nearest_resistance")) if isinstance(sr, dict) and sr.get("nearest_resistance") is not None else None
+                        except Exception:
+                            nr = None
+
+                        if nr is not None and nr > float(ref_px):
+                            # Keep existing zone (may be far). Continue to tap logic; it will only arm on touch.
+                            # Attach a soft reason for debug visibility.
+                            gate_meta = {
+                                "reason": "sell_zone_far_wait_tap",
+                                "stage": "ZONE_PICK",
+                                "blocked": False,
+                                "price": float(ref_px),
+                                "note": "Resistance exists but is far; waiting for tap+reversal.",
+                                "zone":zone,
+                            }
+                        else:
+                            # Truly no resistance above price in SR
+                            return False, {
+                                "reason": "no_sell_resistance_above_price",
+                                "stage": "ZONE_PICK",
+                                "blocked": False,
+                                "price": float(ref_px),
+                                "note": "No resistance above price in SR; cannot run SELL tap gate now.",
+                            }
+
+
+            else:  # BUY
+                # Support must be BELOW current price
+                wrong_side = (zl > ref_px)
+                too_far    = (zh < ref_px - far) if far > 0 else False
+
+                if wrong_side or too_far:
+                    z2 = _pick_zone_from_sr(sr, "BUY", ref_px, atr)
+                    if z2:
+                        zone = z2
+                        try:
+                            zone_tf = str(z2.get("tf") or zone_tf or tf_tag or "H1").upper()
+                        except Exception:
+                            pass
+                    else:
+                        ns = None
+                        try:
+                            ns = float(sr.get("nearest_support")) if isinstance(sr, dict) and sr.get("nearest_support") is not None else None
+                        except Exception:
+                            ns = None
+
+                        if ns is not None and ns < float(ref_px):
+                            gate_meta = {
+                                "reason": "buy_zone_far_wait_tap",
+                                "stage": "ZONE_PICK",
+                                "blocked": False,
+                                "price": float(ref_px),
+                                "note": "Support exists but is far; waiting for tap+reversal.",
+                                "zone":zone,
+                            }
+                        else:
+                            return False, {
+                                "reason": "no_buy_support_below_price",
+                                "stage": "ZONE_PICK",
+                                "blocked": False,
+                                "price": float(ref_px),
+                                "note": "No support below price in SR; cannot run BUY tap gate now.",
+                            }
+
+
+    # keep close-only break state based on close (cl)
+    break_state, break_meta = _break_state_close_only(float(cl))
+    # --- attach strength meta for provisional/flipped zones (so bootstrap can extend) ---
+    try:
+        _attach_zone_strength_meta(zone, sr)
+    except Exception:
+        pass
+    # after _attach_zone_strength_meta(zone, sr)
+    try:
+        half_local = None
+        try:
+            zl = float(zone.get("low"))
+            zh = float(zone.get("high"))
+            half_local = abs(zh - zl) / 2.0
+        except Exception:
+            half_local = float(zone.get("half") or 0.0)
+        if isinstance(gate_meta, dict) and isinstance(zone, dict):
+            gate_meta["zone_used"] = {
+                "level": float(zone.get("level") or 0.0),
+                "low": float(zone.get("low") or 0.0),
+                "high": float(zone.get("high") or 0.0),
+                "touches": int(zone.get("touches") or 0),
+                "strength": float(zone.get("strength") or 0.0),
+                "sr_score": float(zone.get("sr_score") or 0.0),
+                "is_strong": bool(zone.get("is_strong") or False),
+                "tf": str(zone.get("tf") or zone_tf or tf_tag or ""),
+                "type": str(zone.get("type") or zone_type or ""),
+                "half": float(half_local or 0.0),
+                "atr": float(atr or 0.0),
+            }
+    except Exception:
+        pass
+
+
+
+
+    
+    # ==========================================================
+    # 5B) BOS double-check
+    # ==========================================================
+    BOS_BLOCK = os.getenv("XTL_BOS_BLOCK", "1") == "1"
+    try:
+        BOS_MAX_AGE_BARS = int(os.getenv("XTL_BOS_MAX_AGE_BARS", "48"))
+    except Exception:
+        BOS_MAX_AGE_BARS = 48
+    try:
+        BOS_PIVOT_LR = int(os.getenv("XTL_BOS_PIVOT_LR", "2"))
+    except Exception:
+        BOS_PIVOT_LR = 2
+    try:
+        BOS_MIN_ATR = float(os.getenv("XTL_BOS_MIN_ATR", "0.15"))
+    except Exception:
+        BOS_MIN_ATR = 0.15
+
+    def _detect_last_bos(bars_in: list[dict], *, atr_val: float | None, max_age_bars: int) -> dict | None:
+        try:
+            lr = max(1, int(BOS_PIVOT_LR))
+            n0 = len(bars_in)
+            if n0 < (2 * lr + 6):
+                return None
+
+            def _hlc(i: int):
+                b = bars_in[i]
+                h_ = float(b.get("h") or b.get("high"))
+                l_ = float(b.get("l") or b.get("low"))
+                c_ = float(b.get("c") or b.get("close"))
+                return h_, l_, c_
+
+            piv_hi: list[tuple[int, float]] = []
+            piv_lo: list[tuple[int, float]] = []
+
+            for i in range(lr, n0 - lr):
+                h_i, l_i, _ = _hlc(i)
+                ok_hi = True
+                ok_lo = True
+                for k in range(1, lr + 1):
+                    h_l, l_l, _ = _hlc(i - k)
+                    h_r, l_r, _ = _hlc(i + k)
+                    if h_i <= h_l or h_i <= h_r:
+                        ok_hi = False
+                    if l_i >= l_l or l_i >= l_r:
+                        ok_lo = False
+                    if not ok_hi and not ok_lo:
+                        break
+                if ok_hi:
+                    piv_hi.append((i, h_i))
+                if ok_lo:
+                    piv_lo.append((i, l_i))
+
+            if not piv_hi and not piv_lo:
+                return None
+
+            last_i = n0 - 1
+            _, _, last_close = _hlc(last_i)
+
+            bos = None
+            if piv_lo:
+                pi, lvl = piv_lo[-1]
+                if last_close < lvl:
+                    bos = {"ok": True, "dir": "DOWN", "level": float(lvl), "pivot_i": int(pi)}
+
+            if piv_hi:
+                pi, lvl = piv_hi[-1]
+                if last_close > lvl:
+                    up = {"ok": True, "dir": "UP", "level": float(lvl), "pivot_i": int(pi)}
+                    if (bos is None) or (up["pivot_i"] > bos["pivot_i"]):
+                        bos = up
+
+            if not bos:
+                return None
+
+            age_bars = int(last_i - int(bos["pivot_i"]))
+            bos["break_i"] = int(last_i)
+            bos["age_bars"] = age_bars
+            bos["blocked"] = False
+
+            if age_bars > int(max_age_bars):
+                return bos
+
+            if isinstance(atr_val, (int, float)) and float(atr_val) > 0:
+                dist = abs(float(last_close) - float(bos["level"]))
+                if dist < float(BOS_MIN_ATR) * float(atr_val):
+                    return bos
+
+            want = "UP" if direction == "BUY" else "DOWN"
+            if BOS_BLOCK and bos["dir"] != want:
+                # Opposite BOS blocks ONLY if price is still holding beyond the BOS level.
+                try:
+                    lvl = float(bos["level"])
+                    lc = float(last_close)
+                    buf = 0.0
+                    if isinstance(atr_val, (int, float)) and float(atr_val) > 0:
+                        buf = float(BOS_MIN_ATR) * float(atr_val)
+                except Exception:
+                    lvl, lc, buf = 0.0, 0.0, 0.0
+
+                if bos["dir"] == "UP":
+                    # BOS UP opposes SELL: block only while price remains above level (+buf)
+                    bos["blocked"] = (lc > (lvl + buf))
+                else:
+                    # BOS DOWN opposes BUY: block only while price remains below level (-buf)
+                    bos["blocked"] = (lc < (lvl - buf))
+
+            return bos
+
+        except Exception:
+            return None
+
+    bos_meta_h1 = None
+    try:
+        bos_meta_h1 = _detect_last_bos(bars, atr_val=float(atr), max_age_bars=int(BOS_MAX_AGE_BARS))
+    except Exception:
+        bos_meta_h1 = None
+
+    bos_meta_m15 = None
+    try:
+        bars_m15 = row_h1.get("bars_m15") or []
+        if isinstance(bars_m15, list) and len(bars_m15) >= 30:
+            try:
+                M15_MAX_AGE = int(os.getenv("XTL_BOS_M15_MAX_AGE_BARS", "24"))
+            except Exception:
+                M15_MAX_AGE = 24
+            bos_meta_m15 = _detect_last_bos(bars_m15, atr_val=None, max_age_bars=int(M15_MAX_AGE))
+    except Exception:
+        bos_meta_m15 = None
+
+    
+
+    def _bootstrap_taps_from_history(bars_in, zone, direction, atr, zone_half, now_ms, lookback_days, tf_ms):
+        norm = _normalize_snap_bars_to_ms(bars_in or [], int(tf_ms))
+        if not norm:
+            return {"tap_count": 0, "moved_away": True, "last_ts": 0, "first_ts": 0,
+                    "zone_level": float(zone.get("level") or 0.0), "last_tap_bar_ms": 0,
+                    "sweep_ts": 0, "sweep_side": None, "sweep_edge": None,
+                    "bootstrapped": True, "boot_lb_days": int(lookback_days),
+                    "boot_cutoff_ms": 0, "boot_scanned_bars": 0}
+
+        zone_low = float(zone["low"]); zone_high = float(zone["high"])
+        move_req = float(MOVE_AWAY_ATR) * float(atr)
+
+        # cutoff
+        cutoff = int(now_ms) - int(lookback_days) * 24 * 60 * 60 * 1000
+        scanned = 0
+
+        tap_count = 0
+        moved_away = True
+        first_ts = 0
+        last_ts = 0
+        last_tap_bar_ms = 0
+
+        for b in norm:
+            t = int(b.get("t_close_ms") or 0)
+            if t <= 0 or t < cutoff:
+                continue
+            scanned += 1
+
+            h = float(b.get("h") or 0.0)
+            l = float(b.get("l") or 0.0)
+            c = float(b.get("c") or 0.0)
+
+            overlap = (l <= zone_high) and (h >= zone_low)
+
+            # away condition (directional)
+            if direction == "BUY":
+                away = (c - zone_high) >= move_req
+            else:
+                away = (zone_low - c) >= move_req
+
+            if away:
+                moved_away = True
+
+            # Count a tap only on entering overlap while moved_away is True
+            if overlap and moved_away:
+                tap_count += 1
+                moved_away = False
+                last_tap_bar_ms = t
+                last_ts = int(t)
+                if first_ts <= 0:
+                    first_ts = int(t)
+
+        return {
+            "tap_count": int(tap_count),
+            "moved_away": bool(moved_away),
+            "last_ts": int(last_ts or 0),
+            "first_ts": int(first_ts or 0),
+            "zone_level": float(zone.get("level") or 0.0),
+            "zone_low": float(zone_low),
+            "zone_high": float(zone_high),
+            "last_tap_bar_ms": int(last_tap_bar_ms or 0),
+            "sweep_ts": 0, "sweep_side": None, "sweep_edge": None,
+            "bootstrapped": True,
+            "boot_lb_days": int(lookback_days),
+            "boot_cutoff_ms": int(cutoff),
+            "boot_scanned_bars": int(scanned),
+        }
+
+
+
+    def _tap_key_for_zone(sym_u: str, direction: str, zone: dict, tf_tag: str, *, zone_tf: str | None) -> str:
+        """
+        Tap state must be scoped to the zone identity, not request TF.
+        Otherwise taps leak between different zones and between H1/H4 sources.
+        """
+        ztf = str(zone_tf or tf_tag or "H1").upper()
+        try:
+            lvl = float(zone.get("level") or 0.0)
+        except Exception:
+            lvl = 0.0
+
+        # keep it stable and short; 3 decimals is enough for FX/XAU SR
+        # Keep key stable but precise enough to avoid collisions:
+        # - FX pairs: 5 decimals (pip=0.0001)
+        # - JPY pairs: 3 decimals (pip=0.01)
+        # - XAUUSD: 2 decimals (0.01)
+        try:
+            if sym_u == "XAUUSD":
+                dec = 2
+            elif sym_u.endswith("JPY"):
+                dec = 3
+            else:
+                dec = 5
+        except Exception:
+            dec = 5
+
+        lvl_s = (f"{lvl:.{dec}f}".rstrip("0").rstrip(".") if lvl > 0 else "0")
+
+
+        return f"xtl:zone:tap:{sym_u}:{direction}:{ztf}@{lvl_s}"
+
+    # -------------------------------
+    # 4) Tap detection + state (Redis)
+    # -------------------------------
+    R = _r()
+    # zone identity key (prevents tap leakage across zones / TF)
+    key = _tap_key_for_zone(sym_u, direction, zone, tf_tag, zone_tf=zone_tf)
+
+
+    tapped = (float(l) <= float(zone["high"])) and (float(h) >= float(zone["low"]))
+    # ------------------------------------------------------------
+    # derive last CLOSED bar close-ms once for this gate (c_ms)
+    # used for dedup + debug + session weighting
+    # ------------------------------------------------------------
+    c_ms = 0
+    try:
+        _bars0 = row_h1.get("bars") or row_h1.get("ohlc") or []
+    except Exception:
+        _bars0 = []
+
+    try:
+        c0, _p0 = _pick_last_closed_bar_from_bars(_bars0, int(now_ms), int(tf_ms))
+    except Exception:
+        c0, _p0 = None, None
+
+    try:
+        if isinstance(c0, dict):
+            c_ms = int(c0.get("t_close_ms") or c0.get("t") or 0)
+            # normalize seconds -> ms if needed
+            if 0 < c_ms < 10_000_000_000:
+                c_ms *= 1000
+    except Exception:
+        c_ms = 0
+
+    if debug_gate:	
+        try:
+            rk = f"xtl:zone:tap:DBG:{sym_u}:{direction}:{tf_tag.upper()}"
+            R.setex(rk, 600, str(int(now_ms)))
+        except Exception:
+            pass
+
+    
+
+    # 4A) Load existing tap-state; if missing -> bootstrap from last N days of H1 bars
+    raw_st = None
+    try:
+        raw_st = _json_load_twice(R.get(key))
+    except Exception:
+        raw_st = None
+    # 4A.1) Reset tap-state if the zone moved materially (prevents stale tap_count on a new zone)
+    try:
+        zone_low_now = float(zone.get("low") or 0.0)
+        zone_high_now = float(zone.get("high") or 0.0)
+        zone_level_now = float(zone.get("level") or 0.0)
+
+        # "Material" threshold: half-zone width (robust, direction-agnostic)
+        zone_half_now = abs(zone_high_now - zone_low_now) / 2.0
+        if zone_half_now <= 0:
+            zone_half_now = 0.0
+
+        if isinstance(raw_st, dict) and raw_st:
+            prev_low = float(raw_st.get("zone_low") or 0.0)
+            prev_high = float(raw_st.get("zone_high") or 0.0)
+            prev_level = float(raw_st.get("zone_level") or 0.0)
+
+            # Reset if any edge/level drifted by >= 1 * half-zone width
+            zone_changed = (
+                (zone_half_now > 0.0) and (
+                    abs(prev_low - zone_low_now) >= zone_half_now or
+                    abs(prev_high - zone_high_now) >= zone_half_now or
+                    abs(prev_level - zone_level_now) >= zone_half_now
+                )
+            )
+
+            if zone_changed:
+                try:
+                    R.delete(key)  # wipe old tap-state (single source of truth)
+                except Exception:
+                    pass
+                raw_st = None  # forces bootstrap / fresh state
+    except Exception:
+        # never block gate due to reset logic
+        pass
+
+
+    if (not isinstance(raw_st, dict)) or (not raw_st):
+        # Bootstrap taps from history so bot-start-late still respects earlier taps
+        try:
+            lookback_days = int(os.getenv("XTL_TAP_BOOTSTRAP_DAYS", "3"))
+        except Exception:
+            lookback_days = 3
+
+        try:
+            if isinstance(zone, dict) and bool(zone.get("is_strong")):
+                lookback_days = max(
+                    int(lookback_days),
+                    int(os.getenv("XTL_STRONG_ZONE_LOOKBACK_DAYS", "15")),
+                )
+        except Exception:
+            pass
+
+
+        # build a "fresh" state inferred from recent bars
+        try:
+            tf_ms0 = int(TF_MS.get(tf_tag.upper(), 60 * 60 * 1000))
+        except Exception:
+            tf_ms0 = 60 * 60 * 1000
+
+        # IMPORTANT: bootstrap should NOT include the current bar 'c' you are evaluating now.
+        bars_hist = bars[:-1] if isinstance(bars, list) and len(bars) > 2 else (bars or [])
+        try:
+            st = _bootstrap_taps_from_history(
+                bars_hist,
+                zone=zone,
+                direction=direction,
+                atr=float(atr),
+                zone_half=float(zone_half),
+                now_ms=int(now_ms),
+                lookback_days=int(lookback_days),
+                tf_ms=int(tf_ms0),
+            )
+            # --- FIX: bootstrap should set first_ts/last_ts to real tap history times, not now() ---
+            try:
+                # if bootstrap returns a tap timeline, use it; else derive from last_tap_bar_ms
+                ltb = int(st.get("last_tap_bar_ms", 0) or 0)
+                if ltb > 0 and int(st.get("first_ts", 0) or 0) <= 0:
+                    st["first_ts"] = ltb  # fallback: at least not "now"
+                if ltb > 0:
+                    st["last_ts"] = int(st.get("last_ts", 0) or 0) or ltb
+            except Exception:
+                pass
+
+            if debug_gate:
+                try:
+                    log.warning(
+                        "[TAPBOOT] sym=%s dir=%s tf=%s days=%s tap_count=%s moved_away=%s last_ts=%s",
+                        sym_u, direction, tf_tag, lookback_days,
+                        int(st.get("tap_count", 0) or 0),
+                        bool(st.get("moved_away", True)),
+                        int(st.get("last_ts", 0) or 0),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            st = {}
+    else:
+        st = raw_st
+
+    # Ensure required defaults always exist
+    st = st or {}
+    st.setdefault("tap_count", 0)
+    st.setdefault("moved_away", True)
+    st.setdefault("last_ts", 0)
+    st.setdefault("first_ts", 0)
+    st.setdefault("last_tap_bar_ms", 0)
+    st.setdefault("sweep_ts", 0)
+    st.setdefault("sweep_side", None)
+    st.setdefault("sweep_edge", None)
+    # -------------------------------
+    # Reset if zone changed materially
+    # IMPORTANT: must run BEFORE overwriting st["zone_*"]
+    # -------------------------------
+    try:
+        prev_level = float(st.get("zone_level") or 0.0)
+        prev_low   = float(st.get("zone_low") or 0.0)
+        prev_high  = float(st.get("zone_high") or 0.0)
+
+        cur_level = float(zone.get("level") or 0.0)
+        cur_low   = float(zone.get("low") or 0.0)
+        cur_high  = float(zone.get("high") or 0.0)
+
+        prev_w = max(0.0, prev_high - prev_low)
+        cur_w  = max(0.0, cur_high - cur_low)
+
+        # material threshold: half current zone width (with tiny floor)
+        eps = max(cur_w * 0.50, 1e-6)
+
+        zone_changed = (
+            (prev_level > 0.0) and (
+                abs(cur_level - prev_level) > eps or
+                abs(cur_low   - prev_low)   > eps or
+                abs(cur_high  - prev_high)  > eps or
+                abs(cur_w     - prev_w)     > eps
+            )
+        )
+
+        if zone_changed:
+            st["tap_count"] = 0
+            st["moved_away"] = True
+            st["last_ts"] = 0
+            st["first_ts"] = 0
+            st["last_tap_bar_ms"] = 0
+            st["sweep_ts"] = 0
+            st["sweep_side"] = None
+            st["sweep_edge"] = None
+    except Exception:
+        pass
+
+    # FORCE current zone params into state (single source of truth)
+    st["zone_level"] = float(zone.get("level") or 0.0)
+    st["zone_low"]   = float(zone.get("low") or 0.0)
+    st["zone_high"]  = float(zone.get("high") or 0.0)
+    
+
+    # move-away reset (directional)
+    try:
+        move_req = float(MOVE_AWAY_ATR) * float(atr)
+        if direction == "BUY":
+            moved = (float(cl) - float(zone["high"])) >= move_req
+        else:
+            moved = (float(zone["low"]) - float(cl)) >= move_req
+        if moved:
+            st["moved_away"] = True
+    except Exception:
+        pass
+
+
+    # ---- DEBUG (tap state) ----
+    try:
+        if bool(debug_gate):
+            # directional moved-away distance
+            if direction == "BUY":
+                dist = float(cl) - float(zone["high"])
+            else:
+                dist = float(zone["low"]) - float(cl)
+
+            move_req = float(MOVE_AWAY_ATR) * float(atr)
+
+            # show once per bar close to avoid spam
+            cbar = int(c_ms or 0)
+            last_dbg = int(st.get("last_dbg_bar_ms") or 0)
+            if cbar > 0 and cbar != last_dbg:
+                st["last_dbg_bar_ms"] = cbar
+                try:
+                    rk2 = f"xtl:zone:tap:DBG:{sym_u}:{direction}:{tf_tag.upper()}"
+                    R.setex(rk2, 600, json.dumps(st, separators=(",", ":")))
+
+                except Exception:
+                    pass
+
+                log.warning(
+                    "[TAPDBG] sym=%s dir=%s tf=%s tapped=%s tap_count=%s moved_away=%s dist=%.6f req=%.6f zone=[%.6f..%.6f] cl=%.6f",
+                    sym, direction, tf_tag, bool(tapped),
+                    int(st.get("tap_count", 0) or 0),
+                    bool(st.get("moved_away", True)),
+                    float(dist), float(move_req),
+                    float(zone["low"]), float(zone["high"]),
+                    float(cl),
+                )
+    except Exception:
+        pass
+
+
+
+    
+    # ----------------------------------------
+    # TAP STATE + PERSIST (single source of truth)
+    # ----------------------------------------
+    
+
+    # Start from stored count
+    tap_count = int(st.get("tap_count", 0) or 0)
+
+    # moved_away comes from state; default True until we see a valid tap
+    moved_away = bool(st.get("moved_away", True))
+    try:
+        zone_age_days = (int(now_ms) - int(st.get("first_ts") or now_ms)) / (24 * 3600 * 1000)
+    except Exception:
+        zone_age_days = 0
+
+    try:
+        FRESH_DAYS = int(os.getenv("XTL_FRESH_ZONE_DAYS", "3"))  # start with 3
+    except Exception:
+         FRESH_DAYS = 3
+    FRESH_MS = int(FRESH_DAYS) * 24 * 3600 * 1000
+
+    # ----------------------------
+    # Dynamic max taps (fresh/old + volatility)
+    # ----------------------------
+    try:
+        FRESH_MAX_TAPS = int(os.getenv("XTL_FRESH_MAX_TAPS", "3"))
+    except Exception:
+        FRESH_MAX_TAPS = 3
+
+    if zone_age_days <= float(FRESH_DAYS):
+        max_taps_dynamic = int(FRESH_MAX_TAPS)
+    else:
+        max_taps_dynamic = int(MAX_TAPS)
+
+
+    # Volatility bump: if ATR% is higher, allow a couple more taps (H1 FX needs this)
+    try:
+        # ATR as fraction of price (e.g., 0.0010 = 0.10%)
+        atr_pct = abs(float(atr or 0.0)) / max(abs(float(cl or 0.0)), 1e-9)
+    except Exception:
+        atr_pct = 0.0
+
+    try:
+        TAP_VOL1 = float(os.getenv("XTL_TAP_VOL1", "0.0008"))  # +1 tap above this ATR%
+    except Exception:
+        TAP_VOL1 = 0.0008
+    try:
+        TAP_VOL2 = float(os.getenv("XTL_TAP_VOL2", "0.0012"))  # +2 taps above this ATR%
+    except Exception:
+        TAP_VOL2 = 0.0012
+    try:
+        MAX_TAPS_CAP = int(os.getenv("XTL_MAX_TAPS_CAP", "7"))  # hard safety cap
+    except Exception:
+        MAX_TAPS_CAP = 7
+
+    if atr_pct >= TAP_VOL1:
+        max_taps_dynamic += 1
+    if atr_pct >= TAP_VOL2:
+        max_taps_dynamic += 1
+
+    # clamp
+    max_taps_dynamic = max(3, min(int(max_taps_dynamic), int(MAX_TAPS_CAP)))
+
+
+    # Count a tap once per closed H1 bar (avoid double count)
+    if tapped:
+        last_bar = int(st.get("last_tap_bar_ms", 0) or 0)
+        # derive current closed bar close-ms for tap dedup (no c_ms variable in this scope)
+        try:
+            _bars = row_h1.get("bars") or row_h1.get("ohlc") or []
+        except Exception:
+            _bars = []
+
+        try:
+            c, p = _pick_last_closed_bar_from_bars(_bars, now_ms, tf_ms)
+        except Exception:
+            c, p = None, None
+
+        this_bar = int((c or {}).get("t_close_ms") or 0)
+        # normalize seconds->ms if needed
+        if 0 < this_bar < 10_000_000_000:
+            this_bar *= 1000
+
+        # --- repair: poisoned state (last_bar saved earlier but tap_count stayed 0) ---
+        if tap_count < 1 and last_bar > 0 and this_bar > 0 and this_bar == last_bar:
+            tap_count = 1
+            st["tap_count"] = tap_count
+            st["first_ts"] = int(st.get("first_ts") or now_ms)
+            st["last_ts"] = int(now_ms)
+            st["last_tap_ms"] = int(now_ms)
+            st["moved_away"] = False
+
+        if this_bar > 0 and this_bar != last_bar:
+            # ONLY count a new tap if price had moved away enough since the last tap
+            if bool(st.get("moved_away", True)):
+                tap_count = min(int(MAX_TAPS) + 1, tap_count + 1)
+                st["tap_count"] = tap_count
+                st["last_ts"] = int(now_ms)
+                st["last_tap_bar_ms"] = this_bar
+                st["last_tap_ms"] = int(now_ms)
+                st["moved_away"] = False  # must move away again before next tap counts
+                if tap_count == 1 and int(st.get("first_ts") or 0) <= 0:
+                    st["first_ts"] = int(now_ms)
+            else:
+                # touched again but never moved away -> do NOT increment tap_count
+                st["last_ts"] = int(now_ms)  # optional: keep last_ts fresh for debugging
+
+    else:
+        # no tap this bar; keep moved_away state
+        if moved_away:
+            st["moved_away"] = True
+
+    # Apply break effects (key is defined now)
+    if break_state == "HARD_BREAK":
+        try:
+            R.delete(key)
+        except Exception:
+            pass
+        return False, {
+            "reason": "hard_break",
+            "break": break_meta,
+            "zone": {**zone, "type": zone_type},
+            "bos_h1": bos_meta_h1,
+            "bos_m15": bos_meta_m15,
+            "tap_key": key,
+            "tap_count": int(tap_count),
+            "stage": "ZONE_GATE",
+            "blocked": True,
+        }
+
+    if break_state == "SWEEP":
+        st["sweep_ts"] = int(now_ms)
+        st["sweep_side"] = str(break_meta.get("side") or "")
+        st["sweep_edge"] = float(break_meta.get("edge") or 0.0)
+
+    # Persist TAP state (ALWAYS attempt)
+    persist_ok = False
+    persist_exists = None
+    persist_ttl = None
+    persist_len = None
+    persist_exc_type = None
+    persist_exc = None
+
+    try:
+        ttl_sec = int(MAX_TAP_BARS) * 3600
+        # refuse to persist empty/invalid state
+        if not isinstance(st, dict) or not st:
+            st = {
+               "tap_count": 0,
+               "moved_away": True,
+               "last_ts": 0,
+               "first_ts": 0,
+               "zone_level": float(zone.get("level") or 0.0),
+               "last_tap_bar_ms": 0,
+               "sweep_ts": 0,
+               "sweep_side": None,
+               "sweep_edge": None,
+            }
+        payload = json.dumps(st, separators=(",", ":"))
+        if len(payload) <= 2:  # "{}"
+            raise ValueError("Refusing to persist empty tap state")
+        R.set(key, payload)
+        
+        # verify by reading the value back
+        val = R.get(key)
+        persist_len = len(val) if isinstance(val, (bytes, bytearray, str)) else 0
+        persist_ttl = int(R.ttl(key) or -999)
+        persist_exists = int(R.exists(key) or 0)
+        persist_ok = (persist_len > 2) and (persist_exists == 1) and (persist_ttl in (-1,) or persist_ttl > 0)
+    except Exception as e:
+        persist_exc_type = type(e).__name__
+        persist_exc = str(e)
+        
+
+    # Debug payload (ALWAYS available in return dicts)
+    debug_out = {
+        "tap_key": key,
+        "tap_count": int(tap_count),
+        "tapped": bool(tapped),
+        "moved_away": bool(st.get("moved_away", True)),
+        "persist_ok": bool(persist_ok),
+        "persist_exists": persist_exists,
+        "persist_ttl_sec": persist_ttl,
+        "persist_len": persist_len,
+        "persist_exc_type": persist_exc_type,
+        "persist_exc": persist_exc,
+        "__tap_marker__": "TAP_PERSIST_RAN",
+        "__tap_dbg_gate__": bool(debug_gate),
+    }
+    # --- post-persist verification (catch deletes after persist) ---
+    debug_out["tap_key_repr"] = repr(key)
+    # --- attach reference price used for SR/zone selection ---
+    try:
+        debug_out["price"] = float(px) if px is not None else None
+        debug_out["price_src"] = px_src
+        debug_out["price_ts_ms"] = int(px_ts_ms) if px_ts_ms is not None else None
+    except Exception:
+        pass
+    
+    # --- attach zone used for tap logic (so jq can show it) ---
+    try:
+        zu = None
+        if isinstance(gate_meta, dict):
+            zu = gate_meta.get("zone_used")
+
+        if isinstance(zu, dict) and zu:
+            debug_out["zone_used"] = dict(zu)  # single source of truth
+        else:
+            debug_out["zone_used"] = {
+                "level": float(zone.get("level") or 0.0),
+                "low": float(zone.get("low") or 0.0),
+                "high": float(zone.get("high") or 0.0),
+                "touches": int(zone.get("touches") or 0),
+                "strength": float(zone.get("strength") or 0.0),
+                "sr_score": float(zone.get("sr_score") or 0.0),
+                "is_strong": bool(zone.get("is_strong") or False),
+                "tf": str(zone.get("tf") or ""),
+                "type": str(zone.get("type") or ""),
+                "half": float(zone_half or 0.0),
+                "atr": float(atr or 0.0),
+            }
+    except Exception:
+        pass
+
+    # --- attach stored tap-state snapshot (what we loaded / bootstrapped) ---
+    try:
+        debug_out["tap_state"] = {
+            "tap_count_st": int(st.get("tap_count", 0) or 0),
+            "moved_away_st": bool(st.get("moved_away", True)),
+            "first_ts": int(st.get("first_ts", 0) or 0),
+            "last_ts": int(st.get("last_ts", 0) or 0),
+            "last_tap_bar_ms": int(st.get("last_tap_bar_ms", 0) or 0),
+            "last_tap_ms": int(st.get("last_tap_ms", 0) or 0),
+            "zone_level_st": float(st.get("zone_level") or 0.0),
+            "zone_low_st": float(st.get("zone_low") or 0.0),
+            "zone_high_st": float(st.get("zone_high") or 0.0),
+            "bootstrapped": bool(st.get("bootstrapped", False)),
+            "boot_lb_days": int(st.get("boot_lb_days", 0) or 0),
+            "boot_scanned_bars": int(st.get("boot_scanned_bars", 0) or 0),
+        }
+    except Exception:
+        pass
+
+    # --- tap decision basis (no extra bar data needed) ---
+    try:
+        debug_out["tap_basis"] = {
+            "tapped_now": bool(tapped),
+            "dedup_last_tap_bar_ms": int(st.get("last_tap_bar_ms", 0) or 0),
+            "moved_away_required": bool(st.get("moved_away", True)),
+            "max_taps_dynamic": int(max_taps_dynamic),
+            "fresh_days": int(FRESH_DAYS) if "FRESH_DAYS" in locals() else None,
+        }
+    except Exception:
+        pass
+
+
+    
+    try:
+        debug_out["post_exists"] = int(R.exists(key) or 0)
+        debug_out["post_ttl"] = int(R.ttl(key) or -999)
+        debug_out["post_type"] = str(R.type(key) or "")
+        
+    except Exception as _e:
+        debug_out["post_check_exc"] = f"{type(_e).__name__}:{_e}"
+
+    try:
+        kw = getattr(getattr(R, "connection_pool", None), "connection_kwargs", {}) or {}
+        debug_out["__tap_redis_host__"] = kw.get("host")
+        debug_out["__tap_redis_port__"] = kw.get("port")
+        debug_out["__tap_redis_db__"] = kw.get("db")
+    except Exception:
+        pass
+    
+    # --- BOS override (DEBUG ONLY) must be BEFORE the early return ---
+    if debug_gate and os.getenv("XTL_DEBUG_IGNORE_BOS", "0") == "1":
+        try:
+            if isinstance(bos_meta_h1, dict):
+                bos_meta_h1["blocked"] = False
+                bos_meta_h1["__bos_ignored__"] = True
+        except Exception:
+            pass
+    if isinstance(bos_meta_h1, dict) and bool(bos_meta_h1.get("blocked")):
+        return False, {"reason": "bos_opposite_h1", "bos_h1": bos_meta_h1, "zone": {**zone, "type": zone_type},"stage": "ZONE_GATE",
+        "blocked": True,
+        **debug_out,}
+    
+
+
+    if isinstance(bos_meta_m15, dict) and bool(bos_meta_m15.get("blocked")):
+        return False, {"reason": "bos_opposite_m15", "bos_m15": bos_meta_m15, "zone": {**zone, "type": zone_type},"stage": "ZONE_GATE",
+        "blocked": True,
+        **debug_out,}
+
+    # IMPORTANT: return paths MUST include debug_out so curl/jq proves it ran
+    if tap_count < 1:
+        return False, {
+            "reason": "tap_lt_1",
+            "zone": {**zone, "type": zone_type},
+            "break_state": break_state,
+            "break": break_meta,
+            "stage": "ZONE_GATE",
+            "blocked": True,
+            **debug_out,
+        }
+
+    # -------------------------------
+    # Fresh/Old zone policy
+    # -------------------------------
+    
+
+    try:
+        first_ts0 = int(st.get("first_ts", 0) or 0)
+    except Exception:
+        first_ts0 = 0
+
+    zone_is_fresh = (first_ts0 > 0) and (int(now_ms) - first_ts0 <= FRESH_MS)
+
+
+    # "old powerful" heuristic: higher TF OR strong zone_type/strength/touches
+    try:
+        ztf0 = str(zone.get("tf") or zone_tf or tf_tag or "H1").upper()
+    except Exception:
+        ztf0 = str(tf_tag or "H1").upper()
+
+    try:
+        ztype0 = str(zone.get("type") or zone_type or "").upper()
+    except Exception:
+        ztype0 = ""
+
+    try:
+        z_strength0 = float(zone.get("strength") or 0.0)
+    except Exception:
+        z_strength0 = 0.0
+
+    try:
+        z_touches0 = int(zone.get("touches") or 0)
+    except Exception:
+        z_touches0 = 0
+
+    old_powerful = (
+        (ztf0 in ("H4", "D", "DAILY", "W1")) or
+        ("MAJOR" in ztype0) or
+        (z_strength0 >= 8.0) or
+        (z_touches0 >= 6)
+    )
+    # --- debug: show computed tap allowance ---
+    try:
+        debug_out["tap_dyn"] = {
+            "tap_count": int(tap_count),
+            "max_taps_dynamic": int(max_taps_dynamic),
+            "atr_pct": float(atr_pct),
+        }
+    except Exception:
+        pass
+
+
+    if tap_count > int(max_taps_dynamic):
+        # Your rule: if zone is fresh and already over-tapped -> discard this zone
+        if zone_is_fresh:
+            # IMPORTANT: discard should NOT look like a hard "blocked" gate
+            return False, {
+                "reason": "discard_fresh_zone_too_many_taps",
+                "fresh_days": int(FRESH_DAYS),
+                "max_taps_fresh": int(max_taps_dynamic),
+                "zone": {**zone, "type": zone_type},
+                "stage": "ZONE_GATE",
+                "blocked": False,
+                **debug_out,
+            }
+
+        # Old + powerful zones: allow even if over-tapped (do not hard block)
+        if old_powerful:
+            # Continue gate evaluation (reversal logic decides entry)
+            pass
+        else:
+            # Old but not powerful -> keep current behavior (block)
+            return False, {
+                "reason": "too_many_taps",
+                "max_taps_fresh": int(max_taps_dynamic),
+                "fresh_days": int(FRESH_DAYS),
+                "zone": {**zone, "type": zone_type},
+                "stage": "ZONE_GATE",
+                "blocked": True,
+                **debug_out,
+            }
+
+
+    # Tap2 staleness
+    try:
+        tap_age_ms = int(now_ms) - int(st.get("last_ts", 0) or 0)
+    except Exception:
+        tap_age_ms = int(MAX_TAP2_AGE_MS) + 1
+
+    if tap_age_ms > int(MAX_TAP2_AGE_MS):
+        try:
+            R.delete(key)
+        except Exception:
+            pass
+        return False, {"reason": "tap_stale", "tap_count": tap_count}
+
+    # If sweep armed: require reclaim window
+    try:
+        sweep_ts = int(st.get("sweep_ts") or 0)
+    except Exception:
+        sweep_ts = 0
+
+    if sweep_ts > 0:
+        try:
+            ref_ms = int(c_ms or now_ms)
+            sweep_age_bars = int((ref_ms - sweep_ts) / (60 * 60 * 1000))
+            if sweep_age_bars < 0:
+                sweep_age_bars = 0
+        except Exception:
+            sweep_age_bars = 99
+
+        if sweep_age_bars > int(RECLAIM_MAX_BARS):
+            try:
+                R.delete(key)
+            except Exception:
+                pass
+            return False, {
+                "reason": "sweep_no_reclaim",
+                "sweep_age_bars": sweep_age_bars,
+                "reclaim_max_bars": int(RECLAIM_MAX_BARS),
+                "zone": {**zone, "type": zone_type},
+                "break": {"state": "SWEEP", **break_meta},
+            }
+
+        inside = (float(cl) >= float(zone["low"])) and (float(cl) <= float(zone["high"]))
+        if direction == "BUY":
+            reclaim_ok = inside and (float(cl) >= float(zone["level"]))
+        else:
+            reclaim_ok = inside and (float(cl) <= float(zone["level"]))
+
+        if not reclaim_ok:
+            return True, {
+                "reason": "ARMED_SWEEP_WAIT_RECLAIM",
+                "zone": {**zone, "type": zone_type},
+                "tap_count": tap_count,
+                "break_state": "SWEEP",
+                "break": break_meta,
+                "sweep_age_bars": sweep_age_bars,
+                "reclaim_needed": True,
+                "bos_h1": bos_meta_h1,
+                "bos_m15": bos_meta_m15,
+            }
+
+        try:
+            if abs(float(cl) - float(zone["level"])) > (float(RECLAIM_TIGHTEN_ATR) * float(atr)):
+                return True, {
+                    "reason": "ARMED_RECLAIM_TOO_FAR",
+                    "zone": {**zone, "type": zone_type},
+                    "tap_count": tap_count,
+                    "break_state": "SWEEP",
+                    "break": break_meta,
+                    "reclaim_needed": False,
+                    "tighten_atr": float(RECLAIM_TIGHTEN_ATR),
+                    "bos_h1": bos_meta_h1,
+                    "bos_m15": bos_meta_m15,
+                }
+        except Exception:
+            pass
+
+        # reclaim succeeded -> clear sweep marker
+        st["sweep_ts"] = 0
+        st["sweep_side"] = None
+        st["sweep_edge"] = None
+        try:
+            R.set(key, json.dumps(st))
+        except Exception:
+            pass
+
+    # -------------------------------
+    # 5) Reversal confirmation candle (tap2)
+    # -------------------------------
+    body = abs(float(cl) - float(o))
+    rng = max(float(h) - float(l), 1e-6)
+
+    if direction == "BUY":
+        lower_wick = min(float(o), float(cl)) - float(l)
+        pin_ok = (float(cl) > float(o)) and ((lower_wick / rng) >= 0.45) and ((body / rng) <= 0.40)
+    else:
+        upper_wick = float(h) - max(float(o), float(cl))
+        pin_ok = (float(cl) < float(o)) and ((upper_wick / rng) >= 0.45) and ((body / rng) <= 0.40)
+
+    eng_ok = False
+    try:
+        po = float(_bar_f(p, "o", "open", default=None) or _bar_f(p, "c", "close"))
+        pc = float(_bar_f(p, "c", "close"))
+        if direction == "BUY":
+            eng_ok = (float(cl) > float(o)) and (float(o) <= pc) and (float(cl) >= po)
+        else:
+            eng_ok = (float(cl) < float(o)) and (float(o) >= pc) and (float(cl) <= po)
+    except Exception:
+        eng_ok = False
+
+    if direction == "BUY":
+        close_ok = (float(cl) >= (float(l) + 0.60 * rng)) or (float(cl) >= float(zone["level"]))
+        body_ok = (body / rng) >= 0.20
+        close_reject_ok = bool(close_ok and body_ok and (float(cl) > float(o)))
+    else:
+        close_ok = (float(cl) <= (float(h) - 0.60 * rng)) or (float(cl) <= float(zone["level"]))
+        body_ok = (body / rng) >= 0.20
+        close_reject_ok = bool(close_ok and body_ok and (float(cl) < float(o)))
+
+    rev_ok = bool(pin_ok or eng_ok or close_reject_ok)
+    if not rev_ok:
+        conf_tmp = "medium" if str(zone_type).lower() in ("sr", "sr_confirmed") else "low"
+        return True, {
+            "reason": "ARMED_TAP",
+            "zone": {**zone, "type": zone_type},
+            "tap_count": tap_count,
+            "rev_ok": False,
+            "pin_ok": bool(pin_ok),
+            "eng_ok": bool(eng_ok),
+            "close_reject_ok": bool(close_reject_ok),
+            "body_rng": (float(body) / float(rng)) if rng else None,
+            "confidence": conf_tmp,
+            "break_state": break_state,
+            "break": break_meta,
+            "bos_h1": bos_meta_h1,
+            "bos_m15": bos_meta_m15,
+        }
+
+    if pin_ok:
+        rev_path = "pin"
+    elif eng_ok:
+        rev_path = "engulf"
+    else:
+        rev_path = "close_reject"
+
+    # -------------------------------
+    # 6) Volume confirmation (confidence-only by default)
+    # -------------------------------
+    try:
+        VOL_LOOKBACK = int(os.getenv("XTL_VOL_LOOKBACK", "20"))
+    except Exception:
+        VOL_LOOKBACK = 20
+    try:
+        VOL_MIN_MULT = float(os.getenv("XTL_VOL_MIN_MULT", "1.25"))
+    except Exception:
+        VOL_MIN_MULT = 1.25
+    VOL_BLOCK_IF_FAIL = os.getenv("XTL_VOL_BLOCK_IF_FAIL", "0") == "1"
+
+    vol_ok = None
+    vol_ratio = None
+    try:
+        vols = []
+        for b in bars[-int(VOL_LOOKBACK):]:
+            if not isinstance(b, dict):
+                continue
+            v = b.get("v") or b.get("vol") or b.get("volume")
+            if isinstance(v, (int, float)):
+                vols.append(float(v))
+        if len(vols) >= 5:
+            avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
+            cur_vol = vols[-1]
+            if avg_vol > 0:
+                vol_ratio = cur_vol / avg_vol
+                vol_ok = bool(vol_ratio >= float(VOL_MIN_MULT))
+    except Exception:
+        vol_ok = None
+        vol_ratio = None
+
+    if vol_ok is False and VOL_BLOCK_IF_FAIL:
+        return False, {"reason": "low_volume", "vol_ratio": vol_ratio, "zone": {**zone, "type": zone_type}}
+
+    # -------------------------------
+    # 7) Session weighting
+    # -------------------------------
+    try:
+        SESSION_BOOST_LONDON = float(os.getenv("XTL_SESSION_BOOST_LONDON", "1.10"))
+    except Exception:
+        SESSION_BOOST_LONDON = 1.10
+    try:
+        SESSION_BOOST_NY = float(os.getenv("XTL_SESSION_BOOST_NY", "1.10"))
+    except Exception:
+        SESSION_BOOST_NY = 1.10
+    try:
+        SESSION_PENALTY_ASIA = float(os.getenv("XTL_SESSION_PENALTY_ASIA", "0.95"))
+    except Exception:
+        SESSION_PENALTY_ASIA = 0.95
+
+    def _session_weight(ms: int) -> float:
+        try:
+            utc_h = datetime.utcfromtimestamp(ms / 1000.0).hour
+        except Exception:
+            return 1.0
+        if 7 <= utc_h <= 12:
+            return float(SESSION_BOOST_LONDON)
+        if 13 <= utc_h <= 17:
+            return float(SESSION_BOOST_NY)
+        return float(SESSION_PENALTY_ASIA)
+
+    sess_w = float(_session_weight(int(c_ms or now_ms)))
+
+    # -------------------------------
+    # 8) Zone aging score
+    # -------------------------------
+    try:
+        ZONE_MAX_AGE_BARS = int(os.getenv("XTL_ZONE_MAX_AGE_BARS", "30"))
+    except Exception:
+        ZONE_MAX_AGE_BARS = 30
+    try:
+        ZONE_AGE_PENALTY_AFTER = int(os.getenv("XTL_ZONE_AGE_PENALTY_AFTER", "18"))
+    except Exception:
+        ZONE_AGE_PENALTY_AFTER = 18
+
+    zone_age_bars = 0
+    try:
+        if int(st.get("first_ts") or 0) > 0:
+            zone_age_bars = int((int(now_ms) - int(st["first_ts"])) / (60 * 60 * 1000))
+    except Exception:
+        zone_age_bars = 0
+
+    age_penalize = bool(zone_age_bars > int(ZONE_AGE_PENALTY_AFTER))
+
+    # -------------------------------
+    # 9) Final confidence
+    # -------------------------------
+    conf = "high" if str(zone_type).lower() in ("sr", "sr_confirmed") else "medium"
+    if age_penalize and conf == "high":
+        conf = "medium"
+    if vol_ok is False and conf == "high":
+        conf = "medium"
+    if sess_w < 1.0 and conf == "high":
+        conf = "medium"
+    elif sess_w < 1.0 and conf == "medium":
+        conf = "low"
+
+    # Too old: allow but don’t boost (you can choose to block if you want)
+    if zone_age_bars > int(ZONE_MAX_AGE_BARS):
+        pass
+
+    return True, {
+        "zone": {**zone, "type": zone_type},
+        "tap_count": int(tap_count),
+        "zone_age_bars": int(zone_age_bars),
+        "vol_ratio": vol_ratio,
+        "vol_ok": vol_ok,
+        "session_weight": sess_w,
+        "confidence": conf,
+        "rev_ok": True,
+        "rev_path": rev_path,
+        "body_rng": float(body / rng),
+        "reason": "REVERSAL_OK",
+        "break_state": break_state,
+        "break": break_meta,
+        "bos_h1": bos_meta_h1,
+        "bos_m15": bos_meta_m15,
+    }
+
 
 # Minimum overall opportunity score (0-100 scale) before we surface an item.
 # Can be tuned or overridden via env var: XTREND_OPP_SCORE_MIN
-try:
-    OPP_SCORE_MIN: float = float(os.getenv("XTREND_OPP_SCORE_MIN", "40.0"))
-except Exception:
-    OPP_SCORE_MIN = 40.0
+OPP_SCORE_MIN: float = float(os.getenv("XTREND_OPP_SCORE_MIN", "35.0") or 35.0)
+
 
 def _extract_tf_sr(sr_summary: dict | None, tf_key: str) -> dict[str, float | str | None]:
     """
@@ -244,20 +3538,45 @@ def _extract_tf_sr(sr_summary: dict | None, tf_key: str) -> dict[str, float | st
 
     return out
 
+def _oppt_cfg(sym: str, tfu: str) -> dict:
+    m = _get_meta(sym)
+    tfu = (tfu or "").upper()
+
+    # per-symbol override: meta["oppt_tf"][TF]
+    v = None
+    try:
+        ot = m.get("oppt_tf")
+        if isinstance(ot, dict):
+            v = ot.get(tfu)
+    except Exception:
+        v = None
+
+    # common default: _MetaCache.common["oppt_tf"][TF]
+    if not isinstance(v, dict):
+        try:
+            c = getattr(_MetaCache, "common", {}) or {}
+            ot2 = c.get("oppt_tf") if isinstance(c, dict) else None
+            if isinstance(ot2, dict):
+                v = ot2.get(tfu)
+        except Exception:
+            v = None
+
+    return v if isinstance(v, dict) else {}
+
 
 def _room_thr_h1(sym: str) -> float:
-    # default fallback for 1h room (percent)
-    if not sym:
-        return 0.23
+    cfg = _oppt_cfg(sym, "H1")
+    v = cfg.get("min_room_pct")
+    if isinstance(v, (int, float)) and float(v) > 0:
+        return float(v)
     return float(ROOM_THRESHOLDS_H1.get(sym.upper(), 0.23))
 
-
 def _room_thr_h4(sym: str) -> float:
-    # default fallback for 4h structure (percent)
-    if not sym:
-        return 0.40
+    cfg = _oppt_cfg(sym, "H4")
+    v = cfg.get("min_room_pct")
+    if isinstance(v, (int, float)) and float(v) > 0:
+        return float(v)
     return float(ROOM_THRESHOLDS_H4.get(sym.upper(), 0.40))
-
 
 # Where we keep per-symbol frozen H1 opportunity snapshots in Redis
 
@@ -282,6 +3601,135 @@ def _opp_snapshot_key(sym: str, opp_dir: str) -> str:
     elif d in ("SELL", "SHORT", "DOWN", "BEAR", "BEARISH"):
         d = "DOWN"
     return f"{OPP_SNAPSHOT_PREFIX}:{s}:{d}"
+def _persist_entry_meta_to_snapshot(sym: str, out: dict) -> None:
+    """
+    Persist frozen entry fields into the active snapshot hash so entry survives across requests.
+
+    Rules:
+      - No-op unless entry_triggered=True
+      - Never overwrite an existing frozen entry_price/entry_ts_ms if present
+      - BUT: if tp/sl are missing (or non-finite) in snapshot and we have good values now,
+        we *do* fill them (this fixes "TP/SL moving" caused by partial persistence)
+    """
+    try:
+        sym_u = (sym or "").upper().strip()
+        if not sym_u or not isinstance(out, dict) or not bool(out.get("entry_triggered")):
+            return
+
+        # direction stored on snapshot is UP/DOWN
+        d = str(out.get("opp_direction") or out.get("direction") or "").upper()
+        if d in ("BUY", "UP"):
+            d = "UP"
+        elif d in ("SELL", "DOWN"):
+            d = "DOWN"
+        if d not in ("UP", "DOWN"):
+            return
+
+        snap_key = _opp_snapshot_key(sym_u, d)
+
+        def _j(x):
+            # decode json-ish fields
+            if x is None:
+                return None
+            if isinstance(x, (bytes, bytearray)):
+                x = x.decode("utf-8", "ignore")
+            try:
+                return json.loads(x) if isinstance(x, str) else x
+            except Exception:
+                return x
+
+        def _to_float(x):
+            try:
+                v = float(x)
+                # reject NaN/inf
+                if not (v == v) or v in (float("inf"), float("-inf")):
+                    return None
+                return v
+            except Exception:
+                return None
+
+        # current snapshot (if exists)
+        snap = {}
+        try:
+            snap = R.hgetall(snap_key) or {}
+        except Exception:
+            snap = {}
+
+        def _snap_get(k: str):
+            v = None
+            try:
+                v = snap.get(k)
+                if v is None:
+                    v = snap.get(k.encode("utf-8"))
+            except Exception:
+                v = None
+            return _j(v)
+
+        snap_entry_triggered = bool(_snap_get("entry_triggered"))
+        snap_entry_ts = _snap_get("entry_ts_ms")
+        snap_entry_px = _to_float(_snap_get("entry_price"))
+        snap_tp = _to_float(_snap_get("tp_price"))
+        snap_sl = _to_float(_snap_get("sl_price"))
+
+        # new values from 'out'
+        out_entry_ts = out.get("entry_ts_ms")
+        try:
+            out_entry_ts = int(out_entry_ts) if out_entry_ts is not None else None
+        except Exception:
+            out_entry_ts = None
+
+        out_entry_px = _to_float(out.get("entry_price"))
+        out_tp = _to_float(out.get("tp_price"))
+        out_sl = _to_float(out.get("sl_price"))
+
+        # If snapshot already frozen and has entry core, do NOT overwrite those.
+        # But we *can* fill TP/SL if missing.
+        mapping = {}
+
+        # Always ensure entry_triggered True is present
+        if not snap_entry_triggered:
+            mapping["entry_triggered"] = True
+
+        # freeze core once (first writer wins)
+        if snap_entry_px is None and out_entry_px is not None:
+            mapping["entry_price"] = out_entry_px
+        if (snap_entry_ts is None or int(snap_entry_ts or 0) <= 0) and out_entry_ts is not None:
+            mapping["entry_ts_ms"] = out_entry_ts
+
+        # fill TP/SL only if snapshot missing AND out has good values
+        if snap_tp is None and out_tp is not None:
+            mapping["tp_price"] = out_tp
+        if snap_sl is None and out_sl is not None:
+            mapping["sl_price"] = out_sl
+
+        # these are “nice to have” and safe to overwrite
+        if out.get("entry_signal"):
+            mapping["entry_signal"] = str(out.get("entry_signal"))
+        if out.get("entry_reason"):
+            mapping["entry_reason"] = str(out.get("entry_reason"))
+
+        tp_orig = _to_float(out.get("tp_price_orig"))
+        sl_orig = _to_float(out.get("sl_price_orig"))
+        if tp_orig is not None:
+            mapping["tp_price_orig"] = tp_orig
+        if sl_orig is not None:
+            mapping["sl_price_orig"] = sl_orig
+
+        mapping["last_status_ms"] = int(out.get("server_now_ms") or out_entry_ts or int(_time.time() * 1000))
+        mapping["opp_direction"] = d
+        mapping["decision"] = "BUY" if d == "UP" else "SELL"
+
+        # Nothing new to write?
+        if not mapping:
+            return
+
+        R.hset(snap_key, mapping={k: json.dumps(v) for k, v in mapping.items()})
+
+        # keep snapshot alive post-entry (7d default)
+        ttl = int(os.getenv("XTL_OPP_POST_ENTRY_TTL_SEC", str(7 * 24 * 3600)))
+        R.expire(snap_key, ttl)
+    except Exception:
+        pass
 
 
 def _freeze_or_snapshot_opp(sym: str, row: dict, now_ms: int) -> dict:
@@ -305,16 +3753,71 @@ def _freeze_or_snapshot_opp(sym: str, row: dict, now_ms: int) -> dict:
             return json.loads(x)
         except Exception:
             return x
+    import json
 
+    
+
+    def _snap_get_raw_json(key: str) -> str | None:
+        """
+        Return snapshot as JSON string regardless of storage type:
+        - STRING: returns the string
+        - HASH: reads fields and returns json.dumps(dict)
+        """
+        R = _r()
+        try:
+            t = R.type(key)
+            if isinstance(t, (bytes, bytearray)):
+                t = t.decode("utf-8", "ignore")
+            t = str(t or "").lower()
+
+            if t == "string":
+                s = R.get(key)
+                if not s:
+                    return None
+                if isinstance(s, (bytes, bytearray)):
+                    s = s.decode("utf-8", "ignore")
+                s = s.strip()
+
+                # If this is a device-id pointer, DO NOT treat as JSON
+                if s.startswith("dev_") and not s.startswith("{") and not s.startswith("["):
+                    return s  # caller must dereference
+                return s
+
+            if t == "hash":
+                h = R.hgetall(key) or {}
+                if not h:
+                    return None
+
+                out: dict[str, object] = {}
+                for k, v in h.items():
+                    kk = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
+                    vv = v.decode("utf-8", "ignore") if isinstance(v, (bytes, bytearray)) else v
+
+                    # if vv looks like JSON, decode it; else keep string
+                    if isinstance(vv, str) and vv and vv[0] in "[{":
+                        try:
+                            out[kk] = json.loads(vv)
+                        except Exception:
+                            out[kk] = vv
+                    else:
+                        out[kk] = vv
+
+                return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+
+            return None
+        except Exception:
+            return None
+
+    
     def _hgetall_json(key: str) -> dict:
-        raw = R.hgetall(key) or {}
-        out = {}
-        for k, v in raw.items():
-            if isinstance(k, (bytes, bytearray)):
-                k = k.decode("utf-8", "ignore")
-            out[str(k)] = _sj(v)
-        return out
-
+        raw = _snap_get_raw_json(key)
+        if not raw:
+            return {}
+        try:
+            obj = json.loads(raw) if isinstance(raw, str) else None
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
     # ---------------- config knobs ----------------
     horizon_min_default = int(os.getenv("XTL_OPP_HORIZON_MIN", "60"))
 
@@ -353,6 +3856,58 @@ def _freeze_or_snapshot_opp(sym: str, row: dict, now_ms: int) -> dict:
         except Exception:
             return None
 
+    # ---------------- entry state helpers ----------------
+    def _is_entered(s: dict) -> bool:
+        """
+        True once entry has triggered (manual trading).
+        We treat this as "LOCKED" => no time expiry + no replacement.
+        """
+        try:
+            if bool(s.get("entry_triggered")):
+                return True
+            # common fallbacks used across codepaths
+            if s.get("entry_ts_ms") and int(s.get("entry_ts_ms") or 0) > 0:
+                return True
+            
+            
+            e1 = s.get("entry_1m")
+            if isinstance(e1, dict) and (bool(e1.get("triggered")) or bool(e1.get("entry_triggered"))):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _as_float(x, default=None):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    def _should_replace_pre_entry(existing: dict, incoming: dict) -> bool:
+        """
+        Replace only when NOT entered.
+        Heuristic: prefer higher opp_score; otherwise replace if forecast move improved.
+        """
+        ex_score = _as_float(existing.get("opp_score"))
+        in_score = _as_float(incoming.get("opp_score"))
+        if (in_score is not None) and (ex_score is not None):
+            # small margin to prevent churn
+            if in_score >= (ex_score + 0.5):
+                return True
+
+        ex_mv = _as_float(existing.get("forecast_move_pct_1h") or existing.get("expected_move_pct_1h") or existing.get("expected_move_pct"))
+        in_mv = _as_float(incoming.get("expected_move_pct_1h") or incoming.get("expected_move_pct"))
+        if (in_mv is not None) and (ex_mv is not None):
+            if abs(in_mv) >= abs(ex_mv) * 1.10:  # 10% better room
+                return True
+
+        # fallback: if incoming has a different alert/opp id, allow replace (pre-entry only)
+        ex_id = str(existing.get("alert_id") or existing.get("opp_id") or "").strip()
+        in_id = str(incoming.get("alert_id") or incoming.get("opp_id") or "").strip()
+        if in_id and ex_id and in_id != ex_id:
+            return True
+
+        return False
 
     # ---------------- EXISTING ACTIVE SNAPSHOT ----------------
     for d in ("UP", "DOWN"):
@@ -382,44 +3937,22 @@ def _freeze_or_snapshot_opp(sym: str, row: dict, now_ms: int) -> dict:
             continue
 
         st2 = str(snap.get("status") or "").lower()
-        if st2 in ("hit", "expired"):
+        if st2 in ("hit", "expired", "exit"):
             try:
                 _delete_live_snapshot(sym_u, d)
             except Exception:
                 pass
             continue
 
-        # -------- hard expire guard (prevents ACTIVE stuck at 0m) --------
-        try:
-            exp_ts = snap.get("opp_expire_ts")
-            exp_ts = int(exp_ts) if isinstance(exp_ts, (int, float)) else 0
-        except Exception:
-            exp_ts = 0
+        
+        # ---------------- entered? lock snapshot (NO TIME EXPIRY + NO REPLACE) ----------------
+        entered = _is_entered(snap)
 
-        if not exp_ts:
+        # If an active snapshot exists in the *other* direction, and we're NOT entered,
+        # allow replacement: delete the old opposite snapshot and continue searching/creating.
+        if (not entered) and (want_dir in ("UP", "DOWN")) and (d != want_dir):
             try:
-                created = snap.get("alert_created_ms")
-                created = int(created) if isinstance(created, (int, float)) else 0
-            except Exception:
-                created = 0
-            if created:
-                exp_ts = created + horizon_ms
-
-        if exp_ts and now_ms >= exp_ts:
-            try:
-                aid = str(snap.get("alert_id") or snap.get("opp_id") or "").strip()
-                if aid:
-                    key = f"{ALERT_HASH_PREFIX}{aid}"
-                    R.hset(key, mapping={
-                        "status": json.dumps("expired"),
-                        "hit_target": json.dumps(False),
-                        "expired_ts": json.dumps(now_ms),
-                        "last_status_ms": json.dumps(now_ms),
-                    })
-            except Exception:
-                pass
-
-            try:
+                # pre-entry replacement => remove old snapshot so new dir can surface
                 R.hset(snap_key, mapping={
                     "status": json.dumps("expired"),
                     "expired_ts": json.dumps(now_ms),
@@ -427,12 +3960,85 @@ def _freeze_or_snapshot_opp(sym: str, row: dict, now_ms: int) -> dict:
                 })
             except Exception:
                 pass
-
             try:
                 _delete_live_snapshot(sym_u, d)
             except Exception:
                 pass
             continue
+
+        # If same direction snapshot exists, still allow replacement pre-entry if incoming is better/newer
+        if (not entered) and (want_dir in ("UP", "DOWN")) and (d == want_dir):
+            try:
+                if _should_replace_pre_entry(snap, row or {}):
+                    try:
+                        R.hset(snap_key, mapping={
+                            "status": json.dumps("expired"),
+                            "expired_ts": json.dumps(now_ms),
+                            "last_status_ms": json.dumps(now_ms),
+                        })
+                    except Exception:
+                        pass
+                    try:
+                        _delete_live_snapshot(sym_u, d)
+                    except Exception:
+                        pass
+                    # continue loop; after loop ends we'll CREATE NEW SNAPSHOT
+                    continue
+            except Exception:
+                pass
+
+        # -------- time expiry only when NOT entered --------
+        if not entered:
+            try:
+                exp_ts = snap.get("opp_expire_ts")
+                exp_ts = int(exp_ts) if isinstance(exp_ts, (int, float)) else 0
+            except Exception:
+                exp_ts = 0
+
+            if not exp_ts:
+                try:
+                    created = snap.get("alert_created_ms")
+                    created = int(created) if isinstance(created, (int, float)) else 0
+                except Exception:
+                    created = 0
+                if created:
+                    exp_ts = created + horizon_ms
+
+            if exp_ts and now_ms >= exp_ts:
+                try:
+                    aid = str(snap.get("alert_id") or snap.get("opp_id") or "").strip()
+                    if aid:
+                        key = f"{ALERT_HASH_PREFIX}{aid}"
+                        R.hset(key, mapping={
+                            "status": json.dumps("expired"),
+                            "hit_target": json.dumps(False),
+                            "expired_ts": json.dumps(now_ms),
+                            "last_status_ms": json.dumps(now_ms),
+                        })
+                except Exception:
+                    pass
+
+                try:
+                    R.hset(snap_key, mapping={
+                        "status": json.dumps("expired"),
+                        "expired_ts": json.dumps(now_ms),
+                        "last_status_ms": json.dumps(now_ms),
+                    })
+                except Exception:
+                    pass
+
+                try:
+                    _delete_live_snapshot(sym_u, d)
+                except Exception:
+                    pass
+                continue
+
+        # If entered, keep the redis key alive longer (do NOT expire from horizon)
+        if entered:
+            try:
+                R.expire(snap_key, int(os.getenv("XTL_OPP_POST_ENTRY_TTL_SEC", str(7 * 24 * 3600))))
+            except Exception:
+                pass
 
         # still active ? return frozen
         out = dict(snap)
@@ -443,6 +4049,8 @@ def _freeze_or_snapshot_opp(sym: str, row: dict, now_ms: int) -> dict:
         out["server_now_ms"] = int(now_ms)
         out["decision"] = "BUY" if d == "UP" else "SELL"
         out["opp_direction"] = d
+        
+
         return out
 
     # ---------------- CREATE NEW SNAPSHOT ----------------
@@ -459,9 +4067,25 @@ def _freeze_or_snapshot_opp(sym: str, row: dict, now_ms: int) -> dict:
             break
 
     pct_1h = row.get("expected_move_pct_1h") or row.get("expected_move_pct")
+
+    # coerce pct to float if it's a numeric string
+    try:
+        if isinstance(pct_1h, str):
+            pct_1h = float(pct_1h.strip())
+    except Exception:
+        pass
+
+    # basis must be float
+    try:
+        if isinstance(basis, str):
+            basis = float(basis.strip())
+    except Exception:
+        pass
+
     if not isinstance(pct_1h, (int, float)) or basis is None:
         row["status"] = "filtered"
         return row
+
 
     # ---- COST-AWARE TP / SL ----
     forecast_pct = abs(float(pct_1h))               # %
@@ -627,11 +4251,13 @@ def _compute_opp_score(sym: str, row: dict, m1: float | None, thr1: float) -> fl
         except (TypeError, ValueError):
             return float(default)
 
-    def _sfn(v):
+    def _sfn(x, default=0.0) -> float:
         try:
-            return float(v)
+            if x is None:
+                return float(default)
+            return float(x)
         except (TypeError, ValueError):
-            return None
+            return float(default)
 
     # -------- 0) basic sanity on move / threshold --------
     move = _sfn(m1)
@@ -751,7 +4377,7 @@ def _compute_opp_score(sym: str, row: dict, m1: float | None, thr1: float) -> fl
         nearest = sr.get("nearest") or sr.get("nearest_zone") or {}
         if isinstance(nearest, dict):
             kind = str(nearest.get("kind") or nearest.get("side") or "").lower()
-            dist_pct = _sfn(nearest.get("distance_pct") or nearest.get("dist_pct"), 0.0)
+            dist_pct = _sfn((nearest.get("distance_pct") or nearest.get("dist_pct") or 0.0))
 
             if dist_pct > 0.0:
                 # Proximity: best if we are ~0.150.8% away from level
@@ -818,6 +4444,26 @@ FORCE_TZ_OFFSET_MIN = os.getenv("FORCE_TZ_OFFSET_MIN")  # e.g., "0", "120", "180
 # Make sure this matches the writer (routes_devices.py)
 REDIS_URL = os.getenv("REDIS_URL", "redis://default:xau12345@10.0.0.132:6379/0")
 R = redis.from_url(REDIS_URL, decode_responses=True)
+
+def _r():
+    global R
+    try:
+        url = os.getenv("REDIS_URL")
+        if not url:
+            return R
+        # Always rebuild if current R doesn't match env host/port/db
+        if not R:
+            R = redis.from_url(url, decode_responses=True)
+            return R
+        ck = getattr(getattr(R, "connection_pool", None), "connection_kwargs", {}) or {}
+        env_r = redis.from_url(url, decode_responses=True)
+        ck2 = getattr(getattr(env_r, "connection_pool", None), "connection_kwargs", {}) or {}
+        if (ck.get("host"), ck.get("port"), ck.get("db")) != (ck2.get("host"), ck2.get("port"), ck2.get("db")):
+            R = env_r
+    except Exception:
+        pass
+    return R
+
 log.info(f"[TREND]  module={__file__}")
 log.info(f"[TREND] REDIS_URL={REDIS_URL}")
 
@@ -1069,15 +4715,23 @@ def _delete_live_snapshot(sym: str, opp_dir: str | None = None):
     If opp_dir is None, delete both directions + legacy key.
     """
     try:
-        # Legacy key (cleanup)
-        R.delete(f"opp:snap:{sym}")
+        sym_u = (sym or "").upper().strip()
+        if not sym_u:
+            return
 
-        # New per-direction snapshots
+        R.delete(f"opp:snap:{sym_u}")
+
         if opp_dir:
-            R.delete(_opp_snapshot_key(sym, opp_dir))
+            d = str(opp_dir).upper().strip()
+            if d in ("BUY", "UP"):
+                d = "UP"
+            elif d in ("SELL", "DOWN"):
+                d = "DOWN"
+            R.delete(_opp_snapshot_key(sym_u, d))
         else:
             for d in ("UP", "DOWN"):
-                R.delete(_opp_snapshot_key(sym, d))
+                R.delete(_opp_snapshot_key(sym_u, d))
+
     except Exception as e:
         log.warning("[OPP] _delete_live_snapshot failed sym=%s err=%r", sym, e)
 
@@ -1170,6 +4824,18 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
 
         mapping = {k: json.dumps(v) for k, v in payload.items()}
         R.hset(key, mapping=mapping)
+        
+
+        # add:
+        try:
+            # keep alerts for 120h by default (or tie to horizon if you want)
+            ttl = int(payload.get("oppt_ttl_sec") or 5 * 24 * 3600)
+            if R.ttl(key) < 0:      # only set once
+                R.expire(key, ttl)
+
+        except Exception:
+            pass
+
         R.lrem(ALERT_INDEX_KEY, 0, alert_id)
         R.lpush(ALERT_INDEX_KEY, alert_id)
         R.ltrim(ALERT_INDEX_KEY, 0, 99)
@@ -1283,7 +4949,7 @@ def _load_opp_history(limit: int = 50) -> list[dict[str, Any]]:
         if "hit_target" not in decoded:
             if decoded["status"] == "hit":
                 decoded["hit_target"] = True
-            elif decoded["status"] == "expired":
+            elif decoded["status"] in ("expired", "sl_hit"):
                 decoded["hit_target"] = False
             else:
                 decoded["hit_target"] = None
@@ -1291,7 +4957,7 @@ def _load_opp_history(limit: int = 50) -> list[dict[str, Any]]:
 
 
         # only completed alerts in history
-        if decoded["status"] not in ("hit", "expired"):
+        if decoded["status"] not in ("hit", "expired","sl_hit"):
             continue
         decoded["status"] = str(decoded.get("status") or "").lower()
 
@@ -1310,6 +4976,7 @@ def _load_opp_history(limit: int = 50) -> list[dict[str, Any]]:
 
         # outcome timestamps (ms aliases)
         decoded.setdefault("hit_ts_ms", decoded.get("hit_ts_ms") or decoded.get("hit_ts"))
+        decoded.setdefault("sl_hit_ts_ms", decoded.get("sl_hit_ts_ms") or decoded.get("sl_hit_ts"))
         decoded.setdefault("expired_ts_ms", decoded.get("expired_ts_ms") or decoded.get("expired_ts"))
         decoded.setdefault("updated_ms", decoded.get("updated_ms") or decoded.get("last_status_ms"))
         # ---------- END NEW ----------
@@ -1327,7 +4994,7 @@ def _load_opp_history(limit: int = 50) -> list[dict[str, Any]]:
 
 def _mark_alert_hit(alert_id: str, realized_move_pct: float, now_ms: int):
     """Mark a stored alert as hit."""
-    key = f"xtl:trend:opp:h1:{alert_id}"
+    key = f"{ALERT_HASH_PREFIX}{alert_id}"
     try:
         if not R.exists(key):
             return
@@ -1343,7 +5010,7 @@ def _mark_alert_hit(alert_id: str, realized_move_pct: float, now_ms: int):
 
 def _mark_alert_expired(alert_id: str, now_ms: int):
     """Mark a stored alert as expired (time horizon reached)."""
-    key = f"xtl:trend:opp:h1:{alert_id}"
+    key = f"{ALERT_HASH_PREFIX}{alert_id}"
     try:
         if not R.exists(key):
             return
@@ -1700,7 +5367,7 @@ def load_models_if_needed() -> None:
             log.exception("failed to load xgb_cls.json: %s", e)
 
 
-router = APIRouter()
+#router = APIRouter()
 
 @router.on_event("startup")
 async def _startup_models():
@@ -1826,6 +5493,232 @@ def _log_prediction(row: dict, last_close: float) -> None:
             ])
     except Exception:
         pass
+def require_auth_optional(request: Request):
+    """
+    Best-effort user resolver for public-ish endpoints:
+      1) session user (routes_devices._session_user)
+      2) relaxed user (api.deps.get_current_user_relaxed), if present
+      3) fallback: anonymous {user_id: None}
+    Always returns an object with .user_id (string or None).
+    """
+    # 1) session
+    try:
+        u = _session_user(request)
+        if u:
+            uid = _uid_hard(u) or _uid_soft(u)
+            return SimpleNamespace(user_id=(str(uid) if uid else None))
+    except Exception:
+        pass
+
+    # 2) relaxed
+    if get_current_user_relaxed:
+        try:
+            u2 = get_current_user_relaxed(request)  # may return dict/object
+            if u2:
+                uid = _uid_hard(u2) or _uid_soft(u2)
+                return SimpleNamespace(user_id=(str(uid) if uid else None))
+        except Exception:
+            pass
+
+    # 3) anonymous
+    return SimpleNamespace(user_id=None)
+
+
+
+@router.get("/pulse")
+def trend_pulse(
+    symbol: str = Query(...),
+    tf: str = "M15",
+    device: str | None = Query(None),
+    x_device_id: str | None = Header(None, convert_underscores=False),
+    user=Depends(require_auth_optional),
+):
+    """
+    Rich per-symbol “Pulse” payload:
+      - SR (H1/H4) summary
+      - Fib levels (derived from H1 range, fallback H4)
+      - short deterministic pulse_text
+
+    This endpoint is separate from /predict/all by design.
+    """
+    sym_u = (symbol or "").upper().strip()
+    if not sym_u:
+        raise HTTPException(status_code=400, detail="symbol required")
+
+    tfu = (tf or "M15").upper().strip()
+
+    # ---- 1) reuse your forecast path for prob/decision/target (minimal) ----
+    # If you already have a helper that builds the single “row” like predict_all does,
+    # call it here. Otherwise: read last row from redis (fast) and use it as forecast snapshot.
+    # (You already write lastrow in predict_all) :contentReference[oaicite:5]{index=5}
+    row = None
+    try:
+        raw = _redis_get_text(f"xtl:pred:lastrow:{sym_u}")
+        row = json.loads(raw) if raw else None
+    except Exception:
+        row = None
+
+    # fallback-safe fields
+    decision = str((row or {}).get("decision") or "ABSTAIN").upper()
+    prob_up = (row or {}).get("prob_up")
+    expected_move_pct = (row or {}).get("expected_move_pct")
+    target_price = (row or {}).get("target_price")
+
+    # live-ish price (prefer existing value from row; else redis price)
+    # live-ish price (prefer lastrow fields; else redis live price)
+    price = None
+    try:
+        for k in ("last_price", "price", "mid", "close"):
+            v = (row or {}).get(k)
+            if isinstance(v, (int, float)):
+                price = float(v)
+                break
+    except Exception:
+        price = None
+
+    pinned_device = (
+        (device or "").strip()
+        or (x_device_id or "").strip()
+        or (getattr(user, "device_id", None) or "")
+        or (getattr(user, "deviceId", None) or "")
+    )
+    # --- NEW: auto-select active device when none is pinned (fixes price=null in /pulse) ---
+    if not pinned_device and R is not None:
+        try:
+            best_dev = None
+            best_hb = -1
+
+            for key in R.scan_iter("device:dev_*"):
+                try:
+                    h = R.hgetall(key) or {}
+                except Exception:
+                    h = {}
+                if not h:
+                    continue
+
+                status = h.get(b"status") or h.get("status")
+                if isinstance(status, (bytes, bytearray)):
+                    status = status.decode("utf-8", "ignore")
+                if (status or "").strip().lower() != "online":
+                    continue
+
+                hb = h.get(b"last_heartbeat_ms") or h.get("last_heartbeat_ms")
+                if isinstance(hb, (bytes, bytearray)):
+                    hb = hb.decode("utf-8", "ignore").strip()
+                try:
+                    hb_i = int(hb) if hb not in (None, "") else -1
+                except Exception:
+                    hb_i = -1
+
+                if isinstance(key, (bytes, bytearray)):
+                    key_s = key.decode("utf-8", "ignore")
+                else:
+                    key_s = str(key)
+                dev_id = key_s.replace("device:", "").strip()
+
+                if hb_i > best_hb:
+                    best_hb = hb_i
+                    best_dev = dev_id
+
+            if best_dev:
+                pinned_device = best_dev
+        except Exception:
+            pass
+    if price is None:
+        try:
+            # IMPORTANT: use the device-scoped key
+            px, _ts = _get_live_price(sym_u, pinned_device)
+            if isinstance(px, (int, float)):
+                price = float(px)
+        except Exception:
+            price = None
+
+
+    # ---- 2) fetch H1/H4 bars for SR + Fib ----
+    # Use your existing pull_latest_h1/pull_latest_h4 (already imported) :contentReference[oaicite:6]{index=6}
+    h1_df = None
+    h4_df = None
+    try:
+        h1_df = pull_latest_h1(sym_u)  # should return df-like
+    except Exception:
+        h1_df = None
+    try:
+        h4_df = pull_latest_h4(sym_u)
+    except Exception:
+        h4_df = None
+
+    h1_df = _to_hlc(h1_df)
+    h4_df = _to_hlc(h4_df)
+    try:
+        if h1_df is not None and not h1_df.empty:
+            h1_df = h1_df.dropna(subset=["h", "l", "c"])
+        if h4_df is not None and not h4_df.empty:
+            h4_df = h4_df.dropna(subset=["h", "l", "c"])
+    except Exception:
+        pass
+    
+
+    # pip_factor for SR distance (keep it simple)
+    pip_factor = 0.01 if sym_u == "XAUUSD" else (0.01 if sym_u.endswith("JPY") else 0.0001)
+
+    sr_summary = summarize_sr_multi_tf(
+        symbol=sym_u,
+        price=(lambda v: (float(v) if v is not None and str(v).strip() != "" else None))(price),
+        h4_df=h4_df,
+        h1_df=h1_df,
+        pip_factor=float(pip_factor),
+        cache=R,
+        cache_ttl_sec=0, 
+        good_ttl_sec=7*24*3600,
+    )
+    # ----------------------------------------------------------
+    # SR zones for UI overlays (derived from sr_summary bundle)
+    # sr_summary shape: {"h4": {...supports_major/resistances_major...}, "h1": {...}}
+    # Also: summarize_sr_multi_tf() already uses Redis last_good bundle key:
+    #   xtl:sr:bundle:last_good:{SYMBOL}
+    # ----------------------------------------------------------
+
+    
+
+
+    # NOTE: do NOT use your custom "xtl:sr:lastgood:{sym}:H1H4" key.
+    # summarize_sr_multi_tf() already caches & falls back using:
+    #   xtl:sr:bundle:last_good:{SYMBOL}
+    sr_zones = _build_sr_zones_from_summary(
+        sr_summary,
+        sym=sym_u,
+        pip_factor=float(pip_factor),
+        atr=None,
+    )
+    
+    
+    # ---- 3) delegate “pulse composition” to api/pulse.py ----
+    pulse = build_pulse(
+         symbol=sym_u,
+         tf=tfu,
+         price=price,
+         decision=decision,
+         prob_up=prob_up if isinstance(prob_up, (int, float)) else None,
+         expected_move_pct=expected_move_pct if isinstance(expected_move_pct, (int, float)) else None,
+         target_price=target_price if isinstance(target_price, (int, float)) else None,
+         sr_summary=sr_summary,
+         h1_df=h1_df,
+         h4_df=h4_df,
+    )
+
+    
+    # Attach SR + zones so UI can draw shaded blocks
+    try:
+        if isinstance(pulse, dict):
+            chart = pulse.setdefault("chart", {})
+            overlays = chart.setdefault("overlays", {})
+
+            overlays["sr_zones"] = sr_zones if isinstance(sr_zones, list) else []
+            pulse["sr"] = sr_summary if isinstance(sr_summary, dict) else {}
+    except Exception:
+        pass
+
+    return pulse
 
 @router.get("/predict/eval/ready")
 def predict_eval_ready(limit: int = 500):
@@ -1929,7 +5822,7 @@ def _next_boundary_ms(tf_sec: int, now_ms: int, off_min: int) -> int:
 import os, json, time
 from typing import Optional
 
-_META_PATH = os.path.join(os.path.dirname(__file__), "..", "configs", "symbol_meta.json")
+_META_PATH = os.path.join(os.path.dirname(__file__), "configs", "symbol_meta.json")
 _META_PATH = os.path.abspath(_META_PATH)
 
 
@@ -1943,6 +5836,8 @@ _HT_H4_LOCK: dict[str, dict[str, Any]] = {}
 class _MetaCache:
     data: dict[str, dict] = {}
     mtime: float = 0.0
+    raw: dict = {}
+    common: dict = {}
 
     @classmethod
     def load(cls, force: bool = False):
@@ -1952,30 +5847,90 @@ class _MetaCache:
             return
         if not force and mt <= cls.mtime:
             return
-        with open(_META_PATH, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        # accept dict or list
+
+        try:
+            with open(_META_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as e:
+            # keep old cache if JSON is broken
+            try:
+                log.warning("[META] failed to load %s: %s", _META_PATH, e)
+            except Exception:
+                pass
+            return
+
+        cls.raw = raw if isinstance(raw, dict) else {}
+        cls.common = cls.raw.get("common", {}) if isinstance(cls.raw.get("common"), dict) else {}
+
         out: dict[str, dict] = {}
+
         if isinstance(raw, dict):
-            for k, v in raw.items():
-                d = dict(v or {})
-                d.setdefault("symbol", k)
-                out[k.upper()] = d
+            # NEW SHAPE: {"common": {...}, "symbols": {...}}
+            if isinstance(raw.get("symbols"), dict):
+                syms = raw.get("symbols") or {}
+                for k, v in syms.items():
+                    if not isinstance(v, dict):
+                        continue
+                    d = dict(v)
+                    d.setdefault("symbol", k)
+                    out[str(k).upper()] = d
+            else:
+                # OLD SHAPE: {"XAUUSD": {...}, "EURUSD": {...}}
+                for k, v in raw.items():
+                    if not isinstance(v, dict):
+                        continue
+                    d = dict(v)
+                    d.setdefault("symbol", k)
+                    out[str(k).upper()] = d
+
         elif isinstance(raw, list):
             for it in raw:
-                if not isinstance(it, dict): 
+                if not isinstance(it, dict):
                     continue
                 sym = str(it.get("symbol", "")).upper()
                 if sym:
                     out[sym] = dict(it)
+
         cls.data = out
+        try:
+            ex = cls.data.get("XAUUSD") or {}
+            log.warning("[META_LOAD] path=%s keys_common=%s", _META_PATH, sorted(list((cls.common or {}).keys()))[:50])
+            log.warning("[META_LOAD] sym=XAUUSD keys=%s", sorted(list(ex.keys()))[:80])
+            if isinstance(ex.get("oppt_min_move_pct"), dict):
+                log.warning("[META_LOAD] sym=XAUUSD oppt_min_move_pct=%s", ex.get("oppt_min_move_pct"))
+            if isinstance(cls.common.get("oppt_tf"), dict):
+                log.warning("[META_LOAD] common.oppt_tf keys=%s", sorted(list(cls.common.get("oppt_tf").keys()))[:20])
+        except Exception:
+            pass
+
         cls.mtime = mt
 
+
 def _get_meta(sym: str) -> dict:
+    # Always check mtime and reload if file changed (cheap)
+    _MetaCache.load(force=False)
+
+    # If cache is still empty (first boot / load failed), force a load once
     if not _MetaCache.data:
         _MetaCache.load(force=True)
-    return _MetaCache.data.get(sym.upper(), {
-        "symbol": sym.upper(),
+
+    s = (sym or "").upper().strip()
+    m = dict(_MetaCache.data.get(s) or {})
+
+    # merge common defaults (non-destructive)
+    try:
+        if isinstance(_MetaCache.common, dict):
+            for k, v in _MetaCache.common.items():
+                m.setdefault(k, v)
+    except Exception:
+        pass
+
+    if m:
+        m.setdefault("symbol", s)
+        return m
+
+    return {
+        "symbol": s,
         "tau": 0.55,
         "abstain_band": 0.02,
         "p_hi": 0.7,
@@ -1983,7 +5938,76 @@ def _get_meta(sym: str) -> dict:
         "min_rvol": 0.8,
         "target_atr": {"mult": 0.8, "floor_pips": 0.0},
         "reasons": {"DXY": -1, "UST10Y": -1, "USD_SHORT_RATE": -1, "RVOL": 1, "VIX": -1},
-    })
+    }
+
+def _oppt_min_move_pct(sym: str, tf: str) -> float:
+    m = _get_meta(sym) or {}
+    tfu = (tf or "").upper()
+
+    # ---------------------------------------------------------
+    # NEW: normalize meta root (support both shapes)
+    # - some configs are stored under m["common"]
+    # - others are stored top-level
+    # ---------------------------------------------------------
+    root = m
+    try:
+        if isinstance(m.get("common"), dict):
+            root = m["common"]
+    except Exception:
+        root = m
+
+    # 1) Preferred: explicit thresholds in meta
+    #    oppt_min_move_pct: { "H1": 0.30, "H4": 0.60 }
+    for src in (m, root):
+        try:
+            d = src.get("oppt_min_move_pct")
+            if isinstance(d, dict):
+                v = d.get(tfu)
+                if isinstance(v, (int, float)) and v > 0:
+                    return float(v)
+        except Exception:
+            pass
+
+    # 2) Alternate: per-TF config bucket
+    #    oppt_tf: { "H1": {"min_move_pct": 0.30}, "H4": {"min_move_pct": 0.60} }
+    for src in (m, root):
+        try:
+            ot = src.get("oppt_tf")
+            if isinstance(ot, dict):
+                cfg = ot.get(tfu)
+                if isinstance(cfg, dict):
+                    v = cfg.get("min_move_pct") or cfg.get("min_move") or cfg.get("thr_pct")
+                    if isinstance(v, (int, float)) and v > 0:
+                        return float(v)
+        except Exception:
+            pass
+
+    # 3) Fallback: tau-based heuristic
+    try:
+        tau = float((root.get("tau") if isinstance(root, dict) else None) or m.get("tau") or 0.55)
+    except Exception:
+        tau = 0.55
+
+    cfg = _oppt_cfg(sym, tfu)
+    try:
+        frac = float(cfg.get("min_move_frac_tau", 0.60))
+    except Exception:
+        frac = 0.60
+
+    thr = max(0.0, frac * tau)
+
+    # NEW: safety clamp for metals so you don't get crazy 0.45+ accidentally
+    # (tweak these later, but this fixes your immediate “no opps” problem)
+    if sym.upper() == "XAUUSD" and tfu == "H1":
+        thr = min(thr, 0.30)
+
+    return thr
+
+
+def _oppt_min_prob(sym: str, tf: str) -> float:
+    cfg = _oppt_cfg(sym, tf)
+    return float(cfg.get("min_prob", 0.52))
+
 
 def _policy_decision(sym: str, p_up: float, atr_val: float | None = None):
     """
@@ -2067,57 +6091,352 @@ def _fmt_price(symbol: str, p: float, broker: dict | None) -> float:
         return round(float(p), digits)
     except Exception:
         return float(p)
+
+def _build_sr_zones_from_summary(
+    sr_summary: dict | None,
+    *,
+    sym: str,
+    pip_factor: float,
+    atr: float | None = None,
+) -> list[dict]:
+    """Build drawable SR zones (low/high bands) from sr_summary.
+
+    Accepts multiple schema variants:
+      - sr_summary["h1"]/["h4"] or sr_summary["H1"]/["H4"]
+      - sr_summary["by_tf"]["H1"]/["H4"]
+      - level lists under supports_major/supports/support_levels, resistances_major/...
+    """
+    if not isinstance(sr_summary, dict):
+        return []
+    
+    # If caller already provided drawable zones (e.g., fallback pivots), use them directly.
+    # Expected shape: list[dict] with at least low/high (and ideally tf/kind/level).
+    z0 = sr_summary.get("sr_zones") or sr_summary.get("zones")
+    if isinstance(z0, list):
+        z_ok = [z for z in z0 if isinstance(z, dict) and z.get("low") is not None and z.get("high") is not None]
+        if z_ok:
+            return z_ok
+
+    def _pick_tf(sr: dict, key: str) -> dict:
+        for k in (key, key.upper(), key.lower()):
+            v = sr.get(k)
+            if isinstance(v, dict):
+                return v
+        by_tf = sr.get("by_tf")
+        if isinstance(by_tf, dict):
+            for k in (key, key.upper(), key.lower()):
+                v = by_tf.get(k)
+                if isinstance(v, dict):
+                    return v
+        return {}
+
+    def _to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    def _levels(d: dict, side: str) -> list[dict]:
+        if not isinstance(d, dict):
+            return []
+        if side == "support":
+            return d.get("supports_major") or d.get("supports") or d.get("support_levels") or []
+        return d.get("resistances_major") or d.get("resistances") or d.get("resistance_levels") or []
+
+    # half-width logic: keep visible for XAU + FX
+    def _half_width() -> float:
+        try:
+            if sym == "XAUUSD":
+                min_half = float(os.getenv("XTL_ZONE_MIN_PX_XAU", "0.8"))
+            else:
+                min_half = float(os.getenv("XTL_ZONE_MIN_PX_FX", "0.0008"))
+        except Exception:
+            min_half = 0.8 if sym == "XAUUSD" else 0.0008
+
+        half = min_half
+        if isinstance(atr, (int, float)):
+            try:
+                half = max(min_half, float(atr) * float(ZONE_ATR_WIDTH))
+            except Exception:
+                pass
+
+        # If not XAU, ensure at least a few pips so it is visible
+        if sym != "XAUUSD":
+            try:
+                half = max(half, 3.0 * float(pip_factor))
+            except Exception:
+                pass
+        return float(half)
+
+    half = _half_width()
+
+    zones: list[dict] = []
+    for tf_label, tf_key in (("H4", "h4"), ("H1", "h1")):
+        d = _pick_tf(sr_summary, tf_label) or _pick_tf(sr_summary, tf_key)
+        for side in ("support", "resistance"):
+            rows = _levels(d, side)
+            for r in (rows or []):
+                lvl = _to_float((r or {}).get("level"))
+                if lvl is None:
+                    continue
+                kind = (r or {}).get("kind") or (r or {}).get("side") or side
+                zones.append(
+                    {
+                        "tf": tf_label,
+                        "kind": str(kind).lower(),
+                        "low": float(lvl - half),
+                        "high": float(lvl + half),
+                        "level": float(lvl),
+                        "strength": (r or {}).get("strength"),
+                        "touches": (r or {}).get("touches"),
+                        "zone_tap_count": (r or {}).get("touches"),
+                    }
+                )
+
+    # Mark strong zones when H1 and H4 levels overlap (same kind within tolerance).
+    try:
+        atr = _to_float((sr_summary or {}).get("atr")) or 0.0
+        pip_factor = _to_float((sr_summary or {}).get("pip_factor")) or 0.0
+        overlap_tol = max(0.20 * float(atr or 0.0), 5.0 * float(pip_factor or 0.0), float(half) * 2.0)
+        # Pre-index by kind + tf
+        by_kind_tf: dict[tuple[str, str], list[dict]] = {}
+        for z in zones:
+            k = (str(z.get("kind") or "").lower(), str(z.get("tf") or "").upper())
+            by_kind_tf.setdefault(k, []).append(z)
+
+        for kind in ("support", "resistance"):
+            h1 = by_kind_tf.get((kind, "H1"), [])
+            h4 = by_kind_tf.get((kind, "H4"), [])
+            for a in h1:
+                la = _to_float(a.get("level"))
+                if la is None:
+                    continue
+                for b in h4:
+                    lb = _to_float(b.get("level"))
+                    if lb is None:
+                        continue
+                    if abs(float(la) - float(lb)) <= overlap_tol:
+                        a["strong_zone"] = True
+                        b["strong_zone"] = True
+        # default flag
+        for z in zones:
+            z.setdefault("strong_zone", False)
+    except Exception:
+        for z in zones:
+            z.setdefault("strong_zone", False)
+
+    return zones
+ 
+def _to_hlc(df):
+    if df is None or getattr(df, "empty", True):
+        return df
+
+    # normalize column names (supports: high/low/close/open/time OR H/L/C/O/T or mixed)
+    cols = {str(c).lower(): c for c in df.columns}
+    ren = {}
+
+    # map to short names used by SR/Fib logic
+    if "high" in cols:  ren[cols["high"]] = "h"
+    if "h" in cols:     ren[cols["h"]] = "h"
+
+    if "low" in cols:   ren[cols["low"]] = "l"
+    if "l" in cols:     ren[cols["l"]] = "l"
+
+    if "close" in cols: ren[cols["close"]] = "c"
+    if "c" in cols:     ren[cols["c"]] = "c"
+
+    if "open" in cols:  ren[cols["open"]] = "o"
+    if "o" in cols:     ren[cols["o"]] = "o"
+
+    if "time" in cols:  ren[cols["time"]] = "t"
+    if "t" in cols:     ren[cols["t"]] = "t"
+
+    df = df.rename(columns=ren, errors="ignore")
+    return df
+
+
 TF_SEC_MAP = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600, "H4": 14400}
 
 def _pick_last_closed_bar(snap: dict, tf: str, now_ms: int) -> dict | None:
-    """
-    snap: {"bars":[{"t": <epoch seconds>, "o":..., "h":..., "l":..., "c":...}, ...]}
-    Return the last CLOSED bar (dict) or None.
-    A bar with start time t (sec) is closed when now_ms >= (t + TF_SEC) * 1000.
-    """
     try:
+        snap = snap or {}
         bars = snap.get("bars") or []
-        if not bars:
-            return None
-        tf_ms = TF_SEC_MAP.get(tf, 60) * 1000
-        # Traverse from the end until we find a closed one
-        for b in reversed(bars):
-            t_ms = int(b["t"]) * 1000  # t is in seconds in our snapshots
-            if now_ms >= t_ms + tf_ms:
-                return b
-        # None closed? then no result
-        return None
+        tf_ms = int(TF_SEC_MAP.get(str(tf or "").upper(), 60) * 1000)
+
+        # prefer snap server time (matches device candle stream)
+        use_now_ms = int(snap.get("serverNow") or snap.get("server_now_ms") or now_ms or 0)
+
+        c, _p = _pick_last_closed_bar_from_bars(bars, use_now_ms, tf_ms)
+        return c
     except Exception:
         return None
+def _read_freshest_snap_any_device(sym_u: str, tf: str):
+    """
+    Try to find freshest device-scoped snap:
+      xtl:ohlc:snap:{dev}:{sym}:{tf}
 
+    If none exist (or none valid), fallback to:
+      xtl:ohlc:latest:{sym}:{tf}
+
+    NOTE: latest may be JSON OR a device-id pointer (e.g. "dev_...").
+    If pointer, dereference to device-scoped snap key.
+
+    Returns (snap_dict, dev) or (None, None)
+    """
+    try:
+        R = _r()
+        sym_u = str(sym_u or "").upper().strip()
+        tf_u = str(tf or "").upper().strip()
+
+        # 1) legacy scan
+        pattern = f"xtl:ohlc:snap:*:{sym_u}:{tf_u}"
+        best_dev = None
+        best_snap = None
+        best_ms = -1
+
+        for k in R.scan_iter(match=pattern, count=200):
+            key = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
+            parts = key.split(":")
+            if len(parts) < 6:
+                continue
+            dev = parts[3]
+
+            snap, _ = _read_snap_for_device(dev, sym_u, tf_u)
+            if not isinstance(snap, dict):
+                continue
+
+            ms = snap.get("updated_ms") or snap.get("ts_ms") or 0
+            try:
+                ms = int(float(ms))
+            except Exception:
+                ms = 0
+
+            bars = snap.get("bars") or snap.get("ohlc")
+            if not (isinstance(bars, list) and len(bars) >= 2):
+                continue
+
+            if ms > best_ms:
+                best_ms = ms
+                best_dev = dev
+                best_snap = snap
+
+        if best_snap:
+            return best_snap, best_dev
+
+        # 2) fallback: global latest key (may be JSON OR a device pointer)
+        key2 = f"xtl:ohlc:latest:{sym_u}:{tf_u}"
+        raw = _snap_get_raw_json(key2)
+        if not raw:
+            return (None, None)
+
+        # If latest is a device-id pointer, dereference it
+        if isinstance(raw, str):
+            s = raw.strip()
+            if s.startswith("dev_") and (not s.startswith("{")) and (not s.startswith("[")):
+                key3 = _snap_key(s, sym_u, tf_u)
+                raw2 = _snap_get_raw_json(key3)
+                if raw2:
+                    raw = raw2  # now raw should be JSON snapshot content
+
+        # raw may already be dict (because _snap_get_raw_json may decode hashes)
+        snap2 = raw if isinstance(raw, dict) else None
+        if snap2 is None:
+            try:
+                snap2 = json.loads(raw) if isinstance(raw, str) else None
+            except Exception:
+                snap2 = None
+
+        if not isinstance(snap2, dict):
+            return (None, None)
+
+        bars2 = snap2.get("bars") or snap2.get("ohlc")
+        if not (isinstance(bars2, list) and len(bars2) >= 2):
+            return (None, None)
+
+        return (snap2, None)
+    except Exception:
+        return (None, None)
 
 
 # read a specific device snapshot for symbol/tf
-def _read_snap_for_device(device_id: str, symbol: str, tf: str):
+def _read_snap_for_device(device_id: str, symbol: str, tf: str, *, header_device: str | None = None):
     try:
-        key = f"xtl:ohlc:snap:{device_id}:{symbol}:{tf}"
-        raw = R.get(key)
+        R = _r()
+        sym_u = str(symbol or "").upper().strip()
+        tf_u = str(tf or "").upper().strip()
+
+        # Prefer header device if provided, then fallback to passed device_id
+        hdr = str(header_device or "").strip()
+        dev0 = str(device_id or "").strip()
+
+        # -------------------------------
+        # 1) device-scoped snap key (try header first, then device_id)
+        # -------------------------------
+        raw = None
+        key = None
+        used_dev = None
+
+        for dev_try in (hdr, dev0):
+            if not dev_try:
+                continue
+            k = _snap_key(dev_try, sym_u, tf_u)
+            r = _snap_get_raw_json(k)  # works for STRING and HASH
+            if r:
+                raw = r
+                key = k
+                used_dev = dev_try
+                break
+
+        # -------------------------------
+        # 2) fallback: global latest key (may be JSON OR a device pointer)
+        # -------------------------------
+        if not raw and sym_u and tf_u:
+            key2 = f"xtl:ohlc:latest:{sym_u}:{tf_u}"
+            raw = _snap_get_raw_json(key2)
+
+            # If latest is a device-id pointer, dereference it
+            if isinstance(raw, str):
+                s = raw.strip()
+                if s.startswith("dev_") and (not s.startswith("{")) and (not s.startswith("[")):
+                    key3 = _snap_key(s, sym_u, tf_u)
+                    raw2 = _snap_get_raw_json(key3)
+                    if raw2:
+                        raw = raw2
+                        key = key3
+                        used_dev = s
+
         if not raw:
             return None, None
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8", "ignore")
-        snap = json.loads(raw)
+
+        # raw may already be dict (because _snap_get_raw_json may decode hashes)
+        snap = raw if isinstance(raw, dict) else None
+        if snap is None:
+            try:
+                snap = json.loads(raw) if isinstance(raw, str) else None
+            except Exception:
+                snap = None
+
+        if not isinstance(snap, dict):
+            return None, None
 
         # optional: broker meta from device hash if you keep it there
         b = None
         try:
-            h = R.hgetall(f"device:{device_id}")
-            if h:
-                # normalize bytes?str
-                b = { (k.decode() if isinstance(k,(bytes,bytearray)) else str(k)) :
-                      (v.decode() if isinstance(v,(bytes,bytearray)) else str(v))
-                      for k,v in h.items() }
+            dev_meta = used_dev or dev0 or hdr
+            if dev_meta:
+                h = R.hgetall(f"device:{dev_meta}")
+                if h:
+                    b = {
+                        (k.decode() if isinstance(k, (bytes, bytearray)) else str(k)):
+                        (v.decode() if isinstance(v, (bytes, bytearray)) else str(v))
+                        for k, v in h.items()
+                    }
         except Exception:
             pass
+
         return snap, b
     except Exception:
         return None, None
-
 
 def require_auth_optional(request: Request):
     """
@@ -2171,7 +6490,12 @@ def _is_uuid(s: str) -> bool:
     import re
     return bool(re.fullmatch(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", s))
-
+def _unlock_inflight() -> None:
+    try:
+        if inflight_lock_key and inflight_got_lock:
+            R.delete(inflight_lock_key)
+    except Exception:
+        pass
 
 def _resolve_user_id(user_key: str) -> str:
     # Already a UUID?
@@ -2376,72 +6700,292 @@ def _read_freshest_snap_for_user_or_any(uid, sym_u: str, tfu: str):
     best = max(candidates, key=last_closed_ts_ms)
     return best, (best.get("broker") if isinstance(best, dict) else None)
 
+def _get_live_price_with_ts(sym: str, device: str | None) -> tuple[float | None, int | None, str | None]:
+    """
+    Read live-ish price from Redis.
+
+    Accepts either:
+      - old format: "4318.12"
+      - new format: {"price": 4318.12, "ts_ms": 1767..., "src": "tick" | "ohlc_m1_close" | ...}
+
+    Keys tried:
+      xtl:price:<dev>:<SYMBOL>
+      xtl:price:<SYMBOL>
+    """
+    try:
+        sym_u = (sym or "").upper().strip()
+        if not sym_u:
+            return (None, None, None)
+
+        dev = (device or "").strip()
+        if dev.lower() == "auto":
+            dev = ""
+
+        keys: list[str] = []
+        if dev:
+            dev_key = dev if dev.startswith("dev_") else f"dev_{dev}"
+            keys.append(f"xtl:price:{dev_key}:{sym_u}")
+        keys.append(f"xtl:price:{sym_u}")
+        # --- NEW: if no device pinned, try freshest device-scoped price for this symbol ---
+        if not dev:
+            try:
+                best_key = None
+                best_ts = -1
+
+                for kk in R.scan_iter(f"xtl:price:dev_*:{sym_u}", count=50):
+                    try:
+                        raw_k = R.get(kk)
+                    except Exception:
+                        raw_k = None
+                    if not raw_k:
+                        continue
+
+                    if isinstance(raw_k, (bytes, bytearray)):
+                        raw_k = raw_k.decode("utf-8", "ignore")
+                    ss = str(raw_k).strip()
+                    if not ss.startswith("{"):
+                        continue
+
+                    try:
+                        d = json.loads(ss)
+                        ts = int(d.get("ts_ms") or 0)
+                        if ts > best_ts:
+                            best_ts = ts
+                            best_key = kk
+                    except Exception:
+                        continue
+
+                if best_key is not None:
+                    if isinstance(best_key, (bytes, bytearray)):
+                        best_key = best_key.decode("utf-8", "ignore")
+                    keys.insert(0, str(best_key))
+            except Exception:
+                pass
+
+
+        for k in keys:
+            try:
+                raw = R.get(k)
+            except Exception:
+                raw = None
+            if not raw:
+                continue
+
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "ignore")
+
+            s = str(raw).strip()
+            if not s:
+                continue
+
+          
+
+            # 1) JSON format
+            if s.startswith("{"):
+                try:
+                    d = json.loads(s)
+                    if isinstance(d, dict) and d.get("price") is not None:
+                        px = float(d.get("price"))
+                        ts = d.get("ts_ms") or d.get("ts") or None
+                        try:
+                            ts_ms = int(ts) if ts is not None else None
+                        except Exception:
+                            ts_ms = None
+
+                        src = d.get("src")
+                        if src is not None:
+                            try:
+                                src = str(src)
+                            except Exception:
+                                src = None
+
+                        return (px, ts_ms, src)
+                except Exception:
+                    pass
+
+            # 2) plain float format (no timestamp/source)
+            try:
+                return (float(s), None, None)
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    return (None, None, None)
+
+# Optional backward-compatible wrapper (ONLY if other code still calls _get_live_price)
+def _get_live_price(sym: str, device: str | None) -> tuple[float | None, int | None]:
+    px, ts, _src = _get_live_price_with_ts(sym, device)
+    return (px, ts)
+
+
+
+def _get_device_tz_offset_min(dev: str | None) -> int | None:
+    import os
+    try:
+        if not dev:
+            return None
+
+        d = dev if str(dev).startswith("dev_") else f"dev_{dev}"
+
+        def _to_str(x):
+            if x is None:
+                return ""
+            if isinstance(x, (bytes, bytearray)):
+                return x.decode("utf-8", "ignore")
+            return str(x)
+
+        # 1) device hash (matches routes_devices.py fallback auth)
+        prefix = os.getenv("XTL_DEVICE_KEY_PREFIX", "device:")
+        meta = R.hgetall(f"{prefix}{d}") or {}
+        if meta:
+            # normalize to str->str
+            m = {_to_str(k): _to_str(v) for k, v in meta.items()}
+
+            for key in (
+                "tz_offset_min",
+                "tzOffsetMin",
+                "broker_tz_offset_min",
+                "Broker.TzOffsetMin",
+                "mt5_broker_tz_offset_min",
+            ):
+                v = m.get(key)
+                if v:
+                    try:
+                        return int(float(v))
+                    except Exception:
+                        pass
+
+        # 2) explicit string key fallback
+        for k in (
+            f"xtl:device:{d}:tz_offset_min",
+            f"xtl:device:{d}:Broker.TzOffsetMin",
+        ):
+            v2 = R.get(k)
+            if v2:
+                try:
+                    return int(float(_to_str(v2).strip()))
+                except Exception:
+                    pass
+
+    except Exception:
+        pass
+    return None
+
+
 @router.get("/price/all")
 def price_all(
     tf: str = "M1",
     symbols: str = "XAUUSD,EURUSD,USDJPY,GBPUSD,USDCAD,USDCHF",
     device: str | None = Query(None),
     x_device_id: str | None = Header(None, convert_underscores=False),
-    user = Depends(require_auth_optional),   # optional auth; prefer user's device when not pinned
+    user=Depends(require_auth_optional),  # optional auth; prefer user's device when not pinned
 ):
-    tfu = (tf or "M1").upper()                      # display price is from M1; we keep param for future
+    tfu = (tf or "M1").upper()  # display price is from M1; keep param for future
     syms = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
     rows: list[dict] = []
     broker = None
 
-    # 0) resolve which device to use
-    user_id = _uid_from_user(user)
-    pinned_device = device or x_device_id or getattr(user, "device_id", None) or getattr(user, "deviceId", None)
-    device_used = None
-
-    # 1) build rows
     import time
     now_ms = int(time.time() * 1000)
 
+    user_id = _uid_from_user(user)
+
+    pinned_device = device or x_device_id or getattr(user, "device_id", None) or getattr(user, "deviceId", None)
+
+    # AUTO-SELECT active device when none is pinned
+    if not pinned_device and R is not None:
+        try:
+            best_dev = None
+            best_hb = -1
+
+            for key in R.scan_iter("device:dev_*"):
+                try:
+                    h = R.hgetall(key) or {}
+                except Exception:
+                    h = {}
+                if not h:
+                    continue
+
+                # status (bytes -> str)
+                status = h.get(b"status") or h.get("status")
+                if isinstance(status, (bytes, bytearray)):
+                    status = status.decode("utf-8", "ignore")
+                status_s = (status or "").strip().lower()
+                if status_s != "online":
+                    continue
+
+                # Prefer devices that actually have broker tz fields
+                tz_v = h.get(b"broker_tz_offset_min") or h.get("broker_tz_offset_min") or h.get(b"Broker.TzOffsetMin") or h.get("Broker.TzOffsetMin")
+                has_tz = tz_v is not None and tz_v != b"" and tz_v != ""
+
+                # last_heartbeat_ms (bytes -> str -> int)
+                hb = h.get(b"last_heartbeat_ms") or h.get("last_heartbeat_ms")
+                if isinstance(hb, (bytes, bytearray)):
+                    hb = hb.decode("utf-8", "ignore").strip()
+                try:
+                    hb_i = int(hb) if hb is not None and hb != "" else -1
+                except Exception:
+                    hb_i = -1
+
+                # decode key -> device id
+                if isinstance(key, (bytes, bytearray)):
+                    key_s = key.decode("utf-8", "ignore")
+                else:
+                    key_s = str(key)
+                dev_id = key_s.replace("device:", "").strip()
+
+                # ranking: prefer higher heartbeat; if tie, prefer has_tz
+                if hb_i > best_hb:
+                    best_hb = hb_i
+                    best_dev = dev_id
+                elif hb_i == best_hb and best_dev and has_tz:
+                    # if current best doesn't have tz but this one does, prefer it
+                    # (safe “tie-breaker”)
+                    best_dev = dev_id
+
+            if best_dev:
+                pinned_device = best_dev
+        except Exception:
+            pass
+
+    device_used = pinned_device or "auto"
+    tz_off_min = _get_device_tz_offset_min(pinned_device)
+
     for sym_u in syms:
-        # strictly use pinned device if provided; otherwise fallback to your existing helper
-        if pinned_device:
-            snap, bmeta = _read_snap_for_device(pinned_device, sym_u, "M1")
-            device_used = pinned_device
-        else:
-            snap, bmeta = _read_freshest_snap_for_user_or_any(user_id, sym_u, "M1")
-            # ^ this may pick any device; we will expose which one below if your helper sets it,
-            # otherwise leave device_used None
-
-        if not snap:
-            rows.append({"symbol": sym_u, "price": None, "lastTs": None})
+        px, ts_ms, src = _get_live_price_with_ts(sym_u, pinned_device)
+        if px is None or ts_ms is None:
+            rows.append({"symbol": sym_u, "price": None, "lastTs": None, "price_source": "none"})
             continue
+        age_ms = now_ms - int(ts_ms)
+        src_s = (src or "").strip().lower()
 
-        bars = snap.get("bars") or []
-        last = None
-
-        # pick the last CLOSED bar (complete==True OR elapsed >= 60s)
-        for bbar in reversed(bars):
-            t_ms = _ms_from_t(bbar.get("t_open_ms") or bbar.get("t"))
-            if t_ms is None:
-                continue
-            if bbar.get("complete") is True or (t_ms + TF_MS["M1"] <= now_ms):
-                last = {**bbar, "t_open_ms": t_ms}
-                break
-
-        if last:
-            price_c = float(last.get("c")) if last.get("c") is not None else None
-            rows.append({
-                "symbol": sym_u,
-                "price": _fmt_price(sym_u, price_c, bmeta),
-                "lastTs": last["t_open_ms"],
-            })
-            if bmeta and not broker:
-                broker = bmeta
+        # Honest labeling + freshness:
+        # - tick is only "tick" if it truly came from tick and is <= 10s old
+        # - otherwise label as whatever OHLC wrote (e.g. ohlc_m1_close)
+        if src_s == "tick" and age_ms <= 10_000:
+            price_source = "tick"
         else:
-            rows.append({"symbol": sym_u, "price": None, "lastTs": None})
+            price_source = src or "ohlc"
 
+        rows.append(
+            {
+                "symbol": sym_u,
+                "price": _fmt_price(sym_u, px, broker),
+                "lastTs": int(ts_ms),
+                "price_source": price_source,
+            }
+        )
+
+    # Keep response contract stable
+    out_broker = {"tz_offset_min": int(tz_off_min)} if tz_off_min is not None else {}
     return {
         "ok": True,
         "tf": tfu,
         "rows": rows,
-        "broker": broker or {},
-        "device": device_used or (pinned_device or "auto")  # helpful for debugging
+        "broker": out_broker,
+        "device": device_used,
     }
 
 def _uid_from_request(request: Request) -> str | None:
@@ -2475,124 +7019,289 @@ def _read_user_snap(uid: str, sym: str, tfu: str):
     except Exception:
         return None, None
 
-def _scan_freshest_device_snap(sym: str, tfu: str):
-    # look across all devices; choose snapshot with max freshness
-    best = None
-    best_dev = "-"
-    best_fresh = -1
-    cursor = 0
-    pattern = f"xtl:ohlc:snap:dev_*:{sym}:{tfu}"
-    while True:
-        cursor, keys = R.scan(cursor, match=pattern, count=200)
-        for k in keys:
-            raw = R.get(k)
-            if not raw:
-                continue
-            try:
-                js = json.loads(raw)
-            except Exception:
-                continue
-            bars = js.get("bars") or []
-            if not bars:
-                continue
-            last = bars[-1]
-            price = float(last.get("c", 0.0))
-            t_s   = int(last.get("t", 0))
-            t_ms  = (t_s * 1000) if t_s < 10_000_000_000 else t_s
-            # freshness: prefer serverNow/lastClosedTs if present
-            fresh = max(int(js.get("serverNow") or 0), int(js.get("lastClosedTs") or 0), t_ms)
-            if fresh > best_fresh:
-                best_fresh = fresh
-                best = {"price": price, "t_ms": t_ms}
-                # k = xtl:ohlc:snap:dev_<id>:<sym>:<tf>
-                parts = k.split(":")
-                if len(parts) >= 3:
-                    best_dev = parts[2]  # dev_<id>
-        if cursor == 0:
-            break
-    return best, best_dev
+def _rows_to_df(rows):
+    """
+    Convert normalized OHLC rows (dicts) to a DataFrame with columns: t,o,h,l,c
+    Accepts time keys: t_close_ms / t_open_ms / t (sec or ms).
+    """
+    if not rows or not isinstance(rows, list):
+        return None
+    data = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            data.append(
+                {
+                    "t": _epoch_to_ms_any(r.get("t_close_ms") or r.get("t_open_ms") or r.get("t")),
+                    "o": float(r["o"]),
+                    "h": float(r["h"]),
+                    "l": float(r["l"]),
+                    "c": float(r["c"]),
+                }
+            )
+        except Exception:
+            continue
+    if not data:
+        return None
+    try:
+        import pandas as pd
+        return pd.DataFrame(data)
+    except Exception:
+        return None
+
+def _normalize_snap_bars_to_ms(bars: Any, tf_ms: int) -> list[dict]:
+    """
+    Normalize snapshot bars into a standard list of dict bars with:
+      - t_close_ms (ms)
+      - t_open_ms (ms) = t_close_ms - tf_ms
+      - o,h,l,c,v,complete
+    Also: sort by t_close_ms and drop invalid/future bars.
+    """
+    if not isinstance(bars, list):
+        return []
+
+    out: list[dict] = []
+    for b in bars:
+        if not isinstance(b, dict):
+            continue
+
+        # Accept multiple possible timestamp fields
+        t_close = (
+            b.get("t_close_ms")
+            or b.get("tClose")
+            or b.get("t_close")
+            or b.get("t")
+            or 0
+        )
+
+        # Convert seconds -> ms if needed
+        try:
+            t_close = int(t_close)
+        except Exception:
+            t_close = 0
+        if 0 < t_close < 10_000_000_000:  # looks like seconds
+            t_close *= 1000
+
+        # Build normalized bar
+        nb = {
+            "t_close_ms": t_close,
+            "o": b.get("o"),
+            "h": b.get("h"),
+            "l": b.get("l"),
+            "c": b.get("c"),
+            "v": b.get("v") if b.get("v") is not None else b.get("vol"),
+            "complete": b.get("complete", True),
+        }
+
+        # If any OHLC missing, skip (prevents BOS/ATR weirdness)
+        if nb["t_close_ms"] <= 0:
+            continue
+        if nb["c"] is None or nb["h"] is None or nb["l"] is None:
+            continue
+        if nb["o"] is None:
+            nb["o"] = nb["c"]
+
+        # ✅ CRITICAL FIX: ensure t_open_ms is always correct (never 0)
+        nb["t_open_ms"] = int(nb["t_close_ms"] - tf_ms)
+
+        out.append(nb)
+
+    # Sort and remove duplicates by t_close_ms
+    out.sort(key=lambda x: x.get("t_close_ms", 0))
+    dedup: list[dict] = []
+    seen = set()
+    for b in out:
+        tc = b["t_close_ms"]
+        if tc in seen:
+            continue
+        seen.add(tc)
+        dedup.append(b)
+
+    return dedup
+
 
 @router.get("/predict/ping")
 def predict_ping():
     return {"ok": True, "msg": "predict router alive"}
 
+def _scan_freshest_device_snap(sym: str, tfu: str, uid: str | None = None):
+    """
+    NO-SCAN version.
+    Try known devices from:
+      1) xtl:user:{uid}:devices (preferred)
+      2) xtl:devices            (optional global set)
+    Returns (best_quote, best_dev)
+    """
+    best = None
+    best_dev = "-"
+    best_fresh = -1
+
+    sym = (sym or "").upper().strip()
+    tfu = (tfu or "").upper().strip()
+    if not sym or not tfu:
+        return None, "-"
+
+    # Candidate devices (no SCAN)
+    devs = []
+
+    # 1) user devices set (already used elsewhere in this file)
+    if uid:
+        try:
+            ds = R.smembers(f"xtl:user:{uid}:devices") or []
+            for d in ds:
+                devs.append(d.decode("utf-8", "ignore") if isinstance(d, (bytes, bytearray)) else str(d))
+        except Exception:
+            pass
+
+    # 2) optional global devices set (if you add it on agent writes)
+    if not devs:
+        try:
+            ds = R.smembers("xtl:devices") or []
+            for d in ds:
+                devs.append(d.decode("utf-8", "ignore") if isinstance(d, (bytes, bytearray)) else str(d))
+        except Exception:
+            pass
+
+    # If we don't know any devices, do NOT scan; return fast
+    if not devs:
+        return None, "-"
+
+    # Probe deterministic keys: xtl:ohlc:snap:{dev}:{sym}:{tf}
+    for dev in devs:
+        if not dev:
+            continue
+        k = f"xtl:ohlc:snap:{dev}:{sym}:{tfu}"
+        raw = None
+        try:
+            raw = R.get(k)
+        except Exception:
+            raw = None
+        if not raw:
+            continue
+        try:
+            js = json.loads(raw)
+        except Exception:
+            continue
+
+        bars = js.get("bars") or []
+        if not bars:
+            continue
+
+        last = bars[-1]
+        try:
+            price = float(last.get("c", 0.0))
+        except Exception:
+            continue
+
+        try:
+            t_s = int(last.get("t", 0))
+        except Exception:
+            t_s = 0
+        t_ms = (t_s * 1000) if t_s < 10_000_000_000 else t_s
+
+        # freshness: prefer serverNow/lastClosedTs if present
+        try:
+            fresh = max(int(js.get("serverNow") or 0), int(js.get("lastClosedTs") or 0), int(t_ms or 0))
+        except Exception:
+            fresh = int(t_ms or 0)
+
+        if fresh > best_fresh:
+            best_fresh = fresh
+            best = {"price": price, "t_ms": t_ms}
+            best_dev = dev
+
+    return best, best_dev
+
+
 
 
 @router.get("/predict/all")
 def predict_all(
-    tf: str = "M15",
+    tf: str = "M15",  # keep default for page-load convenience
     symbols: str = "XAUUSD,EURUSD,USDJPY,GBPUSD,USDCAD,USDCHF",
     device: str | None = Query(None),
     x_device_id: str | None = Header(None, convert_underscores=False),
-    user = Depends(require_auth_optional),
+    user=Depends(require_auth_optional),
 ):
     """
-    Main prediction feed.
+    Main prediction feed (TF-STRICT, PER-TF FETCH).
 
-    ST trend = 1-hour structure (H1) + H1 model + macro
-    HT trend = 4-hour structure (H4) + H4 model + macro
-
-    Returns:
-      - expected_move_pct_1h / target_price_1h from H1 model (if available)
-      - expected_move_pct_4h / target_price_4h from H4 model (if available)
-      - reasons_h1 / reasons_h4 (separate) + reasons (H1 for backward compat)
-      - updated_broker_ts (server timestamp) + broker tz info if available
+    Locked contract:
+      1) Forecast is bar-based only (no tick influence).
+      2) `price` is tick/live display only.
+      3) Target basis is last closed TF close (fallback: last closed M1 close). Never tick.
+      4) Per-TF fetch: response contains only requested TF forecast fields.
+      5) Freeze: if stale, do not recompute; serve last-good cached row for that TF/symbol.
+      6) M15 is paused => returns ok=false model_not_trained.
     """
 
-    tfu = (tf or "M15").upper()
-    syms = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
+    # ---------------- STRICT TF VALIDATION ----------------
+    tfu = (tf or "").upper().strip()
+    if not tfu:
+        tfu = "M15"
+    if tfu not in ("M15", "H1", "H4"):
+        raise HTTPException(status_code=400, detail=f"Invalid tf '{tf}'. Allowed: M15, H1, H4")
 
-    # prefer user's device if present; fall back to freshest-any for OHLC snapshots
+    syms = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
     user_id = _uid_from_user(user)
     now_ms = int(_time.time() * 1000)
 
+    TF_MS_LOCAL = {"M15": 15 * 60_000, "H1": 60 * 60_000, "H4": 4 * 60 * 60_000}
+    tf_ms = TF_MS_LOCAL.get(tfu, 15 * 60_000)
+
     # ---- imports kept inside to avoid startup import failures ----
-    # H1/H4 inference
+    predict_next_hour = None
+    predict_next_4h = None
+    pull_latest_h1 = None
+    pull_latest_h4 = None
     try:
         from api.trend.infer_rt import predict_next_hour, predict_next_4h, pull_latest_h1, pull_latest_h4
     except Exception:
         try:
-            # fallback (older layout)
             from .infer_rt import predict_next_hour, predict_next_4h, pull_latest_h1, pull_latest_h4
         except Exception:
-            predict_next_hour = None  # type: ignore
-            predict_next_4h = None    # type: ignore
-            pull_latest_h1 = None     # type: ignore
-            pull_latest_h4 = None     # type: ignore
+            pass
 
-    # TTH inference (dynamic horizon)
-    try:
-        from api.trend.infer_tth import predict_tth  # preferred
-    except Exception:
-        try:
-            from ml.infer_tth import predict_tth  # user stated infer_tth is under /ml
-        except Exception:
-            predict_tth = None  # type: ignore
-
-    # Macro snapshot once per request (shared by H1/H4)
+    # ---- Macro snapshot once per request (IMPORTANT: macro ALWAYS defined) ----
+    macro = None
     try:
         macro = get_macro_snapshot()
     except Exception:
         macro = None
 
-    # build frames once per request to reduce redis scans inside infer_rt
-    now_frames_h1 = None
-    now_frames_h4 = None
+    # Debug log (safe for dict or MacroSnapshot)
     try:
-        if callable(pull_latest_h1):
-            need_syms = ["XAUUSD", "EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCHF", "USDCAD"]
-            now_frames_h1 = {s: pull_latest_h1(s) for s in need_syms}
-        if ENABLE_H4_MODEL and callable(pull_latest_h4):
-            need_syms = ["XAUUSD", "EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCHF", "USDCAD"]
-            now_frames_h4 = {s: pull_latest_h4(s) for s in need_syms}
+        def _mg(x, k):
+            return x.get(k) if isinstance(x, dict) else getattr(x, k, None)
+
+        log.warning(
+            "[predict_all] tf=%s macro_type=%s dxy_z=%s us10y_z=%s usd_rate_z=%s vix_z=%s",
+            tfu,
+            type(macro).__name__ if macro is not None else "None",
+            _mg(macro, "dxy_z"),
+            _mg(macro, "us10y_z"),
+            _mg(macro, "usd_rate_z"),
+            _mg(macro, "vix_z"),
+        )
     except Exception:
-        now_frames_h1 = None
-        now_frames_h4 = None
+        pass
 
-    rows: list[dict] = []
+    # Build frames once per request ONLY for the requested TF
+    now_frames = None
+    try:
+        if tfu == "H1" and callable(pull_latest_h1):
+            need_syms = ["XAUUSD", "EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCHF", "USDCAD"]
+            now_frames = {s: pull_latest_h1(s) for s in need_syms}
+        if tfu == "H4" and ENABLE_H4_MODEL and callable(pull_latest_h4):
+            need_syms = ["XAUUSD", "EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCHF", "USDCAD"]
+            now_frames = {s: pull_latest_h4(s) for s in need_syms}
+    except Exception:
+        now_frames = None
 
-    TF_MS_LOCAL = {"M15": 15 * 60_000, "H1": 60 * 60_000, "H4": 4 * 60 * 60_000}
-    tf_ms = TF_MS_LOCAL.get(tfu, 15 * 60_000)
+    # ---- Freeze config (forecast only; tick price is independent) ----
+    STALE_MS = 5 * 60_000  # 5 min: used to decide recompute vs freeze
+    ROW_LAST_KEY = "xtl:pred:lastrow:{tf}:{sym}"  # Per-symbol, per-TF last-good row cache
 
     def _score_to_label(s: float) -> str:
         if s >= 0.6:
@@ -2612,319 +7321,622 @@ def predict_all(
             return fallback
 
     def _safe_move_pct(pr: dict) -> float:
-        # treat move_pct / predMovePct as already in PERCENT
         raw = pr.get("move_pct", pr.get("predMovePct"))
         try:
             return abs(float(raw)) if raw is not None else 0.0
         except Exception:
             return 0.0
 
-    for sym in syms:
-        # --- A) H1/H4 model inference -------------------------------------
-        pr_h1: dict = {"ok": False, "reason": "h1_not_loaded"}
-        pr_h4: dict = {"ok": False, "reason": "h4_not_loaded"}
+    def _conf_from_p(p: float) -> str:
+        try:
+            spread = abs(float(p) - 0.5)
+        except Exception:
+            spread = 0.0
+        if spread >= 0.20:
+            return "high"
+        if spread >= 0.05:
+            return "medium"
+        return "low"
 
-        if callable(predict_next_hour):
+    def _macro_chips_for_symbol(sym_u_: str, macro_: object | None, p_up_: float | None, extra_: dict | None) -> list[str]:
+        """
+        Returns up to 4 compact macro chips like: DXY↓, US10Y↓, VIX↑, RVOL↑
+        Works with both dict macro and MacroSnapshot object.
+        """
+
+        def _get(obj: object | None, key: str):
             try:
-                pr_h1 = predict_next_hour(sym, now_frames=now_frames_h1)  # type: ignore[arg-type]
-            except Exception as e:
-                log.exception("[predict_all] predict_next_hour EXC sym=%s", sym)
-                pr_h1 = {"ok": False, "reason": "infer_exc_h1", "detail": str(e)}
-        else:
-            pr_h1 = {"ok": False, "reason": "infer_rt_missing_h1"}
+                if obj is None:
+                    return None
+                if isinstance(obj, dict):
+                    return obj.get(key)
+                return getattr(obj, key, None)
+            except Exception:
+                return None
+        def _get_extra(key: str):
+            try:
+                return extra_.get(key) if isinstance(extra_, dict) else None
+            except Exception:
+                return None
+        try:
+            CHIP_Z_ON = float(os.getenv("XTL_MACRO_CHIP_Z_ON", "0.10"))
+        except Exception:
+            CHIP_Z_ON = 0.10
 
-        if ENABLE_H4_MODEL:
-            if callable(predict_next_4h):
-                try:
-                    pr_h4 = predict_next_4h(sym, now_frames=now_frames_h4)  # type: ignore[arg-type]
-                except Exception as e:
-                    log.exception("[predict_all] predict_next_4h EXC sym=%s", sym)
-                    pr_h4 = {"ok": False, "reason": "infer_exc_h4", "detail": str(e)}
-            else:
-                pr_h4 = {"ok": False, "reason": "infer_rt_missing_h4"}
-        else:
-            pr_h4 = {"ok": False, "reason": "h4_disabled"}
 
-        if not isinstance(pr_h1, dict):
-            pr_h1 = {"ok": False, "reason": "infer_not_dict_h1"}
-        if not isinstance(pr_h4, dict):
-            pr_h4 = {"ok": False, "reason": "infer_not_dict_h4"}
+        def _sgn(x) -> int:
+            try:
+                v = float(x)
+            except Exception:
+                return 0
+            if v > CHIP_Z_ON:
+                return 1
+            if v < -CHIP_Z_ON:
+                return -1
+            return 0
 
-        ok_h1 = bool(pr_h1.get("ok", False))
-        ok_h4 = bool(pr_h4.get("ok", False))
+        def _arrow(sign: int) -> str:
+            return "↑" if sign > 0 else ("↓" if sign < 0 else "→")
 
         
-        # --- B) Dynamic horizon (TTH) -------------------------------------
-        # If TTH is OK, choose horizon from bucket_idx (NOT tth.horizon_min which is 0 in your logs)
-        horizon_min = 60
-        p_dir = None
-        tth_raw = None
+        # z-scores (support both dict keys and MacroSnapshot attrs)
+        # IMPORTANT: fallback to z-scores already placed into extra_ by predict_all()
+        dxy_z = _get(macro_, "dxy_z")
+        if dxy_z is None:
+            dxy_z = _get_extra("macro_dxy_z")
 
-        TTH_BUCKET_MIN = [15, 30, 60, 120, 240]  # tune later
+        y10_z = _get(macro_, "us10y_z") or _get(macro_, "yield_z")
+        if y10_z is None:
+            y10_z = _get_extra("macro_yield_z")
 
-        if callable(predict_tth):
+        sr_z = _get(macro_, "usd_rate_z") or _get(macro_, "usd_short_rate_z")
+        if sr_z is None:
+            sr_z = _get_extra("macro_usd_rate_z")
+
+        vix_z = _get(macro_, "vix_z")
+        if vix_z is None:
+            vix_z = _get_extra("macro_vix_z")
+
+
+        # Optional: RVOL from extra/pr (not macro snapshot)
+        rvol = None
+        try:
+            if isinstance(extra_, dict):
+                rvol = extra_.get("feat_rvol15")
+        except Exception:
+            rvol = None
+
+        chips: list[tuple[str, int, float]] = []
+
+        is_xau = str(sym_u_ or "").upper().startswith("XAU")
+
+        dxy_s = _sgn(dxy_z)
+        if is_xau:
+            dxy_s = -dxy_s
+        if dxy_s != 0 and dxy_z is not None:
+            chips.append(("DXY", dxy_s, abs(float(dxy_z))))
+
+        y10_s = _sgn(y10_z)
+        if is_xau:
+            y10_s = -y10_s
+        if y10_s != 0 and y10_z is not None:
+            chips.append(("US10Y", y10_s, abs(float(y10_z))))
+
+        sr_s = _sgn(sr_z)
+        if is_xau:
+            sr_s = -sr_s
+        if sr_s != 0 and sr_z is not None:
+            chips.append(("USDRATE", sr_s, abs(float(sr_z))))
+
+        vix_s = _sgn(vix_z)
+        if vix_s != 0 and vix_z is not None:
+            chips.append(("VIX", vix_s, abs(float(vix_z))))
+
+        try:
+            rv = float(rvol) if rvol is not None else None
+        except Exception:
+            rv = None
+        if rv is not None:
             try:
-                tth = predict_tth(sym)  # type: ignore[misc]
-                tth_raw = tth
-                if isinstance(tth, dict) and tth.get("ok"):
-                    bidx = tth.get("bucket_idx", None)
-                    try:
-                       bidx_i = int(bidx) if bidx is not None else 2  # default to 60m
-                    except Exception:
-                       bidx_i = 2
-                    bidx_i = max(0, min(bidx_i, len(TTH_BUCKET_MIN) - 1))
-                    horizon_min = int(TTH_BUCKET_MIN[bidx_i])
+                RVOL_HI = float(os.getenv("XTL_MACRO_RVOL_HI", "1.2"))
+                RVOL_LO = float(os.getenv("XTL_MACRO_RVOL_LO", "0.8"))
+            except Exception:
+                RVOL_HI, RVOL_LO = 1.2, 0.8
 
-                    # directional probability summary (optional)
-                    try:
-                       p_dir = max(float(tth.get("p_up", 0.0)), float(tth.get("p_down", 0.0)))
-                    except Exception:
-                       p_dir = None
-                # else keep fallback 60m
-            except Exception as e:
-                log.exception("[predict_all] predict_tth EXC sym=%s", sym)
-                tth_raw = {"ok": False, "reason": "tth_exc", "detail": str(e)}
+                if rv >= RVOL_HI:
+                    chips.append(("RVOL", 1, rv))
+                elif rv <= RVOL_LO:
+                    chips.append(("RVOL", -1, 1.0 - rv))
 
-        
 
-        # --- C) Latest OHLC + broker meta ---------------------------------
-        snap, broker = _read_freshest_snap_for_user_or_any(user_id, sym, tfu)
-        bars = (snap or {}).get("bars") or []
+        chips.sort(key=lambda t: t[2], reverse=True)
+        out: list[str] = []
+        for k, s, _mag in chips[:4]:
+            out.append(f"{k}{_arrow(s)}")
+        return out
 
-        last_closed = None
-        for b in reversed(bars):
+    def _snap_last_closed_open_ts_ms(bars: list, tf_ms_: int, now_ms_: int) -> int | None:
+        for b in reversed(bars or []):
             t_ms = _ms_from_t(b.get("t_open_ms") or b.get("t"))
             if t_ms is None:
                 continue
-            is_closed = (b.get("complete") is True) or (t_ms + tf_ms <= now_ms)
-            if is_closed:
-                last_closed = {**b, "t_open_ms": t_ms}
-                break
+            if b.get("complete") is True or (t_ms + tf_ms_ <= now_ms_):
+                return int(t_ms)
+        return None
 
-        # basis for targets: prefer M1 close if present, else last_closed close, else model lastClose
-        last_price_m1 = None
+    def _last_closed_close_price(bars: list, tf_ms_: int, now_ms_: int) -> float | None:
+        for b in reversed(bars or []):
+            t_ms = _ms_from_t(b.get("t_open_ms") or b.get("t"))
+            if t_ms is None:
+                continue
+            if b.get("complete") is True or (t_ms + tf_ms_ <= now_ms_):
+                c = b.get("c")
+                if isinstance(c, (int, float)):
+                    return float(c)
+        return None
+
+    def _read_live_price_with_ts(sym: str) -> tuple[float | None, int | None]:
         try:
-            snap_m1, _ = _read_freshest_snap_for_user_or_any(user_id, sym, "M1")
+            sym_u = (sym or "").upper().strip()
+            if not sym_u:
+                return (None, None)
+
+            dev = (device or x_device_id or "").strip()
+            keys: list[str] = []
+            if dev:
+                dev_key = dev if dev.startswith("dev_") else f"dev_{dev}"
+                keys.append(f"xtl:price:{dev_key}:{sym_u}")
+            keys.append(f"xtl:price:{sym_u}")
+
+            for k in keys:
+                try:
+                    v = R.get(k)
+                except Exception:
+                    v = None
+                if not v:
+                    continue
+
+                if isinstance(v, (bytes, bytearray)):
+                    try:
+                        v = v.decode("utf-8", "ignore")
+                    except Exception:
+                        v = str(v)
+
+                if isinstance(v, str) and v.strip().startswith("{"):
+                    try:
+                        import json
+                        obj = json.loads(v)
+                        px = obj.get("price")
+                        ts = obj.get("ts_ms")
+                        px_f = float(px) if px is not None else None
+                        ts_i = int(ts) if ts is not None else None
+                        return (px_f, ts_i)
+                    except Exception:
+                        pass
+
+                try:
+                    return (float(v), None)
+                except Exception:
+                    continue
+
+        except Exception:
+            return (None, None)
+
+        return (None, None)
+
+    def _bar_cache_key(sym_u_: str, tf_: str, now_ms_: int, broker_off_min_: int) -> tuple[int, int, str]:
+        tf_ms_ = TF_MS_LOCAL.get(tf_, 60 * 60_000)
+        off_ms = int(broker_off_min_) * 60_000
+        slot0_ms = ((now_ms_ + off_ms) // tf_ms_) * tf_ms_ - off_ms
+        last_close_ms = int(slot0_ms)
+        last_open_ms = int(slot0_ms - tf_ms_)
+        ck = f"xtl:pred:bar:{tf_}:{sym_u_}:{last_close_ms}"
+        return last_open_ms, last_close_ms, ck
+
+    def _read_lastrow(sym_u_: str) -> dict | None:
+        try:
+            import json
+            raw = R.get(ROW_LAST_KEY.format(tf=tfu, sym=sym_u_))
+            if not raw:
+                return None
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "ignore")
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def _write_lastrow(sym_u_: str, row: dict, ttl_sec: int = 7 * 24 * 3600) -> None:
+        try:
+            import json
+            R.setex(ROW_LAST_KEY.format(tf=tfu, sym=sym_u_), ttl_sec, json.dumps(row, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _mk_row(
+        sym_u: str,
+        ok: bool,
+        reason: str | None,
+        price_px: float | None,
+        price_ts_ms: int | None,
+        broker_off_min: int,
+        feed_last_ts_ms: int,
+        frozen: bool,
+        p_up: float | None,
+        expected_move_pct: float | None,
+        target_price: float | None,
+        decision: str | None,
+        confidence: str | None,
+        label: str | None,
+        score: float | None,
+        basis_close: float | None,
+        basis_source: str,
+        bar_open_ms: int | None,
+        bar_close_ms: int | None,
+        reasons: list[str] | None,
+        macro_reasons: list[str] | None = None,
+    ) -> dict:
+        structure_reason = None
+        try:
+            rr = reasons or []
+            if isinstance(rr, list) and rr:
+                structure_reason = str(rr[0])[:120]
+        except Exception:
+            structure_reason = None
+
+        legacy_reasons = [structure_reason] if structure_reason else []
+
+        return {
+            "symbol": sym_u,
+            "tf": tfu,
+
+            "price": float(price_px) if isinstance(price_px, (int, float)) else None,
+            "price_ts_ms": price_ts_ms,
+            "price_source": "live" if isinstance(price_px, (int, float)) else "na",
+
+            "ok": bool(ok),
+            "reason": reason,
+            "p_up": float(p_up) if isinstance(p_up, (int, float)) else 0.5,
+            "prob_up": float(p_up) if isinstance(p_up, (int, float)) else 0.5,
+            "expected_move_pct": float(expected_move_pct) if isinstance(expected_move_pct, (int, float)) else 0.0,
+            "target_price": float(target_price) if isinstance(target_price, (int, float)) else None,
+            "decision": decision or ("ABSTAIN" if not ok else "ABSTAIN"),
+            "confidence": confidence or ("low" if not ok else "low"),
+            "label": label or ("Unavailable" if not ok else "Neutral"),
+            "score": float(score) if isinstance(score, (int, float)) else 0.0,
+
+            "frozen": bool(frozen),
+            "feed_last_ts_ms": int(feed_last_ts_ms) if isinstance(feed_last_ts_ms, (int, float)) else 0,
+            "server_now_ms": now_ms,
+            "resp_ts_ms": now_ms,
+            "broker_tz_offset_min": int(broker_off_min),
+
+            "basis_close": float(basis_close) if isinstance(basis_close, (int, float)) else None,
+            "basis_source": basis_source,
+
+            "bar_open_ms": bar_open_ms,
+            "bar_close_ms": bar_close_ms,
+
+            "reasons": legacy_reasons,
+            "structure_reason": structure_reason,
+            "macro_reasons": macro_reasons if isinstance(macro_reasons, list) else [],
+        }
+
+    rows: list[dict] = []
+
+    # ---------------- MAIN LOOP ----------------
+    for sym in syms:
+        sym_u = sym.upper().strip()
+
+        live_px, live_ts_ms = _read_live_price_with_ts(sym_u)
+
+        if tfu == "M15":
+            row = _mk_row(
+                sym_u=sym_u,
+                ok=False,
+                reason="model_not_trained",
+                price_px=live_px,
+                price_ts_ms=live_ts_ms,
+                broker_off_min=0,
+                feed_last_ts_ms=0,
+                frozen=False,
+                p_up=0.5,
+                expected_move_pct=0.0,
+                target_price=None,
+                decision="ABSTAIN",
+                confidence="low",
+                label="Unavailable",
+                score=0.0,
+                basis_close=None,
+                basis_source="na",
+                bar_open_ms=None,
+                bar_close_ms=None,
+                reasons=["model_not_trained"],
+            )
+            rows.append(row)
+            _write_lastrow(sym_u, row)
+            continue
+
+        if tfu == "H4" and not ENABLE_H4_MODEL:
+            row = _mk_row(
+                sym_u=sym_u,
+                ok=False,
+                reason="h4_disabled",
+                price_px=live_px,
+                price_ts_ms=live_ts_ms,
+                broker_off_min=0,
+                feed_last_ts_ms=0,
+                frozen=False,
+                p_up=0.5,
+                expected_move_pct=0.0,
+                target_price=None,
+                decision="ABSTAIN",
+                confidence="low",
+                label="Unavailable",
+                score=0.0,
+                basis_close=None,
+                basis_source="na",
+                bar_open_ms=None,
+                bar_close_ms=None,
+                reasons=["h4_disabled"],
+                macro_reasons=[],
+            )
+            rows.append(row)
+            _write_lastrow(sym_u, row)
+            continue
+
+        snap, broker = _read_freshest_snap_for_user_or_any(user_id, sym_u, tfu)
+        bars_tf = (snap or {}).get("bars") or []
+        try:
+            snap_m1, _b1 = _read_freshest_snap_for_user_or_any(user_id, sym_u, "M1")
         except Exception:
             snap_m1 = None
-
         bars_m1 = (snap_m1 or {}).get("bars") or []
-        for b in reversed(bars_m1):
-            c = b.get("c")
-            if isinstance(c, (int, float)):
-                last_price_m1 = float(c)
-                break
 
-        last_close = None
-        if isinstance(pr_h1.get("lastClose"), (int, float)):
-            last_close = float(pr_h1["lastClose"])
-        elif isinstance(pr_h4.get("lastClose"), (int, float)):
-            last_close = float(pr_h4["lastClose"])
-        elif isinstance(last_closed, dict) and isinstance(last_closed.get("c"), (int, float)):
-            last_close = float(last_closed["c"])
-
-        price_for_targets = last_price_m1 if isinstance(last_price_m1, (int, float)) else last_close
-
-        # broker tz for horizon timestamps
-        off_min = 0
+        broker_off_min = 0
         try:
-            off_min = int((broker or {}).get("tz_offset_min") or 0)
+            if isinstance(broker, dict):
+                broker_off_min = int(broker.get("tz_offset_min") or broker.get("broker_tz_offset_min") or 0)
         except Exception:
-            off_min = 0
+            broker_off_min = 0
 
-        target_close_ts_h1 = _next_boundary_ms(60 * 60, now_ms, off_min)
-        target_close_ts_4h = _next_boundary_ms(4 * 60 * 60, now_ms, off_min)
-        # dynamic target close based on TTH-selected horizon
-        target_close_ts_dyn = _next_boundary_ms(int(horizon_min) * 60, now_ms, off_min)
+        tf_last_open_ms = _snap_last_closed_open_ts_ms(bars_tf, tf_ms, now_ms)
+        m1_last_open_ms = _snap_last_closed_open_ts_ms(bars_m1, 60_000, now_ms)
 
-        # --- D) build expected moves + targets ----------------------------
-        p_up_h1 = _safe_p_up(pr_h1, 0.5)
-        p_up_h4 = _safe_p_up(pr_h4, p_up_h1)
+        feed_last_ts_ms = 0
+        for x in (tf_last_open_ms, m1_last_open_ms):
+            if x is not None:
+                try:
+                    feed_last_ts_ms = max(feed_last_ts_ms, int(x))
+                except Exception:
+                    pass
 
-        mag_pct_h1 = _safe_move_pct(pr_h1)
-        mag_pct_h4 = _safe_move_pct(pr_h4)
+        feed_is_stale = (feed_last_ts_ms <= 0) or ((now_ms - feed_last_ts_ms) > STALE_MS)
 
-        direction_sign_h1 = 1.0 if p_up_h1 >= 0.5 else -1.0
-        direction_sign_h4 = 1.0 if p_up_h4 >= 0.5 else -1.0
+        if feed_is_stale:
+            cached = _read_lastrow(sym_u)
+            if isinstance(cached, dict) and (cached.get("symbol") or "").upper() == sym_u and cached.get("tf") == tfu:
+                cached2 = dict(cached)
+                cached2["frozen"] = True
+                cached2["reason"] = cached2.get("reason") or "feed_stale"
+                cached2["feed_last_ts_ms"] = int(feed_last_ts_ms) if feed_last_ts_ms else 0
+                cached2["resp_ts_ms"] = now_ms
+                cached2["server_now_ms"] = now_ms
+                cached2["price"] = float(live_px) if isinstance(live_px, (int, float)) else None
+                cached2["price_ts_ms"] = live_ts_ms
+                cached2["price_source"] = "live" if isinstance(live_px, (int, float)) else "na"
+                rows.append(cached2)
+                continue
 
-        signed_pct_1h = mag_pct_h1 * direction_sign_h1
-        signed_pct_4h = mag_pct_h4 * direction_sign_h4
+            row = _mk_row(
+                sym_u=sym_u,
+                ok=False,
+                reason="feed_stale",
+                price_px=live_px,
+                price_ts_ms=live_ts_ms,
+                broker_off_min=broker_off_min,
+                feed_last_ts_ms=feed_last_ts_ms,
+                frozen=True,
+                p_up=0.5,
+                expected_move_pct=0.0,
+                target_price=None,
+                decision="ABSTAIN",
+                confidence="low",
+                label="Unavailable",
+                score=0.0,
+                basis_close=None,
+                basis_source="na",
+                bar_open_ms=None,
+                bar_close_ms=None,
+                reasons=["feed_stale"],
+                macro_reasons=_macro_chips_for_symbol(sym_u, macro, None, None),
+            )
+            rows.append(row)
+            _write_lastrow(sym_u, row)
+            continue
 
-        decimals = _price_decimals(sym)
+        bar_open_ms, bar_close_ms, bar_ck = _bar_cache_key(sym_u, tfu, now_ms, broker_off_min)
 
+        pr: dict = {"ok": False, "reason": "not_loaded"}
         try:
-            expected_move_pct_1h = round(float(signed_pct_1h), 2)
+            import json
+            raw = R.get(bar_ck)
+            if raw:
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", "ignore")
+                tmp = json.loads(raw)
+                if isinstance(tmp, dict):
+                    pr = tmp
         except Exception:
-            expected_move_pct_1h = 0.0
+            pass
 
-        try:
-            expected_move_pct_4h = round(float(signed_pct_4h), 2)
-        except Exception:
-            expected_move_pct_4h = 0.0
+        if not bool(pr.get("ok", False)):
+            if tfu == "H1":
+                if callable(predict_next_hour):
+                    try:
+                        pr = predict_next_hour(sym_u, now_frames=now_frames)  # type: ignore[arg-type]
+                    except Exception as e:
+                        log.exception("[predict_all] predict_next_hour EXC sym=%s", sym_u)
+                        pr = {"ok": False, "reason": "infer_exc_h1", "detail": str(e)}
+                else:
+                    pr = {"ok": False, "reason": "infer_rt_missing_h1"}
 
-        target_price_1h = None
-        target_price_4h = None
-        if isinstance(price_for_targets, (int, float)):
+            elif tfu == "H4":
+                if callable(predict_next_4h):
+                    try:
+                        pr = predict_next_4h(sym_u, now_frames=now_frames)  # type: ignore[arg-type]
+                    except Exception as e:
+                        log.exception("[predict_all] predict_next_4h EXC sym=%s", sym_u)
+                        pr = {"ok": False, "reason": "infer_exc_h4", "detail": str(e)}
+                else:
+                    pr = {"ok": False, "reason": "infer_rt_missing_h4"}
+
             try:
-                target_price_1h = round(float(price_for_targets) * (1.0 + expected_move_pct_1h / 100.0), decimals)
+                import json
+                if isinstance(pr, dict) and pr.get("ok"):
+                    pr = {**pr, "bar_open_ms": bar_open_ms, "bar_close_ms": bar_close_ms}
+                    R.setex(bar_ck, 3 * 24 * 3600, json.dumps(pr, ensure_ascii=False))
             except Exception:
-                target_price_1h = None
-            try:
-                target_price_4h = round(float(price_for_targets) * (1.0 + expected_move_pct_4h / 100.0), decimals)
-            except Exception:
-                target_price_4h = None
+                pass
 
-        # --- E) structure scores (tech-only) ------------------------------
+        if not isinstance(pr, dict):
+            pr = {"ok": False, "reason": "infer_not_dict"}
+
+        ok = bool(pr.get("ok", False))
+
+        try:
+            if not ok and _is_transient_insufficient(pr):
+                lg = _rg_lastgood(sym_u, tfu)
+                if isinstance(lg, dict) and lg.get("ok"):
+                    pr = {**lg, "stale": True, "stale_reason": pr.get("reason")}
+                    ok = True
+        except Exception:
+            pass
+
+        try:
+            if ok:
+                _rs_lastgood(sym_u, tfu, pr, ttl_sec=3600)
+        except Exception:
+            pass
+
+        p_up = _safe_p_up(pr, 0.5)
+        mag_pct = _safe_move_pct(pr)
+
+        direction_sign = 1.0 if p_up >= 0.5 else -1.0
+        signed_pct = mag_pct * direction_sign
+        try:
+            expected_move_pct = round(float(signed_pct), 2)
+        except Exception:
+            expected_move_pct = 0.0
+
+        conf = _conf_from_p(p_up)
+
+        basis_close_tf = None
+        try:
+            if isinstance(pr.get("lastClose"), (int, float)):
+                basis_close_tf = float(pr["lastClose"])
+        except Exception:
+            basis_close_tf = None
+
+        if not isinstance(basis_close_tf, (int, float)):
+            basis_close_tf = _last_closed_close_price(bars_tf, tf_ms, now_ms)
+
+        basis_close_m1 = _last_closed_close_price(bars_m1, 60_000, now_ms)
+
+        if isinstance(basis_close_tf, (int, float)):
+            basis_price = float(basis_close_tf)
+            basis_source = "tf_close"
+        elif isinstance(basis_close_m1, (int, float)):
+            basis_price = float(basis_close_m1)
+            basis_source = "m1_close"
+        else:
+            basis_price = None
+            basis_source = "na"
+
+        target_price = None
+        if isinstance(basis_price, (int, float)):
+            decimals = _price_decimals(sym_u)
+            try:
+                target_price = round(float(basis_price) * (1.0 + expected_move_pct / 100.0), decimals)
+            except Exception:
+                target_price = None
+
+        base_reasons: list[str] = []
+        r_raw = pr.get("reasons") or pr.get("reason")
+        if isinstance(r_raw, list):
+            base_reasons = [str(x) for x in r_raw if x]
+        elif isinstance(r_raw, str) and r_raw:
+            base_reasons = [str(r_raw)]
+
+        extra: Dict[str, Any] = {
+            "base_reasons": base_reasons,
+            "feat_rvol15": pr.get("rvol15"),
+            "feat_usd_basket": pr.get("usd_basket_d1h_pct"),
+            "tf_scope": tfu,
+        }
+
+        # Macro fields into extra (dict or MacroSnapshot safe)
+        try:
+            def _mg(x, k):
+                return x.get(k) if isinstance(x, dict) else getattr(x, k, None)
+
+            extra["macro_dxy_z"] = _mg(macro, "dxy_z")
+            extra["macro_yield_z"] = _mg(macro, "us10y_z")
+            extra["macro_usd_rate_z"] = _mg(macro, "usd_rate_z") or _mg(macro, "usd_short_rate_z")
+            extra["macro_vix_z"] = _mg(macro, "vix_z")
+        except Exception:
+            pass
+
         st_thr = 0.35
         ht_thr = 0.70
-        st_tech = max(min((signed_pct_1h / st_thr) if st_thr else 0.0, 1.0), -1.0)
-        ht_tech = max(min((signed_pct_4h / ht_thr) if ht_thr else 0.0, 1.0), -1.0)
+        tech = signed_pct / (st_thr if tfu == "H1" else ht_thr if tfu == "H4" else 1.0)
+        try:
+            tech = max(min(float(tech), 1.0), -1.0)
+        except Exception:
+            tech = 0.0
 
-        # --- F) reasons + weighted status ---------------------------------
-        base_reasons_h1: list[str] = []
-        r_raw = pr_h1.get("reasons") or pr_h1.get("reason")
-        if isinstance(r_raw, list):
-            base_reasons_h1 = [str(x) for x in r_raw if x]
-        elif isinstance(r_raw, str) and r_raw:
-            base_reasons_h1 = [str(r_raw)]
+        label_w = None
+        combined_score = None
+        try:
+            combined_score, label_w, *_ = _compute_weighted_status(sym_u, tech, p_up, extra)
+        except Exception:
+            combined_score = tech
+            label_w = _score_to_label(tech)
 
-        base_reasons_h4: list[str] = []
-        r_raw = pr_h4.get("reasons") or pr_h4.get("reason")
-        if isinstance(r_raw, list):
-            base_reasons_h4 = [str(x) for x in r_raw if x]
-        elif isinstance(r_raw, str) and r_raw:
-            base_reasons_h4 = [str(r_raw)]
+        if not label_w:
+            label_w = _score_to_label(tech)
 
-        extra_h1: Dict[str, Any] = {
-            "base_reasons": base_reasons_h1,
-            "feat_rvol15": pr_h1.get("rvol15"),
-            "feat_usd_basket": pr_h1.get("usd_basket_d1h_pct"),
-            "tf_scope": "H1",
-        }
-        extra_h4: Dict[str, Any] = {
-            "base_reasons": base_reasons_h4,
-            "feat_rvol15": pr_h4.get("rvol15"),
-            "feat_usd_basket": pr_h4.get("usd_basket_d1h_pct"),
-            "tf_scope": "H4",
-        }
-        if isinstance(macro, dict):
-            for d in (extra_h1, extra_h4):
-                d["macro_dxy_z"] = macro.get("dxy_z")
-                d["macro_yield_z"] = macro.get("us10y_z")
-                d["macro_usd_rate_z"] = macro.get("usd_short_rate_z")
-                d["macro_vix_z"] = macro.get("vix_z")
+        decision = "BUY" if p_up >= 0.5 else "SELL"
 
-        st_combined, st_label_w, st_t, st_m, st_macro = _compute_weighted_status(sym, st_tech, p_up_h1, extra_h1)
-        ht_combined, ht_label_w, ht_t, ht_m, ht_macro = _compute_weighted_status(sym, ht_tech, p_up_h4, extra_h4)
-
-        if not st_label_w:
-            st_label_w = _score_to_label(st_tech)
-        if not ht_label_w:
-            ht_label_w = _score_to_label(ht_tech)
-
-        # headline selection
-        if ENABLE_H4_MODEL and ok_h4:
-            combined_score = ht_combined
-            combined_label = ht_label_w
-        else:
-            combined_score = st_combined
-            combined_label = st_label_w
-
-        label = combined_label
-        if label in ("Strong Bullish", "Bullish"):
-            decision = "BUY"
-        elif label in ("Strong Bearish", "Bearish"):
-            decision = "SELL"
-        else:
-            decision = "ABSTAIN"
-
-        spread = abs(p_up_h1 - 0.5)
-        if spread >= 0.20:
-            confidence = "high"
-        elif spread >= 0.05:
-            confidence = "medium"
-        else:
-            confidence = "low"
-
-        row: Dict[str, Any] = {
-            "symbol": sym,
-
-            "label": label,
-            "score": float(combined_score),
-            "decision": decision,
-            "confidence": confidence,
-
-            "p_up": p_up_h1,
-            "prob_up": p_up_h1,
-            "prob_up_h1": p_up_h1,
-            "prob_up_h4": p_up_h4,
-
-            "st_trend_label": st_label_w,
-            "st_trend_score": float(st_combined),
-            "ht_trend_label": ht_label_w,
-            "ht_trend_score": float(ht_combined),
-
-            "st_tech_component": float(st_t),
-            "st_model_component": float(st_m),
-            "st_macro_component": float(st_macro),
-            "ht_tech_component": float(ht_t),
-            "ht_model_component": float(ht_m),
-            "ht_macro_component": float(ht_macro),
-
-            "expected_move_pct_1h": expected_move_pct_1h,
-            "target_price_1h": target_price_1h,
-            "expected_move_pct_4h": expected_move_pct_4h,
-            "target_price_4h": target_price_4h,
-            "basis_price_1h": price_for_targets,
-
-            "horizon": f"{int(horizon_min)}m",
-            "target_close_ts": target_close_ts_dyn,
-            "update_tf": tfu,
-            "server_now_ms": now_ms,
-            "updated_broker_ts": now_ms,
-
-            # dynamic horizon (from TTH) for UI expiry + future logic
-            "horizon_min": int(horizon_min) if horizon_min is not None else 60,
-            "tth_p_dir": p_dir,
-            "tth_raw": tth_raw,
-
-            "raw": pr_h1,
-            "raw_h4": pr_h4,
-        }
-        # --- UI canonical fields (model-driven, no _1h suffix) ---
-        row["basis_price"] = price_for_targets
-        row["target_price"] = target_price_1h
-        row["expected_move_pct"] = expected_move_pct_1h
-        row["model_source"] = "ml" if ok_h1 else "na"
-
-
-        if not ok_h1:
-            row.setdefault("reason_h1_error", pr_h1.get("reason", "model_error_h1"))
-        if not ok_h4:
-            row.setdefault("reason_h4_error", pr_h4.get("reason", "model_error_h4"))
-
-        reasons_h1 = _build_reasons(sym, st_label_w, p_up_h1, extra_h1)
-        reasons_h4 = _build_reasons(sym, ht_label_w, p_up_h4, extra_h4)
-
-        if reasons_h1:
-            row["reasons_h1"] = reasons_h1
-        if reasons_h4:
-            row["reasons_h4"] = reasons_h4
-        row["reasons"] = reasons_h1 or reasons_h4 or []
-
-        # broker/device meta (if available)
-        if isinstance(broker, dict):
-            if "tz_offset_min" in broker:
-                row["broker_tz_offset_min"] = broker.get("tz_offset_min")
-                row["tz_offset_min"] = broker.get("tz_offset_min")
-            if "tz_abbr" in broker:
-                row["broker_tz_abbr"] = broker.get("tz_abbr")
-        if isinstance(snap, dict) and "using_device" in snap:
-            row["using_device"] = snap.get("using_device")
+        row = _mk_row(
+            sym_u=sym_u,
+            ok=ok,
+            reason=None if ok else str(pr.get("reason", "model_error")),
+            price_px=live_px,
+            price_ts_ms=live_ts_ms,
+            broker_off_min=broker_off_min,
+            feed_last_ts_ms=feed_last_ts_ms,
+            frozen=False,
+            p_up=p_up,
+            expected_move_pct=expected_move_pct if ok else 0.0,
+            target_price=target_price if ok else None,
+            decision=decision if ok else "ABSTAIN",
+            confidence=conf if ok else "low",
+            label=label_w if ok else "Unavailable",
+            score=float(combined_score) if combined_score is not None else 0.0,
+            basis_close=float(basis_price) if isinstance(basis_price, (int, float)) else None,
+            basis_source=basis_source,
+            bar_open_ms=bar_open_ms,
+            bar_close_ms=bar_close_ms,
+            reasons=_build_reasons(sym_u, label_w, p_up, extra) if ok else base_reasons,
+            macro_reasons=_macro_chips_for_symbol(sym_u, macro, p_up, extra) if ok else [],
+        )
 
         rows.append(row)
+        _write_lastrow(sym_u, row)
 
-    return {"ok": True, "tf": tfu, "rows": rows}
+    return {"ok": True, "tf": tfu, "server_now_ms": now_ms, "rows": rows}
+
 
 def _redis_get_text(key: str) -> str | None:
     try:
@@ -3012,21 +8024,33 @@ def build_commentary_payload(row: dict) -> dict:
 def trend_commentary(
     symbol: str,
     tf: str = "H1",
-    user = Depends(require_user_relaxed),
+    user = Depends(require_auth_optional),
 ):
-    
     """
     AI commentary for ML forecast.
     Generated on-demand, cached per candle.
     """
+    # hard gate
     if os.getenv("XTL_ENABLE_COMMENTARY", "false").lower() != "true":
-         return {"ok": False, "reason": "commentary_disabled"}
-    tfu = (tf or "H1").upper()
+        return {"ok": False, "reason": "commentary_disabled"}
+
+    # validate inputs
+    tfu = (tf or "").upper().strip()
     sym_u = (symbol or "").upper().strip()
     if not sym_u:
         return {"ok": False, "reason": "missing_symbol"}
+    if tfu not in ("M15", "H1", "H4"):
+        tfu = "H1"
 
-    # Reuse existing ML prediction feed
+    # require OpenAI only here (NOT at module import)
+    if OpenAI is None:
+        return {"ok": False, "reason": "openai_not_installed"}
+
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        return {"ok": False, "reason": "openai_key_missing"}
+
+    # reuse prediction feed (your existing behavior)
     resp = predict_all(tf=tfu, symbols=sym_u, user=user)
     if not isinstance(resp, dict) or not resp.get("ok"):
         return {"ok": False, "reason": "prediction_failed"}
@@ -3039,45 +8063,62 @@ def trend_commentary(
     if not row:
         return {"ok": False, "reason": "symbol_not_found"}
 
-    cache_key = f"xtl:trend:commentary:{sym_u}:{tfu}:{row.get('target_close_ts') or 0}"
-    cached = _redis_get_text(cache_key)
-    if cached:
-        return {"ok": True, "cached": True, "commentary": cached}
+    # If ML is unavailable, do not generate commentary
+    tfs = row.get("tfs") or {}
+    h1_ok = bool((tfs.get("H1") or {}).get("ok"))
+    h4_ok = bool((tfs.get("H4") or {}).get("ok"))
+    if not (h1_ok or h4_ok):
+        return {"ok": False, "reason": "no_model_data"}
 
-    payload = build_commentary_payload(row)
+    # build strict payload (no new numbers)
+    payload = build_commentary_payload({
+        "symbol": sym_u,
+        "horizon": tfu,
+        "horizon_min": 60 if tfu == "H1" else (240 if tfu == "H4" else 15),
+
+        "decision": (tfs.get(tfu) or {}).get("decision"),
+        "label": (tfs.get(tfu) or {}).get("label"),
+        "confidence": (tfs.get(tfu) or {}).get("confidence"),
+
+        "basis_price_1h": row.get("basis_price"),
+        "target_price_1h": (tfs.get(tfu) or {}).get("target_price"),
+        "expected_move_pct_1h": (tfs.get(tfu) or {}).get("expected_move_pct"),
+
+        "st_trend_label": (tfs.get("H1") or {}).get("label"),
+        "ht_trend_label": (tfs.get("H4") or {}).get("label"),
+
+        "reasons_h1": row.get("reasons_h1") or [],
+        "reasons_h4": row.get("reasons_h4") or [],
+
+        "updated_broker_ts": row.get("feed_last_ts_ms"),
+        "broker_tz_offset_min": row.get("broker_tz_offset_min"),
+        "tth_raw": None,
+        "tth_p_dir": None,
+        "target_close_ts": None,
+    })
+
+    # call OpenAI
     try:
-        txt = call_llm_commentary(payload)
-        if not txt:
-            txt = "Commentary unavailable for this candle."
+        client = OpenAI(api_key=api_key)
+        # (keep your existing model/prompt; below is just a safe skeleton)
+        out = client.responses.create(
+            model=os.getenv("XTL_COMMENTARY_MODEL", "gpt-4.1-mini"),
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a trading assistant. "
+                        "Only narrate the provided JSON. "
+                        "Do NOT invent numbers, prices, probabilities, or targets."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, separators=(",", ":"), ensure_ascii=False)},
+            ],
+        )
+        text = getattr(out, "output_text", None) or ""
+        return {"ok": True, "symbol": sym_u, "tf": tfu, "commentary": text, "payload": payload}
     except Exception as e:
-        txt = f"Commentary unavailable ({type(e).__name__})."
-
-
-    now_ms = int(time.time() * 1000)
-
-    target_close_ts = row.get("target_close_ts")
-    buffer_sec = 10 * 60  # 10 min safety buffer
-
-    if isinstance(target_close_ts, (int, float)) and target_close_ts > now_ms:
-        ttl_sec = int((target_close_ts - now_ms) / 1000) + buffer_sec
-    else:
-        # fallback: short TTL to avoid stale cache
-        ttl_sec = 15 * 60
-
-    _redis_set_text(cache_key, txt, ttl_sec=ttl_sec)
-
-    return {
-        "ok": True,
-        "cached": False,
-        "commentary": txt,
-        "meta": {
-            "symbol": sym_u,
-            "tf": tfu,
-            "target_close_ts": row.get("target_close_ts"),
-            "ttl_sec": ttl_sec
-        },
-    }
-
+        return {"ok": False, "reason": "openai_error", "detail": str(e)}
 
 def call_llm_commentary(payload: dict) -> str:
     """
@@ -3112,16 +8153,20 @@ def opportunities_history(limit: int = 100):
     return {"ok": True, "rows": []}
 
 
+
+
 @router.get("/opportunities")
 def trend_opportunities(
+    request: Request,
     tf: str = "M15",
     symbols: str = "XAUUSD,EURUSD,USDJPY,GBPUSD,USDCAD,USDCHF",
     device: str | None = Query(None),
-    x_device_id: str | None = Header(None, convert_underscores=False),
+    x_device_id: str | None = Header(None, alias="X-Device-Id"),
     loose: bool = Query(False),
     debug_force: bool = Query(False),
     debug_top: int = Query(0, ge=0, le=10),
     debug_persist: bool = Query(False),
+    debug_gate: int = Query(0),
     user=Depends(require_auth_optional),
 ):
     """
@@ -3133,9 +8178,33 @@ def trend_opportunities(
     - No "bias flip" auto-expire here (to avoid 5-10 min flip noise).
     - Weekend: do NOT create new opps.
     """
+     
+    from collections import defaultdict
+    
 
+
+    gate_stats = defaultdict(int)
     tfu = (tf or "M15").upper()
     now_ms = int(_time.time() * 1000)
+    # ---- debug_gate: normalize ONCE (do not re-parse later) ----
+    try:
+        debug_gate_on = bool(int(debug_gate))
+    except Exception:
+        # allow "true/yes/on" style if someone passes it weirdly
+        try:
+            debug_gate_on = str(debug_gate).strip().lower() in ("1", "true", "t", "yes", "y", "on")
+        except Exception:
+            debug_gate_on = False
+
+
+    # -------------------------------------------------
+    # defaults so debug_gate/debug_force never 500s
+    # -------------------------------------------------
+    cache_key: str | None = None
+    cache_ttl_s: int = 0
+    inflight_lock_key: str | None = None
+    inflight_got_lock: bool = False
+
 
     # ---------- helpers ----------
     def _sym_list(s: str) -> list[str]:
@@ -3146,15 +8215,7 @@ def trend_opportunities(
                 out.append(xx)
         return out
 
-    def _json_load_maybe(x):
-        if x is None:
-            return None
-        if isinstance(x, (bytes, bytearray)):
-            x = x.decode("utf-8", "ignore")
-        try:
-            return json.loads(x)
-        except Exception:
-            return x
+   
 
     def _redis_hash_to_dict(h: dict) -> dict:
         out = {}
@@ -3164,60 +8225,273 @@ def trend_opportunities(
             out[kk] = _json_load_maybe(vv)
         return out
 
-    def _json_load_twice(x):
-        y = _json_load_maybe(x)
-        if isinstance(y, str):
-            y2 = _json_load_maybe(y)
-            return y2
-        return y
+    
 
 
+    
     # ---------- auth gate (entry logic requires login) ----------
     def _uid_from_user(u):
         try:
-           return getattr(u, "id", None) or getattr(u, "user_id", None) or getattr(u, "uid", None)
+           if u is None:
+               return None
+           # dict user (common)
+           if isinstance(u, dict):
+               return u.get("id") or u.get("user_id") or u.get("uid") or u.get("sub")
+           # object user
+           return (
+               getattr(u, "id", None)
+               or getattr(u, "user_id", None)
+               or getattr(u, "uid", None)
+               or getattr(u, "sub", None)
+           )
         except Exception:
            return None
 
     uid_for_entry = _uid_from_user(user)
-    auth_ok = bool(uid_for_entry)
+    # -------------------------------------------------
+    # -------------------------------------------------
+    # FIX 2: Redis snapshot cache (2s TTL) to avoid 504
+    # + anti-stampede lock (prevents concurrent predict_all storms)
+    # -------------------------------------------------
+    cache_ttl_s = 2  # tiny TTL keeps it fresh but collapses burst polling
+    inflight_lock_key = None
+    inflight_got_lock = False
+    sym_key = ",".join(_sym_list(symbols))
+    dev_key = (x_device_id or device or "").strip() or "nodev"
+    uid_key = str(uid_for_entry or "nouid")
+    cache_key = f"xtl:oppt:cache:{tfu}:{uid_key}:{dev_key}:{sym_key}"
+    # ---- DEBUG: bypass cache so gate diagnostics are always live ----
+    if debug_gate or debug_force or (debug_top and debug_top > 0) or debug_persist:
+        cache_key = None
+        cache_ttl_s = 0
 
-    # ---------- load CLOSED M1 candles from user snapshot (agent pushed) ----------
+    # 1) fast-path: serve cache immediately
+    if cache_key and (not (debug_force or debug_gate or loose)):
+        try:
+           cached = R.get(cache_key)
+           if cached:
+               js = _json_load_twice(cached)
+               if isinstance(js, dict) and js.get("ok"):
+                   js["cached"] = True
+                   js["cache_ttl_s"] = cache_ttl_s
+                   return js
+        except Exception:
+           pass
+
+        # 2) anti-stampede: only one request computes for ~6s
+        inflight_lock_key = cache_key + ":lock"
+        try:
+           inflight_got_lock = bool(R.set(inflight_lock_key, "1", nx=True, ex=6))
+        except Exception:
+           inflight_got_lock = False
+
+        # If we didn't get lock, someone else is computing → serve stale if available
+        if not inflight_got_lock:
+            try:
+                cached2 = R.get(cache_key)
+                if cached2:
+                    js2 = _json_load_twice(cached2)
+                    if isinstance(js2, dict) and js2.get("ok"):
+                        js2["cached"] = True
+                        js2["cache_ttl_s"] = cache_ttl_s
+                        js2["cache_note"] = "served_stale_while_inflight"
+                        return js2
+            except Exception:
+                pass
+
+
+    
+    # Allow entry logic if user is logged-in OR device id header is present
+    # ------------------------------------------------------------
+    # Device resolution (single source of truth)
+    # ------------------------------------------------------------
+    # We may get device id from multiple places:
+    #   - request header X-Device-Id (preferred)
+    #   - query param / injected x_device_id
+    #   - existing "device" variable (older flows)
+    #
+    # Goal:
+    #   - Always end up with ONE effective_device and use it everywhere
+    #     (predict_all, snapshot reads, zone gate).
+    # ------------------------------------------------------------
+    pinned_device = ""
+    try:
+        pinned_device = (getattr(user, "pinned_device", None) or getattr(user, "pinnedDevice", None) or "").strip()
+    except Exception:
+        pinned_device = ""
+    pinned_device = (pinned_device or "").strip()
+    device = (device or "").strip()
+
+    # Prefer FastAPI-parsed header param, but fallback to raw headers too
+    try:
+        _hdr_raw = request.headers.get("x-device-id") or request.headers.get("X-Device-Id")
+    except Exception:
+        _hdr_raw = None
+    x_device_id_hdr = (x_device_id or _hdr_raw or "").strip()
+
+
+    resolved_device = (x_device_id_hdr or pinned_device or device).strip()
+    effective_device = resolved_device
+    dev_for_gate = resolved_device
+    
+    if effective_device:
+        x_device_id = x_device_id_hdr or effective_device
+        device = device or effective_device
+        pinned_device = pinned_device or effective_device
+
+    # --- HARD FALLBACK: auto-select an online device if none is pinned ---
+    # Step 2: HARD fallback only if still none
+    if not resolved_device and R is not None:
+        try:
+            best_dev = None
+            best_hb = -1
+            for key in R.scan_iter("device:dev_*"):
+                try:
+                    h = R.hgetall(key) or {}
+                except Exception:
+                    h = {}
+                if not h:
+                    continue
+
+                status = h.get(b"status") or h.get("status")
+                if isinstance(status, (bytes, bytearray)):
+                    status = status.decode("utf-8", "ignore")
+                if (status or "").strip().lower() != "online":
+                    continue
+
+                hb = h.get(b"last_heartbeat_ms") or h.get("last_heartbeat_ms")
+                if isinstance(hb, (bytes, bytearray)):
+                    hb = hb.decode("utf-8", "ignore").strip()
+                try:
+                    hb_i = int(hb) if hb not in (None, "") else -1
+                except Exception:
+                    hb_i = -1
+
+                key_s = key.decode("utf-8", "ignore") if isinstance(key, (bytes, bytearray)) else str(key)
+                dev_id = key_s.replace("device:", "").strip()
+
+                if hb_i > best_hb:
+                    best_hb = hb_i
+                    best_dev = dev_id
+
+            if best_dev:
+                resolved_device = best_dev
+        except Exception:
+            pass
+
+    # Step 3: propagate resolved device consistently everywhere downstream
+    effective_device = resolved_device
+    dev_for_gate = resolved_device
+
+    if effective_device:
+        # Ensure downstream calls all see the same resolved value
+        x_device_id = effective_device
+        device = effective_device
+        pinned_device = pinned_device or effective_device
+
+    auth_ok = bool(uid_for_entry) or bool(effective_device)
+    # --- DEBUG BYPASS: allow zone-gate evaluation using X-Device-Id even without login ---
+    # This does NOT place orders; it only computes and returns entry_gate metadata.
+    if (not auth_ok) and (debug_gate or debug_force) and x_device_id_hdr:
+        effective_device = x_device_id_hdr
+        dev_for_gate = x_device_id_hdr
+        x_device_id = x_device_id_hdr
+        device = x_device_id_hdr
+        pinned_device = pinned_device or x_device_id_hdr
+        auth_ok = True
+        if oppt_dev_dbg is not None:
+            oppt_dev_dbg["dbg_auth_bypass"] = True
+
+
+    print(
+        "[OPPT_AUTH]",
+        {
+            "uid_for_entry": uid_for_entry,
+            "pinned_device": pinned_device,
+            "x_device_id_hdr": x_device_id_hdr,
+            "device_qs": device,
+            "effective_device": effective_device,
+            "dev_for_gate": dev_for_gate,
+            "auth_ok": auth_ok,
+        },
+    )
+
+    # Build debug dict here; attach to rows later (row doesn't exist yet)
+    oppt_dev_dbg = None
+
+    if debug_gate_on:
+        # show real header values (previous code accidentally echoed x_device_id twice)
+        try:
+            hdr_l = request.headers.get("x-device-id")
+            hdr_u = request.headers.get("X-Device-Id")
+            hdr_keys_head = list(request.headers.keys())[:12]
+        except Exception:
+            hdr_l = None
+            hdr_u = None
+            hdr_keys_head = None
+
+        try:
+            scope_has_x_device_id = any(
+                (k.decode("utf-8", "ignore").lower() == "x-device-id")
+                for (k, _v) in (request.scope.get("headers") or [])
+                if isinstance(k, (bytes, bytearray))
+            )
+        except Exception:
+            scope_has_x_device_id = None
+
+        oppt_dev_dbg = {
+             "dbg_x_device_id_hdr": x_device_id_hdr,
+             "dbg_hdr_x_device_id_l": hdr_l,
+             "dbg_hdr_x_device_id_u": hdr_u,
+             "dbg_hdr_keys_head": hdr_keys_head,
+             "dbg_scope_has_x_device_id": scope_has_x_device_id,
+             "dbg_pinned_device": pinned_device,
+             "dbg_effective_device": effective_device,
+             "dbg_dev_for_gate": dev_for_gate,
+             "dbg_auth_ok": auth_ok,
+        }
+        print("[OPPT_DEV]", oppt_dev_dbg)
+    
+    
     # ---------- load CLOSED M1 candles from user snapshot (agent pushed) ----------
     def _get_closed_m1(sym: str) -> list[dict]:
         """
         Reads CLOSED M1 bars pushed by agent.
+
         Primary:
           xtl:trend:snap:{uid}:{SYMBOL}:M1
 
-        Fallback (when user snapshot missing):
+        Fallback (when user snapshot missing or uid missing):
           xtl:ohlc:snap:{device_id}:{SYMBOL}:M1
-          (and hydrate user snapshot so entry gate stays stable)
+          (and hydrate user snapshot when uid exists)
 
         Returns list of {o,h,l,c} dicts (entry_logic compatible).
         """
         try:
-            uid = _uid_from_user(user)
-            if not uid:
-                return []
-
             sym_u = (sym or "").upper().strip()
             if not sym_u:
                 return []
 
-            key_user = f"xtl:trend:snap:{uid}:{sym_u}:M1"
-            raw = R.get(key_user)
+            uid = _uid_from_user(user)
 
-            # ---------- fallback + hydrate from device M1 snapshot ----------
+            raw = None
+            key_user = None
+
+            # ----- primary: user snapshot -----
+            if uid:
+                key_user = f"xtl:trend:snap:{uid}:{sym_u}:M1"
+                raw = R.get(key_user)
+
+            # ----- fallback: device snapshot + hydrate user snapshot -----
             if not raw:
                 dev = ""
                 try:
-                    dev = (x_device_id or device or "").strip()
+                    dev = str(effective_device or x_device_id or device or "").strip()
                 except Exception:
                     dev = ""
 
-                # Prefer leader device
-                if not dev:
+                # If we have uid but no explicit dev header, try leader + registered devices
+                if (not dev) and uid:
                     try:
                         leader = _json_load_twice(R.get(f"xtl:user:{uid}:trend:leader")) or {}
                         if isinstance(leader, dict):
@@ -3232,8 +8506,8 @@ def trend_opportunities(
                     except Exception:
                         dev = ""
 
-                # Fallback to any registered device
-                if not dev:
+                # Fallback to any registered device (only if we have uid)
+                if (not dev) and uid:
                     try:
                         ds = list(R.smembers(f"xtl:user:{uid}:devices") or [])
                         if ds:
@@ -3244,19 +8518,19 @@ def trend_opportunities(
                     except Exception:
                         dev = ""
 
-                # Read device snapshot and hydrate user snapshot
                 if dev:
                     try:
                         raw2 = R.get(f"xtl:ohlc:snap:{dev}:{sym_u}:M1")
                         if raw2:
-                            try:
-                                R.setex(key_user, 3600, raw2)
-                            except Exception:
-                                pass
+                            # Hydrate user snapshot so next call hits the primary key (only if uid exists)
+                            if uid and key_user:
+                                try:
+                                    R.setex(key_user, 3600, raw2)
+                                except Exception:
+                                    pass
                             raw = raw2
                     except Exception:
                         pass
-            # ---------- end fallback + hydrate ----------
 
             js = _json_load_twice(raw) if raw else None
             if not isinstance(js, dict):
@@ -3274,12 +8548,7 @@ def trend_opportunities(
                     continue
                 try:
                     out.append(
-                        {
-                            "o": float(b["o"]),
-                            "h": float(b["h"]),
-                            "l": float(b["l"]),
-                            "c": float(b["c"]),
-                        }
+                        {"o": float(b["o"]), "h": float(b["h"]), "l": float(b["l"]), "c": float(b["c"])}
                     )
                 except Exception:
                     continue
@@ -3291,10 +8560,9 @@ def trend_opportunities(
    
 
     def _force_hydrate_m1(sym: str) -> None:
-        if not auth_ok:
-            return
+        
         try:
-           uid = _uid_from(user)
+           uid = _uid_from_user(user)
            if not uid:
                return
 
@@ -3319,7 +8587,35 @@ def trend_opportunities(
                R.setex(user_key, 3600, raw)
         except Exception:
            pass
+       
+  
+    def _price_from_ohlc_snap(raw: str) -> float | None:
+        try:
+           obj = json.loads(raw)
+        except Exception:
+           return None
 
+        bars = obj.get("bars") if isinstance(obj, dict) else None
+        if not isinstance(bars, list) or not bars:
+            return None
+
+        # Prefer last COMPLETE bar close
+        for b in reversed(bars):
+            try:
+               if bool(b.get("complete")):
+                   c = b.get("c", None)
+                   return float(c) if c is not None else None
+            except Exception:
+               continue
+
+        # Fallback: last bar close
+        try:
+           c = bars[-1].get("c", None)
+           return float(c) if c is not None else None
+        except Exception:
+           return None
+     
+    
 
     def _attach_entry_1m(row: dict) -> None:
         try:
@@ -3348,34 +8644,103 @@ def trend_opportunities(
                 row["signal"] = "WAIT"
                 row["signal_reason"] = "bad_direction"
                 return
+            # Ensure we have M1 bars in user snapshot (hydrates from leader/registered device if needed)
             _force_hydrate_m1(sym)
+
             candles = _get_closed_m1(sym)
-            if len(candles) < 8:
-                row["entry_1m"] = {"ok": False, "reason": "need_8_bars"}
-                row["signal"] = "WAIT"
-                row["signal_reason"] = "need_8_bars"
+            # ==========================================================
+            # TEMP DEBUG: FORCE ENTRY (validate TP/SL lifecycle end-to-end)
+            # Enable with env: XTL_FORCE_ENTRY=1
+            # ==========================================================
+            if os.getenv("XTL_FORCE_ENTRY", "0") == "1":
+                lp = row.get("last_price") or row.get("price") or row.get("mid")
+                try:
+                    lp = float(lp) if isinstance(lp, (int, float)) else None
+                except Exception:
+                    lp = None
+
+                row["entry_1m"] = {
+                    "ok": True,
+                    "reason": "FORCED_DEBUG",
+                    "mode": "FORCE",
+                    "entry_trigger": "CLOSE",
+                    "entry_price": lp,
+                }
+
+                row["signal"] = direction
+                row["signal_reason"] = "FORCED_DEBUG"
                 return
-            # --- TEST MODE: relax M1 entry gating so you can test BUY/SELL + target hit ---
+
+            try:
+                if candles:
+                    c_last = candles[-1].get("c") or candles[-1].get("close")
+                    if c_last is not None:
+                       row["last_price"] = float(c_last)
+            except Exception:
+                pass
+
+            # ---- NORMAL LOGIC CONTINUES BELOW ----
+            if len(candles) < 8:
+                # Try one more hydrate + read (covers race where device posted just now)
+                try:
+                    _force_hydrate_m1(sym)
+                except Exception:
+                    pass
+
+                candles = _get_closed_m1(sym)
+                if len(candles) < 8:
+                    row["entry_1m"] = {"ok": False, "reason": "need_8_bars", "bars": len(candles)}
+                    row["signal"] = "WAIT"
+                    row["signal_reason"] = "need_8_bars"
+                    return
+
+            # --- ENTRY PROFILE SWITCH ---
+            # DEFAULT is production; set XTL_ENTRY_PROFILE=TEST only when you want relaxed gating
+            active_profile = os.getenv("XTL_ENTRY_PROFILE", "DEFAULT").upper().strip()
+            if active_profile not in ("DEFAULT", "TEST"):
+                active_profile = "DEFAULT"
+
             
-            # Default behavior remains unchanged unless you pass profiles["_active"]="TEST"
+            # Base production defaults (these are "overrides" applied on top of entry_decision_m1 DEFAULT)
+            base_default_overrides = {
+                "max_age_min": 120,
+                "min_remaining_tp_frac": 0.15,
+                "max_traveled_tp_frac": 0.70,
+
+                "impulse_range_mult": 1.10,
+                "impulse_body_frac": 0.40,
+                "impulse_min_tp_frac": 0.04,
+
+                "pullback_min": 0.08,
+                "pullback_max": 0.65,
+                "pullback_reject": 0.80,
+
+                "prefer_mode": "MOMENTUM",
+                "use_break_trigger": False,
+            }
+
+            # Optional relaxed overrides for lifecycle testing
+            test_default_overrides = {
+                "max_age_min": 240,
+                "min_remaining_tp_frac": 0.05,
+                "max_traveled_tp_frac": 0.90,
+
+                "impulse_range_mult": 0.90,
+                "impulse_body_frac": 0.25,
+                "impulse_min_tp_frac": 0.01,
+
+                "pullback_min": 0.02,
+                "pullback_max": 0.80,
+                "pullback_reject": 0.95,
+
+                "prefer_mode": "MOMENTUM",
+                "use_break_trigger": False,
+            }
             profiles = {
-                "_active": "TEST",
-                "DEFAULT": {
-                    "max_age_min": 120,
-                    "min_remaining_tp_frac": 0.15,
-                    "max_traveled_tp_frac": 0.70,
+                "_active": active_profile,
+                "DEFAULT": (test_default_overrides if active_profile == "TEST" else base_default_overrides),
 
-                    "impulse_range_mult": 1.10,
-                    "impulse_body_frac": 0.40,
-                    "impulse_min_tp_frac": 0.04,
-
-                    "pullback_min": 0.08,
-                    "pullback_max": 0.65,
-                    "pullback_reject": 0.80,
-
-                    "prefer_mode": "MOMENTUM",
-                    "use_break_trigger": False,
-                },
+                # Per-symbol tweaks (apply regardless of active profile)
                 "XAUUSD": {"spread_tp_mult": 1.6, "body_spread_mult": 0.9},
                 "USDJPY": {"spread_tp_mult": 1.6, "body_spread_mult": 0.9},
                 "EURUSD": {"spread_tp_mult": 1.6, "body_spread_mult": 0.9},
@@ -3414,43 +8779,82 @@ def trend_opportunities(
           (no flip back to WAIT)
         - Freeze entry meta: entry_ts_ms, entry_price
         """
-        # If snapshot already has a frozen entry signal, honor it.
-        # This must be persisted in the snapshot (entry_triggered/entry_signal).
         # Use server_now_ms if present, else current time
         try:
             now_ms = int(row.get("server_now_ms") or 0)
         except Exception:
             now_ms = 0
+
         if now_ms <= 0:
             try:
-               now_ms = int(time.time() * 1000)
+                now_ms = int(_time.time() * 1000)
             except Exception:
-               now_ms = 0
-        try:
-           if bool(row.get("entry_triggered")):
-               sig0 = str(row.get("entry_signal") or "").upper()
-               if sig0 in ("BUY", "SELL"):
-                   row["signal"] = sig0
-                   row["signal_text"] = sig0
-                   row["signal_reason"] = str(row.get("entry_reason") or "entry_triggered")
-                   return
-        except Exception:
-           pass
+                now_ms = 0
 
+        # ------------------------------------------------------------
+        # If snapshot already has a frozen entry signal, honor it.
+        # ------------------------------------------------------------
+        try:
+            if bool(row.get("entry_triggered")):
+                sig0 = str(row.get("entry_signal") or "").upper()
+                if sig0 in ("BUY", "SELL"):
+                    row["signal"] = sig0
+                    row["signal_text"] = sig0
+                    row["signal_reason"] = str(row.get("entry_reason") or "entry_triggered")
+
+                    # TP/SL disabled always
+                    _disable_tp_sl_fields(row)
+
+                    return 
+                    
+                    
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------
         # If auth is required and entry was blocked upstream, keep it explicit.
+        # ------------------------------------------------------------
         ed = row.get("entry_1m") or {}
         if isinstance(ed, dict) and str(ed.get("reason") or "") == "auth_required":
             row["signal"] = "WAIT"
             row["signal_text"] = "LOGIN"
             row["signal_reason"] = "auth_required"
+            
+            _disable_tp_sl_fields(row)
             return
 
+        # ------------------------------------------------------------
         # If entry gate says OK, emit BUY/SELL and FREEZE it (persist fields into snapshot)
+        # ------------------------------------------------------------
+        eg = row.get("entry_gate") or row.get("gate") or {}
+        eg_reason = str(eg.get("reason") or "").upper()
+        try:
+            tap_n = int(float(eg.get("tap_count") or 0))
+        except Exception:
+            tap_n = 0
+
+        rev_ok = bool(eg.get("rev_ok"))
+
+        # HARD BLOCK: do not freeze/enter unless reversal is confirmed
+        # Allow entry evaluation once TAP is armed (tap_count 1..3)
+        armed = False
+        if eg_reason in ("REVERSAL_OK", "LOOSE_BYPASS"):
+            armed = True
+        elif eg_reason == "ARMED_TAP" and 1 <= tap_n <= 3:
+            armed = True
+
+        if not armed:
+            row["signal"] = "WAIT"
+            row["signal_text"] = "WAIT"
+            row["signal_reason"] = f"waiting_gate:{eg_reason.lower() or 'missing'}"
+            return
+
+
         if isinstance(ed, dict) and ed.get("ok") is True:
             dec = str(
-                row.get("decision")          # BUY/SELL if present
-                or row.get("opp_direction")  # UP/DOWN
-                or row.get("direction")      # Bullish/Bearish sometimes
+                row.get("decision")
+                or row.get("opp_direction")
+                or row.get("direction")
                 or ""
             ).upper()
 
@@ -3464,15 +8868,14 @@ def trend_opportunities(
             row["signal_text"] = sig
             row["signal_reason"] = f"ENTRY_OK:{ed.get('mode') or 'NA'}:{ed.get('entry_trigger') or 'NA'}"
 
-            # ---- FREEZE entry result on the snapshot ----
+            # --------------------------------------------------------
+            # ENTRY ACCEPT / FREEZE (only after late-entry gating passes)
+            # --------------------------------------------------------
             if sig in ("BUY", "SELL"):
-                row["entry_triggered"] = True
-                row["entry_signal"] = sig
-                row["entry_reason"] = row["signal_reason"]
-                row["entry_ts_ms"] = int(now_ms) if now_ms > 0 else int(time.time() * 1000)
-                # best-effort entry price (prefer live price fields, then basis)
+                # best-effort entry price
                 ep = (
-                    row.get("last_price")
+                    (ed.get("entry_price") if isinstance(ed, dict) else None)
+                    or row.get("last_price")
                     or row.get("live")
                     or row.get("live_price")
                     or row.get("price")
@@ -3482,34 +8885,99 @@ def trend_opportunities(
                     or row.get("basis_price_1h")
                 )
                 try:
-                    row["entry_price"] = float(ep)
-                except Exception:
-                    row["entry_price"] = None
-
-                # ---- TP / SL (freeze at entry; re-anchor ONCE at entry, then freeze) ----
-                # Preserve original model levels for transparency (UI/history)
-                tp_orig = row.get("target_price_1h") or row.get("target_price")
-                sl_orig = row.get("stop_loss_1h") or row.get("stop_loss") or row.get("stop_loss_price")
-
-                try:
-                    tp_orig = float(tp_orig) if tp_orig is not None else None
-                except Exception:
-                    tp_orig = None
-                try:
-                    sl_orig = float(sl_orig) if sl_orig is not None else None
-                except Exception:
-                    sl_orig = None
-
-                row["tp_price_orig"] = tp_orig
-                row["sl_price_orig"] = sl_orig
-
-                # Entry price (must be real live price at trigger time)
-                try:
-                    ep0 = float(row.get("entry_price")) if row.get("entry_price") is not None else None
+                    ep0 = float(ep)
                 except Exception:
                     ep0 = None
 
-                # Basis used by forecast/model (for remaining-move computation)
+                # Preserve original model levels
+                #tp_orig = None
+                #sl_orig = None
+
+                #try:
+                #    tp_orig = float(tp_orig) if tp_orig is not None else None
+                #except Exception:
+                #    tp_orig = None
+
+                #try:
+                #    sl_orig = float(sl_orig) if sl_orig is not None else None
+                #except Exception:
+                #    sl_orig = None
+
+                #row["tp_price_orig"] = tp_orig
+                #row["sl_price_orig"] = sl_orig
+
+                #tp = None
+                #sl = None
+
+                # TP pct override (testing) -> else fallback to model move
+                #tp_pct = None
+                #try:
+                 #  tp_env = float(os.getenv("XTL_ENTRY_TP_PCT", "0.0"))
+                  # if tp_env and tp_env > 0:
+                   #   tp_pct = tp_env / 100.0
+                #except Exception:
+                #   tp_pct = None
+
+                # fallback: TP pct from model move
+                #if tp_pct is None:
+                #    for k in ("trade_tp_pct_1h", "expected_move_pct_1h", "expected_move_pct", "move_pct_1h"):
+                #        v = row.get(k)
+                #        if isinstance(v, (int, float)):
+                #            try:
+                #               tp_pct = abs(float(v)) / 100.0
+                #               break
+                #            except Exception:
+                #               tp_pct = None
+
+                # SL pct fallback
+                #try:
+                #    sl_pct = float(os.getenv("XTL_ENTRY_SL_PCT", "0.15")) / 100.0
+                #except Exception:
+                #    sl_pct = 0.0015
+
+                #use_rrr_sl = os.getenv("XTL_ENTRY_USE_RRR_SL", "1") == "1"
+                #try:
+                #    rrr = float(os.getenv("XTL_ENTRY_RRR", "1.20"))
+                #   if rrr <= 0:
+                #        rrr = 1.20
+                #except Exception:
+                #    rrr = 1.20
+
+                # Compute TP/SL anchored to entry if possible
+                #if ep0 is not None and ep0 > 0:
+                #    if tp_pct is not None and tp_pct > 0:
+                #        if sig == "BUY":
+                #            tp = ep0 * (1.0 + tp_pct)
+                #            reward = abs(tp - ep0)
+                #            if use_rrr_sl:
+                #                risk = reward / rrr
+                #                sl = ep0 - risk
+                #            else:
+                #                sl = ep0 * (1.0 - sl_pct)
+                #        else:  # SELL
+                #            tp = ep0 * (1.0 - tp_pct)
+                #            reward = abs(ep0 - tp)
+                #            if use_rrr_sl:
+                #                risk = reward / rrr
+                #                sl = ep0 + risk
+                #            else:
+                #                sl = ep0 * (1.0 + sl_pct)
+
+                #    if tp is None and tp_orig is not None:
+                #        tp = float(tp_orig)
+                #   if sl is None and sl_orig is not None:
+                #        sl = float(sl_orig)
+
+                #    if sl is None and tp is not None:
+                #        if sig == "BUY":
+                #            sl = ep0 * (1.0 - sl_pct)
+                #        else:
+                #            sl = ep0 * (1.0 + sl_pct)
+
+                
+                # -------- late-entry gating REMOVED (WAIT-FOREVER policy) --------
+                # We still compute remaining room for debugging/UI,
+                # but we do NOT block entry once entry_1m.ok=True.
                 basis0 = (
                     row.get("basis_price_1h")
                     or row.get("basis_price")
@@ -3521,110 +8989,177 @@ def trend_opportunities(
                 except Exception:
                     basis0 = None
 
-                # Default: keep original TP/SL if we cannot compute safely
-                tp = tp_orig
-                sl = sl_orig
+                
 
-                # --- Late-entry gate + re-anchoring ---
-                # If price already travelled most of the forecast move, either:
-                # (a) reject entry (recommended), or (b) re-anchor TP to remaining move and set SL by RRR.
-                late_min_rem_ratio = None
+                # -------- NOW FREEZE (entry accepted) --------
+                row["entry_triggered"] = True
+                row["entry_signal"] = sig
+                row["entry_reason"] = row.get("signal_reason") or "entry_triggered"
+                row["entry_ts_ms"] = int(now_ms) if now_ms > 0 else int(_time.time() * 1000)
+                row["entry_price"] = float(ep0) if ep0 is not None else None
+                # ---- freeze entry zone (MANDATORY for exit consistency) ----
                 try:
-                    late_min_rem_ratio = float(os.getenv("XTL_LATE_ENTRY_MIN_REMAIN_RATIO", "0.30"))
+                    gm = row.get("entry_gate") or row.get("gate") or row.get("gate_meta") or {}
+                    z = None
+                    if isinstance(gm, dict):
+                        z = gm.get("zone") or gm.get("zone_meta") 
+                    if not isinstance(z, dict):
+                        # fallback: some pipelines attach zone directly
+                        z = row.get("zone") if isinstance(row.get("zone"), dict) else None
+
+                    if isinstance(z, dict):
+                        zl = z.get("low"); zh = z.get("high"); zv = z.get("level")
+                        if isinstance(zl, (int, float)) and isinstance(zh, (int, float)) and isinstance(zv, (int, float)):
+                            row["entry_zone_low"] = float(zl)
+                            row["entry_zone_high"] = float(zh)
+                            row["entry_zone_level"] = float(zv)
+                            row["entry_zone_type"] = str(z.get("type") or z.get("zone_type") or "")
                 except Exception:
-                    late_min_rem_ratio = 0.30
-
-                # Set to 0.0 to disable late-entry rejection in testing
-                late_reject_enabled = late_min_rem_ratio > 0.0
-
-                # RRR used to compute SL from adjusted TP distance
-                try:
-                    rrr = float(os.getenv("XTL_ENTRY_RRR", "1.20"))
-                except Exception:
-                    rrr = 1.20
-                if rrr <= 0:
-                    rrr = 1.20
-
-                # Optional minimum remaining move (absolute price units)
-                try:
-                    min_rem_abs = float(os.getenv("XTL_LATE_ENTRY_MIN_REMAIN_ABS", "0.0"))
-                except Exception:
-                    min_rem_abs = 0.0
-
-                if ep0 is not None and basis0 is not None and tp_orig is not None and sig in ("BUY", "SELL"):
-                    # total/used/remaining move toward original target
-                    if sig == "BUY":
-                        total_move = tp_orig - basis0
-                        used_move = ep0 - basis0
-                    else:
-                        total_move = basis0 - tp_orig
-                        used_move = basis0 - ep0
-
-                    # Guardrails
-                    if total_move is None or total_move <= 0:
-                        total_move = 0.0
-                    if used_move is None:
-                        used_move = 0.0
-
-                    rem = max(total_move - used_move, 0.0)
-                    rem_ratio = (rem / total_move) if total_move > 0 else 0.0
-
-                    row["move_total"] = total_move
-                    row["move_used"] = used_move
-                    row["move_remaining"] = rem
-                    row["move_remaining_ratio"] = rem_ratio
-
-                    # Late-entry rejection (prevents chasing when almost no room left)
-                    if late_reject_enabled and (rem_ratio < late_min_rem_ratio or rem < min_rem_abs):
-                        row["signal"] = "WAIT"
-                        row["signal_text"] = "WAIT"
-                        row["signal_reason"] = "late_entry"
-                        row["late_entry_reject"] = True
-                        row["late_entry_min_rem_ratio"] = late_min_rem_ratio
-                        # Do NOT freeze entry meta if we reject
-                        return
-
-                    # Re-anchor TP to the remaining move (honest: smaller TP if you enter late)
-                    if rem > 0:
-                        tp = (ep0 + rem) if sig == "BUY" else (ep0 - rem)
-
-                        # Compute SL from desired RRR (risk = reward/rrr)
-                        reward = abs(tp - ep0)
-                        risk = (reward / rrr) if rrr > 0 else reward
-
-                        # Optional minimum SL distance (absolute)
-                        try:
-                            min_sl_abs = float(os.getenv("XTL_ENTRY_MIN_SL_ABS", "0.0"))
-                        except Exception:
-                            min_sl_abs = 0.0
-                        if risk < min_sl_abs:
-                            risk = min_sl_abs
-
-                        sl = (ep0 - risk) if sig == "BUY" else (ep0 + risk)
-
-                # Persist for UI + lifecycle checks (frozen at entry)
-                row["tp_price"] = tp
-                row["sl_price"] = sl
-
-                # ---- Discord notify (best-effort, once) ----
-                _maybe_discord_entry(row=row, sig=sig, tp=tp, sl=sl, now_ms=now_ms)
-
-            return
-
+                    pass
+                _disable_tp_sl_fields(row)
 
                 
 
+                # Discord notify (best-effort)
+                try:
+                    _maybe_discord_entry(row=row, sig=sig, tp=None, sl=None, now_ms=now_ms)
+                except Exception:
+                    pass
+                
+                return
+             
             
 
+        # ------------------------------------------------------------
         # Not triggered yet -> WAIT
+        # ------------------------------------------------------------
         row["signal"] = "WAIT"
         row["signal_text"] = "WAIT"
         row["signal_reason"] = ed.get("reason") if isinstance(ed, dict) else "no_entry"
 
+        # --- Make entry gating visible to UI/debug ---
+        row["entry_reason"] = row.get("signal_reason")
+        if isinstance(ed, dict):
+            row["entry_debug"] = {
+                "ok": bool(ed.get("ok")),
+                "reason": ed.get("reason"),
+                "age_min": ed.get("age_min"),
+                "mode": ed.get("mode"),
+                "notes": ed.get("notes"),
+            }
+        # --- NEW: blank TP/SL while WAIT ---
+        row["tp_price"] = None
+        row["sl_price"] = None
+        row["target_price"] = None
+        row["target_price_1h"] = None
+        row["stop_loss"] = None
+        row["stop_loss_1h"] = None
 
+
+    def _tf_view(row: dict, tfu: str) -> dict:
+        """
+        Merge per-tf view (row["tfs"][TF]) into the base row so downstream code
+        can keep using row.get("decision"), row.get("expected_move_pct"), etc.
+        """
+        try:
+            tfs = row.get("tfs")
+            if isinstance(tfs, dict):
+                v = tfs.get(tfu)
+                if isinstance(v, dict):
+                    merged = dict(row)
+                    merged.update(v)
+                    return merged
+        except Exception:
+            pass
+        return row
+
+
+    def _get_float(d: dict, *keys: str):
+        for k in keys:
+            try:
+                v = d.get(k)
+                if isinstance(v, (int, float)):
+                    return float(v)
+                if isinstance(v, str) and v.strip() != "":
+                    return float(v)
+            except Exception:
+                pass
+        return None
+    def _sr_gate_view(sr_any: Any) -> dict:
+        """
+        Normalize SR bundle to what _zone_reversal_gate expects:
+        nearest_support / nearest_resistance (floats).
+        Accepts multi-tf sr bundles (H1/H4) or nearest dict formats.
+        """
+        out: dict = {}
+        sr = sr_any if isinstance(sr_any, dict) else {}
+
+        # 1) If sr already has nearest_support/resistance, keep it.
+        ns = sr.get("nearest_support")
+        nr = sr.get("nearest_resistance")
+        if isinstance(ns, (int, float)):
+            out["nearest_support"] = float(ns)
+        if isinstance(nr, (int, float)):
+            out["nearest_resistance"] = float(nr)
+
+        # 2) Try multi-tf: prefer H1, then H4
+        for tfk in ("H1", "h1", "H4", "h4"):
+            z = sr.get(tfk)
+            if not isinstance(z, dict):
+                continue
+            nearest = z.get("nearest") or z.get("nearest_zone") or z
+            if not isinstance(nearest, dict):
+                continue
+            kind = str(nearest.get("kind") or nearest.get("side") or "").lower()
+            lvl = nearest.get("level")
+            if not isinstance(lvl, (int, float)):
+                continue
+            lvl = float(lvl)
+            if kind == "support" and "nearest_support" not in out:
+                out["nearest_support"] = lvl
+            if kind == "resistance" and "nearest_resistance" not in out:
+                out["nearest_resistance"] = lvl
+
+        # 3) Last resort: sr["nearest"] (if present)
+        nearest2 = sr.get("nearest") or sr.get("nearest_zone")
+        if isinstance(nearest2, dict):
+            kind = str(nearest2.get("kind") or nearest2.get("side") or "").lower()
+            lvl = nearest2.get("level")
+            if isinstance(lvl, (int, float)):
+                lvl = float(lvl)
+                if kind == "support" and "nearest_support" not in out:
+                    out["nearest_support"] = lvl
+                if kind == "resistance" and "nearest_resistance" not in out:
+                    out["nearest_resistance"] = lvl
+
+        return out
+
+
+    def _run_entry_only_if_armed(r: dict) -> None:
+        try:
+            # If already triggered, always show signal from entry (don’t require "armed")
+            if bool(r.get("entry_triggered")):
+                _set_signal_from_entry(r)
+                return
+            gm = r.get("entry_gate") or r.get("gate") or r.get("gate_meta") or {}
+            reason = str((gm or {}).get("reason") or "").upper()
+
+            if reason in ("REVERSAL_OK","ARMED_TAP", "LOOSE_BYPASS"):
+                _attach_entry_1m(r)
+                _set_signal_from_entry(r)
+                return
+
+            # not armed => do not compute M1 entry
+            r["entry_1m"] = {"ok": False, "reason": f"not_armed:{reason.lower() or 'missing'}"}
+            r["signal"] = "WAIT"
+            r["signal_reason"] = f"not_armed:{reason.lower() or 'missing'}"
+        except Exception:
+            r["entry_1m"] = {"ok": False, "reason": "not_armed:exc"}
+            r["signal"] = "WAIT"
+            r["signal_reason"] = "not_armed:exc"
 
     def _load_active_snapshots(symbols_csv: str) -> list[dict]:
-        res = []
+        res: list[dict] = []
         user_id = _uid_from_user(user)
         pinned_device = device or x_device_id
 
@@ -3635,47 +9170,149 @@ def trend_opportunities(
 
             for d in ("UP", "DOWN"):
                 snap_key = _opp_snapshot_key(sym_u, d)
-                snap = R.hgetall(snap_key)
-                if not snap:
-                    continue
 
                 # Build row FIRST so outcome checker can use live-ish price
-                row0 = _redis_hash_to_dict(snap)
+                raw = None
+                try:
+                    raw = _snap_get_raw_json(snap_key)   # works for STRING or HASH
+                except Exception:
+                    raw = None
+
+                if not raw:
+                    continue
+
+                # optional: only fetch hash fields if you still need snap dict later
+                snap = None
+                try:
+                    snap = R.hgetall(snap_key) or None
+                except Exception:
+                    snap = None
+
+                row0 = {}
+                if raw:
+                    try:
+                        row0 = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    except Exception:
+                        row0 = {}
+                else:
+                    # fallback if snap is already a dict/hash payload
+                    try:
+                        row0 = _redis_hash_to_dict(snap)
+                    except Exception:
+                        row0 = {}
                 row0.setdefault("symbol", sym_u)
 
-                # attach a live price for HIT detection (prefer last closed M1 close)
-                lp = _last_closed_m1_price(sym_u, user_id, pinned_device, now_ms)
-                if lp is not None:
-                    row0["last_price"] = lp
-                    row0["live_price"] = lp
+                
+                # attach a live price for HIT detection (prefer device-scoped price; fallback to last closed M1)
+                lp = _get_live_price(sym_u, pinned_device)
+                if lp is None:
+                    lp = _last_closed_m1_price(sym_u, user_id, pinned_device, now_ms)
+
+                # Log only if missing OR non-numeric (avoid spam)
+                if lp is None:
+                    try:
+                       log.warning("PH1 lp_missing sym=%s dev=%s", sym_u, pinned_device)
+                    except Exception:
+                       pass
+                else:
+                     try:
+                        lp_f = float(lp)
+                     except Exception:
+                        lp_f = None
+                        try:
+                           log.warning("PH1 lp_bad sym=%s dev=%s lp=%r", sym_u, pinned_device, lp)
+                        except Exception:
+                           pass
+
+                     if lp_f is not None and lp_f > 0:
+                         row0["last_price"] = lp_f
+                         row0["live_price"] = lp_f
+                     else:
+                          try:
+                             log.warning("PH1 lp_nonpos sym=%s dev=%s lp=%r", sym_u, pinned_device, lp)
+                          except Exception:
+                             pass
+
 
                 # evaluate HIT/EXPIRED and cleanup if needed
                 try:
-                    _evaluate_alert_outcome(sym_u, snap, row0, now_ms)
+                   _evaluate_alert_outcome(sym_u, snap or {}, row0, now_ms)
                 except Exception:
-                    pass
+                   pass
 
+                # re-read after evaluation (may be deleted)
                 snap = R.hgetall(snap_key)
                 if not snap:
                     continue
 
-                any_key = next(iter(snap.keys()))
-                status_val = snap.get(b"status") if isinstance(any_key, (bytes, bytearray)) else snap
-                status = str(_json_load_maybe(status_val) or "active").lower()
+                # ✅ FIX: correct status read (bytes + str hashes)
+                try:
+                    status_raw = snap.get(b"status")
+                    if status_raw is None:
+                        status_raw = snap.get("status")
+                    status = str(_json_load_maybe(status_raw) or "active").lower()
+                except Exception:
+                    status = "active"
 
                 if status in ("active", "new", "open"):
                     row = _redis_hash_to_dict(snap)
+                    row["symbol"] = sym_u
+                    if debug_gate and isinstance(oppt_dev_dbg, dict):
+                        try:
+                            row.update(oppt_dev_dbg)
+                        except Exception:
+                            pass
+
                     row.setdefault("update_tf", tfu)
                     row.setdefault("server_now_ms", now_ms)
+                    # attach dev debug to each returned row (so curl/jq can see it)
+                    if debug_gate and isinstance(oppt_dev_dbg, dict):
+                        try:
+                            row.update(oppt_dev_dbg)
+                        except Exception:
+                            pass
+
+                    # keep last_price consistent in row too (helps UI + entry/exit checks)
+                    try:
+                        if lp is not None:
+                            row["last_price"] = float(lp)
+                            row["live_price"] = float(lp)
+                    except Exception:
+                        pass
 
                     _force_hydrate_m1(row.get("symbol"))
-                    _attach_entry_1m(row)
-                    _set_signal_from_entry(row)
+                    _run_entry_only_if_armed(row)
+                    # NEW: persist entry freeze so TP/SL stops moving across polls
+                    try:
+                        if bool(row.get("entry_triggered")):
+                           _persist_entry_meta_to_snapshot(sym_u, row)
+                    except Exception:
+                        pass
 
                     res.append(row)
 
-        return res
+        # ✅ keep only one active snapshot per symbol (prevents same symbol double-appearing)
+        try:
+            best: dict[str, dict] = {}
 
+            def _rank(x: dict):
+                et = 1 if bool(x.get("entry_triggered")) else 0
+                sc = float(x.get("opp_score") or x.get("score") or 0.0)
+                ts = int(x.get("opp_open_ts") or x.get("alert_created_ms") or 0)
+                return (et, sc, ts)
+
+            for r in res:
+                s = str(r.get("symbol") or "").upper().strip()
+                if not s:
+                    continue
+                if s not in best or _rank(r) > _rank(best[s]):
+                    best[s] = r
+
+            res = list(best.values())
+        except Exception:
+            pass
+
+        return res
     # ---------- weekend rule: NO NEW opportunities ----------
     utc_weekday = datetime.now(timezone.utc).weekday()  # 0=Mon ... 5=Sat 6=Sun
     is_weekend = utc_weekday >= 5
@@ -3686,34 +9323,135 @@ def trend_opportunities(
     except Exception:
         pass
 
-    if is_weekend and not debug_force:
+    if is_weekend and not (debug_force or debug_gate):
+        
         # show only active snapshots + history; do NOT call predict_all (no new creation)
         history = _load_opp_history(limit=50)
         rows = _load_active_snapshots(symbols)
-        return {"ok": True, "tf": tfu, "rows": rows, "history": history}
+        # DROP null/empty symbol rows (prevents {"symbol": null} in UI)
+        rows = [r for r in rows if str((r or {}).get("symbol") or "").strip()]
+        payload = {"ok": True, "tf": tfu, "rows": rows, "history": history}
+        
 
-    # ---------- Reuse main prediction logic ----------
-    base = predict_all(
-        tf=tfu,
+        # cache + unlock (best effort)
+        if cache_key:
+            try:
+               R.setex(cache_key, cache_ttl_s, json.dumps(payload))
+            except Exception:
+               pass
+        try:
+            if inflight_lock_key and inflight_got_lock:
+                R.delete(inflight_lock_key)
+        except Exception:
+            pass
+       
+       
+
+        return payload
+
+
+    
+    # ---------- Reuse main prediction logic (need H1 + H4 because predict_all is TF-STRICT) ----------
+    base_h1 = predict_all(
+        tf="H1",
         symbols=symbols,
         device=device,
         x_device_id=x_device_id,
         user=user,
     )
 
-    if not isinstance(base, dict):
-        return {"ok": False, "reason": "predict_all_not_dict"}
-    if not base.get("ok", True):
-        return base
+    base_h4 = predict_all(
+        tf="H4",
+        symbols=symbols,
+        device=device,
+        x_device_id=x_device_id,
+        user=user,
+    )
 
-    rows_in = base.get("rows") or []
+    if not isinstance(base_h1, dict):
+        _unlock_inflight()
+        return {"ok": False, "reason": "predict_all_h1_not_dict"}
+    if not base_h1.get("ok", True):
+        _unlock_inflight()
+        return base_h1
+
+    # H4 is optional: if it fails, we still allow H1-only opps
+    h4_rows = []
+    if isinstance(base_h4, dict) and base_h4.get("ok", True):
+        h4_rows = base_h4.get("rows") or []
+
+    h4_by_sym: dict[str, dict] = {}
+    for r in h4_rows:
+        s = str((r or {}).get("symbol") or "").upper().strip()
+        if s:
+            h4_by_sym[s] = r
+
+    rows_in = base_h1.get("rows") or []
+  
+
+    
     opp_rows: list[dict[str, Any]] = []
     debug_pool: list[dict[str, Any]] = []
+    res = debug_pool  # alias: debug_gate uses res.append(...)
+    def _push_blocked(sym: str, base_row: dict, *, stage: str, reason: str, meta: dict | None = None):
+        if not debug_gate_on:
+            return
+        out_dbg = dict(base_row or {})
+        out_dbg["symbol"] = sym
+        out_dbg["debug_only"] = True
+        out_dbg["status"] = "blocked"
+        out_dbg["blocked_at"] = stage
+        out_dbg["blocked_reason"] = reason
+        if isinstance(meta, dict):
+            out_dbg["blocked_meta"] = meta
+        out_dbg.setdefault("update_tf", tfu)
+        out_dbg.setdefault("server_now_ms", now_ms)
 
-    for row in rows_in:
-        sym = str(row.get("symbol") or "").upper()
+        # keep price visible in UI
+        try:
+            lp = out_dbg.get("last_price") or out_dbg.get("price")
+            if isinstance(lp, (int, float)):
+                out_dbg["last_price"] = float(lp)
+        except Exception:
+            pass
+
+        debug_pool.append(out_dbg)
+
+
+    for row0 in rows_in:
+        sym = str((row0 or {}).get("symbol") or "").upper()
         if not sym:
             continue
+
+        # ---- IMPORTANT: per-TF view merge (predict_all now returns values under row["tfs"][TF]) ----
+        row_h1 = dict(row0 or {})   # frozen H1 view for gate (do NOT alias row0)
+        # --- TRACE row_h1 attach (row0 alias) ---
+        try:
+            _bars0 = (row_h1.get("bars") or row_h1.get("ohlc") or [])
+        except Exception:
+            _bars0 = None
+
+        log.error(
+           "TRACE[row_h1= row0] sym=%s tf=%s row0_type=%s row0_keys=%s bars_n=%s last=%s",
+           (sym or ""),
+           (tf or ""),
+           type(row0).__name__,
+           list(row0.keys()) if isinstance(row0, dict) else None,
+           (len(_bars0) if isinstance(_bars0, list) else None),
+           (_bars0[-1] if isinstance(_bars0, list) and _bars0 else None),
+        )
+        row0_h4 = h4_by_sym.get(sym) or {}
+        row_h4 = row0_h4  # already H4
+
+
+        # Use H1 view as the working row (keeps the rest of this function consistent)
+        row = row_h1
+        # Attach request/device debug to every output row (so curl/jq can see it)
+        if debug_gate_on and isinstance(oppt_dev_dbg, dict):
+            try:
+                row.update(oppt_dev_dbg)
+            except Exception:
+                pass
 
         # ---- attach a live-ish price for UI + hit detection ----
         lp = (
@@ -3726,11 +9464,67 @@ def trend_opportunities(
         )
         if isinstance(lp, (int, float)):
             row["last_price"] = float(lp)
+        # ==========================================================
+        # DEBUG: attach SR early so later gates can show SR values
+        # even if blocked earlier (DELTA, MIN_PROB, etc.)
+        # ==========================================================
+        if debug_gate_on and (not isinstance(row.get("sr"), dict) or not row.get("sr")):
+            try:
+                b, bsrc = _get_sr_bundle(sym, prefer_dev=x_device_id_hdr, return_src=True)
+                b = b or {}
+                row["dbg_sr_src"] = bsrc
 
+                
+
+                row["sr"] = b if isinstance(b, dict) else {}
+
+                price = row.get("last_price") or row.get("price")
+                p = float(price) if isinstance(price, (int, float)) else None
+                h1 = (b.get("H1") or b.get("h1")) if isinstance(b, dict) else None
+                if debug_gate_on:
+                    row["dbg_sr_bundle_keys"] = list(b.keys()) if isinstance(b, dict) else []
+                    row["dbg_sr_h1_keys"] = list((h1 or {}).keys()) if isinstance(h1, dict) else []
+
+                if isinstance(h1, dict) and p is not None:
+                    def _levels(arr):
+                        out = []
+                        for z in (arr or []):
+                            if isinstance(z, dict) and isinstance(z.get("level"), (int, float)):
+                                out.append(float(z["level"]))
+                        return sorted(set(out))
+
+                    sup_lvls = _levels(h1.get("supports") or [])
+                    res_lvls = _levels(h1.get("resistances") or [])
+
+                    ns = nr = None
+                    below = [x for x in sup_lvls if x <= p]
+                    if below:
+                        ns = max(below)
+                    above = [x for x in res_lvls if x >= p]
+                    if above:
+                        nr = min(above)
+
+                    # fallback if nothing on correct side
+                    if ns is None and sup_lvls:
+                        ns = max(sup_lvls)
+                    if nr is None and res_lvls:
+                        nr = min(res_lvls)
+
+                    # attach at top-level for gate/debug/UI
+                    if isinstance(row["sr"], dict):
+                        if isinstance(ns, (int, float)):
+                            row["sr"]["nearest_support"] = float(ns)
+                        if isinstance(nr, (int, float)):
+                            row["sr"]["nearest_resistance"] = float(nr)
+            except Exception:
+                pass
         # --- DEBUG FORCE: emit fabricated opp candidates (no snapshot writes) ---
         if debug_force and debug_top > 0:
-            thr1 = _room_thr_h1(sym)
-            thr4 = _room_thr_h4(sym)
+            thr1 = _oppt_min_move_pct(sym, "H1")
+            thr4 = _oppt_min_move_pct(sym, "H4")
+            
+
+
 
             dec = str(row.get("decision") or row.get("opp_direction") or row.get("direction") or "BUY").upper()
             s = 1 if dec in ("BUY", "UP", "LONG") else -1
@@ -3755,35 +9549,139 @@ def trend_opportunities(
             out["opp_expire_ts"] = bucket_open_ts + hour_ms
             out["opp_min_room_h1"] = thr1
             out["opp_min_room_h4"] = thr4
-            out["opp_score"] = 99.0
-            out["opp_reason"] = "DEBUG_FORCE (fabricated opportunity for UI testing)"
+            
+            
             out.setdefault("update_tf", tfu)
             out.setdefault("server_now_ms", now_ms)
 
             # attach entry + signal in debug too (helps UI)
-            _attach_entry_1m(out)
-            _set_signal_from_entry(out)
+            _run_entry_only_if_armed(out)
+            
+            
+            # ---------------------------------------------------------
+            # DEBUG_PERSIST: write the fabricated opp into live snapshot
+            # so UI (no-debug) can see it on the next poll.
+            # ---------------------------------------------------------
+            if debug_persist:
+                try:
+                    
+                    out["debug_force"] = True
+                    out["debug_force_ts_ms"] = int(now_ms)
+                    out["status"] = "active"
+                    # --- normalize reason fields so UI/debug show same reason key ---
+                    try:
+                        if out.get("opp_reason") in (None, "", "missing"):
+                            eg = out.get("entry_gate")
+                            gate_reason = eg.get("reason") if isinstance(eg, dict) else None
+
+                            out["opp_reason"] = (
+                                gate_reason
+                                or out.get("signal_reason")
+                                or out.get("structure_reason")
+                                or (out.get("reasons")[0] if isinstance(out.get("reasons"), list) and out.get("reasons") else None)
+                            )
+
+                        if out.get("reason") in (None, "", "missing"):
+                            out["reason"] = out.get("opp_reason")
+                    except Exception:
+                        pass
+
+
+                    # Persist into the same snapshot store used by normal path
+                    _freeze_or_snapshot_opp(sym, out, now_ms)
+
+                    # Make debug snapshots self-cleaning
+                    try:
+                        snap_key = _opp_snapshot_key(sym, out.get("opp_direction") or out.get("decision") or "UP")
+                        ttl_sec = int(os.getenv("XTL_DEBUG_OPP_TTL_SEC", "0"))  # 2 hours default
+                        if ttl_sec > 0:
+                            R.expire(snap_key, ttl_sec)
+                        
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
             debug_pool.append(out)
             continue
 
-        thr1 = _room_thr_h1(sym)
-        thr4 = _room_thr_h4(sym)
+            # --- DEBUG_FORCE: attach entry_context chart overlay so UI can render ---
+            try:
+                sr0 = out.get("sr")
+                if isinstance(sr0, dict) and sr0:
+                    atr0 = out.get("atr") or out.get("atr14") or out.get("atr_h1")
+                    px0 = out.get("basis_price") or out.get("last_price") or out.get("price") or out.get("mid")
+
+                    ent = _pick_entry_sr_levels(sr0, px0, top_n=4, atr=atr0)
+                    if isinstance(ent, dict) and ent:
+                        out.update(ent)
+
+                    ch = out.get("chart")
+                    if not isinstance(ch, dict):
+                        ch = {}
+                        out["chart"] = ch
+
+                    ov = ch.get("overlays")
+                    if not isinstance(ov, dict):
+                        ov = {}
+                        ch["overlays"] = ov
+
+                    ec = ov.get("entry_context")
+                    if not isinstance(ec, dict):
+                        ec = {}
+                        ov["entry_context"] = ec
+
+                    ec["px"] = px0
+                    ec["entry_support"] = ent.get("entry_support")
+                    ec["entry_support_tf"] = ent.get("entry_support_tf")
+                    ec["entry_support_kind"] = ent.get("entry_support_kind")
+                    ec["entry_resistance"] = ent.get("entry_resistance")
+                    ec["entry_resistance_tf"] = ent.get("entry_resistance_tf")
+
+                    ec["entry_support_near_levels"] = ent.get("entry_support_near_levels") or []
+                    ec["entry_support_major_levels"] = ent.get("entry_support_major_levels") or []
+                    ec["entry_resistance_near_levels"] = ent.get("entry_resistance_near_levels") or []
+                    ec["entry_resistance_major_levels"] = ent.get("entry_resistance_major_levels") or []
+                    ec["entry_support_flipped_levels"] = ent.get("entry_support_flipped_levels") or []
+                    ec["entry_resistance_flipped_levels"] = ent.get("entry_resistance_flipped_levels") or []
+            except Exception:
+                pass
+
+           
+
+
+
+      
 
         # Extract H1/H4 expected move (%)
-        try:
-            m1 = float(row.get("expected_move_pct_1h"))
-        except (TypeError, ValueError):
-            m1 = None
-        try:
-            m4 = float(row.get("expected_move_pct_4h"))
-        except (TypeError, ValueError):
-            m4 = None
+        # H1 uses row_h1 (merged), H4 uses row_h4 (merged)
+        m1 = _get_float(
+            row_h1,
+            "expected_move_pct_1h", "expected_move_pct", "move_pct_1h", "move_pct",
+        )
+        m4 = _get_float(
+            row_h4,
+            "expected_move_pct_4h", "expected_move_pct", "move_pct_4h", "move_pct",
+        )
 
         s1 = _sign(m1)
         s4 = _sign(m4)
+        # ---- REQUIRED: thresholds must exist in normal path (not just debug_force) ----
+        thr1 = _oppt_min_move_pct(sym, "H1")
+        thr4 = _oppt_min_move_pct(sym, "H4")
+
+        # ---- DEBUG: expose gate inputs to the API response ----
+        if debug_gate:
+            row["dbg_m1"] = m1
+            row["dbg_m4"] = m4
+            row["dbg_thr1"] = thr1
+            row["dbg_thr4"] = thr4
+            row["dbg_s1"] = s1
+            row["dbg_s4"] = s4
+
 
         # --- Enrich H1 features for scoring/UI (optional) ---
+
         extra_h1 = row.get("extra_h1") or {}
         feats_h1 = extra_h1.get("features") if isinstance(extra_h1.get("features"), dict) else extra_h1
         if isinstance(feats_h1, dict):
@@ -3816,19 +9714,31 @@ def trend_opportunities(
                 if not snap:
                     continue
 
-                any_key = next(iter(snap.keys()))
-                status_val = snap.get(b"status") if isinstance(any_key, (bytes, bytearray)) else snap.get("status")
-                status = str(_json_load_maybe(status_val) or "active").lower()
+                try:
+                   status_raw = snap.get(b"status")
+                   if status_raw is None:
+                        status_raw = snap.get("status")
+                   status = str(_json_load_maybe(status_raw) or "active").lower()
+                except Exception:
+                   status = "active"
+
 
                 if status in ("active", "new", "open"):
                     has_active_snapshot = True
                     active_snap_row = _redis_hash_to_dict(snap)
+                    active_snap_row["symbol"] = sym
                     break
         except Exception:
             has_active_snapshot = False
             active_snap_row = None
 
         if has_active_snapshot and active_snap_row:
+            # Attach request/device debug to snapshot row too
+            if debug_gate_on and isinstance(oppt_dev_dbg, dict):
+                try:
+                    active_snap_row.update(oppt_dev_dbg)
+                except Exception:
+                    pass
             active_snap_row.setdefault("update_tf", tfu)
             active_snap_row.setdefault("server_now_ms", now_ms)
 
@@ -3836,21 +9746,174 @@ def trend_opportunities(
             if isinstance(lp2, (int, float)):
                 active_snap_row["last_price"] = float(lp2)
 
-            _attach_entry_1m(active_snap_row)
-            _set_signal_from_entry(active_snap_row)
+            _run_entry_only_if_armed(active_snap_row)
+            # NEW: persist entry freeze so TP/SL stops moving across polls
+            try:
+                if bool(active_snap_row.get("entry_triggered")):
+                   _persist_entry_meta_to_snapshot(sym, active_snap_row)
+            except Exception:
+                pass
+
+            # ---- ensure SR + entry SR fields exist even for ACTIVE SNAPSHOT rows ----
+            try:
+                # active_snap_row may already carry "sr" (or may not)
+                sr0 = active_snap_row.get("sr")
+
+                if not isinstance(sr0, dict) or not sr0:
+                    sr_bundle, bsrc = _get_sr_bundle(sym, prefer_dev=x_device_id_hdr, return_src=True)
+                    if isinstance(sr_bundle, dict) and sr_bundle:
+                        active_snap_row["sr"] = sr_bundle
+                        if debug_gate_on:
+                            active_snap_row["dbg_sr_src"] = f"active_snap|{bsrc}"
+                    else:
+                        if debug_gate_on:
+                            active_snap_row["dbg_sr_src"] = f"active_snap|missing|{bsrc}"
+                else:
+                    if debug_gate_on and "dbg_sr_src" not in active_snap_row:
+                        active_snap_row["dbg_sr_src"] = "active_snap|carried"
+
+                sr0 = active_snap_row.get("sr")
+                if isinstance(sr0, dict) and sr0:
+                    atr0 = None
+                    try:
+                        atr0 = (
+                             active_snap_row.get("atr")
+                             or active_snap_row.get("atr14")
+                             or active_snap_row.get("atr_h1")
+                             or row.get("atr")
+                             or row.get("atr14")
+                             or row.get("atr_h1")
+                        )
+                    except Exception:
+                        atr0 = None
+                    px0 = (
+                        active_snap_row.get("basis_price")
+                        or active_snap_row.get("last_price")
+                        or active_snap_row.get("price")
+                        or active_snap_row.get("mid")
+                        or row.get("basis_price")
+                        or row.get("last_price")
+                        or row.get("price")
+                        or row.get("mid")
+                    )
+
+                    ent = _pick_entry_sr_levels(sr0, px0, top_n=4, atr=atr0)
+                    if isinstance(ent, dict) and ent:
+                        active_snap_row.update(ent)
+
+                    # optional: also expose in chart overlay for UI labels
+                    try:
+                        ch = active_snap_row.get("chart")
+                        if not isinstance(ch, dict):
+                            ch = {}
+                            active_snap_row["chart"] = ch
+
+                        ov = ch.get("overlays")
+                        if not isinstance(ov, dict):
+                            ov = {}
+                            ch["overlays"] = ov
+
+                        ec = ov.get("entry_context")
+                        if not isinstance(ec, dict):
+                            ec = {}
+                            ov["entry_context"] = ec
+                        ec["px"] = px0
+                        # single picks
+                        ec["entry_support"] = ent.get("entry_support")
+                        ec["entry_support_tf"] = ent.get("entry_support_tf")
+                        ec["entry_support_kind"] = ent.get("entry_support_kind")
+
+                        ec["entry_resistance"] = ent.get("entry_resistance")
+                        ec["entry_resistance_tf"] = ent.get("entry_resistance_tf")
+                        ec["entry_resistance_kind"] = ent.get("entry_resistance_kind")
+
+                        # lists (near + major)
+                        ec["entry_support_near_levels"] = ent.get("entry_support_near_levels") or []
+                        ec["entry_support_major_levels"] = ent.get("entry_support_major_levels") or []
+
+                        ec["entry_resistance_near_levels"] = ent.get("entry_resistance_near_levels") or []
+                        ec["entry_resistance_major_levels"] = ent.get("entry_resistance_major_levels") or []
+                        # NEW: flipped lists
+                        ec["entry_support_flipped_levels"] = ent.get("entry_support_flipped_levels") or []
+                        ec["entry_resistance_flipped_levels"] = ent.get("entry_resistance_flipped_levels") or []
+                       
+
+
+
+                    except Exception as e:
+                        if debug_gate:
+                            active_snap_row["dbg_entry_context_exc"] = f"{type(e).__name__}:{e}"
+
+            except Exception as e:
+                if debug_gate_on:
+                    active_snap_row["dbg_entry_sr_exc"] = f"{type(e).__name__}:{e}"
+            # ensure sym_u exists in this active-snapshot branch (prevents UnboundLocalError)
+            sym_u = str(active_snap_row.get("symbol") or active_snap_row.get("sym") or sym or "").upper().strip()
+            if not sym_u:
+                sym_u = str(sym or "").upper().strip()
+            try:
+                allowed, gate_meta = _zone_reversal_gate(
+                    sym=sym_u,
+                    direction=("BUY" if str(active_snap_row.get("opp_direction") or active_snap_row.get("decision") or "").upper() in ("UP", "BUY") else "SELL"),
+                    row_h1=row_h1,
+                    sr=_sr_gate_view(active_snap_row.get("sr")),
+                    now_ms=now_ms,
+                    tf_tag="H1",
+                    pinned_device=dev_for_gate,
+                    x_device_id=dev_for_gate,
+                    debug_gate=bool(debug_gate_on),
+                )
+                gm = gate_meta if isinstance(gate_meta, dict) else {"reason": "gate_meta_not_dict"}
+                # (optional but useful) reflect allow/deny at row level too
+                # Respect explicit gm["blocked"] if gate provided it (needed for soft-discard states)
+                if "blocked" in gm:
+                    gm["blocked"] = bool(gm.get("blocked"))
+                else:
+                    gm["blocked"] = (not bool(allowed))
+
+
+                # callsite marker (debug only)
+                if debug_gate_on:
+                    gm["__callsite_marker__"] = "AFTER_ZONE_GATE_CALL"
+                    gm["__callsite_debug_gate__"] = True
+
+                active_snap_row["entry_gate"] = gm
+
+            except Exception as e:
+                active_snap_row["entry_gate"] = {"reason": "ZONE_GATE_EXCEPTION", "blocked": True, "exc_type": type(e).__name__, "exc": str(e)}
+
 
             opp_rows.append(active_snap_row)
             continue
 
         # Weekend rule: do NOT open new ones (but can show existing above)
-        if is_weekend:
+        if is_weekend and not (debug_force or debug_gate):
             continue
 
         # --------------------------------------------------
         # 2) New opportunity gate: H1 room must pass threshold
         # --------------------------------------------------
-        if (not isinstance(m1, (int, float))) or s1 == 0 or abs(m1) < thr1:
-            continue
+        if not loose:
+            if (not isinstance(m1, (int, float))) or s1 == 0 or abs(m1) < thr1:
+                _push_blocked(sym, row, stage="H1_ROOM", reason=f"m1={m1} thr1={thr1}")
+                continue
+        # --------------------------------------------------
+        # 2b) New opportunity gate: min_prob by TF (from meta.common.oppt_tf)
+        # --------------------------------------------------
+        if not loose:
+            try:
+                cfg_tf = (_get_meta(sym) or {}).get("oppt_tf") or {}
+                cfg_h1 = cfg_tf.get("H1") if isinstance(cfg_tf, dict) else None
+                min_prob = float(cfg_h1.get("min_prob")) if isinstance(cfg_h1, dict) and isinstance(cfg_h1.get("min_prob"), (int, float)) else None
+            except Exception:
+                min_prob = None
+
+            if min_prob is not None:
+                p = _get_float(row_h1, "p_up", "prob_up")
+                if (not isinstance(p, (int, float))) or float(p) < float(min_prob):
+                    _push_blocked(sym, row, stage="MIN_PROB", reason=f"p={p} min_prob={min_prob}")
+                    continue
+
 
         # --- prediction delta gate (optional anti-spam) ---
         delta_pct = None
@@ -3871,8 +9934,21 @@ def trend_opportunities(
             except Exception:
                 delta_pct = None
 
-        if delta_pct is not None and delta_pct < delta_thr:
-            continue
+        # STRICT behavior: block only in normal mode.
+        # DEBUG behavior: report, but do NOT block progression.
+        if (not loose) and (delta_pct is not None) and (delta_pct < delta_thr):
+            _push_blocked(
+                sym,
+                row,
+                stage="DELTA",
+                reason=f"delta={delta_pct:.3f} thr={delta_thr:.3f}",
+                meta={"delta_pct": delta_pct, "delta_thr": delta_thr, "m1": float(m1)},
+            )
+
+            if not debug_gate_on:
+                continue
+
+
 
         # --------------------------------------------------
         # 3) H4 confirmation logic
@@ -3881,19 +9957,50 @@ def trend_opportunities(
         opp_conf = "medium"
         h4_agree: bool | None = None
 
+        # ------------------------------------------------------------
+        # H4 confirmation / conflict handling
+        # Policy:
+        #   - If H4 agrees with H1: boost confidence (high/medium based on H4 strength)
+        #   - If H4 conflicts:
+        #       * strict mode (loose=0): BLOCK only when H4 is a *strong* opposite signal (abs(m4) >= thr4)
+        #       * otherwise: ALLOW but downgrade confidence (medium if H1 is very strong, else low)
+        #   - If no usable H4 signal: confidence based on H1 strength
+        # ------------------------------------------------------------
         if isinstance(m4, (int, float)) and s4 != 0:
             if s1 == s4:
+                # H4 agrees with H1
                 h4_agree = True
                 opp_conf = "high" if abs(m4) >= thr4 else "medium"
             else:
-                # conflict => drop
-                continue
-        else:
+                # H4 conflicts with H1
+                h4_agree = False
+
+                # strict mode: only block if H4 is a strong opposite signal
+                strong_h4_opp = abs(m4) >= max(thr4 * 1.5, 0.60)
+
+                if (not loose) and strong_h4_opp:
+                    _push_blocked(
+                       sym,
+                       row,
+                       stage="H4_CONFLICT",
+                       reason=f"m1={m1} m4={m4} thr4={thr4} (strong H4 opp)",
+                       meta={"m1": m1, "m4": m4, "thr1": thr1, "thr4": thr4, "strong_h4_opp": True},
+                    )
+                    # DO NOT continue — keep evaluating (ZONE_GATE will decide quality)
+                    opp_conf = "low"                     
+                 
+                else:
+                     # H4 conflicts but not "strong" -> allow with downgrade
+                     opp_conf = "medium" if abs(m1) >= (1.5 * thr1) else "low"
+
+        else:       
+            # No usable H4 signal => confidence based on H1 strength only
             opp_conf = "high" if abs(m1) >= 1.5 * thr1 else "medium"
 
         opp_score = _compute_opp_score(sym, row, m1, thr1)
 
-        if opp_score < OPP_SCORE_MIN:
+
+        if (not loose) and opp_score < OPP_SCORE_MIN:
             if debug_top > 0 and (debug_force or loose):
                 out_dbg = dict(row)
                 hour_ms = 60 * 60 * 1000
@@ -3921,21 +10028,801 @@ def trend_opportunities(
                 _set_signal_from_entry(out_dbg)
 
                 debug_pool.append(out_dbg)
-            continue
+            _push_blocked(sym, row, stage="OPP_SCORE", reason=f"opp_score={opp_score} min={OPP_SCORE_MIN}")
+            if not debug_gate:
+                continue
+            # debug_gate=1 -> do NOT stop here; keep going so ZONE_GATE can run and report bars/device
+
+        
+        # --------------------------------------------------
+        # FINAL STRATEGY GATE: ZONE + SECOND TAP + REVERSAL
+        # --------------------------------------------------
+        if loose:
+            allowed = True
+            gate_meta = {
+                "reason": "LOOSE_BYPASS",
+                "confidence": opp_conf,
+                "zone": None,
+            }
+            try:
+                bsrc = row_h1.get("bars") or row_h1.get("ohlc") or []
+                row["bars_h1"] = bsrc if isinstance(bsrc, list) else []
+            except Exception:
+                row["bars_h1"] = []
+        else:
+            # ---- ensure ATR exists for zone gate + SR zone rendering ----
+            try:
+                atr = (
+                    row.get("atr_1h")
+                    or row.get("atr")
+                    or row.get("atr14")
+                    or row.get("atr14_1h")
+                    or row_h1.get("atr_1h")
+                    or row_h1.get("atr")
+                    or row_h1.get("atr14")
+                    or row_h1.get("atr14_1h")
+                )
+                atr = float(atr) if isinstance(atr, (int, float)) else None
+            except Exception:
+                atr = None
+
+            # Pull H1 snap once (also used to attach bars for the gate)
+            sym_u = (sym or "").upper().strip()
+            snap_any = None
+            snap_tf = None
+
+            # 1) device-scoped snaps (prefer H1, then M15, then M5, then M1)
+            x_device_id_hdr = (x_device_id or "").strip()
+            if debug_gate_on:
+                row["dbg_hdr_x_device_id"] = x_device_id_hdr
+                row["dbg_hdr_present"] = bool(x_device_id_hdr)
+
+            if x_device_id_hdr:
+                x_device_id = x_device_id_hdr
+
+            dev_for_snap = str((x_device_id_hdr or x_device_id or effective_device or "")).strip()
+            if debug_gate_on:
+                row["dbg_dev_for_snap"] = dev_for_snap
+                row["dbg_sym_u"] = sym_u
+                row["dbg_snap_try_tfs"] = ["H1", "M15", "M5", "M1"]
+            if dev_for_snap and sym_u:
+                for tf_try in ("H1",):
+                    try:
+                        snap_key = f"xtl:ohlc:snap:{dev_for_snap}:{sym_u}:{tf_try}"
+
+                        raw = R.get(snap_key)
+
+                        if debug_gate_on:
+                            row["dbg_R_id"] = id(R)
+                            row["dbg_snap_key_try"] = snap_key
+                            row["dbg_snap_raw_len"] = (len(raw) if isinstance(raw, str) else (len(raw) if raw else 0))
+                        if debug_gate_on:
+                            print(f"[DBG_SNAP] hdr={x_device_id_hdr!r} x_device_id={x_device_id!r} effective={effective_device!r} dev_for_snap={dev_for_snap!r} key={snap_key} raw_len={(len(raw) if raw else 0)}", flush=True)
+
+
+
+                        if debug_gate_on and snap_any is None:
+                            row["dbg_snap_key_try"] = snap_key
+                            row["dbg_snap_raw_len"] = len(raw) if raw else 0
+
+                        s = _json_load_twice(raw) if raw else None
+                        bars = s.get("bars") if isinstance(s, dict) else None
+
+                        if debug_gate_on and snap_any is None:
+                            row["dbg_snap_tf"] = tf_try
+                            row["dbg_snap_bars_len"] = len(bars) if isinstance(bars, list) else 0
+                        if isinstance(bars, list) and bars:
+                            snap_any = s
+                            snap_tf = tf_try
+                            break
+                    except Exception:
+                        continue
+
+            
+
+            # 3) broker-direct fallback (H1 only) when snaps are missing
+            # This fixes cases like XAUUSD where tick price exists but ohlc snaps are not being published.
+            if snap_any is None and sym_u:
+                try:
+                    # Pull a reasonable tail so ATR14 + tap logic works
+                    agent_rows = _broker_bars_sync(sym_u, "H1", limit=240) or []
+                    bars_b: list[dict] = []
+
+                    # _broker_bars_sync rows are typically {t_open_ms,t_close_ms,o,h,l,c,complete}
+                    for b in agent_rows:
+                        if not isinstance(b, dict):
+                            continue
+                        try:
+                            bars_b.append(
+                                {
+                                    "t_open_ms": int(b.get("t_open_ms") or b.get("tOpen") or b.get("t") or 0),
+                                    "t_close_ms": int(b.get("t_close_ms") or b.get("tClose") or b.get("t") or 0),
+                                    "o": float(b["o"]),
+                                    "h": float(b["h"]),
+                                    "l": float(b["l"]),
+                                    "c": float(b["c"]),
+                                    "complete": True,
+                                }
+                            )
+                        except Exception:
+                            continue
+
+                    if bars_b:
+                        snap_any = {"bars": bars_b}
+                        snap_tf = "H1:broker"
+                except Exception:
+                    pass
+
+            
+            # Attach bars so _zone_reversal_gate can compute taps/reversal reliably
+            # Attach H1 bars so _zone_reversal_gate can compute taps/reversal reliably
+            # Source order (PERMANENT):
+            #   1) device-scoped snap   xtl:ohlc:snap:{dev}:{sym}:H1
+            #   2) global latest        xtl:ohlc:latest:{sym}:H1
+            #   3) otherwise -> no_h1_bars (do NOT evaluate gate on stale data)
+            try:
+                dev = str(pinned_device or x_device_id or row.get("device") or row.get("device_id") or "").strip()
+
+                k_dev = f"xtl:ohlc:snap:{dev}:{sym_u}:H1" if dev else ""
+                k_latest = f"xtl:ohlc:latest:{sym_u}:H1"
+
+                raw = _snap_get_raw_json(k_dev) if k_dev else None
+                src = "dev_snap" if raw else None
+
+                if not raw:
+                    raw = _snap_get_raw_json(k_latest)
+                    if raw:
+                        src = "latest"
+
+                js = _json_load_twice(raw) if raw else None
+
+                bars = None
+                if isinstance(js, dict):
+                    bars = js.get("bars") or js.get("ohlc") or js.get("data")
+                elif isinstance(js, list):
+                    bars = js
+
+                if not isinstance(bars, list) or len(bars) < 2:
+                    if debug_gate:
+                        row["dbg_h1_src"] = "missing"
+                        row["dbg_h1_key_dev"] = k_dev
+                        row["dbg_h1_key_latest"] = k_latest
+
+                    row["entry_gate"] = {
+                        "reason": "no_h1_bars",
+                        "bars_n": 0,
+                        "stage": "ZONE_GATE",
+                        "dev_used": dev,
+                        "stage": "ZONE_GATE",
+                        "blocked": True,
+                    }
+                    continue
+
+                nb = _normalize_snap_bars_to_ms(bars, 60 * 60 * 1000)  # H1
+
+                def _tc(b):
+                    v = b.get("t_close_ms") or b.get("tClose") or b.get("t") or 0
+                    v = int(float(v)) if v is not None else 0
+                    if 0 < v < 10_000_000_000:
+                        v *= 1000
+                    return v
+
+                nb = [
+                    b for b in nb
+                    if isinstance(b, dict) and all(k in b for k in ("o", "h", "l", "c"))
+                ]
+                nb.sort(key=_tc)
+
+                row_h1["bars"] = nb
+
+                if debug_gate_on:
+                    row["dbg_h1_src"] = src
+                    row["dbg_h1_key_dev"] = k_dev
+                    row["dbg_h1_key_latest"] = k_latest
+                    row["dbg_h1_bars_n"] = len(nb)
+                    lastb = nb[-1]
+                    row["dbg_h1_last_close_ms"] = _tc(lastb)
+                    row["dbg_h1_last_c"] = float(lastb.get("c"))
+
+            except Exception:
+                pass
+
+            # ALSO expose closed H1 bars on the opp row so _evaluate_alert_outcome can run structure TP/exit
+            try:
+                bsrc = row_h1.get("bars") or row_h1.get("ohlc") or []
+                row["bars_h1"] = bsrc if isinstance(bsrc, list) else []
+            except Exception:
+                row["bars_h1"] = []
+
+
+            if atr is None:
+                # 1) Prefer bars already attached to row_h1 (most reliable)
+                try:
+                    bsrc = row_h1.get("bars") if isinstance(row_h1, dict) else None
+                    if isinstance(bsrc, list) and len(bsrc) >= 20:
+                        atr = _atr14_from_hlc(bsrc)
+                except Exception:
+                    atr = None
+
+            if atr is None:
+                # 2) Fallback: device snap from Redis
+                try:
+                    dev = str(pinned_device or x_device_id or row.get("device") or row.get("device_id") or "").strip()
+                    if dev:
+                        raw = R.get(f"xtl:ohlc:snap:{dev}:{sym_u}:H1")
+                        js = _json_load_twice(raw) if raw else None
+                        if isinstance(js, dict):
+                            h1_bars = js.get("bars") or []
+                            if isinstance(h1_bars, list) and len(h1_bars) >= 20:
+                                h1_bars = _normalize_snap_bars_to_ms(h1_bars, 60 * 60 * 1000)
+                                atr = _atr14_from_hlc(h1_bars)
+                except Exception:
+                    atr = None
+
+
+            if atr is not None:
+                # write to all common names (covers whatever _zone_reversal_gate expects)
+                for k in ("atr_1h", "atr", "atr14", "atr14_1h"):
+                    row[k] = atr
+                    row_h1[k] = atr
+
+                # IMPORTANT: inject into the exact place _zone_reversal_gate reads
+                try:
+                    extra = row_h1.get("extra_h1")
+                    if not isinstance(extra, dict):
+                        extra = {}
+                    feats = extra.get("features")
+                    if not isinstance(feats, dict):
+                        feats = {}
+                    feats["feat_atr"] = float(atr)
+                    extra["features"] = feats
+                    row_h1["extra_h1"] = extra
+                except Exception:
+                    pass
+
+                # ALSO provide ATR in bp (basis points) in case gate expects it
+                try:
+                    px = float(
+                        row.get("last_price")
+                        or row.get("price")
+                        or row.get("basis_price")
+                        or row.get("mid")
+                        or 0.0
+                    )
+                except Exception:
+                    px = 0.0
+
+                atr_bp = None
+                if px > 0:
+                    atr_bp = (atr / px) * 10000.0
+                    for k in ("feat_atr_bp", "atr_bp", "atr14_bp", "atr_1h_bp"):
+                        row[k] = atr_bp
+                        row_h1[k] = atr_bp
+
+                # ==========================================================
+                # DEBUG: ATR + BARS VISIBILITY (Point-1)
+                # ==========================================================
+                if debug_gate_on:
+                    row["dbg_h1_bars_n"] = len(row_h1.get("bars") or [])
+                    row["dbg_atr_1h"] = atr
+                    row["dbg_atr_src"] = (
+                        "from_row_fields"
+                        if (
+                            row.get("atr_1h")
+                            or row.get("atr")
+                            or row.get("atr14")
+                            or row.get("atr14_1h")
+                        )
+                        else "computed_from_bars"
+                    )
+                    if atr_bp is not None:
+                        row["dbg_atr_bp"] = atr_bp
+
+            # ---- ensure SR exists for zone gate ----
+            if not isinstance(row.get("sr"), dict) or not row.get("sr"):
+                try:
+                    sr_bundle, bsrc = _get_sr_bundle(
+                        sym,
+                        prefer_dev=(dev or pinned_device or x_device_id_hdr),
+                        return_src=True,
+                    )
+                    if isinstance(sr_bundle, dict) and sr_bundle:
+                        row["sr"] = sr_bundle
+                    if debug_gate_on:
+                        row["dbg_sr_src"] = bsrc if (isinstance(sr_bundle, dict) and sr_bundle) else f"missing|{bsrc}"
+                except Exception as _e:
+                    if debug_gate_on:
+                        row["dbg_sr_src"] = f"exc|{type(_e).__name__}"
+            
+            # ---- after SR is attached to row ----
+            try:
+                sr0 = row.get("sr")
+                if isinstance(sr0, dict) and sr0:
+                    atr0 = None
+                    try:
+                         atr0 = (
+                              active_snap_row.get("atr")
+                              or active_snap_row.get("atr14")
+                              or active_snap_row.get("atr_h1")
+                              or row.get("atr")
+                              or row.get("atr14")
+                              or row.get("atr_h1")
+                         )
+                    except Exception:
+                         atr0 = None
+  
+                    px0 = (
+                         active_snap_row.get("basis_price")
+                         or active_snap_row.get("last_price")
+                         or active_snap_row.get("price")
+                         or active_snap_row.get("mid")
+                         or row.get("basis_price")
+                         or row.get("last_price")
+                         or row.get("price")
+                         or row.get("mid")
+                    )
+ 
+                    ent = _pick_entry_sr_levels(sr0, px0, top_n=4, atr=atr0)
+                    if isinstance(ent, dict) and ent:
+                        row.update(ent)
+
+                    # Also pass into chart overlay for UI labels (robust to bad chart shape)
+                    try:
+                        ch = row.get("chart")
+                        if not isinstance(ch, dict):
+                            ch = {}
+                            row["chart"] = ch
+
+                        ov = ch.get("overlays")
+                        if not isinstance(ov, dict):
+                            ov = {}
+                            ch["overlays"] = ov
+
+                        ec = ov.get("entry_context")
+                        if not isinstance(ec, dict):
+                            ec = {}
+                            ov["entry_context"] = ec
+                        ec["px"] = px0
+
+                        ec["entry_support"] = ent.get("entry_support")
+                        ec["entry_support_tf"] = ent.get("entry_support_tf")
+                        ec["entry_support_kind"] = ent.get("entry_support_kind")
+                        ec["entry_resistance"] = ent.get("entry_resistance")
+                        ec["entry_resistance_tf"] = ent.get("entry_resistance_tf")
+
+                        # lists (near + major)
+                        ec["entry_support_near_levels"] = ent.get("entry_support_near_levels") or []
+                        ec["entry_support_major_levels"] = ent.get("entry_support_major_levels") or []
+
+                        ec["entry_resistance_near_levels"] = ent.get("entry_resistance_near_levels") or []
+                        ec["entry_resistance_major_levels"] = ent.get("entry_resistance_major_levels") or []
+                        # NEW: flipped lists
+                        ec["entry_support_flipped_levels"] = ent.get("entry_support_flipped_levels") or []
+                        ec["entry_resistance_flipped_levels"] = ent.get("entry_resistance_flipped_levels") or []
+                        
+
+
+                    except Exception as e:
+                        if debug_gate_on:
+                            row["dbg_entry_context_exc"] = f"{type(e).__name__}:{e}"
+
+            except Exception as e:
+                if debug_gate_on:
+                    row["dbg_entry_sr_exc"] = f"{type(e).__name__}:{e}"
+
+
+            # ---------------- DEBUG: what the zone gate actually sees ----------------
+            
+            sr_for_gate = _sr_gate_view(row.get("sr"))
+            if debug_gate_on:
+                b0 = None
+                if isinstance(row_h1, dict):
+                    b0 = row_h1.get("bars") or row_h1.get("ohlc") or []
+
+                row["dbg_gate_bars_n"] = len(b0) if isinstance(b0, list) else 0
+                if isinstance(b0, list) and b0 and isinstance(b0[-1], dict):
+                    z = b0[-1]
+                    row["dbg_gate_bar_keys"] = sorted(list(z.keys()))[:40]
+                    t_ms = z.get("t_close_ms") or z.get("tClose") or z.get("t_close") or z.get("ts")
+                    t_sec = z.get("t") or z.get("time")
+
+                    if t_ms is None and t_sec is not None:
+                        try:
+                            t_ms = int(float(t_sec) * 1000.0)
+                        except Exception:
+                            t_ms = None
+
+                    row["dbg_gate_last_t_close_ms"] = t_ms
+                    row["dbg_gate_last_t_close_sec"] = t_sec
+
+            
+            
+            # Single source of truth: use effective_device computed earlier
+            dev_for_gate = str((x_device_id or effective_device or "")).strip()
+
+            # ---- HARD FALLBACK: if still empty, recover from known values (NO request here) ----
+            if not dev_for_gate:
+                dev_for_gate = str(x_device_id or "").strip()
+
+            # ---- CHANGE 2: if still empty, recover from leader / registered devices ----
+            if not dev_for_gate:
+                try:
+                    uid = _uid_from_user(user)
+                except Exception:
+                    uid = None
+
+                if (not dev_for_gate) and uid and R is not None:
+                    # 1) leader device (best)
+                    try:
+                        leader = _json_load_twice(R.get(f"xtl:user:{uid}:trend:leader")) or {}
+                        if isinstance(leader, dict):
+                            dev_for_gate = str(
+                                leader.get("device_id") or leader.get("id") or leader.get("device") or ""
+                            ).strip()
+                        elif isinstance(leader, str):
+                            dev_for_gate = leader.strip()
+                    except Exception:
+                        pass
+
+                    # 2) any registered device (fallback)
+                    if not dev_for_gate:
+                        try:
+                            ds = list(R.smembers(f"xtl:user:{uid}:devices") or [])
+                            if ds:
+                                d0 = ds[0]
+                                if isinstance(d0, (bytes, bytearray)):
+                                    d0 = d0.decode("utf-8", "ignore")
+                                dev_for_gate = str(d0).strip()
+                        except Exception:
+                            pass
+
+            # keep pinned_device consistent for any later logic
+            if dev_for_gate and not pinned_device:
+                pinned_device = dev_for_gate
+
+            # (optional) keep x_device_id_hdr only for debug visibility
+            x_device_id_hdr = str(x_device_id or "").strip()
+
+
+
+            if debug_gate_on:
+                row["dbg_pinned_device"] = str(pinned_device or "").strip()
+                row["dbg_x_device_id_hdr"] = x_device_id_hdr
+                row["dbg_dev_for_gate"] = str(dev_for_gate or "").strip()
+                row["dbg_effective_device"] = str(effective_device or "").strip()
+                row["dbg_auth_ok"] = bool(uid_for_entry) or bool(effective_device)
+            
+            # --- ensure H1 bars exist for zone gate (rehydrate from device-scoped store) ---
+            try:
+                b0 = row_h1.get("bars") or row_h1.get("ohlc") or []
+            except Exception:
+                b0 = []
+
+            bad_shape = True
+            if isinstance(b0, list) and len(b0) >= 2 and isinstance(b0[-1], dict):
+                # require at least H/L/C (and ideally O)
+                bad_shape = not all(k in b0[-1] for k in ("h", "l", "c"))
+
+            if (not isinstance(b0, list)) or (len(b0) < 2) or bad_shape:
+                try:
+                    
+                    # --------- NEW: fallback to latest-pointer device if this device has no H1 snap ----------
+                    dev_h1 = str(dev_for_gate or "").strip()
+
+                    if R is not None and sym_u:
+                       try:
+                           # If this device has no H1 snap key, try latest pointer
+                           if dev_h1:
+                               k = f"xtl:ohlc:snap:{dev_h1}:{sym_u}:H1"
+                               if not R.exists(k):
+                                   ptr = R.get(f"xtl:ohlc:latest:{sym_u}:H1")
+                                   if isinstance(ptr, (bytes, bytearray)):
+                                       ptr = ptr.decode("utf-8", "ignore")
+                                   ptr = str(ptr or "").strip()
+                                   if ptr:
+                                       dev_h1 = ptr
+                                       if debug_gate:
+                                           row["dbg_h1_ptr_used"] = dev_h1
+                           else:
+                                # No dev_for_gate at all -> try latest pointer directly
+                                ptr = R.get(f"xtl:ohlc:latest:{sym_u}:H1")
+                                if isinstance(ptr, (bytes, bytearray)):
+                                    ptr = ptr.decode("utf-8", "ignore")
+                                ptr = str(ptr or "").strip()
+                                if ptr:
+                                    dev_h1 = ptr
+                                    if debug_gate:
+                                        row["dbg_h1_ptr_used"] = dev_h1
+                       except Exception:
+                           pass
+                    bars_h1 = _get_closed_h1_bars(sym_u, dev_h1) if dev_h1 else []
+                    if debug_gate_on:
+                        row["dbg_h1_bars_n"] = len(bars_h1) if isinstance(bars_h1, list) else 0
+                        row["dbg_attach_bars_tf"] = "H1" if row["dbg_h1_bars_n"] >= 2 else None
+                        row["dbg_h1_dev_used"] = dev_h1
+
+                    bars_h1 = bars_h1 if isinstance(bars_h1, list) else []
+                    if len(bars_h1) >= 2:
+                        row_h1["bars"] = bars_h1
+                        if debug_gate_on:
+                            row["dbg_h1_bars_src"] = "rehydrated:_get_closed_h1_bars"
+                            row["dbg_h1_bars_n2"] = len(bars_h1)
+                    else:
+                        if debug_gate_on:
+                            row["dbg_h1_bars_src"] = "rehydrated_empty"
+                            row["dbg_h1_bars_n2"] = len(bars_h1)
+                except Exception:
+                    if debug_gate_on:
+                        row["dbg_h1_bars_src"] = "rehydrate_exception"
+            
+            # --- REFRESH STALE H1 BARS (even if shape is valid) ---
+            try:
+                tf_ms = 60 * 60 * 1000
+                bcur = row_h1.get("bars") or row_h1.get("ohlc") or []
+                bcur = bcur if isinstance(bcur, list) else []
+
+                def _tc(b):
+                    v = b.get("t_close_ms") or b.get("tClose") or b.get("t") or 0
+                    try:
+                        v = int(float(v)) if v is not None else 0
+                    except Exception:
+                        v = 0
+                    if 0 < v < 10_000_000_000:
+                        v *= 1000
+                    return v
+
+                last_close_ms = _tc(bcur[-1]) if (bcur and isinstance(bcur[-1], dict)) else 0
+                # pick the SAME device we used for rehydration (pointer-aware)
+                dev_h1_used = None
+                try:
+                    dev_h1_used = row.get("dbg_h1_dev_used") or row.get("dbg_h1_ptr_used")
+                except Exception:
+                    dev_h1_used = None
+                dev_h1_used = str(dev_h1_used or dev_for_gate or "").strip()
+                # --- NEW: compare with Redis snap last close (deterministic refresh) ---
+                snap_last_close_ms = 0
+                try:
+                    raw0 = R.get(f"xtl:ohlc:snap:{dev_h1_used}:{sym_u}:H1") \
+                         if (R is not None and dev_h1_used and sym_u) else None
+                    js0 = json.loads(raw0) if raw0 else None
+                    bars0 = (js0.get("bars") if isinstance(js0, dict) else None) or []
+                    if isinstance(bars0, list) and bars0 and isinstance(bars0[-1], dict):
+                        t_last = bars0[-1].get("t") or 0  # seconds
+                        if isinstance(t_last, (int, float)) and t_last > 1_000_000_000:
+                            snap_last_close_ms = int(t_last * 1000 + tf_ms)
+                except Exception:
+                    snap_last_close_ms = 0
+
+                if debug_gate_on:
+                    row["dbg_h1_last_close_ms_before"] = last_close_ms
+                    row["dbg_h1_snap_last_close_ms"] = snap_last_close_ms
+
+                
+
+
+                # stale if last close is too old compared to now (buffer allows slight delays)
+                # refresh if Redis snap is newer than attached bars
+                if snap_last_close_ms > 0 and snap_last_close_ms > last_close_ms:
+
+                    raw = R.get(f"xtl:ohlc:snap:{dev_h1_used}:{sym_u}:H1") if (R is not None and dev_h1_used and sym_u) else None
+                    # parse JSON safely (no _json_load_twice dependency)
+                    js = None
+                    if raw:
+                        try:
+                            if isinstance(raw, (bytes, bytearray)):
+                                raw = raw.decode("utf-8", "ignore")
+                            js = json.loads(raw)
+                        except Exception:
+                            js = None
+                    
+                    bars = (js.get("bars") if isinstance(js, dict) else None) or []
+                    if isinstance(bars, list) and len(bars) >= 2:
+                        nb = _normalize_snap_bars_to_ms(bars, tf_ms)
+                        nb = [b for b in nb if isinstance(b, dict) and all(k in b for k in ("o", "h", "l", "c"))]
+                        nb.sort(key=_tc)
+                        if len(nb) >= 2:
+                            row_h1["bars"] = nb
+                            if debug_gate_on:
+                                row["dbg_h1_refresh"] = True
+                                row["dbg_h1_last_close_ms"] = _tc(nb[-1])
+                                row["dbg_h1_refresh_dev_used"] = dev_h1_used
+            except Exception as e:
+                if debug_gate_on:
+                    row["dbg_h1_refresh_exc_type"] = type(e).__name__
+                    row["dbg_h1_refresh_exc"] = str(e)
+
+            zone_exc_type = None
+            zone_exc = None
+            zone_tb = None
+            if debug_gate_on:
+                try:
+                    b1 = row_h1.get("bars") or row_h1.get("ohlc") or []
+                    row["dbg_gate_bars_n"] = len(b1) if isinstance(b1, list) else 0
+                    if isinstance(b1, list) and b1 and isinstance(b1[-1], dict):
+                        row["dbg_gate_bar_keys"] = list(b1[-1].keys())
+                        def _tc_dbg(b):
+                            v = b.get("t_close_ms") or b.get("t") or 0
+                            try:
+                                v = int(float(v)) if v is not None else 0
+                            except Exception:
+                                v = 0
+                            if 0 < v < 10_000_000_000:
+                                v *= 1000
+                            return v
+
+                        if isinstance(b1, list) and b1:
+                            last_bar = max((x for x in b1 if isinstance(x, dict)), key=_tc_dbg, default=None)
+                            row["dbg_gate_last_t_close_ms"] = _tc_dbg(last_bar) if last_bar else None
+
+                except Exception:
+                    pass
+            if debug_gate_on:
+                try:
+                    fn = _pick_last_closed_bar_from_bars
+                    code = getattr(fn, "__code__", None)
+                    row["dbg_pick_fn"] = {
+                        "obj": str(fn),
+                        "firstlineno": getattr(code, "co_firstlineno", None),
+                        "file": getattr(code, "co_filename", None),
+                    }
+                except Exception:
+                    pass
+            # --- Build TF-sliced SR lists for zone gate ---
+            try:
+                ec = (((row.get("chart") or {}).get("overlays") or {}).get("entry_context") or {})
+            except Exception:
+                ec = {}
+
+            sr_for_gate = {
+                "h1": {
+                    "supports_near": ec.get("entry_support_near_levels") or [],
+                    "supports_major": ec.get("entry_support_major_levels") or [],
+                    "resistances_near": ec.get("entry_resistance_near_levels") or [],
+                    "resistances_major": ec.get("entry_resistance_major_levels") or [],
+                },
+                "h4": {},  # optional; safe placeholder
+            }
+
+            
+
+           
+            
+
+            try:
+                allowed, gate_meta = _zone_reversal_gate(
+                    sym=sym_u,
+                    direction=("BUY" if opp_dir == "UP" else "SELL"),
+                    row_h1=row_h1,
+                    sr=sr_for_gate,
+                    now_ms=now_ms,
+                    tf_tag="H1",
+                    pinned_device=dev_for_gate,
+                    x_device_id=dev_for_gate,
+                    debug_gate=bool(debug_gate_on),
+                )
+
+                # --- CALLSITE DEBUG MARKER ---
+                if isinstance(gate_meta, dict):
+                    try:
+                        gate_meta["__callsite_marker__"] = "AFTER_ZONE_GATE_CALL"
+                        gate_meta["__callsite_debug_gate__"] = bool(debug_gate_on)
+                        gate_meta["__callsite_file__"] = __file__
+                        if debug_gate_on:
+                            gate_meta["sr"] = sr_for_gate
+                            gate_meta["dbg_sr_for_gate_top"] = {
+                                "supp_near_n": len(sr_for_gate.get("supports_near") or []),
+                                "supp_major_n": len(sr_for_gate.get("supports_major") or []),
+                                "res_near_n": len(sr_for_gate.get("resistances_near") or []),
+                                "res_major_n": len(sr_for_gate.get("resistances_major") or []),
+                                "supp_near_1": (sr_for_gate.get("supports_near") or [None])[0],
+                                "res_near_1": (sr_for_gate.get("resistances_near") or [None])[0],
+                            }
+                    except Exception:
+                        pass
+
+                try:
+                    row["entry_gate"] = gate_meta
+                except Exception:
+                    pass
+
+
+                # (optional) convenience field
+                try:
+                    if isinstance(gate_meta, dict):
+                        row["entry_zone"] = gate_meta.get("zone")
+                except Exception:
+                    pass
+
+
+                # If gate returns an error dict (not raising), surface it in debug output
+                if debug_gate_on and isinstance(gate_meta, dict) and (gate_meta.get("exc") or gate_meta.get("exc_type")):
+                     row["dbg_zone_gate_meta"] = {
+                         "reason": gate_meta.get("reason"),
+                         "stage": gate_meta.get("stage"),
+                         "exc_type": gate_meta.get("exc_type"),
+                         "exc": gate_meta.get("exc"),
+                         "dev_used": gate_meta.get("dev_used"),
+                     }
+
+            except Exception as e:
+                
+                
+                zone_exc_type = type(e).__name__
+                zone_exc = str(e)
+                zone_tb = traceback.format_exc(limit=10)
+                allowed = False
+                gate_meta = {
+                    "reason": "ZONE_GATE_EXCEPTION",
+                    "blocked": True,
+                    "stage": "ZONE_GATE",
+                    "exc_type": zone_exc_type,
+                    "exc": zone_exc,
+                    "tb": zone_tb,
+                    "dev_used": dev_for_gate,
+                }
+            if isinstance(gate_meta, dict):
+                gate_meta["dev_used"] = dev_for_gate
+                gate_meta.setdefault("stage", "ZONE_GATE")
+            if debug_gate_on:
+                row["dbg_zone_gate_exc_type"] = zone_exc_type
+                row["dbg_zone_gate_exc"] = zone_exc
+                row["dbg_dev_for_gate"] = dev_for_gate
+                if zone_tb:
+                    row["dbg_zone_gate_tb"] = zone_tb
+
+
+            if not allowed:
+                reason = gate_meta.get("reason") if isinstance(gate_meta, dict) else None
+                gate_stats[str(reason or "unknown")] += 1
+
+                
+
+                _push_blocked(
+                    sym,
+                    row,
+                    stage="ZONE_GATE",
+                    reason=str(reason or "unknown"),
+                    meta={**(gate_meta if isinstance(gate_meta, dict) else {}), "dev": dev_for_gate},
+                )
+
+                # SOFT MODE: keep the opportunity visible, but mark entry as gated
+                if not isinstance(gate_meta, dict):
+                    gate_meta = {}
+                gate_meta["blocked"] = True
+                gate_meta.setdefault("reason", str(reason or "unknown"))
+                gate_meta["stage"] = "ZONE_GATE"
+
+                # downgrade confidence so UI reflects it's not “clean”
+                opp_conf = "low"
+
+                
+
+
+
+
 
         # --------------------------------------------------
         # 4) Build opportunity row
         # --------------------------------------------------
         out = dict(row)
+        # ---- NEW: horizon-based expiry (default 6h) ----
+        try:
+            horizon_min = int(float(out.get("horizon_min") or row.get("horizon_min") or 540))
+        except Exception:
+            horizon_min = 540
         hour_ms = 60 * 60 * 1000
         bucket_open_ts = (now_ms // hour_ms) * hour_ms
         opp_open_ts = bucket_open_ts
-        opp_expire_ts = bucket_open_ts + hour_ms
+        opp_expire_ts = opp_open_ts + horizon_min * 60_000
         opp_id = f"{sym}-H1-{opp_dir}-{opp_open_ts}"
 
         out["opp_id"] = opp_id
+        out["id"] = opp_id
         out["opp_direction"] = opp_dir
         out["decision"] = "BUY" if opp_dir == "UP" else "SELL"
+        out.setdefault("id", opp_id)
+        out.setdefault("status", "active")
+        out.setdefault("blocked", False)
         out["opp_confidence"] = opp_conf
         out["opp_horizon"] = "H1"
         out["opp_h4_agree"] = h4_agree
@@ -3944,6 +10831,19 @@ def trend_opportunities(
         out["opp_min_room_h1"] = thr1
         out["opp_min_room_h4"] = thr4
         out["opp_score"] = round(float(opp_score), 1)
+        gm = gate_meta if isinstance(gate_meta, dict) else None
+
+        out["entry_gate"] = gm
+        out["gate_meta"] = gm  # keep a stable copy for _run_entry_only_if_armed + UI/debug
+
+        if gm:
+            out["zone"] = gm.get("zone")
+            out["opp_confidence"] = gm.get("confidence", opp_conf)
+            out["opp_reason"] = gm.get("reason", out.get("opp_reason"))
+        else:
+            out["zone"] = None
+
+        out["horizon_min"] = horizon_min
 
         # SR summary (same as your code)
         sr = row.get("sr")
@@ -3988,14 +10888,265 @@ def trend_opportunities(
         out.setdefault("opp_reason", f"H1 {m1:.3f}% thr {thr1:.3f}%; H4 {m4:.3f}% thr {thr4:.3f}%")
         out.setdefault("update_tf", tfu)
         out.setdefault("server_now_ms", now_ms)
+        # ------------------------------------------------------------
+        # DEBUG: always compute zone gate when debug_gate is on
+        # (so entry_gate/zone/tap info is visible even if not armed)
+        # ------------------------------------------------------------
+        if debug_gate_on and (not isinstance(out.get("entry_gate"), dict) or not out.get("entry_gate")):
+            try:
+                allowed_dbg, gm_dbg = _zone_reversal_gate(
+                    sym=sym_u,
+                    direction=("BUY" if opp_dir == "UP" else "SELL"),
+                    row_h1=row_h1,
+                    sr=sr_for_gate,
+                    now_ms=now_ms,
+                    tf_tag="H1",
+                    pinned_device=dev_for_gate,
+                    x_device_id=dev_for_gate,
+                    debug_gate=True,
+                )
+                if isinstance(gm_dbg, dict):
+                    # keep it consistent with other callsite behavior
+                    gm_dbg.setdefault("blocked", (not bool(allowed_dbg)))
+                    gm_dbg["__callsite_marker__"] = "DEBUG_FORCE_GATE"
+                    out["entry_gate"] = gm_dbg
+                    out["zone"] = gm_dbg.get("zone")
+                    # optional: keep a copy under "gate" for UI inspection
+                    out["gate"] = gm_dbg
+            except Exception as e:
+                out["dbg_force_gate_exc"] = f"{type(e).__name__}:{e}"
 
-        _attach_entry_1m(out)
-        _set_signal_from_entry(out)
+        _run_entry_only_if_armed(out)
+        # ------------------------------------------------------------
+        # Self-heal stale pointer-hash gates (prevents permanent lock)
+        # ------------------------------------------------------------
+        try:
+            pointer_key = f"xtl:trend:opp:h1:{sym_u}:{opp_dir}"
+            eg = out.get("entry_gate")
+            if isinstance(eg, str):      
+                eg = _json_load_twice(eg)
+            reason = eg.get("reason") if isinstance(eg, dict) else None
+
+            if reason in ("no_h1_bars", "no_atr"):
+                bars_h1 = _get_closed_h1_bars(sym_u, dev_h1) if dev_h1 else []
+                if debug_gate_on:
+                    row["dbg_h1_dev_used"] = dev_h1
+
+                if isinstance(bars_h1, list) and len(bars_h1) >= 2:
+                    # patch existing row_h1 instead of replacing it
+                    try:
+                        if isinstance(row_h1, dict):
+                            row_h1["bars"] = bars_h1
+                    except Exception:
+                        pass
+
+                    allowed, gate_meta2 = _zone_reversal_gate(
+                        sym=sym_u,
+                        direction=("BUY" if opp_dir == "UP" else "SELL"),
+                        row_h1=row_h1,
+                        sr=sr_for_gate,
+                        now_ms=now_ms,
+                        tf_tag="H1",
+                        pinned_device=dev_for_gate,
+                        x_device_id=dev_for_gate,
+                        debug_gate=bool(debug_gate_on),
+
+                    )
+
+                    out["entry_gate"] = gate_meta2
+                    # re-sync derived fields from healed gate
+                    try:
+                        gm2 = gate_meta2 if isinstance(gate_meta2, dict) else None
+                        if gm2:
+                            out["zone"] = gm2.get("zone")
+                            out["opp_reason"] = gm2.get("reason", out.get("opp_reason"))
+                            out["opp_confidence"] = gm2.get("confidence", out.get("opp_confidence"))
+                            if debug_gate_on:
+                                out["gate"] = gm2
+                    except Exception:
+                        pass
+                    try:
+                        _run_entry_only_if_armed(out)
+                    except Exception:
+                        pass
+
+
+                    out["signal_reason"] = (
+                        "armed" if allowed else "not_armed:" + str(gate_meta2.get("reason") or "unknown")
+                    )
+
+                    R.hset(
+                        pointer_key, 
+                        mapping={
+                            "entry_gate": json.dumps(gate_meta2, separators=(",", ":")),
+                            "signal_reason": out["signal_reason"],
+                            "resp_ts_ms": str(now_ms),
+                            "opp_id": json.dumps(out.get("opp_id") or "", separators=(",", ":")),
+                        }
+                    )
+
+                    if debug_gate_on:
+                        out["dbg_h1_bars_src"] = "self_heal_pointer_hash"
+                        out["dbg_h1_bars_n2"] = len(bars_h1)
+        except Exception:
+            pass
+
 
         # freeze snapshot (keeps it visible until hit/expired)
-        out = _freeze_or_snapshot_opp(sym, out, now_ms)
-        status = str(out.get("status") or "active").strip().lower()
-        if status in ("active", "new", "open"):
+        # freeze snapshot (keeps it visible until hit/expired)
+        # BUT: never freeze a gate exception (otherwise you keep returning stale exceptions forever)
+        try:
+            is_gate_exc = (
+                isinstance(gate_meta, dict)
+                and (
+                    gate_meta.get("reason") == "ZONE_GATE_EXCEPTION"
+                    or gate_meta.get("exc_type")
+                    or gate_meta.get("exc")
+                )
+            )
+        except Exception:
+            is_gate_exc = False
+
+        if is_gate_exc:
+            # best-effort cleanup so next request recomputes cleanly
+            try:
+                tfu0 = (out.get("tf") or tfu or "H1").upper()
+                dir0 = "UP" if (out.get("opp_dir") or opp_dir) == "UP" else "DOWN"
+                pointer_key = f"xtl:trend:opp:{tfu0.lower()}:{sym_u}:{dir0}"
+                R.delete(pointer_key)
+                # delete frozen snapshots too
+                for k in R.scan_iter(match=f"xtl:trend:opp:{tfu0.lower()}:{sym_u}-{tfu0}-{dir0}-*"):
+                    R.delete(k)
+                if debug_gate_on:
+                    out["dbg_no_snapshot"] = "gate_exception_no_freeze"
+            except Exception:
+                pass
+        else:
+            # In debug, NEVER serve frozen/cached opps — always recompute so gate + Redis truth is visible
+            if debug_force or debug_gate:
+                try:
+                    tfu0 = (out.get("tf") or tfu or "H1").upper()
+                    dir0 = "UP" if (out.get("opp_dir") or opp_dir) == "UP" else "DOWN"
+                    pointer_key = f"xtl:trend:opp:{tfu0.lower()}:{sym_u}:{dir0}"
+                    R.delete(pointer_key)
+                except Exception:
+                    pass
+                # skip freezing
+            else:
+                out = _freeze_or_snapshot_opp(sym, out, now_ms)
+
+
+        #out = _freeze_or_snapshot_opp(sym, out, now_ms)
+        # ALWAYS keep latest gate result (snapshot may h#ave stale/blank dev)
+        try:
+            eg_final = out.get("entry_gate")
+            if isinstance(eg_final, str):
+                eg_final = _json_load_twice(eg_final)
+                out["entry_gate"] = eg_final
+
+            if isinstance(eg_final, dict):
+                # enforce dev in final gate meta
+                if dev_for_gate and not eg_final.get("dev"):
+                    eg_final["dev"] = dev_for_gate
+        except Exception:
+            pass
+        # Set status for UI (so blocked opps still appear)
+        try:
+            eg0 = out.get("entry_gate")
+            is_blocked = isinstance(eg0, dict) and bool(eg0.get("blocked"))
+
+            # Always "active" so UI doesn't filter it out
+            out["status"] = "active"
+
+            # Keep gate metadata for UI badges
+            if is_blocked:
+                out["blocked_reason"] = out.get("blocked_reason") or eg0.get("reason")
+                out["blocked_at"] = out.get("blocked_at") or now_ms
+            else:
+                out["blocked_reason"] = None
+
+            # UI-facing decision (WAIT until armed)
+            out["decision_raw"] = out.get("decision")  # BUY/SELL original
+            out["decision"] = out["decision_raw"] if not is_blocked else "WAIT"
+            out["is_armed"] = (not is_blocked)
+            out["ui_state"] = "armed" if not is_blocked else "waiting"
+        except Exception:
+            out["status"] = out.get("status") or "active"
+            out.setdefault("decision_raw", out.get("decision"))
+            out.setdefault("is_armed", True)
+            out.setdefault("ui_state", "armed")
+
+
+        # ------------------------------------------------------------
+        # DEBUG: preserve dbg_* fields even if snapshot returns a cached hash
+        # ------------------------------------------------------------
+        if debug_gate_on:
+            try:
+                # "row" is the live working row that has dbg_* keys
+                for k, v in (row or {}).items():
+                    if isinstance(k, str) and k.startswith("dbg_"):
+                        out[k] = v
+            except Exception:
+                pass
+
+            # also preserve pinned/header device visibility (useful in jq)
+            try:
+                out["dbg_dev_for_gate"] = str(dev_for_gate or "").strip()
+                out["dbg_x_device_id_hdr"] = str(x_device_id_hdr or "").strip()
+                out["dbg_pinned_device"] = str(pinned_device or "").strip()
+                out["dbg_effective_device"] = str(effective_device or "").strip()
+            except Exception:
+                pass
+
+        # Persist entry freeze into Redis snapshot so it never flips back to WAIT
+        _persist_entry_meta_to_snapshot(sym, out)
+        
+        # ---- chart overlays for UI ----
+        try:
+            overlays = {}
+
+            # SR overlay (use the SR you already attached to out/row)
+            # SR zones (shared helper; works for H1/H4 and h1/h4 bundles)
+            try:
+                atr = (
+                    out.get("atr_1h")
+                    or out.get("atr")
+                    or out.get("atr14")
+                    or out.get("atr14_1h")
+                )
+                atr = float(atr) if isinstance(atr, (int, float)) else None
+
+                overlays["sr_zones"] = _build_sr_zones_from_summary(
+                    out.get("sr"),
+                    sym=sym,
+                    pip_factor=float(pip_factor),
+                    atr=atr,
+                )
+            except Exception:
+                overlays["sr_zones"] = []
+
+            # entry context (gate meta)
+            gm = out.get("entry_gate")
+            if isinstance(gm, dict):
+                overlays["entry_context"] = gm
+
+            # trade overlay (use final frozen fields)
+            overlays["trade"] = {
+                "decision": out.get("signal") or out.get("decision"),
+                "entry_price": out.get("entry_price"),
+                "tp_price": out.get("tp_price") or out.get("target_price"),
+                "sl_price": out.get("sl_price") or out.get("stop_loss"),
+                "entry_ts_ms": out.get("entry_ts_ms"),
+            }
+
+            out.setdefault("chart", {})
+            if isinstance(out["chart"], dict):
+                out["chart"]["overlays"] = overlays
+        except Exception:
+            pass
+
+        status = str(out.get("status") or "").strip().lower()
+        if status in ("active", "new", "open", "blocked", ""):
             opp_rows.append(out)
 
     history = _load_opp_history(limit=50)
@@ -4004,7 +11155,48 @@ def trend_opportunities(
         debug_pool.sort(key=lambda x: float(x.get("opp_score") or 0.0), reverse=True)
         opp_rows = debug_pool[:debug_top]
 
-    return {"ok": True, "tf": tfu, "rows": opp_rows, "history": history}
+    
+    
+
+    
+
+    # heavy work happens here (predict_all + build opp_rows/history/payload) ...
+    # DROP null/empty symbol rows (safety)
+    opp_rows = [r for r in opp_rows if str((r or {}).get("symbol") or "").strip()]
+    payload = {"ok": True, "tf": tfu, "rows": opp_rows, "history": history}
+    if debug_gate and gate_stats:
+        payload["gate_stats"] = dict(sorted(gate_stats.items(), key=lambda x: -x[1]))
+    # -------------------------------------------------
+    # FIX 2 (finish): write cache + unlock
+    # -------------------------------------------------
+    # write fresh cache + unlock
+    if cache_key and (not (debug_force or debug_gate or loose)):
+            
+        try:
+            R.setex(cache_key, cache_ttl_s, json.dumps(payload))
+        except Exception:
+            pass
+
+           
+        try:
+           if inflight_lock_key and inflight_got_lock:
+               R.delete(inflight_lock_key)
+        except Exception:
+           pass
+       
+    # ----------------------------------------
+    # Emit per-run opportunity gate statistics
+    # ----------------------------------------
+    if gate_stats:
+        try:
+            log.info(
+               "[OPP_GATE_STATS] %s",
+               dict(sorted(gate_stats.items(), key=lambda x: -x[1]))
+            )
+        except Exception:
+            pass
+    return payload
+
 
 
 @router.get("/opportunities/stats")
@@ -4266,6 +11458,73 @@ def _load_broker_meta(uid: str, snap_broker: dict | None) -> Optional["BrokerMet
     # 3) Nothing
     return None
 
+def _as_bool(x) -> bool:
+    try:
+        if isinstance(x, bool):
+            return x
+        if x is None:
+            return False
+        s = str(x).strip().lower()
+        return s in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return False
+
+
+def _as_int(x, default=0) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+
+def _find_tradable_devices_for_user(user_id: str) -> list[dict]:
+    """
+    Looks for device hashes: device:{dev_id}
+    Filters to tradable devices for this user.
+    Returns list of dicts with key device_id + a few fields.
+    """
+    out = []
+    try:
+        # scan_iter is safe; does not block Redis like KEYS
+        for key in R.scan_iter(match="device:dev_*", count=200):
+            try:
+                dev_id = key.split("device:", 1)[1]
+            except Exception:
+                dev_id = key
+
+            try:
+                h = R.hgetall(key) or {}
+            except Exception:
+                continue
+
+            if str(h.get("owner_id") or "") != str(user_id):
+                continue
+
+            if str(h.get("status") or "").lower() != "online":
+                continue
+
+            if _as_int(h.get("mt5_ok"), 0) != 1:
+                continue
+
+            if not _as_bool(h.get("mt5_terminal_connected")):
+                continue
+
+            if not _as_bool(h.get("mt5_terminal_trade_allowed")):
+                continue
+
+            out.append({
+                "device_id": dev_id,
+                "label": h.get("label"),
+                "version": h.get("version"),
+                "mt5_account_login": h.get("mt5_account_login"),
+                "mt5_account_server": h.get("mt5_account_server"),
+                "mt5_account_trade_mode": h.get("mt5_account_trade_mode"),
+            })
+    except Exception:
+        pass
+
+    return out
+
 
 class PreviewBar(BaseModel):
     t_open_ms: int   # broker bar OPEN time (ms since epoch, UTC)
@@ -4281,6 +11540,8 @@ class PreviewPayload(BaseModel):
     bars: List[PreviewBar] = []
     lastClosedTs: Optional[int] = None  # ms
     probe: Optional[dict] = None  
+    overlays: Optional[Dict[str, Any]] = None 
+    broker: Optional[Dict[str, Any]] = None   
 
 class BrokerMeta(BaseModel):
     price_basis: Optional[str] = None
@@ -4340,6 +11601,29 @@ def update_bot_state(payload: BotStateUpdate, user = Depends(require_auth_option
     current = _load_bot_state(user_id)
     patch = payload.dict(exclude_unset=True)
 
+    # --- NEW: guard when enabling bot ---
+    # Only check if this call will make enabled True (or keep it True)
+    enabling = False
+    try:
+        if "enabled" in patch:
+            enabling = bool(patch.get("enabled")) and not bool(current.get("enabled"))
+        else:
+            enabling = False
+    except Exception:
+        enabling = False
+
+    if enabling:
+        tradable = _find_tradable_devices_for_user(user_id)
+        if not tradable:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No tradable MT5 device available. Ensure at least one device is ONLINE, "
+                    "mt5_ok=1, terminal connected=True, and terminal trade_allowed=True "
+                    "(turn ON Algo Trading in MT5)."
+                ),
+            )
+
     for k, v in patch.items():
         if v is None:
             continue
@@ -4353,8 +11637,6 @@ def update_bot_state(payload: BotStateUpdate, user = Depends(require_auth_option
 
     _save_bot_state(user_id, current)
     return BotStateResp(ok=True, state=current)
-
-
 
 class MAParams(BaseModel):
     fast: int = Field(50, ge=2, le=500)
@@ -4829,24 +12111,13 @@ def trend_state2(
     adxMin: Optional[int] = Query(None, ge=5, le=60),
     useDIbias: Optional[bool] = Query(None),
     n: Optional[int] = Query(60, ge=30, le=500),
+    user=Depends(require_auth_optional),
 ):
     import os, json, time
     
 
     # ---------- helpers ----------
-    def _to_ms_any(x) -> int:
-        """Normalize any epoch-like value to milliseconds without raising."""
-        try:
-            xi = int(x or 0)
-        except Exception:
-            return 0
-        if xi >= 1_000_000_000_000_000_000:  # ns
-            return xi // 1_000_000
-        if xi >= 1_000_000_000_000_000:      # microseconds
-            return xi // 1_000
-        if xi >= 1_000_000_000_000:          # ms
-            return xi
-        return xi * 1000 if xi > 0 else 0     # seconds
+    
 
     TF_MS = {"M15": 15*60*1000, "H1": 60*60*1000, "H4": 4*60*60*1000}
 
@@ -4865,8 +12136,10 @@ def trend_state2(
         or request.headers.get("x_user_key")
         if allow_hdr else None
     )
-    requested = user_id_override or (str(hdr_key).strip() if hdr_key else get_user_id(request))
+    # optional-auth safe: prefer override/header, else use optional user, else "public"
+    requested = user_id_override or (str(hdr_key).strip() if hdr_key else (_uid_from_user(user) if user else None)) or "public"
     uid = _resolve_user_id(str(requested))
+
 
     sym = symbol.upper()
     tfu = tf.upper()
@@ -5076,15 +12349,18 @@ def trend_state2(
                     "reason": "Warming up - awaiting bars",
                     "expected_key": key_user,
                 },
+                "sr": {},
                 "preview": {
                     "symbol": sym,
                     "tf": tfu,
                     "bars": [],
                     "lastClosedTs": None,
+                    "overlays": {"sr": {}, "sr_zones": []},
                 },
                 "broker": _safe_broker_meta(broker_obj.dict() if broker_obj else (device_broker or {})),
                 "pollAfterMs": int(max(1200, min((next_close_ms - server_now_ms + 250), 5000))),
                 "usingDevice": prefer_dev, 
+                
             }
 
     # ---------- parse user snapshot ----------
@@ -5301,10 +12577,12 @@ def trend_state2(
                 "expected_key": key_user,
                 "snap_has_bars": bool(bars),
             },
-            "preview": {"symbol": sym, "tf": tfu, "bars": [], "lastClosedTs": last_closed_ms or None},
+            "sr": {},
+            "preview": {"symbol": sym, "tf": tfu, "bars": [], "lastClosedTs": last_closed_ms or None,"overlays": {"sr": {}, "sr_zones": []},},
             "broker": broker_safe,
             "pollAfterMs": int(max(1200, min((next_close_ms - server_now_ms + 250), 5000))),
             "usingDevice": prefer_dev,
+            
     }
 
     if not isinstance(bars, list) or not bars:
@@ -5350,10 +12628,12 @@ def trend_state2(
                     "expected_key": key_user,
                     "snap_has_bars": bool(bars),
                 },
-                "preview": {"symbol": sym, "tf": tfu, "bars": [], "lastClosedTs": last_closed_ms or None},
+                "sr": {},
+                "preview": {"symbol": sym, "tf": tfu, "bars": [], "lastClosedTs": last_closed_ms or None,"overlays": {"sr": {}, "sr_zones": []},},
                 "broker": broker_safe,
                 "pollAfterMs": int(max(1200, min((next_close_ms - server_now_ms + 250), 5000))),
                 "usingDevice": prefer_dev, 
+                
             }
 
 
@@ -5891,7 +13171,8 @@ def trend_state2(
                 "prev_rows_override_len": len(prev_rows_override or []),
                 "closed_snapshot_len": len(closed or []),
             },
-            "preview": {"symbol": sym, "tf": tfu, "bars": [], "lastClosedTs": None},
+            "sr": {},
+            "preview": {"symbol": sym, "tf": tfu, "bars": [], "lastClosedTs": None,"overlays": {"sr": {}, "sr_zones": []},},
             "broker": broker_safe,
        
         }
@@ -6148,6 +13429,10 @@ def trend_state2(
 
     
 
+
+    
+
+
     # --- SR summary (H4 + H1) for this symbol ---
     sr_summary = None
     try:
@@ -6159,7 +13444,7 @@ def trend_state2(
                 try:
                     data.append(
                         {
-                            "t": _epoch_to_ms_any(r.get("t")),
+                            "t": _epoch_to_ms_any(r.get("t_close_ms") or r.get("t_open_ms") or r.get("t")),
                             "o": float(r["o"]),
                             "h": float(r["h"]),
                             "l": float(r["l"]),
@@ -6184,28 +13469,169 @@ def trend_state2(
 
         h1_df = _rows_to_df(h1_rows)
         h4_df = _rows_to_df(h4_rows)
+        # --- PATCH: fallback to already-built closed bars when broker H1/H4 fetch fails ---
+        # If user requested tf=H1 and we can't fetch H1 rows, reuse `closed` (already correct bars for this tf)
+        if (h1_df is None or getattr(h1_df, "empty", True)) and tfu == "H1" and closed:
+            h1_df = _rows_to_df(closed)
+
+        # If user requested tf=H4 and we can't fetch H4 rows, reuse `closed`
+        if (h4_df is None or getattr(h4_df, "empty", True)) and tfu == "H4" and closed:
+            h4_df = _rows_to_df(closed)
+
 
         # Last price from preview bars (what UI is showing)
-        last_price = None
-        if prev_rows:
+        last_price = float(prev_rows[-1].get("c")) if (prev_rows and isinstance(prev_rows[-1], dict) and prev_rows[-1].get("c") is not None) else None
+        if last_price is None and closed:
             try:
-                last_price = float(prev_rows[-1]["c"])
+                last_price = float(closed[-1].get("c"))
             except Exception:
                 last_price = None
 
-        # pip factor per symbol (rough, can refine later)
-        pip_factor = 0.1 if sym == "XAUUSD" else 0.0001
 
-        if last_price and (h1_df is not None or h4_df is not None):
-            sr_summary = summarize_sr_multi_tf(
-                symbol=sym,
-                price=last_price,
-                h4_df=h4_df,
-                h1_df=h1_df,
-                pip_factor=pip_factor,
-            )
+        # pip factor per symbol (rough, can refine later)
+        pip_factor = 0.01 if sym == "XAUUSD" else (0.01 if sym.endswith("JPY") else 0.0001)
+
+        # Always attempt SR compute when we have a price.
+        # summarize_sr_multi_tf already:
+        # - falls back to last_good if frames missing
+        # - always writes last (short TTL) when it runs
+        sr_summary = {}
+        try:
+            px0 = float(last_price) if last_price is not None else None
+        except Exception:
+            px0 = None
+        sr_summary = summarize_sr_multi_tf(
+            symbol=sym,
+            price=px0,
+            h4_df=h4_df,
+            h1_df=h1_df,
+            pip_factor=float(pip_factor),
+            cache=R,
+            cache_ttl_sec=900,
+            good_ttl_sec=7 * 24 * 3600,
+        )
     except Exception as e:
         sr_summary = {"error": f"sr_failed: {e}"}
+        # ---- SR fallback: if compute failed or returned empty, load last-good bundle ----
+        try:
+            bad = (not isinstance(sr_summary, dict)) or (len(sr_summary or {}) == 0) or bool(sr_summary.get("error"))
+            if bad and R is not None:
+                raw_lg = _redis_get_text(f"xtl:sr:bundle:last_good:{sym}")  # summarize_sr_multi_tf canonical key
+                if raw_lg:
+                    lg = json.loads(raw_lg)
+                    if isinstance(lg, dict) and len(lg) > 0:
+                        sr_summary = lg
+        except Exception:
+            pass
+    # ---- fallback SR if summarize_sr_multi_tf returns {} ----
+    sr_fallback_zones = None
+    try:
+        if isinstance(sr_summary, dict) and len(sr_summary) == 0:
+            def _pivot_levels(df: pd.DataFrame, w: int = 2):
+                if df is None or df.empty or len(df) < (w * 2 + 5):
+                    return ([], [])
+                hh = df["h"].rolling(w * 2 + 1, center=True).max()
+                ll = df["l"].rolling(w * 2 + 1, center=True).min()
+                piv_hi = df.loc[df["h"] == hh, "h"].dropna().tolist()
+                piv_lo = df.loc[df["l"] == ll, "l"].dropna().tolist()
+                return (piv_lo, piv_hi)
+
+            def _cluster(levels: list[float], bin_size: float):
+               if not levels:
+                   return []
+               out = {}
+               for x in levels:
+                   try:
+                       k = round(float(x) / bin_size) * bin_size
+                       out.setdefault(k, 0)
+                       out[k] += 1
+                   except Exception:
+                       continue
+               # return sorted by touches desc
+               return sorted(out.items(), key=lambda kv: kv[1], reverse=True)
+
+            def _mk_zones(level_counts: list[tuple[float, int]], tf_label: str, kind: str, half: float, topn: int = 6):
+                z = []
+                for lvl, touches in (level_counts or [])[:topn]:
+                    z.append({
+                        "tf": tf_label,
+                        "low": float(lvl) - half,
+                        "high": float(lvl) + half,
+                        "kind": kind,
+                        "touches": int(touches),
+                        "level": float(lvl),
+                        "strength": float(min(1.0, 0.15 * touches)),
+                    })
+                return z
+
+            # zone half width: use a stable minimum (works for XAU)
+            half = float(os.getenv("XTL_ZONE_MIN_PX_XAU", "0.8")) if sym == "XAUUSD" else max(3.0 * float(pip_factor), float(os.getenv("XTL_ZONE_MIN_PX_FX", "0.0008")))
+            bin_size = max(half, 1e-9)
+
+            z_all = []
+
+            if h4_df is not None and not h4_df.empty:
+                lo, hi = _pivot_levels(h4_df, w=2)
+                z_all += _mk_zones(_cluster(lo, bin_size), "H4", "support", half)
+                z_all += _mk_zones(_cluster(hi, bin_size), "H4", "resistance", half)
+
+            if h1_df is not None and not h1_df.empty:
+                lo, hi = _pivot_levels(h1_df, w=2)
+                z_all += _mk_zones(_cluster(lo, bin_size), "H1", "support", half)
+                z_all += _mk_zones(_cluster(hi, bin_size), "H1", "resistance", half)
+
+            sr_fallback_zones = z_all
+
+            # also expose something non-empty under .sr
+            sr_summary = {"method": "fallback_pivots", "zones": sr_fallback_zones}
+    except Exception as _e:
+        # keep sr_summary as-is; don't break endpoint
+        pass
+
+    # ---- attach overlays into preview for UI chart ----
+    try:
+        if isinstance(preview_out, dict):
+            overlays = preview_out.get("overlays")
+            if not isinstance(overlays, dict):
+                overlays = {}
+                preview_out["overlays"] = overlays
+
+            
+            # SR overlay + SR zones (for UI)
+            overlays["sr"] = sr_summary if isinstance(sr_summary, dict) else {}
+
+            # SR ZONES overlay (what Trend.tsx actually draws)
+            try:
+                overlays["sr_zones"] = _build_sr_zones_from_summary(
+                    sr_summary if isinstance(sr_summary, dict) else {},
+                    sym=sym,
+                    pip_factor=float(pip_factor),
+                    atr=None,
+                )
+            except Exception:
+                pass
+
+            # Gate overlay (if you have gate/entry_gate dict available)
+            g = locals().get("entry_gate") or locals().get("gate")
+            if isinstance(g, dict) and g:
+                overlays["gate"] = {
+                    "reason": g.get("reason"),
+                    "confidence": g.get("confidence"),
+                    "zone": g.get("zone"),
+                }
+
+            # Trade overlay (entry/SL/TP)
+            overlays["trade"] = {
+                "entry_price": locals().get("entry_price"),
+                "sl_price": locals().get("sl_price"),
+                "tp_price": locals().get("tp_price"),
+                "decision": locals().get("decision") or locals().get("signal"),
+                "entry_ts_ms": locals().get("entry_ts_ms"),
+            }
+    except Exception:
+        pass
+
+  
 
     # --- Canonical next-bar timing based on preview_last_closed_ts ---
     # Use the last CLOSED bar from preview as the single source of truth,
@@ -6214,45 +13640,28 @@ def trend_state2(
     # --- Canonical next-bar timing based on preview_last_closed_ts ---
     # Use the last CLOSED bar from preview as the single source of truth,
     # but always compute countdown in server time using broker_tz_offset_min.
-    TF_MS = int(TF_SEC * 1000)
+    # --- Canonical next-bar timing (SERVER UTC ms only; monotonic) ---
+    TF_MS = int(TF_SEC * 1000) if TF_SEC else 60 * 60 * 1000
     server_now_ms = int(time.time() * 1000)
 
-    # last_closed_ts = CLOSE time of the last fully closed bar (ms, broker wall-clock)
+    # preview_last_closed_ts is CLOSE time (ms) of last closed bar
     last_closed_ts = int(preview_last_closed_ts or 0)
 
-    if TF_MS <= 0:
-        # safety fallback: default to 1h
-        TF_MS = 60 * 60 * 1000
+    # Guard: if last_closed_ts is in the future, clamp to current server TF grid.
+    if last_closed_ts > server_now_ms + 5_000:
+        last_closed_ts = server_now_ms - (server_now_ms % TF_MS)
 
-    # Broker offset (minutes -> ms)
-    try:
-        off_min = int((broker_safe or {}).get("tz_offset_min") or 0)
-    except Exception:
-        off_min = 0
-    off_ms = off_min * 60_000
+    # next close = one TF after last close; roll forward if needed
+    next_close_ts = (
+        last_closed_ts + TF_MS
+        if last_closed_ts > 0
+        else ((server_now_ms // TF_MS) + 1) * TF_MS
+    )
+    while next_close_ts <= server_now_ms + 250:
+        next_close_ts += TF_MS
 
-    tf_ms_int = int(TF_MS)
-    # Convert server clock to broker wall-clock
-    now_broker_ms = server_now_ms + off_ms
-
-    if last_closed_ts > 0:
-        # last_closed_ts is already broker wall-clock close time
-        next_close_broker = last_closed_ts + tf_ms_int
-
-        # Ensure next close is in the future in broker time
-        if next_close_broker <= now_broker_ms:
-            slots_ahead = (now_broker_ms - last_closed_ts) // tf_ms_int + 1
-            next_close_broker = last_closed_ts + slots_ahead * tf_ms_int
-    else:
-        # No last_closed_ts (warming): align from broker clock grid
-        next_close_broker = ((now_broker_ms // tf_ms_int) + 1) * tf_ms_int
-
-    # Convert broker close time back to server ms (for UI countdown)
-    next_close_ts = int(next_close_broker - off_ms)
-
-    # How long until next close, with a small cushion
     remain_ms = max(0, next_close_ts - server_now_ms)
-    poll_after_ms = max(2_000, min(remain_ms + 500, 5_000))
+    poll_after_ms = max(2_000, min(remain_ms + 500, 60_000))
 
     # ---- Final return ----
     try:
@@ -6289,7 +13698,7 @@ def trend_state2(
         "adx":          (locals().get("adx_val")),
         "slope":        (locals().get("slope_val")),
         "structure":    (locals().get("structure_val")),
-        "sr":           sr_summary,
+        "sr":           sr_summary if isinstance(sr_summary, dict) else {},
         "pollAfterMs":  int(poll_after_ms),
         "usingDevice": prefer_dev,
     }
@@ -6351,7 +13760,7 @@ def trend_state2(
     }
 
     return DetectResp(
-       label=label,
+       label=str(label or "Neutral"),
        score=float(score or 0.0),
        adx=float(adx_val or 0.0),
        slope=float(slope_val or 0.0),
@@ -6362,8 +13771,9 @@ def trend_state2(
        stale=False if stale is None else bool(stale),
        pollAfterMs=int(poll_after_ms or 0),
        diagnostics=diagnostics,          # includes "previewProbe"
-       preview=preview,                  # broker-TZ anchored bars
+       preview=preview_out,                  # broker-TZ anchored bars
        broker=BrokerMeta(**broker_safe), # built from device/snapshot
+       sr=(sr_summary if isinstance(sr_summary, dict) else {}),
        usingDevice= prefer_dev,
     )
 
@@ -6422,7 +13832,9 @@ def trend_detect(req: DetectReq, user_id: str = Depends(get_user_id)) -> DetectR
             lastClosedTs=0,
             nextCloseTs=next_close,
             tf_ms=TF_MS,
-            preview={"bars": []},
+            label="Warming",
+            sr={},
+            preview={"bars": [], "overlays": {"sr": {}, "sr_zones": []}},
             broker=BrokerMeta(**broker_safe),
         )
 
@@ -6438,6 +13850,12 @@ def trend_detect(req: DetectReq, user_id: str = Depends(get_user_id)) -> DetectR
         preview_bars = snap.get("bars") or []
 
     preview = {"bars": preview_bars}
+    # ensure overlays always exist for UI
+    _z = []
+    if isinstance(sr_summary, dict):
+        _z = sr_summary.get("sr_zones") or sr_summary.get("zones") or []
+    preview["overlays"] = {"sr": (sr_summary if isinstance(sr_summary, dict) else {}), "sr_zones": (_z if isinstance(_z, list) else [])}
+
 
     # --- NEW: trust preview bars for lastClosedTs if they are fresher ---
     try:
@@ -6481,11 +13899,13 @@ def trend_detect(req: DetectReq, user_id: str = Depends(get_user_id)) -> DetectR
         ok=True,
         warming=False,
         message="OK",
+        label=label,
+        sr=sr_summary if isinstance(sr_summary, dict) else {},
         serverNow=server_now_ms,
         lastClosedTs=last_closed,
         nextCloseTs=next_close,
         tf_ms=TF_MS,
-        preview=preview,
+        preview=preview_out,
         broker=BrokerMeta(**broker_safe),
     )
 
@@ -6584,13 +14004,113 @@ def predict_4h_debug(
         "raw": pr4,
     }
 
+def _pos_tp_key(sym: str, sig: str) -> str:
+    sym_u = (sym or "").upper().strip()
+    s = (sig or "").upper().strip()
+
+    # normalize synonyms
+    if s in ("LONG", "UP"):
+        s = "BUY"
+    elif s in ("SHORT", "DOWN"):
+        s = "SELL"
+
+    if not sym_u or not s:
+        return "xtl:pos:tp:INVALID"
+
+    return f"xtl:pos:tp:{sym_u}:{s}"
+
+def _load_tp_state(sym: str, sig: str) -> dict:
+    try:
+        k = _pos_tp_key(sym, sig)
+        raw = R.get(k)
+        if not raw:
+            return {}
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+        js = _json_load_twice(raw)
+        return js if isinstance(js, dict) else {}
+    except Exception:
+        return {}
+
+def _save_tp_state(sym: str, sig: str, st: dict, ttl_sec: int = 7 * 24 * 3600) -> None:
+    try:
+        k = _pos_tp_key(sym, sig)
+        try:
+            st.setdefault("version", "tp_v1")
+            st.setdefault("server_now_ms", int(time.time() * 1000))
+        except Exception:
+            pass
+        R.setex(k, int(ttl_sec), json.dumps(st, default=str))
+    except Exception:
+        pass
+
+def _clear_tp_state(sym: str, sig: str) -> None:
+    try:
+        R.delete(_pos_tp_key(sym, sig))
+    except Exception:
+        pass
+
+def _pos_exit_key(sym: str, sig: str) -> str:
+    sym_u = (sym or "").upper().strip()
+    s = (sig or "").upper().strip()
+
+    # normalize synonyms
+    if s in ("LONG", "UP"):
+        s = "BUY"
+    elif s in ("SHORT", "DOWN"):
+        s = "SELL"
+
+    if not sym_u or not s:
+        # last-resort key to avoid polluting redis; caller should handle {}
+        return "xtl:pos:exit:INVALID"
+
+    return f"xtl:pos:exit:{sym_u}:{s}"
+
+def _load_exit_state(sym: str, sig: str) -> dict:
+    try:
+        k = _pos_exit_key(sym, sig)
+        raw = R.get(k)
+        if not raw:
+            return {}
+
+        # redis often returns bytes
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+
+        js = _json_load_twice(raw)
+        return js if isinstance(js, dict) else {}
+    except Exception:
+        return {}
+
+def _save_exit_state(sym: str, sig: str, st: dict, ttl_sec: int = 7 * 24 * 3600) -> None:
+    try:
+        k = _pos_exit_key(sym, sig)
+
+        # small debug helpers (safe)
+        try:
+            st.setdefault("version", "exit_v1")
+            st.setdefault("server_now_ms", int(time.time() * 1000))
+        except Exception:
+            pass
+
+        R.setex(k, int(ttl_sec), json.dumps(st, default=str))
+    except Exception:
+        pass
+
+def _clear_exit_state(sym: str, sig: str) -> None:
+    try:
+        R.delete(_pos_exit_key(sym, sig))
+    except Exception:
+        pass
+
+
 def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
     """
-    Evaluates whether an opportunity HIT target, SL-HIT (stop loss), or EXPIRED.
+    Evaluates whether an opportunity HIT target, STRUCTURE-EXIT (post-entry), or EXPIRED.
 
     - Direction is UP/DOWN (not BUY/SELL) for target-hit evaluation
-    - SL-HIT is evaluated using entry_signal BUY/SELL + sl_price
-    - Close snapshot ONLY when hit OR sl_hit OR expired (time)
+    - STRUCTURE-EXIT is evaluated post-entry using frozen entry zone + sweep->reclaim logic
+    - Close snapshot ONLY when hit OR exit OR expired (time; only when NOT entered)
     - Works even if alert_id is missing (uses opp_id as fallback)
     - Computes target from trade_tp_pct_1h / expected_move_pct_1h if target_price_1h is missing
     """
@@ -6630,8 +14150,22 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
             "entry_ts_ms": _pick("entry_ts_ms", None),
             "entry_price": _pick("entry_price", None),
             "tp_price": _pick("tp_price", None),
-            "sl_price": _pick("sl_price", None),
+            "sl_price": _pick("sl_price", None),  # kept for UI only (NOT used for exit)
             "discord_entry_sent": _pick("discord_entry_sent", None),
+
+            # ---- frozen entry zone for structure exit ----
+            "entry_zone_low": _pick("entry_zone_low", None),
+            "entry_zone_high": _pick("entry_zone_high", None),
+            "entry_zone_level": _pick("entry_zone_level", None),
+            "atr_1h": _pick("atr_1h", None),
+            "atr": _pick("atr", None),
+            "atr14": _pick("atr14", None),
+            "atr14_1h": _pick("atr14_1h", None),
+
+            # optional device hint (if you store it)
+            "device": _pick("device", None),
+            "pinned_device": _pick("pinned_device", None),
+            "device_id": _pick("device_id", None),
         }
 
     # ------------------------------------------------------------------
@@ -6645,13 +14179,15 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
         return
 
     alert_id = _sj("alert_id")
+    opp_id = _sj("opp_id")
+    event_id = str(alert_id or opp_id or "").strip()
     has_alert = bool(alert_id)
 
     # ---------------- basis ----------------
     basis = None
     for k in ("alert_price_1h", "basis_price_1h", "basis_price", "alert_price", "basisPrice"):
         v = _sj(k)
-        if isinstance(v, (int, float)) and v > 0:
+        if isinstance(v, (int, float)) and float(v) > 0:
             basis = float(v)
             break
 
@@ -6659,7 +14195,7 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
     target = None
     for k in ("target_price_1h", "target_price", "targetPrice"):
         v = _sj(k)
-        if isinstance(v, (int, float)) and v > 0:
+        if isinstance(v, (int, float)) and float(v) > 0:
             target = float(v)
             break
 
@@ -6673,37 +14209,111 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
 
     # ---------------- times ----------------
     alert_ms = int(_sj("alert_created_ms") or 0)
-    opp_open_ts = int(_sj("opp_open_ts") or 0)  # kept for compatibility (unused below)
     opp_expire_ts = int(_sj("opp_expire_ts") or 0)
-    horizon_min = int(_sj("horizon_min") or 60)
+    horizon_min = int(_sj("horizon_min") or 360)  # 6h default
+    # If opp_expire_ts missing, set it from horizon (keeps one source of truth)
+    if not opp_expire_ts and alert_ms:
+        opp_expire_ts = alert_ms + horizon_min * 60_000
 
-    # ---------------- last price ----------------
+
+    # ---------------- last price (baseline) ----------------
     last_price = None
     lp = _sj("last_price")
-    if isinstance(lp, (int, float)):
+    if isinstance(lp, (int, float)) and float(lp) > 0:
         last_price = float(lp)
 
     if last_price is None and isinstance(row, dict):
-        for rk in ("last_price", "price", "lastClose", "close", "mid", "bid", "ask"):
+        for rk in ("last_price", "live_price", "price", "lastClose", "close", "mid", "bid", "ask"):
             v = row.get(rk)
-            if isinstance(v, (int, float)):
+            if isinstance(v, (int, float)) and float(v) > 0:
                 last_price = float(v)
                 break
 
-    if last_price is None and isinstance(basis, (int, float)):
-        last_price = float(basis)
+        if last_price is None:
+            raw = row.get("raw")
+            if isinstance(raw, dict):
+                for rk in ("lastClose", "close", "mid", "bid", "ask"):
+                    v = raw.get(rk)
+                    if isinstance(v, (int, float)) and float(v) > 0:
+                        last_price = float(v)
+                        break
 
-    if last_price is None:
-        last_price = 0.0
+    if last_price is None and isinstance(basis, (int, float)) and float(basis) > 0:
+        last_price = float(basis)
 
     snap_key = _opp_snapshot_key(sym_u, direction)
 
+    # ---------- fresh price (prefer row live fields over snap/basis) ----------
+    def _fresh_price(row_obj, snap_obj, fallback):
+        if isinstance(row_obj, dict):
+            for k in (
+                "live", "live_price", "last_price", "price",
+                "mid", "bid", "ask",
+                "lastClose", "close",
+            ):
+                v = row_obj.get(k)
+                try:
+                    if v is not None:
+                        vv = float(v)
+                        if vv > 0:
+                            return vv
+                except Exception:
+                    pass
+
+            raw = row_obj.get("raw")
+            if isinstance(raw, dict):
+                for k in ("lastClose", "close", "mid", "bid", "ask"):
+                    v = raw.get(k)
+                    try:
+                        if v is not None:
+                            vv = float(v)
+                            if vv > 0:
+                                return vv
+                    except Exception:
+                        pass
+
+        if isinstance(snap_obj, dict):
+            for k in ("last_price", "price", "mid", "bid", "ask", "lastClose", "close"):
+                v = snap_obj.get(k)
+                if v is None:
+                    try:
+                        v = snap_obj.get(k.encode("utf-8"))
+                    except Exception:
+                        v = None
+                try:
+                    if v is not None:
+                        vv = float(v)
+                        if vv > 0:
+                            return vv
+                except Exception:
+                    pass
+
+        try:
+            if fallback is not None:
+                vv = float(fallback)
+                return vv if vv > 0 else None
+        except Exception:
+            pass
+
+        return None
+
+    px = _fresh_price(row_obj=row, snap_obj=snap, fallback=last_price)
+    if px is not None:
+        last_price = px
+
+    if last_price is None:
+        return
+
     # ---------------- compute target if missing ----------------
     if target is None and basis and move_pct_1h is not None:
-        pct = abs(move_pct_1h) / 100.0
-        target = basis * (1.0 + pct) if direction == "UP" else basis * (1.0 - pct)
+        try:
+            pct = abs(float(move_pct_1h)) / 100.0
+            if float(basis) > 0 and pct > 0:
+                target = float(basis) * (1.0 + pct) if direction == "UP" else float(basis) * (1.0 - pct)
+        except Exception:
+            target = None
 
-    # ---------------- compute realized move (basis-based, for legacy) ----------------
+    # ---------------- compute realized move (basis-based, legacy) ----------------
     realized_move_pct = None
     if basis:
         try:
@@ -6711,254 +14321,375 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
         except Exception:
             realized_move_pct = None
 
-    # ====================== SL-HIT (Stop Loss) ======================
-    # SL-HIT uses entry meta (BUY/SELL + sl_price), not UP/DOWN.
+    # ====================== ENTRY META (frozen) ======================
     meta = _entry_meta_from_snap()
+    entry_sig = str(meta.get("entry_signal") or "").upper().strip()
+    tp_price = meta.get("tp_price", None)
+    sl_price = meta.get("sl_price", None)  # UI only
+    entered = bool(meta.get("entry_triggered"))
 
-    sl_hit = False
-    sl_price = None
-    entry_sig = None
-    entry_price = None
+    # ==========================================================
+    # STRUCTURE EXIT (post-entry): sweep -> reclaim -> exit
+    # SL is NOT a fixed price anymore.
+    # Runs AFTER entry and BEFORE TP checks.
+    # ==========================================================
+    if entered and entry_sig in ("BUY", "SELL"):
+        try:
+            zl = meta.get("entry_zone_low")
+            zh = meta.get("entry_zone_high")
+            zv = meta.get("entry_zone_level")
 
+            zl = float(zl) if isinstance(zl, (int, float)) else None
+            zh = float(zh) if isinstance(zh, (int, float)) else None
+            zv = float(zv) if isinstance(zv, (int, float)) else None
+
+            if zl is not None and zh is not None and zv is not None:
+                atr = (
+                    meta.get("atr_1h") or meta.get("atr") or meta.get("atr14") or meta.get("atr14_1h")
+                )
+                atr = float(atr) if isinstance(atr, (int, float)) else None
+
+                if atr is not None and atr > 0:
+                    dev = str(meta.get("pinned_device") or meta.get("device") or meta.get("device_id") or "").strip()
+                    bars = _get_closed_h1_bars(sym_u, dev) if dev else []
+                    if not isinstance(bars, list):
+                        bars = []
+
+                    
+
+
+                    if bars:
+                        soft_wick_atr = float(os.getenv("XTL_EXIT_SOFT_WICK_ATR", "0.25"))
+                        hard_close_atr = float(os.getenv("XTL_EXIT_HARD_CLOSE_ATR", "0.10"))
+                        hard_break_atr = float(os.getenv("XTL_EXIT_HARD_BREAK_ATR", "0.60"))
+                        max_soft_bars = int(os.getenv("XTL_EXIT_MAX_SOFT_BARS", "3"))
+                        hard_close_bars = int(os.getenv("XTL_EXIT_HARD_CLOSE_BARS", "2"))
+                        wait_bars = int(os.getenv("XTL_EXIT_RECLAIM_MAX_BARS", "3"))
+
+                        ex = _load_exit_state(sym_u, entry_sig)
+                        st = str(ex.get("state") or "OK").upper()
+
+                        res = _sweep_break_state(
+                            direction=entry_sig,   # BUY/SELL
+                            bars=bars,
+                            zone_low=float(zl),
+                            zone_high=float(zh),
+                            zone_level=float(zv),
+                            atr=float(atr),
+                            soft_wick_atr=soft_wick_atr,
+                            hard_close_atr=hard_close_atr,
+                            hard_break_atr=hard_break_atr,
+                            max_soft_bars=max_soft_bars,
+                            hard_close_bars=hard_close_bars,
+                        )
+
+                        state = str(res.get("state") or "").upper()
+
+                        # HARD break => immediate exit
+                        if state == "HARD_BREAK":
+                            payload = {
+                                "alert_id": event_id,
+                                "symbol": sym_u,
+                                "opp_direction": direction,
+                                "direction": direction,
+                                "alert_created_ms": alert_ms or now_ms,
+                                "status": "exit",
+                                "hit_target": False,
+                                "exit_reason": "hard_break_exit",
+                                "exit_ts": now_ms,
+                                "exit_ts_ms": now_ms,
+                                "last_status_ms": now_ms,
+                                "updated_ms": now_ms,
+                                "last_price": float(last_price),
+                            }
+                            payload.update(meta)
+                            payload["tp_price"] = tp_price
+                            payload["sl_price"] = sl_price
+
+                            # realized move pct from ENTRY (directional for BUY/SELL)
+                            try:
+                                ep = meta.get("entry_price")
+                                ep = float(ep) if ep is not None else None
+                                lp0 = float(last_price)
+                                if ep and ep > 0:
+                                    mv = ((lp0 - ep) / ep) * 100.0
+                                    if entry_sig == "SELL":
+                                        mv = -mv
+                                    payload["realized_move_pct"] = float(mv)
+                                else:
+                                    payload["realized_move_pct"] = None
+                            except Exception:
+                                payload["realized_move_pct"] = None
+
+                            _save_alert_snapshot(sym_u, payload)
+                            _log_trade_outcome(payload)
+                            try:
+                                _discord_notify_outcome("exit", payload)
+                            except Exception:
+                                pass
+
+                            try:
+                                R.hset(
+                                    snap_key,
+                                    mapping={
+                                        "status": json.dumps("exit"),
+                                        "exit_reason": json.dumps("hard_break_exit"),
+                                        "exit_ts": json.dumps(now_ms),
+                                        "last_status_ms": json.dumps(now_ms),
+                                        "last_price": json.dumps(float(last_price)),
+                                    },
+                                )
+                            except Exception:
+                                pass
+
+                            _clear_exit_state(sym_u, entry_sig)
+                            _delete_live_snapshot(sym_u, direction)
+                            _clear_tp_state(sym_u, entry_sig)
+                            return
+
+                        # WAIT for reclaim
+                        if state == "WAIT_RECLAIM":
+                            # initialize wait state
+                            if st != "WAIT_RECLAIM":
+                                ex = {
+                                    "state": "WAIT_RECLAIM",
+                                    "sweep_ts_ms": int(now_ms),
+                                    "checks": 0,
+                                    "wait_bars": int(wait_bars),
+                                    "zone_low": float(zl),
+                                    "zone_high": float(zh),
+                                    "zone_level": float(zv),
+                                    "entry_ts_ms": meta.get("entry_ts_ms"),
+                                    "entry_price": meta.get("entry_price"),
+                                }
+
+                            ex["last_check_ms"] = int(now_ms)
+                            ex["checks"] = int(ex.get("checks") or 0) + 1
+
+                            # timeout => exit
+                            if int(ex.get("checks") or 0) >= int(wait_bars):
+                                payload = {
+                                    "alert_id": event_id,
+                                    "symbol": sym_u,
+                                    "opp_direction": direction,
+                                    "direction": direction,
+                                    "alert_created_ms": alert_ms or now_ms,
+                                    "status": "exit",
+                                    "hit_target": False,
+                                    "exit_reason": "sweep_no_reclaim_exit",
+                                    "exit_ts": now_ms,
+                                    "exit_ts_ms": now_ms,
+                                    "last_status_ms": now_ms,
+                                    "updated_ms": now_ms,
+                                    "last_price": float(last_price),
+                                }
+                                payload.update(meta)
+                                payload["tp_price"] = tp_price
+                                payload["sl_price"] = sl_price
+
+                                # realized move pct from ENTRY (directional for BUY/SELL)
+                                try:
+                                    ep = meta.get("entry_price")
+                                    ep = float(ep) if ep is not None else None
+                                    lp0 = float(last_price)
+                                    if ep and ep > 0:
+                                        mv = ((lp0 - ep) / ep) * 100.0
+                                        if entry_sig == "SELL":
+                                            mv = -mv
+                                        payload["realized_move_pct"] = float(mv)
+                                    else:
+                                        payload["realized_move_pct"] = None
+                                except Exception:
+                                    payload["realized_move_pct"] = None
+
+                                _save_alert_snapshot(sym_u, payload)
+                                _log_trade_outcome(payload)
+                                try:
+                                    _discord_notify_outcome("exit", payload)
+                                except Exception:
+                                    pass
+
+                                try:
+                                    R.hset(
+                                        snap_key,
+                                        mapping={
+                                            "status": json.dumps("exit"),
+                                            "exit_reason": json.dumps("sweep_no_reclaim_exit"),
+                                            "exit_ts": json.dumps(now_ms),
+                                            "last_status_ms": json.dumps(now_ms),
+                                            "last_price": json.dumps(float(last_price)),
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+
+                                _clear_exit_state(sym_u, entry_sig)
+                                _delete_live_snapshot(sym_u, direction)
+                                _clear_tp_state(sym_u, entry_sig)
+
+                                return
+
+                            _save_exit_state(sym_u, entry_sig, ex)
+                        else:
+                            # reclaimed / OK => clear wait state
+                            if st == "WAIT_RECLAIM":
+                                _clear_exit_state(sym_u, entry_sig)
+
+        except Exception:
+            pass
+    # ====================== POST-ENTRY STRUCTURE TP (BOS -> exhaustion) ======================
+    # Hybrid mode: this can exit earlier than tp_price.
     try:
-        if bool(meta.get("entry_triggered")):
-            entry_sig = str(meta.get("entry_signal") or "").upper().strip()
-            entry_price = meta.get("entry_price", None)
-            sl_price = meta.get("sl_price", None)
+        if entered and entry_sig in ("BUY", "SELL"):
+            # You MUST feed closed bars here. Use whatever you already use for zone gate.
+            # Example variable name: bars_h1 (newest last). Replace with your actual list.
+            dev = str(meta.get("pinned_device") or meta.get("device") or meta.get("device_id") or "").strip()
+            bars = _get_closed_h1_bars(sym_u, dev) if dev else []
+            bars = bars if isinstance(bars, list) else []
 
-            lp0 = float(last_price) if last_price is not None else None
-            sl0 = float(sl_price) if sl_price is not None else None
+            if bars:
+                tp_struct = _tp_structure_exit(sym_u=sym_u, entry_sig=entry_sig, bars=bars, now_ms=now_ms)
+                if isinstance(tp_struct, dict) and tp_struct.get("ok"):
 
-            if lp0 is not None and sl0 is not None and entry_sig in ("BUY", "SELL"):
-                # BUY: stopped when price <= SL
-                if entry_sig == "BUY" and lp0 <= sl0:
-                    sl_hit = True
-                # SELL: stopped when price >= SL
-                elif entry_sig == "SELL" and lp0 >= sl0:
-                    sl_hit = True
+                    payload = {
+                        "alert_id": event_id,
+                        "symbol": sym_u,
+                        "opp_direction": direction,
+                        "direction": direction,
+                        "alert_created_ms": alert_ms or now_ms,
+                        "status": "exit",
+                        "hit_target": False,
+                        "exit_reason": str(tp_struct.get("reason") or "tp_structure_exit"),
+                        "exit_ts": now_ms,
+                        "exit_ts_ms": now_ms,
+                        "last_status_ms": now_ms,
+                        "updated_ms": now_ms,
+                        "last_price": float(last_price),
+                        "tp_structure_meta": tp_struct.get("meta") or {},
+                    }
+                    payload.update(meta)
+                    payload["tp_price"] = tp_price
+                    payload["sl_price"] = sl_price
+
+                    # realized move pct from ENTRY (directional)
+                    try:
+                        ep = meta.get("entry_price")
+                        ep = float(ep) if ep is not None else None
+                        lp0 = float(last_price)
+                        if ep and ep > 0:
+                            mv = ((lp0 - ep) / ep) * 100.0
+                            if entry_sig == "SELL":
+                                mv = -mv
+                            payload["realized_move_pct"] = float(mv)
+                        else:
+                            payload["realized_move_pct"] = None
+                    except Exception:
+                        payload["realized_move_pct"] = None
+
+                    _save_alert_snapshot(sym_u, payload)
+                    _log_trade_outcome(payload)
+                    try:
+                        _discord_notify_outcome("exit", payload)
+                    except Exception:
+                        pass
+
+                    try:
+                        R.hset(
+                            snap_key,
+                            mapping={
+                                "status": json.dumps("exit"),
+                                "exit_reason": json.dumps(payload.get("exit_reason")),
+                                "exit_ts": json.dumps(now_ms),
+                                "last_status_ms": json.dumps(now_ms),
+                                "last_price": json.dumps(float(last_price)),
+                            },
+                        )
+                    except Exception:
+                        pass
+
+                    _clear_exit_state(sym_u, entry_sig)
+                    _delete_live_snapshot(sym_u, direction)
+                    _clear_tp_state(sym_u, entry_sig)
+
+                    return
     except Exception:
-        sl_hit = False
-
-    if sl_hit:
-        try:
-            # Build payload similar to HIT/EXPIRED
-            payload = {
-                "alert_id": alert_id,
-                "symbol": sym_u,
-                "opp_direction": direction,
-                "direction": direction,
-                "alert_created_ms": alert_ms or now_ms,
-                "status": "sl_hit",
-                "hit_target": False,
-                "sl_hit": True,
-                "sl_hit_ts": now_ms,
-                "sl_hit_ts_ms": now_ms,
-                "last_status_ms": now_ms,
-                "updated_ms": now_ms,
-                "last_price": last_price,
-            }
-            payload.update(meta)
-
-            # realized move pct from ENTRY (directional for BUY/SELL)
-            try:
-                ep = meta.get("entry_price")
-                ep = float(ep) if ep is not None else None
-                lp0 = float(last_price)
-                if ep and ep > 0:
-                    move = ((lp0 - ep) / ep) * 100.0
-                    if str(meta.get("entry_signal") or "").upper() == "SELL":
-                        move = -move
-                    payload["realized_move_pct"] = float(move)
-                else:
-                    payload["realized_move_pct"] = None
-            except Exception:
-                payload["realized_move_pct"] = None
-
-            # mark alert stopped (optional)
-            try:
-                if has_alert:
-                    # If you don't have a dedicated function, keep it as a no-op.
-                    # (Safe) store status update in Redis hash below anyway.
-                    pass
-            except Exception:
-                pass
-
-            _save_alert_snapshot(sym_u, payload)
-            _log_trade_outcome(payload)
+        pass
 
 
-            # If you want the same deduped notifier style as HIT/EXPIRED:
-            try:
-                _discord_notify_outcome("sl_hit", payload)
-            except Exception:
-                pass
-
-            
-
-            # update live snapshot status (optional, for immediate UI)
-            try:
-                R.hset(snap_key, mapping={
-                    "status": json.dumps("sl_hit"),
-                    "sl_hit_ts": json.dumps(now_ms),
-                    "last_status_ms": json.dumps(now_ms),
-                    "last_price": json.dumps(last_price),
-                })
-            except Exception:
-                pass
-
-        except Exception:
-            pass
-
-        _delete_live_snapshot(sym_u, direction)
-        return
-    # ====================== TP-HIT (Take Profit) ======================
-    # TP-HIT uses entry meta (BUY/SELL + tp_price), not UP/DOWN.
-    tp_hit = False
-    tp_price = None
-
-    try:
-        if bool(meta.get("entry_triggered")):
-            tp_price = meta.get("tp_price", None)
-
-            lp0 = float(last_price) if last_price is not None else None
-            tp0 = float(tp_price) if tp_price is not None else None
-
-            if lp0 is not None and tp0 is not None and entry_sig in ("BUY", "SELL"):
-                # BUY: TP hit when price >= TP
-                if entry_sig == "BUY" and lp0 >= tp0:
-                    tp_hit = True
-                # SELL: TP hit when price <= TP
-                if entry_sig == "SELL" and lp0 <= tp0:
-                    tp_hit = True
-    except Exception:
-        tp_hit = False
-
-    # If entry-triggered TP was hit, treat as overall HIT and freeze target to tp_price.
-    if tp_hit:
-        try:
-            if tp_price is not None:
-                target = float(tp_price)
-        except Exception:
-            pass
-
-
-    # ======================== HIT (Target) ========================
-    hit = False
-
-    # If entry-triggered, TP hit is based on BUY/SELL + tp_price (deterministic).
-    if bool(meta.get("entry_triggered")):
-        hit = bool(tp_hit)
-    else:
-        if target and last_price:
-            try:
-                if direction == "UP" and float(last_price) >= float(target):
-                    hit = True
-                elif direction == "DOWN" and float(last_price) <= float(target):
-                    hit = True
-            except Exception:
-                hit = False
-
-
-    if hit:
-        try:
-            if has_alert:
-                _mark_alert_hit(alert_id, realized_move_pct, now_ms)
-
-                payload = {
-                    "alert_id": alert_id,
-                    "symbol": sym_u,
-                    "opp_direction": direction,
-                    "direction": direction,
-                    "alert_created_ms": alert_ms or now_ms,
-                    "status": "hit",
-                    "hit_target": True,
-                    "tp_hit": bool(tp_hit),
-                    "tp_hit": tp_hit,
-                    "tp_price": tp_price,
-                    "hit_ts": now_ms,
-                    "hit_ts_ms": now_ms,
-                    "last_status_ms": now_ms,
-                    "updated_ms": now_ms,
-                    "time_to_target_min": (now_ms - alert_ms) / 60000.0 if alert_ms else None,
-                    "last_price": last_price,
-                    "realized_move_pct": realized_move_pct,
-                }
-                payload.update(meta)
-                _save_alert_snapshot(sym_u, payload)
-                _log_trade_outcome(payload)
-
-
-                # --- DISCORD: HIT notification (deduped) ---
-                try:
-                    _discord_notify_outcome("hit", payload)
-                except Exception:
-                    pass
-
-            R.hset(snap_key, mapping={
-                "status": json.dumps("hit"),
-                "hit_ts": json.dumps(now_ms),
-                "last_status_ms": json.dumps(now_ms),
-                "last_price": json.dumps(last_price),
-            })
-        except Exception:
-            pass
-
-      
-
-        _delete_live_snapshot(sym_u, direction)
-        return
+    
 
     # ====================== EXPIRED ======================
+    # Rule: expiry ONLY when NOT entered.
     expired = False
     try:
-        if opp_expire_ts and now_ms >= opp_expire_ts:
-            expired = True
-        elif alert_ms and (now_ms - alert_ms >= horizon_min * 60_000):
-            expired = True
+        if not entered:
+            if opp_expire_ts and now_ms >= opp_expire_ts:
+                expired = True
+            elif alert_ms and (now_ms - alert_ms >= horizon_min * 60_000):
+                expired = True
     except Exception:
         expired = False
 
     if expired:
         try:
             if has_alert:
-                _mark_alert_expired(alert_id, now_ms)
+                _mark_alert_expired(str(alert_id), now_ms)
 
-                payload = {
-                    "alert_id": alert_id,
-                    "symbol": sym_u,
-                    "opp_direction": direction,
-                    "direction": direction,
-                    "alert_created_ms": alert_ms or now_ms,
-                    "status": "expired",
-                    "hit_target": False,
-                    "expired_ts": now_ms,
-                    "expired_ts_ms": now_ms,
-                    "last_status_ms": now_ms,
-                    "updated_ms": now_ms,
-                    "time_to_target_min": float(horizon_min),
-                    "last_price": last_price,
-                    "realized_move_pct": realized_move_pct,
-                }
-                payload.update(meta)
-                _save_alert_snapshot(sym_u, payload)
-                _log_trade_outcome(payload)
+            realized_from_entry = None
+            try:
+                if bool(meta.get("entry_triggered")) and meta.get("entry_price") is not None:
+                    ep = float(meta["entry_price"])
+                    lp0 = float(last_price)
+                    if ep > 0:
+                        mv = ((lp0 - ep) / ep) * 100.0
+                        if entry_sig == "SELL":
+                            mv = -mv
+                        realized_from_entry = float(mv)
+            except Exception:
+                realized_from_entry = None
 
-                # --- DISCORD: EXPIRED notification (deduped) ---
-                try:
-                    _discord_notify_outcome("expired", payload)
-                except Exception:
-                    pass
+            payload = {
+                "alert_id": event_id,
+                "symbol": sym_u,
+                "opp_direction": direction,
+                "direction": direction,
+                "alert_created_ms": alert_ms or now_ms,
+                "status": "expired",
+                "hit_target": False,
+                "expired_ts": now_ms,
+                "expired_ts_ms": now_ms,
+                "last_status_ms": now_ms,
+                "updated_ms": now_ms,
+                "time_to_target_min": float(horizon_min),
+                "last_price": float(last_price),
+                "realized_move_pct": realized_from_entry if realized_from_entry is not None else realized_move_pct,
+            }
+            payload.update(meta)
+            payload["tp_price"] = tp_price
+            payload["sl_price"] = sl_price
 
-            R.hset(snap_key, mapping={
-                "status": json.dumps("expired"),
-                "expired_ts": json.dumps(now_ms),
-                "last_status_ms": json.dumps(now_ms),
-                "last_price": json.dumps(last_price),
-            })
+            _save_alert_snapshot(sym_u, payload)
+            _log_trade_outcome(payload)
+
+            try:
+                _discord_notify_outcome("expired", payload)
+            except Exception:
+                pass
+
+            try:
+                R.hset(
+                    snap_key,
+                    mapping={
+                        "status": json.dumps("expired"),
+                        "expired_ts": json.dumps(now_ms),
+                        "last_status_ms": json.dumps(now_ms),
+                        "last_price": json.dumps(float(last_price)),
+                    },
+                )
+            except Exception:
+                pass
         except Exception:
             pass
-
-       
 
         _delete_live_snapshot(sym_u, direction)
         return

@@ -16,6 +16,21 @@ const CardContent: React.FC<React.HTMLAttributes<HTMLDivElement>> = ({ className
   </div>
 );
 
+function fmtBrokerHHMM(
+  tsMs?: number | null,
+  tzOffsetMin?: number | null
+) {
+  if (!tsMs) return "";
+
+  const offsetMs = (tzOffsetMin ?? 0) * 60_000;
+
+  // Shift into broker-local time, then format in UTC 
+  const d = new Date(tsMs + offsetMs);
+  return d.toISOString().slice(11, 16); // HH:MM
+}
+
+
+
 
 /* -------------------------------------------------
  * Clock utilities (broker-tz aware, second-accurate)
@@ -85,6 +100,45 @@ function fmtPrice(sym: string, px: number | null | undefined, decimals?: number)
 }
 
 
+function directionPill(decisionRaw: string): { cls: string; text: string; arrow: string } {
+  const d = (decisionRaw || "").toUpperCase().trim();
+  if (d === "BUY" || d === "UP" || d === "LONG") {
+    return {
+      cls: "inline-flex items-center gap-1 rounded-full border border-emerald-600/40 bg-emerald-950/40 px-2.5 py-1 text-xs font-semibold text-emerald-200",
+      text: "BUY",
+      arrow: "▲",
+    };
+  }
+  if (d === "SELL" || d === "DOWN" || d === "SHORT") {
+    return {
+      cls: "inline-flex items-center gap-1 rounded-full border border-rose-600/40 bg-rose-950/40 px-2.5 py-1 text-xs font-semibold text-rose-200",
+      text: "SELL",
+      arrow: "▼",
+    };
+  }
+  if (d === "HOLD") {
+    return {
+      cls: "inline-flex items-center gap-1 rounded-full border border-slate-600/50 bg-slate-900/40 px-2.5 py-1 text-xs font-semibold text-slate-200",
+      text: "HOLD",
+      arrow: "•",
+    };
+  }
+  return {
+    cls: "inline-flex items-center gap-1 rounded-full border border-slate-700/70 bg-slate-900/40 px-2.5 py-1 text-xs font-semibold text-slate-200",
+    text: d || "—",
+    arrow: "•",
+  };
+}
+
+function fmtProbPct(p: any): string {
+  const n = typeof p === "number" ? p : Number(p);
+  if (!Number.isFinite(n)) return "—";
+  // backend sometimes returns 0..1; sometimes already 0..100
+  const pct = n <= 1.0 ? n * 100.0 : n;
+  return `${pct.toFixed(pct >= 10 ? 0 : 1)}%`;
+}
+
+
 function calcTargetPrice(row: {
   symbol: string;
   price?: number;
@@ -121,8 +175,8 @@ function calcTargetPrice(row: {
   }
 
   // C) Percent-based fallback (1h) — direction should follow ST trend when available
-  if (Number.isFinite(row.expected_move_pct_1h as any)) {
-    const pctAbs = Math.abs(Number(row.expected_move_pct_1h)) / 100;
+  if (Number.isFinite((row as any).expected_move_pct as any)) {
+    const pctAbs = Math.abs(Number((row as any).expected_move_pct)) / 100;
     const stDir = trendDirFromBiasLabel(row.st_trend_label ?? row.bias);
 
     const dir =
@@ -218,15 +272,13 @@ function useOffsetClock(offsetMin: number) {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 }
 
-// Format a timestamp (epoch seconds or ms) as broker time (offset minutes from UTC), invariant to viewer TZ
-function fmtBrokerTime(ts: number | null | undefined, _offsetMin: number) {
-  if (!ts && ts !== 0) return "";
-  const ms = ts! < 2_000_000_000 ? ts! * 1000 : ts!;     // seconds ? ms
-  
-  return new Date(ms).toLocaleTimeString(
-    "en-GB",
-    { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }
-  );
+// Format tick candle time as broker time (HH:MM), invariant to viewer TZ.
+// We shift by broker offset, then format in UTC via ISO string slice.
+function fmtBrokerTime(tsMs: number | null | undefined, tzOffsetMin?: number | null) {
+  if (tsMs == null) return "";
+  if (tzOffsetMin == null) return "";
+  const brokerMs = tsMs + Number(tzOffsetMin) * 60_000;
+  return new Date(brokerMs).toISOString().slice(11, 16); // "HH:MM"
 }
 
 
@@ -319,14 +371,15 @@ function useTfStripData(enabled: boolean = true): {
 }
 
 
-type LivePrice = { price: number; lastTs: number };
+type LivePrice = { price: number | null; lastTs: number | null };
 
 /** Live M1 prices (last CLOSED bar) with cache-busting, visibility refetch,
  *  and dynamic interval (ms). Use 0 to disable auto refresh. */
 function useLivePrices(refreshMs: number = 60_000) {
   const [prices, setPrices] = React.useState<Record<string, LivePrice>>({});
   const [updatedAt, setUpdatedAt] = React.useState<number | null>(null);
-
+  const [brokerMeta, setBrokerMeta] = React.useState<{ tz_offset_min?: number; tz_name?: string; device?: string }>({});
+  const lastPriceTsRef = React.useRef<number>(0);
   const refetch = React.useCallback(async () => {
     try {
       // cache-bust & no-store to avoid any intermediary caching
@@ -335,16 +388,34 @@ function useLivePrices(refreshMs: number = 60_000) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const js = await res.json();
 
-      const map: Record<string, LivePrice> = {};
+      const upd: Record<string, LivePrice> = {};
       if (Array.isArray(js?.rows)) {
         for (const r of js.rows) {
-          if (r?.symbol && typeof r?.price === "number" && typeof r?.lastTs === "number") {
-            map[r.symbol] = { price: r.price, lastTs: r.lastTs };
-          }
+          if (!r?.symbol) continue;
+          const sym = String(r.symbol).toUpperCase();
+          upd[sym] = {
+            price: (typeof r?.price === "number" ? r.price : null),
+            lastTs: (typeof r?.lastTs === "number" ? r.lastTs : null),
+          };
         }
       }
-      setPrices(map);
-      setUpdatedAt(Date.now());
+      setPrices(upd);
+
+      // broker meta from backend (device + tz)
+      try {
+        const b = js?.broker || {};
+        const tzOff = typeof b?.tz_offset_min === "number" ? b.tz_offset_min : undefined;
+        const tzName = typeof b?.tz_name === "string" ? b.tz_name : undefined;
+        const dev = typeof js?.device === "string" ? js.device : undefined;
+        setBrokerMeta({ tz_offset_min: tzOff, tz_name: tzName, device: dev });
+      } catch {
+        // ignore
+      }
+      const respTs =
+        typeof js?.resp_ts_ms === "number" ? js.resp_ts_ms : Date.now();
+
+     
+      setUpdatedAt(respTs);
     } catch {
       // keep previous data on transient errors
     }
@@ -382,7 +453,7 @@ function useLivePrices(refreshMs: number = 60_000) {
     };
   }, [refetch, refreshMs]);
 
-  return { prices, updatedAt, refetch };
+  return { prices, updatedAt, brokerMeta, refetch };
 }
 
 
@@ -477,6 +548,7 @@ type InstrumentRow = {
   symbol: string;
   price: number;
   bias: Bias;
+  price_source?: string;
   short_term_score?: number;
   long_term_score?: number;
   st_trend_label?: Bias;   // ST trend label from backend
@@ -497,7 +569,8 @@ type InstrumentRow = {
   reasons: string[];                // legacy / generic reasons (keep for compat)
   reasons_h1?: string[];            // ST (1h) reasons
   reasons_h4?: string[];            // HT (4h) reasons
-
+  macro?: string[]; 
+  
   confidence_band?: number;         // ATR units
   updated_broker_ts: number;        // epoch ms
   broker_tz_abbr: string;           // e.g., "EET"
@@ -511,10 +584,114 @@ type InstrumentRow = {
   structure?: string;
 };
 
+type PulseLevel = {
+  level: number;
+  touches?: number;
+  strength?: number;
+  kind?: string;
+  tf?: string;
+  distance_atr?: number;
+  stale?: boolean;
+
+};
+
+type PulseSide = {
+  supports?: PulseLevel[];
+  resistances?: PulseLevel[];
+  // enriched views from summarize_sr_multi_tf (optional)
+  supports_near?: PulseLevel[];
+  resistances_near?: PulseLevel[];
+  supports_major?: PulseLevel[];
+  resistances_major?: PulseLevel[];
+};
+
+type PulsePayload = {
+  ok: boolean;
+  symbol: string;
+  tf: string;
+
+  price: number | null;
+  decision: string | null;
+  prob_up: number | null;
+  expected_move_pct: number | null;
+  target_price: number | null;
+  features?: { sr?: boolean; fib?: boolean; commentary?: boolean };
+
+  sr?: {
+    symbol?: string;
+    h4?: PulseSide
+    h1?: PulseSide
+    nearest_support?: number | null;
+    nearest_resistance?: number | null;
+    distance_pips?: { support?: number | null; resistance?: number | null };
+    distance_atr?: { support?: number | null; resistance?: number | null };
+    sr_safety?: string | null;
+   
+  };
+
+  fib?: {
+    range?: { hi?: number; lo?: number } | null;
+    levels?: { pct: number; level: number }[];
+  };
+
+  pulse_text?: string;
+};
+
 
 // Map backend /trend/predict/all row -> InstrumentRow (defensive defaults)
-function mapApiRowToInstrument(r: any): InstrumentRow {
-  const label: string = (r?.label || "").toString();
+function mapApiRowToInstrument(r: any, activeTf: TfLabel): InstrumentRow {
+    // If backend provides per-timeframe payloads under `tfs`,
+  // prefer the selected timeframe view (H1/H4) so UI doesn't "flip" to top-level ABSTAIN.
+  const tfView =
+    r?.tfs && typeof r.tfs === "object" && r.tfs?.[activeTf] && typeof r.tfs[activeTf] === "object"
+      ? r.tfs[activeTf]
+      : null;
+
+  const src = tfView ? { ...r, ...tfView } : r;
+  // --- NEW: macro normalization (backend may send dict | list | string) ---
+  // --- Macro normalization (supports new backend contract) ---
+  const macroLines: string[] = (() => {
+    const srcAny = src as any;
+
+    // 1) canonical
+    if (Array.isArray(srcAny?.macro_reasons)) {
+      return srcAny.macro_reasons.filter(Boolean).map(String);
+    }
+
+    // 2) sometimes nested: macro: { macro_reasons: [...] }
+    if (srcAny?.macro && typeof srcAny.macro === "object" && Array.isArray(srcAny.macro?.macro_reasons)) {
+      return srcAny.macro.macro_reasons.filter(Boolean).map(String);
+    }
+
+    // 3) legacy support
+    const m = srcAny?.macro;
+    if (!m) return [];
+
+    if (Array.isArray(m)) return m.filter(Boolean).map(String);
+
+    if (typeof m === "object") {
+      try {
+        return Object.entries(m)
+          .filter(([, v]) => v != null && String(v).trim() !== "")
+          .map(([k, v]) => `${String(k)}: ${String(v)}`);
+      } catch {
+        return [];
+      }
+    }
+
+    // If macro arrives as a single string like "VIX?, RVOL?, DXY?, 10Y?"
+    // split it so UI can render up to 4 chips.
+    const s = String(m);
+    return s
+      .split(/[\n,;|]+/g)
+      .map(x => x.trim())
+      .filter(Boolean);
+
+  })();
+
+
+
+  const label: string = (src?.label || "").toString();
 
   // --- short-term / long-term trend scores ---
   const st =
@@ -531,7 +708,7 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
   const stLabelApi: string = (r?.st_trend_label || "").toString();
   const htLabelApi: string = (r?.ht_trend_label || "").toString();
 
-  const decision: string = (r?.decision || "").toString();
+  const decision: string = (src?.decision || "").toString();
 
   const bias: Bias =
     label === "Strong Bullish" ? "Strong Bullish" :
@@ -546,9 +723,9 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
 
   // --- probabilities (legacy + new) ---
   const prob_up =
-    typeof r?.prob_up === "number"      ? r.prob_up :
-    typeof r?.prob_up === "number"   ? r.prob_up :
-    typeof r?.p_up === "number"         ? r.p_up :
+    typeof src?.prob_up === "number" ? src.prob_up :
+   
+    typeof src?.p_up === "number"    ? src.p_up :
     null;
 
   // --- NEW ML canonical fields ---
@@ -559,13 +736,13 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
 
   // Pull pct from canonical -> raw.predMovePct -> legacy expected_move_pct_1h -> score (very old fallback)
   const pct_raw =
-    typeof r?.expected_move_pct === "number"
-      ? r.expected_move_pct
+    typeof src?.expected_move_pct === "number"
+      ? src.expected_move_pct
       : (typeof (raw as any)?.predMovePct === "number"
           ? (raw as any).predMovePct
-          : (typeof r?.expected_move_pct_1h === "number"
-              ? r.expected_move_pct_1h
-              : (typeof r?.score === "number" ? r.score : null)));
+          : (typeof src?.expected_move_pct_1h === "number"
+              ? src.expected_move_pct_1h
+              : (typeof src?.score === "number" ? src.score : null)));
 
   // Force sign to match decision (avoids "SELL but target above price")
   const dec = String(decision || "").toUpperCase();
@@ -582,12 +759,12 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
   const expected_move_pct = typeof pct_raw === "number" ? Math.abs(pct_raw) * sign : null;
 
   let target_price =
-    typeof r?.target_price === "number"
-      ? r.target_price
+    typeof src?.target_price === "number"
+      ? src.target_price
       : (typeof (raw as any)?.targetPrice === "number"
           ? (raw as any).targetPrice
-          : (typeof r?.target_price_1h === "number"
-              ? r.target_price_1h
+          : (typeof src?.target_price_1h === "number"
+              ? src.target_price_1h
               : null));
 
   // If target contradicts decision, recompute from basis_price + signed pct
@@ -628,10 +805,17 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
   return {
     symbol: String(r?.symbol || ""),
     price: NaN as any, // priced separately from M1 feed
+    price_source: typeof r?.price_source === "string" ? r.price_source : undefined,
+
 
     bias,
     short_term_score: st ?? undefined,
     long_term_score: ht ?? undefined,
+    reasons,
+    reasons_h1,
+    reasons_h4,
+    macro: macroLines, // NEW ?
+    confidence_band: undefined,
 
     st_trend_label:
       stLabelApi === "Strong Bullish" ||
@@ -673,15 +857,10 @@ function mapApiRowToInstrument(r: any): InstrumentRow {
     expected_move_pct_4h: exp_move_4h,
     target_price_4h: target_price_4h,
 
-    decision: typeof r?.decision === "string" ? (r.decision as any) : "",
+    decision: typeof src?.decision === "string" ? (src.decision as any) : "",
     target_pips: typeof r?.target_pips === "number" ? r.target_pips : undefined,
 
-    reasons,
-    reasons_h1,
-    reasons_h4,
-
-    confidence_band: undefined,
-
+    
     updated_broker_ts:
       (typeof r?.updated_broker_ts === "number" ? r.updated_broker_ts :
        typeof r?.server_now_ms === "number"      ? r.server_now_ms : 0),
@@ -704,7 +883,7 @@ function usePredictRows(tf: "M1" | "M5" | "M15" | "H1" | "H4" = "M1") {
   const [rows, setRows] = React.useState<InstrumentRow[]>([]);
   const [error, setError] = React.useState<string | null>(null);
   const [lastRefreshAt, setLastRefreshAt] = React.useState<number | null>(null);
-
+  const lastRespTsRef = React.useRef<number>(0);
   // keep a ref to the pending timer so we can reschedule precisely
   const timerRef = React.useRef<number | null>(null);
 
@@ -722,11 +901,47 @@ function usePredictRows(tf: "M1" | "M5" | "M15" | "H1" | "H4" = "M1") {
       const res = await fetch(`${API_BASE}/trend/predict/all?tf=${tf}`, { credentials: "include", cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const js = await res.json();
+      const respTs =
+        typeof js?.server_now_ms === "number"
+        ? js.server_now_ms
+        : Date.now();
+
+      lastRespTsRef.current = Math.max(lastRespTsRef.current, respTs);
 
       // map rows safely
       const apiRows: any[] = Array.isArray(js?.rows) ? js.rows : [];
-      const mapped = apiRows.map(mapApiRowToInstrument);
-      setRows(mapped);
+      const mapped = apiRows.map((r: any) => mapApiRowToInstrument(r, tf as TfLabel));
+      setRows((prev) => {
+        const prevBySym = new Map(prev.map((p) => [p.symbol, p]));
+        return mapped.map((x: any) => {
+          const p = prevBySym.get(x.symbol);
+          if (!p) return x;
+
+          // if new poll is missing expected move / target (or flips to WAIT), keep previous
+          const newHasMove =
+            Number.isFinite(Number((x as any).expected_move_pct_1h)) ||
+            Number.isFinite(Number((x as any).expected_move_pct_4h)) ||
+            Number.isFinite(Number((x as any).expected_move_pct));
+
+          const newDec = String((x as any).decision || "").toUpperCase();
+          const prevDec = String((p as any)?.decision || "").toUpperCase();
+
+          const isBlankDecision = (d: string) => d === "" || d === "WAIT" || d === "ABSTAIN";
+
+          //  blank-ish  updates: ABSTAIN/WAIT/empty should NOT erase a previous BUY/SELL
+          const newLooksBlank =
+            !newHasMove ||
+            (p && (prevDec === "BUY" || prevDec === "SELL") && isBlankDecision(newDec));
+
+
+          if (newLooksBlank) {
+            return { ...x, ...p }; // keep last good values
+          }
+          return { ...p, ...x };   // normal update
+        });
+      });
+
+
       setLastRefreshAt(Date.now());
 
       // refresh hint: prefer top-level poll_after_ms => else earliest per-row eta => else align to minute
@@ -850,7 +1065,7 @@ const InstCard: React.FC<{
   row: InstrumentRow;
   showReasons: boolean;
   showTarget: boolean; // kept for API compatibility, not used directly
-  livePrice?: number;
+  livePrice?: number | null;
 }> = ({ row, showReasons, livePrice }) => {
   // --- Trend labels as Bias ---
   const ht: Bias =
@@ -954,8 +1169,8 @@ const InstCard: React.FC<{
             {row.symbol}
           </div>
           <div className="text-xl tabular-nums text-slate-50">
-            {Number.isFinite(livePrice as any)
-              ? fmtPrice(row.symbol, livePrice!, decimalsFromPrice(livePrice))
+            {typeof livePrice === "number" && Number.isFinite(livePrice)
+              ? fmtPrice(row.symbol, livePrice!, priceDecimals(row.symbol))
               : ""}
           </div>
         </div>
@@ -969,7 +1184,7 @@ const InstCard: React.FC<{
             <div className="flex items-center justify-between px-3 py-2">
               <div className="flex items-center gap-2">
                 <span className={stPillClass}>{stLabel}</span>
-                <span className="text-[12px] text-slate-400">ST Trend</span>
+                <span className="text-[12px] text-slate-400">Near-Term Bias</span>
               </div>
             </div>
 
@@ -977,7 +1192,7 @@ const InstCard: React.FC<{
             <div className="flex items-center justify-between px-3 py-2">
               <div className="flex items-center gap-2">
                 <span className={htPillClass}>{htLabel}</span>
-                <span className="text-[12px] text-slate-400">HT Trend</span>
+                <span className="text-[12px] text-slate-400">Broader Bias</span>
               </div>
             </div>
           </div>
@@ -1059,9 +1274,11 @@ const TableView: React.FC<{
   rows: InstrumentRow[];
   showReasons: boolean;
   showTarget: boolean;
-  prices?: Record<string, { price: number; lastTs: number }>;
+  prices?: Record<string, LivePrice>;
   brokerOffsetMin: number;
-}> = ({ rows, showReasons, showTarget, prices, brokerOffsetMin }) => {
+  activetf: TfLabel;
+  deviceUsed: string;
+}> = ({ rows, prices, brokerOffsetMin, activetf, deviceUsed, showReasons }) => {
   // Build display rows: if predictions are empty, make rows from price symbols
   const displayRows: InstrumentRow[] =
     rows && rows.length
@@ -1070,216 +1287,286 @@ const TableView: React.FC<{
         ? Object.keys(prices).map((sym) => ({ symbol: sym } as InstrumentRow))
         : [];
 
-  // Stable sort A-Z when in fallback
-  displayRows.sort((a, b) => (a.symbol || "").localeCompare(b.symbol || ""));
+  // --- local helpers (avoid “missing name” TS errors) ---
+  const fmtProbPctLocal = (v: any) => {
+    const x = typeof v === "number" ? v : typeof v?.prob_up === "number" ? v.prob_up : typeof v?.prob_up === "number" ? v.prob_up : null;
+    if (typeof x !== "number" || !Number.isFinite(x)) return "—";
+    return `${Math.round(x * 100)}%`;
+  };
 
+  const directionPillLocal = (dec: string) => {
+    const d = String(dec || "").toUpperCase();
+    if (d === "BUY" || d === "LONG" || d === "UP") {
+      return { text: "BUY", arrow: "▲", cls: "inline-flex items-center gap-1 rounded-full border border-emerald-700/40 bg-emerald-900/20 px-3 py-1 text-xs font-semibold text-emerald-200" };
+    }
+    if (d === "SELL" || d === "SHORT" || d === "DOWN") {
+      return { text: "SELL", arrow: "▼", cls: "inline-flex items-center gap-1 rounded-full border border-rose-700/40 bg-rose-900/20 px-3 py-1 text-xs font-semibold text-rose-200" };
+    }
+    if (d === "ABSTAIN") {
+      return { text: "ABSTAIN", arrow: "•", cls: "inline-flex items-center gap-1 rounded-full border border-slate-700/60 bg-slate-900/30 px-3 py-1 text-xs font-semibold text-slate-200" };
+    }
+    return { text: d || "—", arrow: "•", cls: "inline-flex items-center gap-1 rounded-full border border-slate-700/60 bg-slate-900/30 px-3 py-1 text-xs font-semibold text-slate-200" };
+  };
+
+  // --- Pulse modal state ---
   const [pulseOpen, setPulseOpen] = React.useState(false);
   const [pulseRow, setPulseRow] = React.useState<InstrumentRow | null>(null);
+  const [pulseLoading, setPulseLoading] = React.useState(false);
+  const [pulseErr, setPulseErr] = React.useState<string | null>(null);
+  const [pulseData, setPulseData] = React.useState<any | null>(null);
 
-  const openPulse = (r: InstrumentRow) => {
-    setPulseRow(r);
-    setPulseOpen(true);
-  };
-  const closePulse = () => {
+  const closePulse = React.useCallback(() => {
     setPulseOpen(false);
+    setPulseRow(null);
+    setPulseErr(null);
+    setPulseData(null);
+  }, []);
+
+  const fetchPulse = React.useCallback(
+    async (sym: string) => {
+      const symU = String(sym || "").toUpperCase().trim();
+      if (!symU) return;
+
+      setPulseLoading(true);
+      setPulseErr(null);
+
+      try {
+        const q = new URLSearchParams();
+        q.set("symbol", symU);
+        q.set("tf", activetf); // bind to selected timeframe (M15/H1/H4)
+        if (deviceUsed) q.set("device", deviceUsed);
+
+        const url = `/_api/trend/pulse?${q.toString()}`;
+        const res = await fetch(url, { credentials: "include" });
+        const js = await res.json().catch(() => null);
+
+        if (!res.ok) throw new Error(js?.detail || js?.message || `HTTP ${res.status}`);
+        setPulseData(js);
+      } catch (e: any) {
+        setPulseErr(String(e?.message || e || "Pulse fetch failed"));
+      } finally {
+        setPulseLoading(false);
+      }
+    },
+    [activetf, deviceUsed]
+  );
+
+  const openPulse = React.useCallback(
+    (r: InstrumentRow) => {
+      setPulseRow(r);
+      setPulseOpen(true);
+      setPulseData(null);
+      void fetchPulse(String((r as any).symbol || "").toUpperCase());
+    },
+    [fetchPulse]
+  );
+
+  // ---------- SR render helpers ----------
+  const srKey = String(activetf || "H1").toLowerCase(); // "h1" | "h4" | ...
+  const srFrameKey = srKey === "h4" ? "h4" : "h1"; // pulse currently returns sr.h1 and sr.h4
+  const getLevelNum = (x: any) => (typeof x?.level === "number" ? x.level : null);
+
+  const filterSupport = (arr: any[], px: number) =>
+    (Array.isArray(arr) ? arr : []).filter((x) => {
+      const lv = getLevelNum(x);
+      if (typeof lv !== "number") return false;
+      if (!(lv <= px)) return false; // support must be BELOW price
+      if (x?.stale === true) return false;
+      if (x?.side_ok === false) return false;
+      return true;
+    });
+
+  const filterResistance = (arr: any[], px: number) =>
+    (Array.isArray(arr) ? arr : []).filter((x) => {
+      const lv = getLevelNum(x);
+      if (typeof lv !== "number") return false;
+      if (!(lv >= px)) return false; // resistance must be ABOVE price
+      if (x?.stale === true) return false;
+      if (x?.side_ok === false) return false;
+      return true;
+    });
+  const fallbackSupportAny = (arr: any[], px: number) =>
+    (Array.isArray(arr) ? arr : [])
+      .filter((x) => typeof getLevelNum(x) === "number")
+      .sort((a, b) => (getLevelNum(b)! - getLevelNum(a)!))  // highest first
+      .slice(0, 3);
+
+  const fallbackResistanceAny = (arr: any[], px: number) =>
+    (Array.isArray(arr) ? arr : [])
+      .filter((x) => typeof getLevelNum(x) === "number")
+      .sort((a, b) => (getLevelNum(a)! - getLevelNum(b)!)) // lowest first
+      .slice(0, 3);
+
+  const srChips = (items: any[], sym: string, maxN: number) => {
+    const out = items.slice(0, maxN);
+    if (!out.length) return <span className="text-slate-500">—</span>;
+    return (
+      <div className="flex flex-wrap gap-2">
+        {out.map((x: any, i: number) => {
+          const lv = getLevelNum(x);
+          const txt =
+            typeof lv === "number"
+              ? fmtPrice(sym, lv, priceDecimals(sym))
+              : String(x?.level ?? "—");
+          const tt = `touches=${x?.touches ?? "—"} strength=${x?.strength ?? "—"} atr=${x?.distance_atr ?? "—"}`;
+          return (
+            <span
+              key={i}
+              className="rounded-full border border-slate-700/70 bg-slate-900/40 px-2.5 py-1 text-[12px] text-slate-200 tabular-nums"
+              title={tt}
+            >
+              {txt}
+            </span>
+          );
+        })}
+      </div>
+    );
   };
 
   return (
     <>
-      <div className="overflow-x-auto rounded-2xl border border-slate-700/60 bg-slate-950/60 shadow-lg shadow-black/40">
-        <table className="min-w-full divide-y divide-slate-700/60">
-          <thead className="bg-slate-900/60 text-xs text-slate-300">
+      <div className="overflow-x-auto rounded-2xl border border-slate-800/80 bg-slate-950/40 shadow-xl">
+        <table className="min-w-full text-left text-sm">
+          <thead className="bg-slate-950/70 text-xs uppercase tracking-wide text-slate-400">
             <tr>
-              <th className="px-4 py-3 text-left font-medium">Instrument</th>
-              <th className="px-4 py-3 text-left font-medium">HT Trend</th>
-              <th className="px-4 py-3 text-left font-medium">ST Trend</th>
-              <th className="px-4 py-3 text-left font-medium">Price (M1)</th>
-              <th className="px-4 py-3 text-left font-medium">Expected move (1h)</th>
-              <th className="px-4 py-3 text-left font-medium">Expected move (4h)</th>
-              <th className="px-4 py-3 text-left font-medium">ProbUp</th>
-              <th className="px-4 py-3 text-left font-medium">Pulse</th>
-              <th className="px-4 py-3 text-left font-medium">Reasons</th>
+              <th className="px-4 py-3">Symbol</th>
+              <th className="px-4 py-3">Price</th>
+              <th className="px-4 py-3">Direction</th>
+              <th className="px-4 py-3">Expected move</th>
+              <th className="px-4 py-3">Macro</th>
+              <th className="px-4 py-3">Prob</th>
+              <th className="px-4 py-3">Pulse</th>
             </tr>
           </thead>
 
-          <tbody className="divide-y divide-slate-800/60 text-sm">
+          <tbody className="divide-y divide-slate-800/70">
             {displayRows.map((r) => {
-              const nowMs = Date.now();
+              const sym = String((r as any).symbol || "").toUpperCase();
+              const live = prices?.[sym];
+              const priceNow = live?.price ?? null;
+              const priceTsMs = live?.lastTs ?? null;
 
-              const isExpiredUI =
-                typeof r.horizon_min === "number" &&
-                typeof r.updated_broker_ts === "number" &&
-                nowMs > r.updated_broker_ts + r.horizon_min * 60_000;
+              const dec = String((r as any).decision || "").toUpperCase();
+              const dpill = directionPillLocal(dec);
 
-              if (isExpiredUI) return null;
+              const emPct =
+                typeof (r as any).expected_move_pct === "number" ? (r as any).expected_move_pct : undefined;
+              const tgt = typeof (r as any).target_price === "number" ? (r as any).target_price : undefined;
 
-              const htLabel: Bias = (r.ht_trend_label as Bias | undefined) ?? (r.bias as Bias);
-              const pill = biasToPill(htLabel);
+              // backend sends macro_reasons; keep fallback for older shapes
+              // backend sends macro_reasons; accept array | string | dict/object
+              const macroRaw =
+                (r as any).macro ??
+                (r as any).macro_reasons ??
+                (r as any).macroReasons ??
+                null;
 
-              const rawPriceTs = prices?.[r.symbol]?.lastTs ?? r.updated_broker_ts;
-              const priceTsMs = toMs(rawPriceTs);
+              const normalizeMacro = (v: any): string[] => {
+                if (!v) return [];
 
-              const rowOffsetMin =
-                (r as any)?.broker_tz_offset_min ??
-                (r as any)?.tz_offset_min ??
-                brokerOffsetMin;
+                // array already
+                if (Array.isArray(v)) return v.filter(Boolean).map(String);
 
-              const priceNow = prices?.[r.symbol]?.price;
+                // single string (optional: split if you ever send CSV)
+                if (typeof v === "string") {
+                  const s = v.trim();
+                  return s ? [s] : [];
+                }
+
+                // object / dict shape: {dxy: "...", vix: "..."} or {reasons:[...]}
+                if (typeof v === "object") {
+                  const rr = (v as any).reasons;
+                  if (Array.isArray(rr)) return rr.filter(Boolean).map(String);
+
+                  // flatten values; if values are arrays, flatten those too
+                  const vals = Object.values(v).flatMap((x: any) => (Array.isArray(x) ? x : [x]));
+                  return vals.filter(Boolean).map(String);
+                }
+
+                return [];
+              };
+
+             const macro = normalizeMacro(macroRaw);
+             const macroShort = macro.slice(0, 4);
+
 
               return (
-                <tr key={r.symbol} className="bg-slate-800/40 hover:bg-slate-800/60">
-                  {/* Instrument */}
-                  <td className="px-4 py-3 font-medium text-slate-200">{r.symbol}</td>
-
-                  {/* HT Trend */}
+                <tr key={sym} className="hover:bg-slate-900/40">
+                  {/* Symbol */}
                   <td className="px-4 py-3">
-                    <span className={pill.className}>{pill.text}</span>
+                    <div className="font-semibold text-slate-100">{sym}</div>
+                    <div className="text-[11px] text-slate-500">{(r as any).structure_reason || (r as any).structure || ""}</div>
                   </td>
 
-                  {/* ST Trend pill */}
-                  <td className="px-4 py-3">
-                    {(() => {
-                      const lbl: Bias =
-                        (r.st_trend_label as Bias | undefined) ??
-                        (scoreToTrendLabel(r.short_term_score) as Bias);
-                      const pillSt = biasToPill(lbl);
-                      return <span className={pillSt.className}>{pillSt.text}</span>;
-                    })()}
-                  </td>
-
-                  {/* Price (M1) */}
+                  {/* Price */}
                   <td className="px-4 py-3">
                     <div className="tabular-nums text-slate-100">
                       {Number.isFinite(priceNow as any)
-                        ? fmtPrice(
-                            r.symbol,
-                            priceNow as number,
-                            decimalsFromPrice(priceNow as number)
-                          )
+                        ? fmtPrice(sym, priceNow as number, priceDecimals(sym))
                         : ""}
                     </div>
                     <div className="text-[11px] text-slate-500">
-                      {fmtBrokerTime(priceTsMs ?? toMs(r.updated_broker_ts), rowOffsetMin)}
+                      {priceNow != null && priceTsMs != null ? (
+                        <>
+                          <div>
+                            Broker: {fmtBrokerTime(priceTsMs, brokerOffsetMin)}{" "}
+                            <span className="text-slate-600">
+                              ({fmtUtcOffset(Number(brokerOffsetMin || 0))})
+                            </span>
+                          </div>
+                          <div className="text-slate-600">
+                            UTC: {new Date(priceTsMs).toISOString().slice(11, 16)}
+                          </div>
+                        </>
+                      ) : (
+                        ""
+                      )}
                     </div>
                   </td>
 
-                  {/* Expected move (1h) - ST based + guaranteed side */}
+                  {/* Direction */}
+                  <td className="px-4 py-3">
+                    <span className={dpill.cls}>
+                      <span className="opacity-80">{dpill.arrow}</span>
+                      {dpill.text}
+                    </span>
+                  </td>
+
+                  {/* Expected move */}
                   <td className="px-4 py-3 text-slate-200">
-                    {showTarget ? (
-                      (() => {
-                        const px =
-                          typeof prices?.[r.symbol]?.price === "number"
-                            ? prices[r.symbol].price
-                            : typeof r.price === "number"
-                              ? r.price
-                              : NaN;
-
-                        const pxOk = Number.isFinite(px);
-                        if (!pxOk) return <span className="text-slate-500">�</span>;
-
-                        // Use 1h pct only (your column is Expected move (1h))
-                        const pctVal =
-                          typeof r.expected_move_pct_1h === "number"
-                            ? r.expected_move_pct_1h
-                            : null;
-
-                        if (pctVal == null) return <span className="text-slate-500">�</span>;
-
-                       
-
-
-                        // ST direction MUST come from the same ST label you show in the ST pill
-                        const stLbl: Bias =
-                          (r.st_trend_label as Bias | undefined) ??
-                          (scoreToTrendLabel(r.short_term_score) as Bias) ??
-                          (r.bias as Bias);
-
-                        const stDir = trendDirFromBiasLabel(stLbl);
-                        if (stDir === 0) return <span className="text-slate-500">�</span>;
-                        
-                        const pctText =
-                          stDir > 0 ? `+${Math.abs(pctVal).toFixed(2)}%` :
-                          stDir < 0 ? `-${Math.abs(pctVal).toFixed(2)}%` :
-                          pctSym(pctVal, r.symbol);
-
-                        const pct = Math.abs(pctVal) / 100;
-                        let target = px * (1 + stDir * pct);
-
-                        // hard guarantee:
-                        if (stDir > 0 && target <= px) target = px * (1 + Math.abs(pct));
-                        if (stDir < 0 && target >= px) target = px * (1 - Math.abs(pct));
-
-                        return (
-                          <span>
-                            {pctText && <>{pctText} {"-"} </>}
-                            <span className="tabular-nums">
-                              {fmtPrice(r.symbol, target, decimalsFromPrice(px))}
-                            </span>
-                          </span>
-                        );
-                      })()
+                    {typeof emPct === "number" && typeof tgt === "number" ? (
+                      <span className="tabular-nums">
+                        {pctSym(emPct, sym)} <span className="text-slate-500">•</span>{" "}
+                        {fmtPrice(sym, tgt, priceDecimals(sym))}
+                      </span>
+                    ) : typeof emPct === "number" ? (
+                      <span className="tabular-nums">{pctSym(emPct, sym)}</span>
                     ) : (
-                      <span className="text-slate-500">�</span>
+                      <span className="text-slate-500">—</span>
                     )}
                   </td>
 
-                  {/* Expected move (4h) - HT informational */}
-                  <td className="px-4 py-3 text-slate-400">
-                    {showTarget ? (
-                      (() => {
-                        const px =
-                          typeof prices?.[r.symbol]?.price === "number"
-                            ? prices[r.symbol].price
-                            : typeof r.price === "number"
-                              ? r.price
-                              : NaN;
-
-                        const pxOk = Number.isFinite(px);
-                        if (!pxOk) return <span className="text-slate-500">�</span>;
-
-                        const pctVal =
-                          typeof r.expected_move_pct_4h === "number" ? r.expected_move_pct_4h : null;
-
-                        if (pctVal == null) return <span className="text-slate-500">�</span>;
-
-                        
-
-
-                        const htLbl: Bias =
-                          (r.ht_trend_label as Bias | undefined) ?? (r.bias as Bias);
-
-                        const htDir = trendDirFromBiasLabel(htLbl);
-                        if (htDir === 0) return <span className="text-slate-500">�</span>;
-
-                        const pctText =
-                          htDir > 0 ? `+${Math.abs(pctVal).toFixed(2)}%` :
-                          htDir < 0 ? `-${Math.abs(pctVal).toFixed(2)}%` :
-                          pctSym(pctVal, r.symbol);
-
-                        const pct = Math.abs(pctVal) / 100;
-                        let target = px * (1 + htDir * pct);
-
-                        // keep on correct side for HT too
-                        if (htDir > 0 && target <= px) target = px * (1 + Math.abs(pct));
-                        if (htDir < 0 && target >= px) target = px * (1 - Math.abs(pct));
-
-                        return (
-                          <span>
-                            {pctText && <>{pctText} {"-"} </>}
-                            <span className="tabular-nums">
-                              {fmtPrice(r.symbol, target, decimalsFromPrice(px))}
-                            </span>
+                  {/* Macro (toggle via showReasons) */}
+                  <td className="px-4 py-3">
+                    {macroShort.length ? (
+                      <div className="flex flex-wrap gap-1.5" title={macro.join("; ")}>
+                        {macroShort.map((m: string, i: number) => (
+                          <span
+                            key={i}
+                            className="inline-flex items-center rounded-full border border-slate-700/70 bg-slate-900/40 px-2.5 py-1 text-[11px] text-slate-200"
+                          >
+                            {m}
                           </span>
-                        );
-                      })()
+                        ))}
+                      </div>
                     ) : (
-                      <span className="text-slate-500">�</span>
+                      <span className="text-slate-500">—</span>
                     )}
                   </td>
 
-                  {/* ProbUp */}
+                  {/* Prob */}
                   <td className="px-4 py-3 tabular-nums text-slate-200">
-                    {r.prob_up != null ? r.prob_up.toFixed(2) : ""}
+                    {fmtProbPctLocal((r as any).prob_up ?? (r as any).prob_up ?? (r as any).p_up)}
                   </td>
 
                   {/* Pulse */}
@@ -1287,44 +1574,12 @@ const TableView: React.FC<{
                     <button
                       onClick={() => openPulse(r)}
                       className="inline-flex items-center gap-2 rounded-xl border border-slate-700/70 bg-slate-900/40 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800/50"
-                      title="Open pulse commentary"
+                      title="Open pulse"
+                      type="button"
                     >
                       <span className="h-2 w-2 rounded-full bg-emerald-400/70" />
                       Pulse
                     </button>
-                  </td>
-
-                  {/* Reasons */}
-                  <td className="px-4 py-3 text-slate-300">
-                    {showReasons ? (
-                      <div className="max-w-xs space-y-1 text-xs">
-                        <div
-                          className="truncate text-slate-200"
-                          title={
-                            (r.reasons_h1 && r.reasons_h1.join("; ")) ||
-                            (r.reasons && r.reasons.join("; ")) ||
-                            ""
-                          }
-                        >
-                          <span className="font-semibold">ST:</span>{" "}
-                          {(r.reasons_h1 && r.reasons_h1.length ? r.reasons_h1 : (r.reasons || []))
-                            .slice(0, 2)
-                            .join("; ")}
-                        </div>
-
-                        <div
-                          className="truncate text-slate-400"
-                          title={r.reasons_h4 && r.reasons_h4.length ? r.reasons_h4.join("; ") : ""}
-                        >
-                          <span className="font-semibold">HT:</span>{" "}
-                          {(r.reasons_h4 && r.reasons_h4.length ? r.reasons_h4 : [])
-                            .slice(0, 2)
-                            .join("; ")}
-                        </div>
-                      </div>
-                    ) : (
-                      ""
-                    )}
                   </td>
                 </tr>
               );
@@ -1335,82 +1590,172 @@ const TableView: React.FC<{
 
       {/* Pulse modal */}
       {pulseOpen && pulseRow ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-          onClick={closePulse}
-        >
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/60 p-4" onClick={closePulse}>
           <div
-            className="w-full max-w-2xl rounded-2xl border border-slate-700/70 bg-slate-950/95 shadow-2xl"
+            className="my-8 w-full max-w-2xl max-h-[85vh] overflow-hidden rounded-2xl border border-slate-700/70 bg-slate-950/95 shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-start justify-between gap-4 border-b border-slate-800/70 p-5">
               <div>
                 <div className="text-xs uppercase tracking-wide text-slate-400">Pulse</div>
-                <div className="mt-1 text-lg font-semibold text-slate-100">{pulseRow.symbol}</div>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {(() => {
-                    const htLbl: Bias = (pulseRow.ht_trend_label as any) ?? (pulseRow.bias as any);
-                    const stLbl: Bias =
-                      (pulseRow.st_trend_label as any) ??
-                      (scoreToTrendLabel(pulseRow.short_term_score) as any) ??
-                      (pulseRow.bias as any);
-                    const htP = biasToPill(htLbl);
-                    const stP = biasToPill(stLbl);
-                    return (
-                      <>
-                        <span className={htP.className}>HT: {htP.text}</span>
-                        <span className={stP.className}>ST: {stP.text}</span>
-                      </>
-                    );
-                  })()}
+                <div className="mt-1 text-lg font-semibold text-slate-100">{String((pulseRow as any).symbol || "").toUpperCase()}</div>
+                <div className="mt-2 text-xs text-slate-500">
+                  SR view: <span className="text-slate-300">{srFrameKey.toUpperCase()}</span>
                 </div>
               </div>
+
               <button
+                className="rounded-xl border border-slate-700/70 bg-slate-900/40 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800/60"
                 onClick={closePulse}
-                className="rounded-xl border border-slate-700/70 bg-slate-900/40 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-800/60"
+                type="button"
               >
                 Close
               </button>
             </div>
 
-            <div className="p-5">
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="rounded-xl border border-slate-800/70 bg-slate-900/30 p-4">
-                  <div className="text-xs font-semibold text-slate-300">ST commentary</div>
-                  <ul className="mt-2 space-y-1 text-sm text-slate-200">
-                    {(pulseRow.reasons_h1 && pulseRow.reasons_h1.length
-                      ? pulseRow.reasons_h1
-                      : pulseRow.reasons || [])
-                      .slice(0, 6)
-                      .map((x, i) => (
-                        <li key={i} className="flex items-start gap-2">
-                          <span className="mt-2 h-1.5 w-1.5 rounded-full bg-slate-500/80" />
-                          <span>{x}</span>
-                        </li>
-                      ))}
-                    {!((pulseRow.reasons_h1 && pulseRow.reasons_h1.length) || (pulseRow.reasons && pulseRow.reasons.length)) ? (
-                      <li className="text-slate-500">No ST commentary available</li>
-                    ) : null}
-                  </ul>
-                </div>
+            <div className="max-h-[calc(85vh-92px)] overflow-y-auto p-5 space-y-4">
+              {pulseLoading ? (
+                <div className="text-sm text-slate-300">Loading pulse…</div>
+              ) : pulseErr ? (
+                <div className="text-sm text-rose-300">Pulse error: {pulseErr}</div>
+              ) : pulseData ? (
+                <>
+                  {/* Pulse text */}
+                  <div className="rounded-xl border border-slate-800/70 bg-slate-900/30 p-4">
+                    <div className="text-sm text-slate-100">{pulseData.pulse_text || "—"}</div>
+                  </div>
 
-                <div className="rounded-xl border border-slate-800/70 bg-slate-900/30 p-4">
-                  <div className="text-xs font-semibold text-slate-300">HT commentary</div>
-                  <ul className="mt-2 space-y-1 text-sm text-slate-200">
-                    {(pulseRow.reasons_h4 && pulseRow.reasons_h4.length ? pulseRow.reasons_h4 : [])
-                      .slice(0, 6)
-                      .map((x, i) => (
-                        <li key={i} className="flex items-start gap-2">
-                          <span className="mt-2 h-1.5 w-1.5 rounded-full bg-slate-500/80" />
-                          <span>{x}</span>
-                        </li>
-                      ))}
-                    {!(pulseRow.reasons_h4 && pulseRow.reasons_h4.length) ? (
-                      <li className="text-slate-500">No HT commentary available</li>
-                    ) : null}
-                  </ul>
-                </div>
-              </div>
+                  {/* SR (Near + Major, correct TF + filters) */}
+                  {pulseData?.sr ? (
+                    (() => {
+                      const sym = String((pulseRow as any)?.symbol || "").toUpperCase();
+                      const px =
+                        typeof pulseData?.price === "number"
+                          ? pulseData.price
+                          : typeof pulseData?.sr?.price === "number"
+                            ? pulseData.sr.price
+                            : null;
+
+                      const srAll = pulseData?.sr || null;
+                      const frameA = srAll?.[srFrameKey] || null;
+                      const otherKey = srFrameKey === "h1" ? "h4" : "h1";
+                      const frameB = srAll?.[otherKey] || null;
+
+                      const frame = frameA || frameB; // render something even if preferred frame missing
+
+                      const pickNearSup = frameA?.supports_near?.length ? frameA.supports_near : (frameB?.supports_near || []);
+                      const pickNearRes = frameA?.resistances_near?.length ? frameA.resistances_near : (frameB?.resistances_near || []);
+
+                      const nearSup = px != null ? filterSupport(pickNearSup || [], px) : [];
+                      const nearRes = px != null ? filterResistance(pickNearRes || [], px) : [];
+
+                      const pickMajorSupRaw =
+                        frameA?.supports_major?.length
+                          ? frameA.supports_major
+                          : frameA?.supports?.length
+                            ? frameA.supports
+                            : frameB?.supports_major?.length
+                              ? frameB.supports_major
+                              : frameB?.supports || [];
+
+                      const pickMajorResRaw =
+                        frameA?.resistances_major?.length
+                          ? frameA.resistances_major
+                          : frameA?.resistances?.length
+                            ? frameA.resistances
+                            : frameB?.resistances_major?.length
+                              ? frameB.resistances_major
+                              : frameB?.resistances || [];
+
+                      let majorSup = px != null ? filterSupport(pickMajorSupRaw || [], px) : (pickMajorSupRaw || []);
+                      let majorRes = px != null ? filterResistance(pickMajorResRaw || [], px) : (pickMajorResRaw || []);
+
+                      // last-resort single chip so we never render blanks when cache has a valid nearest level
+                      if (majorSup.length === 0 && typeof srAll?.nearest_support === "number") {
+                        majorSup = [{ level: srAll.nearest_support }];
+                      }
+                      if (majorRes.length === 0 && typeof srAll?.nearest_resistance === "number") {
+                        majorRes = [{ level: srAll.nearest_resistance }];
+                      }
+
+                      const hasNear = nearSup.length > 0 || nearRes.length > 0;
+
+                      return (
+                        <div className="rounded-xl border border-slate-800/70 bg-slate-900/30 p-4 space-y-4">
+                          <div className="text-xs font-semibold text-slate-300">Support / Resistance</div>
+
+                          {/* Near (actionable) */}
+                         {hasNear && (
+                           <div className="rounded-xl border border-slate-800/60 bg-slate-950/30 p-4">
+                            <div className="text-xs font-semibold text-slate-300">Near (actionable)</div>
+                            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                              <div>
+                                <div className="text-[11px] text-slate-400">Support</div>
+                                <div className="mt-2">{srChips(nearSup, sym, 6)}</div>
+                              </div>
+                              <div>
+                                <div className="text-[11px] text-slate-400">Resistance</div>
+                                <div className="mt-2">{srChips(nearRes, sym, 6)}</div>
+                              </div>
+                            </div>
+                          </div>
+                         )}
+
+                          {/* Major (strong) */}
+                          <div className="rounded-xl border border-slate-800/60 bg-slate-950/30 p-4">
+                            <div className="text-xs font-semibold text-slate-300">Major (strong)</div>
+                            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                              <div>
+                                <div className="text-[11px] text-slate-400">Support</div>
+                                <div className="mt-2">{srChips(majorSup, sym, 8)}</div>
+                              </div>
+                              <div>
+                                <div className="text-[11px] text-slate-400">Resistance</div>
+                                <div className="mt-2">{srChips(majorRes, sym, 8)}</div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()
+                  ) : null}
+
+                  
+                  {/* Fib */}
+                  <div className="rounded-xl border border-slate-800/70 bg-slate-900/30 p-4">
+                    <div className="text-xs font-semibold text-slate-300">
+                      Fibonacci ({String(activetf || "H1").toUpperCase()})
+                    </div>
+
+                    {Array.isArray(pulseData?.fib?.levels) && pulseData.fib.levels.length > 0 ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {pulseData.fib.levels.slice(0, 10).map((x: any, i: number) => (
+                          <span
+                            key={i}
+                            className="rounded-full border border-slate-700/70 bg-slate-900/40 px-2.5 py-1 text-[12px] text-slate-200 tabular-nums"
+                            title={`${x?.pct ?? ""}%`}
+                          >
+                            {typeof x?.level === "number"
+                              ? fmtPrice(
+                                  String((pulseRow as any)?.symbol || "").toUpperCase(),
+                                  x.level,
+                                  priceDecimals(String((pulseRow as any)?.symbol || "").toUpperCase())
+                                )
+                              : String(x?.level ?? "—")}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="mt-2 text-sm text-slate-500">
+                        Fib not available yet.
+                      </div>
+                    )}
+                  </div>
+
+                </>
+              ) : (
+                <div className="text-sm text-slate-500">No pulse loaded.</div>
+              )}
             </div>
           </div>
         </div>
@@ -1419,53 +1764,27 @@ const TableView: React.FC<{
   );
 };
 
-/* -------------------------------------------------
- * Main component: AI-powered forecasts view
- * ------------------------------------------------- */
+
 export default function PredictionMeter() {
-  // State
-  const [view, setView] = React.useState<"cards" | "table">("cards");
-  const showReasons = true;
-  const showTarget = true;
-  // Fixed timeframe  backend is effectively M15 here
-  const tf: TfLabel = "M15";
+  // Timeframe selector (locked design: 15m fast, 1h & 4h frozen)
+  const [tf, setTf] = React.useState<TfLabel>("M15");
+
   const { rows, error } = usePredictRows(tf);
 
-  // Page-level broker offset in minutes (fallback 120 = UTC+02:00)
+  // Live prices (M1) + broker meta (tz offset + device used)
+  const priceRefreshMs = 2_000;
+  const { prices, brokerMeta } = useLivePrices(priceRefreshMs);
+
+  // Prefer tz offset from price endpoint (broker time is source of truth)
   const brokerOffsetMin =
+    (typeof brokerMeta?.tz_offset_min === "number" ? brokerMeta.tz_offset_min : undefined) ??
     (rows?.[0]?.broker_tz_offset_min as number | undefined) ??
     (rows?.[0]?.tz_offset_min as number | undefined) ??
-    120;
+    0;
 
-  const [sort, setSort] = React.useState<"strength" | "prob" | "move" | "az">("strength");
+  const deviceUsed = brokerMeta?.device || "auto";
 
-  // Live prices auto-refresh (fixed interval, no UI control)
-  const priceRefreshMs = 60_000; // 1m polling for prices
-  const { prices, updatedAt: priceUpdatedAt } = useLivePrices(priceRefreshMs);
-
-  // Sorted view of live rows
-  const sortedRows = React.useMemo(() => {
-    const arr = [...rows];
-    switch (sort) {
-      case "strength":
-        return arr.sort((a, b) => biasToScore(b.bias) - biasToScore(a.bias));
-      case "prob":
-        return arr.sort((a, b) => b.prob_up - a.prob_up);
-      case "move":
-        return arr.sort(
-          (a, b) =>
-            Math.abs(b.expected_move_pct_1h ?? 0) -
-            Math.abs(a.expected_move_pct_1h ?? 0)
-        );
-      case "az":
-        return arr.sort((a, b) => a.symbol.localeCompare(b.symbol));
-    }
-  }, [rows, sort]);
-
-  const brokerAbbr = sortedRows[0]?.broker_tz_abbr || "";
-  const device = sortedRows[0]?.using_device || "";
-
-  // Header clocks
+  // Header clocks (nice-to-have)
   const now = useWallClock();
   const londonTime = React.useMemo(
     () =>
@@ -1490,25 +1809,7 @@ export default function PredictionMeter() {
     [now]
   );
 
-  const brokerTzIana = React.useMemo(
-    () => brokerAbbrToIana(brokerAbbr),
-    [brokerAbbr]
-  );
-
-  const brokerTime = React.useMemo(
-    () =>
-      new Intl.DateTimeFormat("en-GB", {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hour12: false,
-        timeZone:
-          brokerTzIana || Intl.DateTimeFormat().resolvedOptions().timeZone,
-      }).format(now),
-    [now, brokerTzIana]
-  );
-
-  // [PATCH] Live broker clock based on numeric offset
+  // Live broker clock based on numeric offset
   const brokerClock = useOffsetClock(brokerOffsetMin);
 
   return (
@@ -1532,116 +1833,51 @@ export default function PredictionMeter() {
           </span>
         </div>
       </div>
-
-      {/* Controls */}
-      <Card className="mt-4">
-        <CardContent className="flex flex-wrap items-center gap-4">
-          {/* Toggles */}
-          {/* View */}
-          {/* View + Sort (right side) */}
-<div className="flex items-center gap-6 text-sm ml-auto">
-  {/* View toggle */}
+{/* Timeframe toggle */}
+<div className="mt-5 flex flex-wrap items-center justify-between gap-3">
   <div className="flex items-center gap-2">
-    <span className="text-slate-400">View</span>
-    <div className="inline-flex rounded-lg border border-slate-700/70 bg-slate-900/60 p-0.5">
-      <button
-        onClick={() => setView("cards")}
-        className={`px-3 py-1.5 rounded-md text-xs sm:text-sm transition-colors ${
-          view === "cards"
-            ? "bg-emerald-400/15 text-emerald-200 shadow-sm"
-            : "text-slate-300 hover:text-slate-100"
-        }`}
-      >
-        Overview
-      </button>
-      <button
-        onClick={() => setView("table")}
-        className={`px-3 py-1.5 rounded-md text-xs sm:text-sm transition-colors ${
-          view === "table"
-            ? "bg-emerald-400/15 text-emerald-200 shadow-sm"
-            : "text-slate-300 hover:text-slate-100"
-        }`}
-      >
-        Depth
-      </button>
+    <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Timeframe</span>
+    <div className="inline-flex rounded-2xl border border-slate-700/70 bg-slate-900/50 p-1">
+      {(["M15", "H1", "H4"] as TfLabel[]).map((t) => (
+        <button
+          key={t}
+          onClick={() => setTf(t)}
+          className={[
+            "px-4 py-2 text-sm rounded-xl transition-colors",
+            tf === t
+              ? "bg-emerald-400/15 text-emerald-200 shadow-sm"
+              : "text-slate-300 hover:text-slate-100",
+          ].join(" ")}
+          title={t === "M15" ? "Fast updates" : "Frozen context"}
+        >
+          {t === "M15" ? "15m" : t === "H1" ? "1h" : "4h"}
+        </button>
+      ))}
     </div>
   </div>
 
-  {/* Sort */}
-  <div className="flex items-center gap-2">
-    <span className="text-slate-400">Sort</span>
-    <select
-      value={sort}
-      onChange={(e) => setSort(e.target.value as any)}
-      className="bg-slate-900/60 border border-slate-700/60 text-slate-200 rounded-md px-2 py-1.5"
-    >
-      <option value="strength">Strength</option>
-      <option value="prob">ProbUp</option>
-      <option value="move">|ExpectedMove|</option>
-      <option value="az">AZ</option>
-    </select>
+  <div className="text-xs text-slate-500">
+    Device: <span className="text-slate-300">{deviceUsed}</span>
   </div>
 </div>
 
-          </CardContent>
-          </Card>
+{/* Content */}
+<div className="mt-6">
+  <TableView
+    rows={rows}
+    showReasons={false}
+    showTarget={true}
+    prices={prices}
+    brokerOffsetMin={brokerOffsetMin}
+    activetf={tf}
+    deviceUsed={deviceUsed}
+  />
+</div>
 
-      {/* Content */}
-      {view === "cards" ? (
-  <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-5">
-    {(sortedRows && sortedRows.length
-      ? sortedRows
-      : prices
-      ? Object.keys(prices).map(
-          (sym) => ({ symbol: sym } as InstrumentRow)
-        )
-      : []
-    ).map((r) => {
-      const nowMs = Date.now();
-      const isExpiredUI =
-        typeof r.horizon_min === "number" &&
-        typeof r.updated_broker_ts === "number" &&
-        nowMs > r.updated_broker_ts + r.horizon_min * 60_000;
-
-      if (isExpiredUI) return null;
-
-      return (
-        <InstCard
-          key={r.symbol}
-          row={r}
-          showReasons={showReasons}
-          showTarget={showTarget}
-          livePrice={prices?.[r.symbol]?.price}
-        />
-      );
-    })}
-  </div>
-) : (
-
-        <div className="mt-6">
-          <TableView
-            rows={sortedRows}
-            showReasons={showReasons}
-            showTarget={showTarget}
-            prices={prices}
-            brokerOffsetMin={brokerOffsetMin}
-          />
-        </div>
-      )}
-
-      {/* Footer note + status */}
-      <p className="mt-6 text-xs text-slate-500"></p>
-      {error ? (
-        <p className="mt-4 text-sm text-rose-400">Error: {error}</p>
-      ) : (
-        <p className="mt-4 text-xs text-slate-500">
-          {priceUpdatedAt
-            ? `Price updated: ${new Date(
-                priceUpdatedAt
-              ).toLocaleTimeString()}`
-            : "Waiting for live price"}
-        </p>
-      )}
+{/* Footer */}
+{error ? (
+  <p className="mt-4 text-sm text-rose-400">Error: {error}</p>
+) : null}
     </div>
   );
 }

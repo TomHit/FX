@@ -22,10 +22,13 @@ from api.routes.predict import router as predict_router
 import logging
 import hashlib
 from api.security import require_user_relaxed
-from api.trend import router as trend_router
+from api.trend_endpoints import router as trend_router
 from api.strategy_endpoints import router as strategy_router
 from api.routes_preview import router as preview_router
-
+from api.routes_strategy_oppt import router as strategy_oppt_router
+from api.strategy.oppt_executor_manager import start_oppt_executor_manager
+from api.ws_gateway import router as ws_router
+from api.ws_prices import router as ws_prices_router
 try:
     from api.routes_admin import r as admin_router
 except Exception:
@@ -104,6 +107,15 @@ def _b2s(x):
 
 # Sessions
 app = FastAPI(docs_url="/_api/docs", openapi_url="/_api/openapi.json")
+@app.on_event("startup")
+def _startup_oppt_executor():
+    # starts one background thread per uvicorn worker;
+    # cross-worker safety is handled inside executor via Redis user-locks
+    try:
+        start_oppt_executor_manager()
+    except Exception as e:
+        log.warning("[OPPT] executor manager failed to start: %s", e)
+
 from starlette.middleware.base import BaseHTTPMiddleware
 
 class _StripApiPrefix(BaseHTTPMiddleware):
@@ -146,7 +158,7 @@ app.add_middleware(
     secret_key=SESSION_SECRET,
     session_cookie="session",
     same_site="none",
-    https_only=True,                 # set True in prod (you are on HTTPS)
+    https_only=(APP_ENV == "prod"),                 # set True in prod (you are on HTTPS)
     max_age=2592000,       # 30 days
     domain=".xautrendlab.com",       # share across subdomains
 )
@@ -158,7 +170,10 @@ app.include_router(google_oidc_router, tags=["auth"])     # /auth/oidc/google/*
 app.include_router(devices_router, prefix="")
 app.include_router(predict_router)
 app.include_router(preview_router) 
-
+app.include_router(strategy_oppt_router)
+app.include_router(ws_router, prefix="/_api")
+app.include_router(ws_prices_router, prefix="/_api")
+app.include_router(ws_prices_router) 
 # --- Logged-in but MFA NOT required (for enrollment) ---
 # All /user/mfa/* endpoints need a user session but should work before MFA is enabled.
 app.include_router(mfa_router, tags=["auth"], dependencies=[Depends(get_current_user_relaxed)])

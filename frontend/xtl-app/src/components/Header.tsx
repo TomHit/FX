@@ -10,6 +10,10 @@ const LINKS = [
   { to: "/devices",    label: "Devices" },
   { to: "/strategy",   label: "Strategy" },
   { to: "/trend",      label: "Trend" },
+  { to: "/my-bots",    label: "My Bots" },
+  { to: "/performance",label: "Daily Performance" },
+  { to: "/kb",label: "Knowledge Base" },
+
 ];
 
 export default function Header() {
@@ -57,11 +61,21 @@ export default function Header() {
 
       {/* Main navigation (kept in header, not in user menu) */}
       <nav className={`nav ${navOpen ? "open" : ""}`}>
-        {LINKS.map(l => (
-          <NavLink key={l.to} to={l.to}>
-            {l.label}
-          </NavLink>
-        ))}
+        {LINKS.map((l) => (
+         <NavLink
+           key={l.to}
+           to={l.to}
+           className={({ isActive }) =>
+             [
+              "nav-link",
+              isActive ? "active" : "",
+             ].join(" ")
+           }
+         >
+           {l.label}
+         </NavLink>
+      ))}
+
       </nav>
 
       <div className="spacer" />

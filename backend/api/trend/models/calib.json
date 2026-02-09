@@ -1,1 +1,14 @@
-{"global_scale": 4.0888037648509306, "per_symbol": {"USDJPY": 3.9625509513551727, "XAUUSD": 2.019963997239181, "GBPUSD": 4.606323389474076, "USDCAD": 4.60461328518659, "EURUSD": 3.745197887217728, "USDCHF": 4.2150565783466885}, "clip_pct": {"majors": 1.5, "XAUUSD": 2.5}, "abstain": {"p_up_margin": 0.1, "min_pct": 0.03}}
+{
+  "global_scale": 1.0,
+  "per_symbol": {},
+  "clip_pct": {
+    "EURUSD": 0.4863968657594061,
+    "GBPUSD": 0.3634268170201311,
+    "USDCAD": 0.2863957791498032,
+    "USDCHF": 0.42738857379407313,
+    "USDJPY": 0.5439284814858583,
+    "XAUUSD": 0.9148037541245275,
+    "majors": 0.438783827506108
+  },
+  "abstain": { "p_up_margin": 0.1, "min_pct": 0.03 }
+}

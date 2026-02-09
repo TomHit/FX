@@ -6,58 +6,229 @@ function useLivePrices(refreshMs: number = 30_000) {
   const [prices, setPrices] = React.useState<Record<string, LivePrice>>({});
   const [updatedAt, setUpdatedAt] = React.useState<number | null>(null);
 
-  const refetch = React.useCallback(async () => {
+  const wsRef = React.useRef<WebSocket | null>(null);
+  const retryRef = React.useRef<number>(0);
+  const lastPullRef = React.useRef<number>(0);
+  const uidRef = React.useRef<string>("");
+
+  // --- best-effort UID resolver (so WS can subscribe to xtl:pub:price:{uid}) ---
+  const resolveUid = React.useCallback(async () => {
+    if (uidRef.current) return uidRef.current;
+
+    const candidates = [
+      "/_api/user/me",
+      "/_api/auth/me",
+      "/_api/user/whoami",
+      "/_api/auth/whoami",
+    ];
+
+    for (const url of candidates) {
+      try {
+        const r = await fetch(`${url}?_=${Date.now()}`, { credentials: "include", cache: "no-store" });
+        if (!r.ok) continue;
+        const js: any = await r.json();
+
+        const uid =
+          js?.user_id ||
+          js?.uid ||
+          js?.id ||
+          js?.user?.id ||
+          js?.user?.user_id ||
+          "";
+
+        if (uid && typeof uid === "string") {
+          uidRef.current = uid;
+          return uidRef.current;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return "";
+  }, []);
+
+  const pullOnce = React.useCallback(async () => {
     try {
       const url = `/_api/trend/price/all?tf=M1&_=${Date.now()}`;
       const res = await fetch(url, { credentials: "include", cache: "no-store" });
       if (!res.ok) return;
       const js = await res.json();
+
       const map: Record<string, LivePrice> = {};
       if (Array.isArray(js?.rows)) {
         for (const r of js.rows) {
-          if (r?.symbol && typeof r?.price === "number" && typeof r?.lastTs === "number") {
-            map[String(r.symbol).toUpperCase()] = { price: r.price, lastTs: r.lastTs };
+          if (r?.symbol && typeof r?.price === "number") {
+            const sym = String(r.symbol).toUpperCase();
+            const lastTs = typeof r?.lastTs === "number" ? r.lastTs : Date.now();
+            map[sym] = { price: r.price, lastTs };
           }
         }
       }
       setPrices(map);
       setUpdatedAt(Date.now());
+      lastPullRef.current = Date.now();
     } catch {
       // ignore
     }
   }, []);
 
+  // keep same external API name
+  const refetch = pullOnce;
+
   React.useEffect(() => {
+    // 1) initial pull so UI isn't empty
+    void pullOnce();
+
+    let stopped = false;
+
+    const connect = async () => {
+      if (stopped) return;
+
+      try {
+        wsRef.current?.close();
+      } catch {}
+      wsRef.current = null;
+
+      // Try to get uid; if not available, we still try WS (cookie-based),
+      // but backend may close quickly; in that case fallback pull will cover.
+      const uid = await resolveUid();
+
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      const base = `${proto}://${window.location.host}`;
+      const qs = new URLSearchParams();
+      qs.set("symbols", "ALL");
+      if (uid) qs.set("uid", uid);
+
+      const url = `${base}/_api/ws/prices?${qs.toString()}`;
+
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        retryRef.current = 0;
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data || "{}");
+          if (!msg || typeof msg !== "object") return;
+
+          // snapshot: {type:"snapshot", prices:{SYM: px}, ts_ms}
+          if (msg.type === "snapshot" && msg.prices && typeof msg.prices === "object") {
+            const incoming = msg.prices as Record<string, number>;
+            setPrices((prev) => {
+              const next = { ...prev };
+              const now = Date.now();
+              for (const [k, v] of Object.entries(incoming)) {
+                const sym = String(k || "").toUpperCase().trim();
+                const px = Number(v);
+                if (!sym || !Number.isFinite(px) || px <= 0) continue;
+                next[sym] = { price: px, lastTs: now };
+              }
+              return next;
+            });
+            setUpdatedAt(Date.now());
+            return;
+          }
+
+          // price: {type:"price", symbol:"XAUUSD", price: 123.4, ts_ms}
+          if (msg.type === "price" && msg.symbol) {
+            const sym = String(msg.symbol || "").toUpperCase().trim();
+            const px = Number(msg.price);
+            const ts = Number(msg.ts_ms) || Date.now();
+            if (!sym || !Number.isFinite(px) || px <= 0) return;
+
+            setPrices((prev) => ({
+              ...prev,
+              [sym]: { price: px, lastTs: ts },
+            }));
+            setUpdatedAt(Date.now());
+            return;
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      ws.onclose = async (ev) => {
+        if (stopped) return;
+
+        // If auth/uid missing, backend may close immediately.
+        // Do NOT hammer reconnect; rely on HTTP pull fallback.
+        if (ev.code === 4401 || ev.code === 4403) {
+          // try resolving uid once more, then just fall back to pull loop
+          await resolveUid();
+          return;
+        }
+
+        const n = Math.min(10, (retryRef.current || 0) + 1);
+        retryRef.current = n;
+        const delay = Math.min(5000, 250 * n);
+        window.setTimeout(() => void connect(), delay);
+      };
+
+      ws.onerror = () => {
+        try {
+          ws.close();
+        } catch {}
+      };
+    };
+
+    void connect();
+
+    // 2) safety: periodic HTTP refresh backstop
     let t: number | null = null;
     const tick = async () => {
-      await refetch();
+      const now = Date.now();
+      const age = now - (lastPullRef.current || 0);
+      if (age > refreshMs) await pullOnce();
       t = window.setTimeout(tick, refreshMs);
     };
-    void tick();
+    t = window.setTimeout(tick, refreshMs);
 
-    const onVis = () => { if (document.visibilityState === "visible") void refetch(); };
-    const onFocus = () => void refetch();
+    // 3) visibility/focus boosts
+    const onVis = () => {
+      if (document.visibilityState === "visible") void pullOnce();
+    };
+    const onFocus = () => void pullOnce();
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onVis);
 
     return () => {
+      stopped = true;
       if (t) window.clearTimeout(t);
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVis);
+      try {
+        wsRef.current?.close();
+      } catch {}
+      wsRef.current = null;
     };
-  }, [refetch, refreshMs]);
+  }, [pullOnce, refreshMs, resolveUid]);
 
   return { prices, updatedAt, refetch };
 }
 
-function outcomeTimeMs(r: any): number | null {
+function outcomeTimeMs(r: OppRow): number | null {
   const st = String(r?.status || "").toLowerCase();
-  if (st === "hit") return typeof r?.hitTsMs === "number" ? r.hitTsMs : null;
-  if (st === "expired") return typeof r?.expiredTsMs === "number" ? r.expiredTsMs : null;
-  if (st === "sl_hit") return typeof (r as any)?.slHitTsMs === "number" ? (r as any).slHitTsMs : (typeof (r as any)?.sl_hit_ts_ms === "number" ? (r as any).sl_hit_ts_ms : null);
-  // fallback: use updatedMs if backend didnt provide explicit hit/expired ts
-  return typeof r?.updatedMs === "number" ? r.updatedMs : null;
+  if (!st) return null;
+  // Prefer explicit timestamps if backend provides them
+  const anyR: any = r as any;
+  if (st === "hit") {
+    const t = anyR.hitTsMs ?? anyR.hit_ts_ms ?? anyR.hit_ts ?? null;
+    return typeof t === "number" ? t : null;
+  }
+  if (st === "sl_hit") {
+    const t = anyR.slHitTsMs ?? anyR.sl_hit_ts_ms ?? anyR.sl_hit_ts ?? null;
+    return typeof t === "number" ? t : null;
+  }
+  if (st === "expired") {
+    const t = anyR.expiredTsMs ?? anyR.expired_ts_ms ?? anyR.expired_ts ?? null;
+    return typeof t === "number" ? t : null;
+  }
+  return null;
 }
+
 
 
 /**
@@ -114,6 +285,8 @@ type ApiRow = {
   // Text reasons from backend
   reasons?: string[] | string;
   opp_reason?: string | null;
+  entry_gate?: any; // optional gate meta from backend
+  sr?: any;
 
   // Timestamps / device
   updated_broker_ms?: number | null;
@@ -192,6 +365,9 @@ type OppRow = {
   oppScore: number | null;
   oppConfidence: string | null;
   reasons: string[];
+  oppReason?: string | null;
+  gateReason?: string | null;
+  blockReason?: string | null;
   updatedBrokerMs: number | null;
   device: string | null;
   alertTimeMs: number | null;
@@ -199,9 +375,13 @@ type OppRow = {
   srSide: string | null;
   srDistPct: number | null;
   srLabel: string | null;
+  srNearest: string | null;
+  srMajor: string | null;
   
 
   signalText?: string | null;
+  signal?: string | null;
+  signalReason?: string | null;
   signalPrice?: number | null;
   signalTsMs?: number | null;
   entryTriggered?: boolean | null;
@@ -253,11 +433,59 @@ const API_BASE =
  * -------------------------- */
 
 function fmtPrice(sym: string, px: number | null | undefined): string {
-  if (!Number.isFinite(px as any)) return "—";
+  if (!Number.isFinite(px as any)) return "";
   const s = sym.toUpperCase();
   const d = s === "XAUUSD" ? 2 : s.endsWith("JPY") ? 3 : 5;
   return (px as number).toFixed(d);
 }
+
+function _pickFirstMajor(sr: any, kind: "support" | "resistance"): { level: number; tf: string } | null {
+  try {
+    const buckets: any[] = [];
+    const h1 = sr?.h1;
+    const h4 = sr?.h4;
+    const k = kind === "support" ? "supports_major" : "resistances_major";
+    if (Array.isArray(h1?.[k])) buckets.push(...h1[k]);
+    if (Array.isArray(h4?.[k])) buckets.push(...h4[k]);
+    const cand = buckets
+      .filter((x) => x && typeof x === "object" && Number.isFinite((x as any).level))
+      .sort((a, b) => {
+        const sa = Number.isFinite(a.sr_score) ? Number(a.sr_score) : 0;
+        const sb = Number.isFinite(b.sr_score) ? Number(b.sr_score) : 0;
+        if (sb !== sa) return sb - sa;
+        const da = Number.isFinite(a.distance_atr) ? Number(a.distance_atr) : 1e9;
+        const db = Number.isFinite(b.distance_atr) ? Number(b.distance_atr) : 1e9;
+        return da - db;
+      })[0];
+    if (!cand) return null;
+    return { level: Number(cand.level), tf: String(cand.tf || "") };
+  } catch {
+    return null;
+  }
+}
+
+function srStringsFromApiRow(r: any): { srNearest: string; srMajor: string } {
+  const sym = String(r?.symbol || "");
+  const sr = r?.sr;
+  const ns = Number.isFinite(sr?.nearest_support) ? Number(sr.nearest_support) : null;
+  const nr = Number.isFinite(sr?.nearest_resistance) ? Number(sr.nearest_resistance) : null;
+
+  const ms = _pickFirstMajor(sr, "support");
+  const mr = _pickFirstMajor(sr, "resistance");
+
+  const nearestParts: string[] = [];
+  if (ns !== null) nearestParts.push(`S ${fmtPrice(sym, ns)}`);
+  if (nr !== null) nearestParts.push(`R ${fmtPrice(sym, nr)}`);
+  const srNearest = nearestParts.join(" | ");
+
+  const majorParts: string[] = [];
+  if (ms?.level != null) majorParts.push(`S ${fmtPrice(sym, ms.level)}${ms.tf ? `(${ms.tf})` : ""}`);
+  if (mr?.level != null) majorParts.push(`R ${fmtPrice(sym, mr.level)}${mr.tf ? `(${mr.tf})` : ""}`);
+  const srMajor = majorParts.join(" | ");
+
+  return { srNearest, srMajor };
+}
+
 
 function fmtTime(ts: number | null): string {
   if (!ts) return "";
@@ -318,7 +546,7 @@ const tpPrice =
 
 const slPrice =
   (typeof r.sl_price === "number" ? r.sl_price : null) ??
-  (typeof r.stop_loss_1h === "number" ? r.stop_loss_1h : null)
+  (typeof r.stop_loss_1h === "number" ? r.stop_loss_1h : null);
 const tpPriceOrig =
   (typeof (r as any).tp_price_orig === "number" ? (r as any).tp_price_orig : null) ??
   (typeof r.target_price_1h === "number" ? r.target_price_1h : null);
@@ -327,7 +555,7 @@ const slPriceOrig =
   (typeof (r as any).sl_price_orig === "number" ? (r as any).sl_price_orig : null) ??
   (typeof (r as any).stop_loss_1h === "number" ? (r as any).stop_loss_1h : null);
 
-;
+
 
 
   const probUp = r.prob_up ?? r.p_up ?? null;
@@ -434,6 +662,20 @@ const slPriceOrig =
     srLabel = `${sidePretty} ~${srDistPct.toFixed(2)}% away`;
   }
 
+
+// -------------------- SR columns (Nearest / Major) --------------------
+let { srNearest, srMajor } = srStringsFromApiRow(r as any);
+
+// Fallback for older server payloads (single H1 level fields)
+// NOTE: keep everything scoped + safe (no free variables)
+const _sym = String((r as any)?.symbol ?? (r as any)?.sym ?? "");
+const _srH1Level = Number((r as any)?.sr?.h1_level ?? (r as any)?.sr?.h1?.level ?? NaN);
+const _srH1Tf = String((r as any)?.sr?.h1_tf ?? (r as any)?.sr?.h1?.tf ?? "H1");
+if (!srNearest && Number.isFinite(_srH1Level)) {
+  srNearest = `SR ${fmtPrice(_sym, _srH1Level)} (${_srH1Tf})`;
+}
+if (!srMajor && !srNearest && srLabel) srMajor = srLabel;
+
   // -------------------- timestamps / misc --------------------
   const updatedBrokerMs =
     (typeof r.updated_broker_ms === "number" ? r.updated_broker_ms : undefined) ??
@@ -506,6 +748,18 @@ const slPriceOrig =
           : entrySignal)
       : signalText;
 
+  const signal = typeof (r as any)?.signal === "string" ? ((r as any).signal as string) : null;
+  const signalReason =
+    typeof (r as any)?.signal_reason === "string" ? ((r as any).signal_reason as string) : null;
+  const oppReason = (
+    (r as any).opp_reason ??
+    (Array.isArray((r as any).reasons) ? (r as any).reasons[0] : (r as any).reasons ?? null) ??
+    (r as any).reason ??
+    null
+  ) as string | null;
+  const gateReason = ((r as any).entry_gate?.reason ?? null) as string | null;
+  const blockReason = (gateReason ?? oppReason ?? signalReason ?? null) as string | null;
+
   const finalSignalPrice =
     entryTriggered && typeof entryPrice === "number"
       ? entryPrice
@@ -550,6 +804,9 @@ const slPriceOrig =
     oppScore,
     oppConfidence,
     reasons: reasonsUnique,
+    oppReason,
+    gateReason,
+    blockReason,
     updatedBrokerMs,
     device,
     alertTimeMs,
@@ -557,8 +814,12 @@ const slPriceOrig =
     srSide,
     srDistPct,
     srLabel,
+    srNearest,
+    srMajor,
     status: normStatus ?? null,
     signalText: finalSignalText,
+    signal,
+    signalReason,
     signalPrice: finalSignalPrice,
     signalTsMs: finalSignalTsMs,
 
@@ -636,7 +897,7 @@ type ApiResponse = {
 
 function useOpportunities() {
   const [rows, setRows] = React.useState<OppRow[]>([]);
-  const { prices: livePrices } = useLivePrices(30_000);
+  
   const [history, setHistory] = React.useState<HistoryRow[]>([]);
   const [lastAt, setLastAt] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -837,8 +1098,8 @@ const Pill: React.FC<{
 
 function OpportunitiesDashboard() {
   const { rows, history, lastAt, error, refetch } = useOpportunities();
-  const livePrices = useLivePrices(30_000);
-  const lastUpdatedLabel = lastAt ? fmtTime(lastAt) : "—";
+  const { prices: livePrices, updatedAt: livePricesUpdatedAt } = useLivePrices(30_000);
+  const lastUpdatedLabel = lastAt ? fmtTime(lastAt) : "";
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5 px-3 pb-10 pt-4">
@@ -926,7 +1187,10 @@ function OpportunitiesDashboard() {
                 <th className="px-3 py-2 text-right">Room</th>
                 <th className="px-3 py-2 text-right">Score</th>
                 <th className="px-3 py-2 text-right">Prob</th>
+                <th className="px-3 py-2 text-left">SR (Nearest)</th>
+                <th className="px-3 py-2 text-left">SR (Major)</th>
                 <th className="px-3 py-2 text-left">Reasons</th>
+                  <th className="px-3 py-2 text-left text-xs font-semibold text-zinc-500">Gate/Block</th>
                 <th className="px-3 py-2 text-right">Created</th>
               </tr>
             </thead>
@@ -934,7 +1198,7 @@ function OpportunitiesDashboard() {
               {rows.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={14}
+                    colSpan={16}
                     className="px-4 py-7 text-center text-xs text-slate-400"
                   >
                     No active opportunities have passed the room & confidence
@@ -954,17 +1218,17 @@ function OpportunitiesDashboard() {
                     typeof r.alertTimeMs === "number" ? (r.alertTimeMs + horizonMs - Date.now()) : null;
                   const timeLeftText =
                     timeLeftMs == null
-                      ? "—"
+                      ? ""
                       : (timeLeftMs <= 0
                           ? "0m"
                           : `${Math.ceil(timeLeftMs / 60_000)}m`);
 
                   const statusText =
                     typeof r.status === "string" && r.status
-                      ? r.status.toUpperCase()
+                      ? r.status.toUpperCase().replace("_", " ")
                       : "ACTIVE";
                   const lp =
-                    livePrices?.prices?.[sym]?.price ??                    
+                    livePrices?.[sym]?.price ??
                     (typeof (r as any).last_price === "number" ? (r as any).last_price : null) ??
                     (typeof (r as any).mid === "number" ? (r as any).mid : null) ??                      
                     r.basisPrice;
@@ -972,7 +1236,7 @@ function OpportunitiesDashboard() {
 
                   const liveStr = fmtPrice(sym, typeof lp === "number" ? lp : null);
 
-                  let distToTargetStr = "—";
+                  let distToTargetStr = "";
                   if (
                     typeof lp === "number" &&
                     typeof (r.tpPrice ?? r.targetPrice) === "number" &&
@@ -985,11 +1249,11 @@ function OpportunitiesDashboard() {
                   }
 const roomStr = r.absMovePct.toFixed(2) + "%";
                   const scoreStr =
-                    r.oppScore != null ? r.oppScore.toFixed(1) : "—";
+                    r.oppScore != null ? r.oppScore.toFixed(1) : "";
                   const probStr =
                     r.probUp != null
                       ? (r.probUp * 100).toFixed(0)+"%"
-                      : "—";
+                      : "";
 
                   const reasons = r.reasons.slice(0, 3);
 
@@ -1033,6 +1297,11 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
                       <td className="px-3 py-2 text-right tabular-nums text-slate-200">
                         {(() => {
                           const tp = r.tpPrice ?? r.targetPrice;
+
+        const show = Boolean(r.entryTriggered);
+        if (!show) {
+          return <div className="text-xs text-white/40"> </div>;
+        }
                           const tpOrig = (r as any).tpPriceOrig ?? r.targetPrice;
                           const main = fmtPrice(sym, tp);
                           const orig = fmtPrice(sym, tpOrig);
@@ -1054,10 +1323,13 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums text-slate-200">
                         {(() => {
+                          if (!r.entryTriggered) {
+                            return <div className="text-xs text-white/40"> </div>;
+                          }
                           const sl = r.slPrice;
-                          const slOrig = (r as any).slPriceOrig ?? sl;
-                          const main = fmtPrice(sym, sl);
-                          const orig = fmtPrice(sym, slOrig);
+                          const slOrig = r.slPriceOrig ?? sl;
+                          const main = typeof sl === "number" ? fmtPrice(sym, sl) : " ";
+                          const orig = typeof slOrig === "number" ? fmtPrice(sym, slOrig) : " ";
                           const showOrig =
                             typeof sl === "number" &&
                             typeof slOrig === "number" &&
@@ -1099,9 +1371,12 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
                         <span className={
                           statusText === "HIT"
                             ? "rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200"
-                            : statusText === "EXPIRED"
-                              ? "rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-200"
-                              : "rounded-full bg-slate-800/80 px-2 py-0.5 text-[10px] font-semibold text-slate-200"
+                            : statusText === "SL HIT"
+
+                              ? "rounded-full bg-rose-500/15 px-2 py-0.5 text-[10px] font-semibold text-rose-200"
+                              : statusText === "EXPIRED"
+                                ? "rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-200"
+                                : "rounded-full bg-slate-800/80 px-2 py-0.5 text-[10px] font-semibold text-slate-200"
                         }>
                           {statusText}
                         </span>
@@ -1126,6 +1401,8 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
                         {probStr}
                       </td>
                       
+                      <td className="px-3 py-2 text-xs text-slate-200 whitespace-nowrap">{r.srNearest || "-"}</td>
+                      <td className="px-3 py-2 text-xs text-slate-200 whitespace-nowrap">{r.srMajor || "-"}</td>
                       <td className="px-3 py-2">
                         <div className="flex flex-col gap-1">
                           {reasons.length === 0 ? (
@@ -1151,6 +1428,9 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
                             </span>
                           )}
                         </div>
+                      </td>
+                      <td className="px-3 py-2 text-xs text-slate-200">
+                        {r.blockReason || r.gateReason || r.oppReason || r.signalReason || "-"}
                       </td>
 
                       <td className="px-3 py-2 text-right text-[11px] text-slate-400">
@@ -1225,17 +1505,22 @@ const roomStr = r.absMovePct.toFixed(2) + "%";
             // -------- Outcome display --------
             const status = String(h.status || "").toLowerCase();
             const isHit = status === "hit";
-            const outcomeLabel = isHit ? "HIT" : "EXPIRED";
+            const isSlHit = status === "sl_hit";
+            const outcomeLabel = isHit ? "HIT" : (isSlHit ? "SL HIT" : "EXPIRED");
             const outcomeClass = isHit
               ? "text-emerald-300"
-              : "text-rose-300";
+              : isSlHit
+                 ? "text-rose-300"
+                 : "text-amber-300";
 
             const outcomeTs =
               typeof h.hitTsMs === "number"
                 ? h.hitTsMs
-                : typeof h.expiredTsMs === "number"
-                ? h.expiredTsMs
-                : null;
+                : typeof (h as any).slHitTsMs === "number"
+                  ? (h as any).slHitTsMs
+                  : typeof h.expiredTsMs === "number"
+                    ? h.expiredTsMs
+                    : null;
 
             const ddStr =
               typeof h.maxDrawdownPct === "number"

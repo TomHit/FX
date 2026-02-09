@@ -66,6 +66,7 @@ def _log(msg: str):
     except Exception:
         print(f"{_ts()} [mt5] {msg}", flush=True)
 
+
 # ---------- registry helpers (Windows) ----------
 
 # --- Registry helpers (prefer LocalSystem HKU\S-1-5-18, then HKLM, then HKCU) ---
@@ -495,6 +496,40 @@ def mt5_init() -> bool:
 
     _MT5_READY = True
     return True
+def get_mt5_tick_price_and_ts(symbol: str):
+    import MetaTrader5 as mt5
+
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return None, None
+
+    # Pick a consistent field (bid is best for FX; last sometimes 0)
+    px = None
+    try:
+        if getattr(tick, "bid", 0) and tick.bid > 0:
+            px = float(tick.bid)
+        elif getattr(tick, "last", 0) and tick.last > 0:
+            px = float(tick.last)
+        elif getattr(tick, "ask", 0) and tick.ask > 0:
+            px = float(tick.ask)
+    except Exception:
+        px = None
+
+    if px is None:
+        return None, None
+
+    # Broker tick time
+    try:
+        ts_ms = int(getattr(tick, "time_msc", 0) or 0)
+        if ts_ms <= 0:
+            ts_ms = int(tick.time * 1000)
+    except Exception:
+        ts_ms = None
+
+    if not ts_ms:
+        return None, None
+
+    return px, ts_ms
 
 def _probe(path_or_none: Optional[str]) -> bool:
     """
@@ -570,7 +605,7 @@ def _tf_seconds(tf: str) -> int:
     tf = (tf or "").upper()
     return {
         "M1":60, "M5":300, "M15":900, "M30":1800,
-        "H1":3600, "H4":14400, "D1":86400, "W1":604800, "MN1":2592000
+        "H1":3600,"H2":7200,"H4":14400, "D1":86400, "W1":604800, "MN1":2592000
     }.get(tf, 3600)
 
 def _map_tf(name: str):
@@ -588,10 +623,13 @@ def _map_tf(name: str):
         "M15": MT5.TIMEFRAME_M15,
         "M30": MT5.TIMEFRAME_M30,
         "H1":  MT5.TIMEFRAME_H1,
+        # H2 exists in newer MT5 builds; fall back to H1 if missing
+        "H2":  getattr(MT5, "TIMEFRAME_H2", MT5.TIMEFRAME_H1),
         "H4":  MT5.TIMEFRAME_H4,
         "D1":  MT5.TIMEFRAME_D1,
     }
     return m.get(n, 0)
+
 # --- helpers: broker id + current stored offset ---
 def _current_broker_id() -> str:
     try:
@@ -716,56 +754,29 @@ def _mt5_reconnect():
     return False
 
 def _probe_broker_offset_min() -> int | None:
-    import MetaTrader5 as MT5, time as _time
+    """
+    Runtime TZ probe is now registry-only.
 
-    def _norm(a):
-        if a is None: return []
-        try: return list(a)
-        except Exception: return [a]
+    We no longer try to infer the offset from M1 bars vs local clock,
+    because that was occasionally giving the wrong value (e.g. +60
+    instead of +120) and causing 1-hour / 1-day shifts on the UI.
 
-    # Try liquid symbols; first hit wins
-    for base in ["XAUUSD","EURUSD","USDJPY","GBPUSD","USDCAD","USDCHF"]:
-        try:
-            sym = _resolve_broker_symbol(base)
-            try:
-                MT5.symbol_select(sym, True)
-            except Exception:
-                pass
+    Return the integer Broker.TzOffsetMin if present, else None.
+    """
+    try:
+        raw = _reg_read("Broker.TzOffsetMin")
+    except Exception:
+        raw = None
 
-            arr = _norm(MT5.copy_rates_from_pos(sym, MT5.TIMEFRAME_M1, 1, 1))
-            if not arr:
-                continue
-            r = arr[0]
+    if raw is None or raw == "":
+        return None
 
-            t_open_sec = int(_ff(r, "time", 0))
-            if t_open_sec <= 0:
-                continue
-
-            tf_ms = 60_000
-            t_open_ms  = t_open_sec * 1000
-            t_close_ms = t_open_ms + tf_ms
-            now_ms     = int(_time.time() * 1000)
-
-            best_off, best_err = None, 10**18
-            # scan -12h .. +15h in 15-minute steps
-            for off_min in range(-720, 901, 15):
-                off_ms   = off_min * 60_000
-                slot_try = ((now_ms + off_ms) // tf_ms) * tf_ms - off_ms
-                err      = abs(slot_try - t_close_ms)
-                if err < best_err:
-                    best_off, best_err = off_min, err
-                    if err <= 1500:     # tight match = great
-                        break
-
-            # Fallback: accept within 5s; otherwise round the delta to 15-min
-            if best_off is None or best_err > 5000:
-                delta_min = round(((t_close_ms - now_ms) / 60_000) / 15) * 15
-                best_off  = int(delta_min)
-
-            if -720 <= best_off <= 900:
-                return best_off
-        except Exception:
-            pass
+    try:
+        off = int(raw)
+        if -720 <= off <= 900:
+            return off
+    except Exception:
+        pass
     return None
 
 
@@ -811,41 +822,29 @@ def _broker_offset_min() -> int:
     return 0
 
 def _ensure_broker_offset_fresh():
-    stored_off = _reg_read("Broker.TzOffsetMin")
-    stored_id  = _reg_read("Broker.Id")
-    this_id    = _current_broker_id()
+    """
+    Legacy helper: runtime auto-detection of broker TZ is DISABLED.
 
-    must_refresh = (stored_off is None) or (stored_id != this_id)
+    We now trust whatever the installer / user has written into
+    Broker.TzOffsetMin / Broker.TzName and just load it into the cache.
+    """
     try:
-        probe = _probe_broker_offset_min()
-        if probe is not None:
-            if stored_off is None or int(stored_off) != int(probe):
-                must_refresh = True
+        raw = _reg_read("Broker.TzOffsetMin")
     except Exception:
-        pass
-    if not must_refresh:
-        # NEW: compare with live probe; refresh if mismatch ≥ 15 minutes
-        try:
-            probe = _probe_broker_offset_min()
-            if probe is not None and str(stored_off) == "330" and int(probe) != 330:
-                # clear stale IST so next write is unambiguous in the service hive
-                _xtl_reg_delete_all("Broker.TzOffsetMin")
-                _xtl_reg_delete_all("Broker.TzName")
-                must_refresh = True
-        except Exception:
-            pass
+        raw = None
 
-    if must_refresh:
-        detect_and_write_broker_tz_any(["XAUUSD","EURUSD","USDJPY","GBPUSD","USDCAD","USDCHF"])
-        # ensure cache reflects what we just wrote/detected
-        try:
-            off = int(_reg_read("Broker.TzOffsetMin") or 0)
-            if -720 <= off <= 900:
-                global _BROKER_OFF_MIN_CACHE
-                _BROKER_OFF_MIN_CACHE = off
-        except Exception:
-            pass
-        _xtl_reg_write_all("Broker.Id", this_id)
+    if raw is None or raw == "":
+        _log("[mt5_tz] Broker.TzOffsetMin missing; please set it via installer/registry.")
+        return
+
+    try:
+        off = int(raw)
+        if -720 <= off <= 900:
+            global _BROKER_OFF_MIN_CACHE
+            _BROKER_OFF_MIN_CACHE = off
+            _log(f"[mt5_tz] using stored broker offset {off} minutes")
+    except Exception as e:
+        _log(f"[mt5_tz] invalid Broker.TzOffsetMin '{raw}': {e}")
 
 # --- Broker timezone: detect from MT5 bars and persist to registry ---
 
@@ -1052,27 +1051,27 @@ def detect_and_write_broker_tz_any(symbols: list[str]) -> None:
                 continue
 
             # Persist
-            global _BROKER_OFF_MIN_CACHE
-            _BROKER_OFF_MIN_CACHE = int(best_off)
+            #global _BROKER_OFF_MIN_CACHE
+            #_BROKER_OFF_MIN_CACHE = int(best_off)
 
-            _xtl_reg_write_all("Broker.TzOffsetMin", str(best_off))
-            _xtl_reg_write_all("Broker.TzName", _tz_label(best_off))
+            #_xtl_reg_write_all("Broker.TzOffsetMin", str(best_off))
+            #_xtl_reg_write_all("Broker.TzName", _tz_label(best_off))
 
             # Log broker_time to confirm
-            try:
-                t_broker = datetime.fromtimestamp(t_open_sec, tz=timezone.utc).astimezone(
-                    timezone(timedelta(minutes=best_off))
-                ).strftime("%Y-%m-%d %H:%M:%S")
-                _log(f"[mt5_detect_tz] {resolved}: off_min={best_off} bar_broker_time={t_broker} err_ms={int(best_err)}")
-            except Exception:
-                pass
+            #try:
+            #   t_broker = datetime.fromtimestamp(t_open_sec, tz=timezone.utc).astimezone(
+            #      timezone(timedelta(minutes=best_off))
+            # ).strftime("%Y-%m-%d %H:%M:%S")
+            #_log(f"[mt5_detect_tz] {resolved}: off_min={best_off} bar_broker_time={t_broker} err_ms={int(best_err)}")
+            #except Exception:
+            #   pass
 
-            return
+            #return
         except Exception as e:
-            _log(f"[mt5_detect_tz] {base} detection error: {e}")
-            continue
+           _log(f"[mt5_detect_tz] {base} detection error: {e}")
+            #continue
 
-    _log("[mt5_detect_tz] unable to detect broker offset using candidates")
+    #_log("[mt5_detect_tz] unable to detect broker offset using candidates")
 
 # ---------- rates -> dicts ----------
 def _np_to_dicts(rates) -> List[Dict]:
@@ -1162,6 +1161,7 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
         "M15": 15 * 60,
         "H1": 60 * 60,
         "H4": 4 * 60 * 60,
+        "H2": 2 * 60 * 60,
     }
     tf_label = str(timeframe) if isinstance(timeframe, str) else getattr(timeframe, "name", "H1")
     tf_label = tf_label.upper()
@@ -1410,15 +1410,16 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
                 # keep ONLY closed bars not beyond the frozen slot
                 if t_close_ms <= slot0_ms:
                     rows.append({
-                         "t": int(_f(r, "time", 0)),
-                         "o": round(float(_f(r, "open",  0.0)), digits),
-                         "h": round(float(_f(r, "high",  0.0)), digits),
-                         "l": round(float(_f(r, "low",   0.0)), digits),
-                         "c": round(float(_f(r, "close", 0.0)), digits),
-                         "v": int(_f(r, "tick_volume", _f(r, "real_volume", 0))),
-                         "t_open_ms": t_open_ms,
-                         "t_close_ms": t_close_ms,
-                         "complete": True,
+                        "t": int(_f(r, "time", 0)),
+                        "o": float(_f(r, "open",  0.0)),
+                        "h": float(_f(r, "high",  0.0)),
+                        "l": float(_f(r, "low",   0.0)),
+                        "c": float(_f(r, "close", 0.0)),
+                        "v": int(_f(r, "tick_volume", _f(r, "real_volume", 0))),
+                        # keep existing fields:
+                        "t_open_ms": t_open_ms,
+                        "t_close_ms": t_close_ms,
+                        "complete": True,
                     })
 
             rows = rows[-need:]  # clamp to requested count
@@ -1485,7 +1486,8 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
         opens_ms  = [int(_f(r, "time", 0)) * 1000 for r in rates]
         closes_ms = [o + tf_ms for o in opens_ms]
 
-        # --- opportunistic broker-TZ detection (keep for registry; DO NOT mutate slot0_ms) ---
+
+        # --- opportunistic broker-TZ detection (LOG ONLY; no more registry writes) ---
         try:
             last_close = None
             try:
@@ -1499,10 +1501,8 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
                 arr2_list = [arr2] if arr2 is not None else []
             if len(arr2_list) >= 1:
                 rr = arr2_list[-1]
-
                 t_open_ms2 = int(_ff(rr, "time", 0)) * 1000
                 last_close = t_open_ms2 + 60_000
-
 
             if last_close is None and closes_ms:
                 last_close = closes_ms[-1]
@@ -1519,21 +1519,15 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
                             break
                 try:
                     _, reg_off_dbg = _broker_meta_from_registry()
-                    _log(f"[mt5_detect_tz/opportunistic] grid best_off={best_off} err_ms={int(best_err)} reg_off={reg_off_dbg} sym={resolved_sym}")
+                    _log(
+                        f"[mt5_detect_tz/opportunistic] grid best_off={best_off} "
+                        f"err_ms={int(best_err)} reg_off={reg_off_dbg} sym={resolved_sym}"
+                    )
                 except Exception:
                     pass
-                if (best_off is not None) and (best_err <= 5000) and (-180 <= best_off <= 480):
-                    try:
-                        _, reg_off = _broker_meta_from_registry()
-                        if best_off != reg_off:
-                            _xtl_reg_write_all("Broker.TzOffsetMin", str(best_off))
-                            _xtl_reg_write_all("Broker.TzName", _tz_label(best_off))
-                            _log(f"[mt5_detect_tz/opportunistic] detected {best_off} via {resolved_sym}; wrote to registry")
-                    except Exception:
-                        pass
+                # NOTE: we deliberately do NOT write to registry here anymore.
         except Exception:
             pass
-
         # --- end-index at frozen slot ---
         end_idx = None
         for i in range(len(closes_ms) - 1, -1, -1):
@@ -1580,10 +1574,10 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
                 continue
             rows.append({
                 "t": int(_f(r, "time", 0)),
-                "o": round(float(_f(r, "open",  0.0)), digits),
-                "h": round(float(_f(r, "high",  0.0)), digits),
-                "l": round(float(_f(r, "low",   0.0)), digits),
-                "c": round(float(_f(r, "close", 0.0)), digits),
+                "o": float(_f(r, "open",  0.0)),   # ✅ no round()
+                "h": float(_f(r, "high",  0.0)),
+                "l": float(_f(r, "low",   0.0)),
+                "c": float(_f(r, "close", 0.0)),
                 "v": int(_f(r, "tick_volume", _f(r, "real_volume", 0))),
                 "t_open_ms": t_open_ms,
                 "t_close_ms": t_close_ms,
@@ -1622,10 +1616,10 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
                         if not dup:
                             rows.append({
                                 "t": int(_f(rr, "time", 0)),
-                                "o": round(float(_f(rr, "open", rows[-1]["c"] if rows else 0.0)), digits),
-                                "h": round(float(_f(rr, "high", rows[-1]["c"] if rows else 0.0)), digits),
-                                "l": round(float(_f(rr, "low",  rows[-1]["c"] if rows else 0.0)), digits),
-                                "c": round(float(_f(rr, "close", rows[-1]["c"] if rows else 0.0)), digits),
+                                "o": float(_f(rr, "open", rows[-1]["c"] if rows else 0.0)),   # ✅ no round()
+                                "h": float(_f(rr, "high", rows[-1]["c"] if rows else 0.0)),
+                                "l": float(_f(rr, "low",  rows[-1]["c"] if rows else 0.0)),
+                                "c": float(_f(rr, "close", rows[-1]["c"] if rows else 0.0)),
                                 "v": int(_f(rr, "tick_volume", _f(rr, "real_volume", 0))),
                                 "t_open_ms": t_open_ms2,
                                 "t_close_ms": t_open_ms2 + tf_ms,

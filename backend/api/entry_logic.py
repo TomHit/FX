@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
-import math
+from typing import Any, Dict, List, Optional, Union
 
 
-def entry_decision_m5(
+def entry_decision_m1(
     sym: str,
     direction: str,
     basis_price: float,
@@ -17,13 +15,32 @@ def entry_decision_m5(
     profiles: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    Decide M5 entry timing for an existing H1 opportunity snapshot.
+    Decide M1 entry timing for an existing H1 opportunity snapshot.
 
     Inputs
     - direction: "BUY"/"SELL" or "UP"/"DOWN"
-    - candles: last N M5 candles (needs >= 8), CLOSED bars only
+    - candles: last N M1 candles (needs >= 8), CLOSED bars only
       Each candle dict should have: open/high/low/close (or o/h/l/c)
     - spread: absolute spread; if None, spread filters are skipped
+
+    Profiles
+    - Base behavior:
+        cfg = DEFAULT
+        then apply overrides (if provided):
+            cfg.update(profiles["DEFAULT"])
+            cfg.update(profiles[symbol])
+
+    - Optional TEST profile (opt-in):
+        If profiles["_active"] == "TEST":
+            cfg.update(TEST_PRESET) first,
+            then apply overrides as usual:
+                cfg.update(profiles["DEFAULT"])
+                cfg.update(profiles[symbol])
+
+      Example:
+        profiles = {"_active": "TEST"}                 # use TEST_PRESET
+        profiles = {"_active": "TEST", "XAUUSD": {...}}# TEST_PRESET + symbol overrides
+        profiles = {"_active": "DEFAULT"}              # production behavior
 
     Returns dict:
       {
@@ -42,27 +59,84 @@ def entry_decision_m5(
 
     # ---------------- profile ----------------
     DEFAULT = {
-        "max_age_min": 30,
-        "min_remaining_tp_frac": 0.50,
-        "max_traveled_tp_frac": 0.35,
+        # universal safety
+        "max_age_min": 10_000,
+        "min_remaining_tp_frac": 0.0,
+        "max_traveled_tp_frac": 9.0,
 
-        "impulse_range_mult": 1.30,   # range_now >= mult * avg_range
-        "impulse_body_frac": 0.60,    # body/range >= this
-        "impulse_min_tp_frac": 0.15,  # abs(close - basis) >= this * tp_distance
+        # momentum
+        "impulse_range_mult": 1.15,   # range_now >= mult * avg_range
+        "impulse_body_frac": 0.45,    # body/range >= this
+        "impulse_min_tp_frac": 0.08,  # abs(close - basis) >= this * tp_distance
 
+        # pullback
         "pullback_min": 0.20,         # retrace fraction of impulse
-        "pullback_max": 0.45,
-        "pullback_reject": 0.60,
+        "pullback_max": 0.60,
+        "pullback_reject": 0.75,
 
-        "spread_tp_mult": 3.0,        # require tp_distance >= spread_tp_mult * spread
-        "body_spread_mult": 1.2,      # require last_body >= body_spread_mult * spread (for entry bar)
+        # spread economics
+        "spread_tp_mult": 1.6,        # require tp_distance >= spread_tp_mult * spread
+        "body_spread_mult": 1.0,      # require last_body >= body_spread_mult * spread (for entry bar)
+
+        # preference + trigger style
         "prefer_mode": "PULLBACK",    # "PULLBACK" or "MOMENTUM"
         "use_break_trigger": True,    # if True: suggest break of confirm candle; else enter at close
+        "require_bos": True,   #  require break of base structure
+        "bos_lookback": 8,     # candles used to form the base (we use pre-impulse slice)
+
     }
+
+    # Opt-in relaxed preset for fast manual testing (does NOT apply unless activated).
+    TEST_PRESET = {
+        # allow more time to see signal flip
+        "max_age_min": 90,
+        # don't block just because price moved a bit already
+        "min_remaining_tp_frac": 0.20,
+        "max_traveled_tp_frac": 0.60,
+
+        # easier momentum triggers
+        "impulse_range_mult": 1.15,
+        "impulse_body_frac": 0.45,
+        "impulse_min_tp_frac": 0.05,
+
+        # easier pullback triggers
+        "pullback_min": 0.10,
+        "pullback_max": 0.60,
+        "pullback_reject": 0.75,
+
+        # keep spread checks available, but slightly relaxed economics if you pass spread
+        "spread_tp_mult": 2.0,
+        "body_spread_mult": 1.0,
+
+        # flip sooner for testing
+        "prefer_mode": "MOMENTUM",
+        "use_break_trigger": False,
+        "require_bos": False,
+    }
+
     cfg = dict(DEFAULT)
+
+    # Activate TEST preset only when explicitly requested.
+    active_profile = None
+    if profiles and isinstance(profiles, dict):
+        try:
+            active_profile = str(profiles.get("_active") or "").upper().strip() or None
+        except Exception:
+            active_profile = None
+
+    if active_profile == "TEST":
+        cfg.update(TEST_PRESET)
+
+    # Apply user overrides (existing behavior intact) + active-profile overrides.
     if profiles:
         cfg.update(profiles.get("DEFAULT", {}) or {})
+
+        # NEW: if you provided profiles["TEST"] (or any named profile), apply it
+        if active_profile:
+            cfg.update(profiles.get(active_profile, {}) or {})
+
         cfg.update(profiles.get(sym_u, {}) or {})
+
 
     # ---------------- normalize direction ----------------
     d = (direction or "").upper().strip()
@@ -107,17 +181,15 @@ def entry_decision_m5(
         return {"ok": False, "mode": None, "reason": "bad_candles", "entry_trigger": None, "entry_price": None}
 
     if n < 8:
-        return {"ok": False, "mode": None, "reason": "need_8_m5_bars", "entry_trigger": None, "entry_price": None}
+        return {"ok": False, "mode": None, "reason": "need_8_bars", "entry_trigger": None, "entry_price": None}
 
     last = _get_row(n - 1)
     last_price = last["c"]
 
     # ---------------- pre-filters (universal) ----------------
-    # remaining % to TP from current price (approx)
     remaining = abs(target - last_price)
     traveled = abs(last_price - basis)
 
-    # late
     if age_min > float(cfg["max_age_min"]):
         return {
             "ok": False, "mode": None, "reason": f"too_late_age_min>{cfg['max_age_min']}",
@@ -125,7 +197,6 @@ def entry_decision_m5(
             "tp_distance": tp_distance, "tp_pct": tp_pct, "age_min": age_min,
         }
 
-    # not enough remaining room
     if tp_distance > 0 and remaining < float(cfg["min_remaining_tp_frac"]) * tp_distance:
         return {
             "ok": False, "mode": None, "reason": "too_close_to_target",
@@ -133,7 +204,6 @@ def entry_decision_m5(
             "tp_distance": tp_distance, "tp_pct": tp_pct, "age_min": age_min,
         }
 
-    # already moved too much away from basis (late chase)
     if tp_distance > 0 and traveled > float(cfg["max_traveled_tp_frac"]) * tp_distance:
         return {
             "ok": False, "mode": None, "reason": "already_moved_too_far_from_basis",
@@ -162,28 +232,39 @@ def entry_decision_m5(
         rr = _range(r)
         return (_body(r) / rr) if rr > 0 else 0.0
 
-    def _sign_dir() -> int:
-        return +1 if d == "BUY" else -1
-
-    sgn = _sign_dir()
-
     # last 5 ranges excluding the last bar for averaging
     ranges = []
     for j in range(n - 6, n - 1):
-        r = _get_row(j)
-        ranges.append(_range(r))
+        r0 = _get_row(j)
+        ranges.append(_range(r0))
     avg_range = sum(ranges) / max(1, len(ranges))
     range_now = _range(last)
+    # ---------------- BOS (break of structure) ----------------
+    bos_ok = True
+    base_hi = None
+    base_lo = None
+    try:
+        lb = int(cfg.get("bos_lookback", 8) or 8)
+        # use the 5 candles BEFORE (imp,pb,cf) => indices: n-lb .. n-3
+        end = max(0, n - 3)                # exclude imp/pb/cf
+        start = max(0, end - lb)           # lb candles before impulse
+        
+        if (end - start) >= 3:
+            base = [_get_row(i) for i in range(start, end)]
+            base_hi = max(r["h"] for r in base)
+            base_lo = min(r["l"] for r in base)
+            if d == "BUY":
+                bos_ok = bool(last["c"] > base_hi)
+            else:
+                bos_ok = bool(last["c"] < base_lo)
+    except Exception:
+        bos_ok = True  # fail-open (don’t block on calc errors)
+
 
     # ---------------- MOMENTUM check ----------------
-    # Requirements:
-    # - range expansion
-    # - good body fraction
-    # - displacement from basis (min fraction of TP)
-    # - candle direction consistent
     displacement_ok = (tp_distance > 0 and abs(last_price - basis) >= float(cfg["impulse_min_tp_frac"]) * tp_distance)
-
     dir_ok = (last["c"] > last["o"]) if d == "BUY" else (last["c"] < last["o"])
+
     momentum_ok = (
         avg_range > 0
         and range_now >= float(cfg["impulse_range_mult"]) * avg_range
@@ -193,26 +274,14 @@ def entry_decision_m5(
     )
 
     # ---------------- PULLBACK check ----------------
-    # We look for:
-    # 1) an impulse bar recently (use bar n-2 as "impulse candidate")
-    # 2) pullback (bar n-1) retracing 20-45% of impulse from basis
-    # 3) confirmation (last bar) with reversal + break condition
+    imp = _get_row(n - 3)
+    pb = _get_row(n - 2)
+    cf  = _get_row(n - 1) # confirm candle is the last closed
 
-    # Define impulse candidate as the previous bar (n-2), pullback as (n-1), confirm as last (n)
-    imp = _get_row(n - 2)
-    pb = _get_row(n - 1)
-    cf = last  # confirm candle is the last closed
-
-    # impulse direction should match
     imp_dir_ok = (imp["c"] > imp["o"]) if d == "BUY" else (imp["c"] < imp["o"])
-
-    # impulse "exists" if it moved at least 10% of TP away from basis (close-to-basis displacement)
     imp_disp = abs(imp["c"] - basis)
     impulse_exists = (tp_distance > 0 and imp_disp >= 0.10 * tp_distance and imp_dir_ok)
 
-    # pullback retrace fraction: how much pb moved against impulse (using prices around impulse close)
-    # For BUY: impulse close above basis; pullback low dips below impulse close
-    # For SELL: impulse close below basis; pullback high rises above impulse close
     retr_ok = False
     retr_frac = None
     if impulse_exists:
@@ -231,11 +300,8 @@ def entry_decision_m5(
             elif retr_frac > float(cfg["pullback_reject"]):
                 retr_ok = False
 
-    # confirmation candle: must reverse back in direction and close beyond pb in that direction
-    # BUY confirm: bullish + close > pb high
-    # SELL confirm: bearish + close < pb low
     cf_dir_ok = (cf["c"] > cf["o"]) if d == "BUY" else (cf["c"] < cf["o"])
-    cf_strength_ok = _body_frac(cf) >= 0.5  # simple strength filter
+    cf_strength_ok = _body_frac(cf) >= 0.5
     confirm_break_ok = (cf["c"] > pb["h"]) if d == "BUY" else (cf["c"] < pb["l"])
     pullback_ok = bool(impulse_exists and retr_ok and cf_dir_ok and cf_strength_ok and confirm_break_ok)
 
@@ -243,11 +309,14 @@ def entry_decision_m5(
     if isinstance(spread, (int, float)) and float(spread) > 0:
         sp = float(spread)
         if _body(cf) < float(cfg["body_spread_mult"]) * sp:
-            # don't allow entries on micro bodies vs spread
             momentum_ok = False
             pullback_ok = False
 
     # ---------------- choose mode ----------------
+    if bool(cfg.get("require_bos", False)) and not bos_ok:
+        momentum_ok = False
+        pullback_ok = False
+
     prefer = str(cfg.get("prefer_mode") or "PULLBACK").upper()
     chosen = None
     if prefer == "PULLBACK":
@@ -263,6 +332,9 @@ def entry_decision_m5(
 
     if not chosen:
         reason = "no_setup"
+        if bool(cfg.get("require_bos", False)) and (not bos_ok):
+            reason = "bos_not_confirmed"
+
         if impulse_exists and retr_frac is not None and not retr_ok:
             reason = f"pullback_retrace_bad({retr_frac:.2f})"
         elif impulse_exists and retr_ok and not confirm_break_ok:
@@ -281,6 +353,7 @@ def entry_decision_m5(
             "tp_pct": tp_pct,
             "age_min": age_min,
             "debug": {
+                "active_profile": active_profile or "DEFAULT",
                 "momentum_ok": momentum_ok,
                 "pullback_ok": pullback_ok,
                 "avg_range": avg_range,
@@ -288,6 +361,10 @@ def entry_decision_m5(
                 "displacement_ok": displacement_ok,
                 "impulse_exists": impulse_exists,
                 "retr_frac": retr_frac,
+                "base_hi": base_hi,
+                "base_lo": base_lo,
+                "bos_ok": bos_ok,
+
             },
         }
 
@@ -296,7 +373,6 @@ def entry_decision_m5(
 
     if chosen == "MOMENTUM":
         if use_break:
-            # break of impulse high/low
             trig = "BREAK_CONFIRM_HIGH" if d == "BUY" else "BREAK_CONFIRM_LOW"
             entry_px = float(last["h"] if d == "BUY" else last["l"])
         else:
@@ -312,6 +388,7 @@ def entry_decision_m5(
             "tp_pct": tp_pct,
             "age_min": age_min,
             "debug": {
+                "active_profile": active_profile or "DEFAULT",
                 "avg_range": avg_range,
                 "range_now": range_now,
                 "body_frac": _body_frac(last),
@@ -337,6 +414,7 @@ def entry_decision_m5(
         "tp_pct": tp_pct,
         "age_min": age_min,
         "debug": {
+            "active_profile": active_profile or "DEFAULT",
             "retr_frac": retr_frac,
             "imp_close": imp["c"],
             "pb_high": pb["h"],

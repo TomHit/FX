@@ -1,6 +1,6 @@
 // src/App.tsx
 import React from "react";
-import { BrowserRouter,Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { Routes, Route, Navigate, useLocation } from "react-router-dom";
 
 import BootBoundary from "@/components/BootBoundary";
 import Header from "@/components/Header";
@@ -14,9 +14,18 @@ import Strategy from "@/pages/Strategy";
 import Trend from "@/pages/Trend";
 import MFASetup from "@/pages/MFASetup";
 import OpportunitiesDashboard from "@/pages/OpportunitiesDashboard";
-import AIForecasts from "@/pages/Dashboard"; 
+import AIForecasts from "@/pages/Dashboard";
+import PerformancePages from "@/pages/PerformancePages";
 
-
+// ✅ Knowledge Base
+import KBLayout from "@/pages/kb/KBLayout";
+import ForecastOverview from "@/pages/kb/forecasts/ForecastOverview";
+import HowToRead from "@/pages/kb/forecasts/HowToRead";
+import ForecastHorizons from "@/pages/kb/forecasts/ForecastHorizons";
+import ExpectedMove from "@/pages/kb/forecasts/ExpectedMove";
+import DirectionConfidence from "@/pages/kb/forecasts/DirectionConfidence";
+import MacroAlignment from "@/pages/kb/forecasts/MacroAlignment";
+import CommonMisunderstandings from "@/pages/kb/forecasts/CommonMisunderstandings";
 
 /** Per-route guard so a single screen error can't blank everything */
 function RouteBoundary({ children }: { children: React.ReactNode }) {
@@ -24,15 +33,19 @@ function RouteBoundary({ children }: { children: React.ReactNode }) {
     return <>{children}</>;
   } catch (e: any) {
     return (
-      <div style={{
-        maxWidth: 760, margin: "40px auto", padding: 16,
-        color: "#fee2e2", background: "rgba(190,18,60,.15)",
-        border: "1px solid rgba(190,18,60,.6)", borderRadius: 12
-      }}>
+      <div
+        style={{
+          maxWidth: 760,
+          margin: "40px auto",
+          padding: 16,
+          color: "#fee2e2",
+          background: "rgba(190,18,60,.15)",
+          border: "1px solid rgba(190,18,60,.6)",
+          borderRadius: 12,
+        }}
+      >
         <div style={{ fontWeight: 700, marginBottom: 8 }}>This page failed to render</div>
-        <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>
-          {String(e?.message || e)}
-        </div>
+        <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>{String(e?.message || e)}</div>
       </div>
     );
   }
@@ -81,25 +94,25 @@ export default function App() {
                 </RouteBoundary>
               }
             />
-            
+
             <Route
               path="/dashboard"
               element={
                 <RouteBoundary>
-                  <OpportunitiesDashboard/>
-                </RouteBoundary>
-              }
-            />
-            <Route
-              path="/ai-forecasts"
-              element={
-                <RouteBoundary>
-                  <AIForecasts/>
+                  <OpportunitiesDashboard />
                 </RouteBoundary>
               }
             />
 
-            
+            <Route
+              path="/ai-forecasts"
+              element={
+                <RouteBoundary>
+                  <AIForecasts />
+                </RouteBoundary>
+              }
+            />
+
             <Route
               path="/onboarding"
               element={
@@ -108,6 +121,7 @@ export default function App() {
                 </RouteBoundary>
               }
             />
+
             <Route
               path="/devices"
               element={
@@ -116,6 +130,7 @@ export default function App() {
                 </RouteBoundary>
               }
             />
+
             <Route
               path="/strategy"
               element={
@@ -124,6 +139,7 @@ export default function App() {
                 </RouteBoundary>
               }
             />
+
             <Route
               path="/trend"
               element={
@@ -132,7 +148,42 @@ export default function App() {
                 </RouteBoundary>
               }
             />
-            <Route path="/" element={<Navigate to="/dashboard" replace />} />
+
+            <Route
+              path="/performance"
+              element={
+                <RouteBoundary>
+                  <PerformancePages />
+                </RouteBoundary>
+              }
+            />
+
+            {/* ✅ Knowledge Base */}
+            <Route
+              path="/kb"
+              element={
+                <RouteBoundary>
+                  <KBLayout />
+                </RouteBoundary>
+              }
+            >
+              {/* default KB landing */}
+              <Route index element={<Navigate to="forecasts/overview" replace />} />
+
+              {/* Forecast docs */}
+              <Route path="forecasts">
+                <Route index element={<Navigate to="overview" replace />} />
+                <Route path="overview" element={<ForecastOverview />} />
+                <Route path="how-to-read" element={<HowToRead />} />
+                <Route path="horizons" element={<ForecastHorizons />} />
+                <Route path="expected-move" element={<ExpectedMove />} />
+                <Route path="direction-confidence" element={<DirectionConfidence />} />
+                <Route path="macro-alignment" element={<MacroAlignment />} />
+                <Route path="common-misunderstandings" element={<CommonMisunderstandings />} />
+              </Route>
+            </Route>
+
+            <Route index element={<Navigate to="/dashboard" replace />} />
           </Route>
 
           {/* FALLBACK */}

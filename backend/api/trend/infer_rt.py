@@ -7,6 +7,8 @@ import redis
 
 from api.utils.redis_client import get_client
 
+
+
 BASE = pathlib.Path("/opt/xauapi/api/trend")
 MODEL_DIR = BASE / "models"
 CLS_PATH = MODEL_DIR / "xgb_cls.json"
@@ -25,6 +27,11 @@ _XGB_H4 = None
 
 
 TF_MS = {"M1":60_000, "M5":300_000, "M15":900_000, "H1":3_600_000, "H4":14_400_000}
+
+def _empty_ohlc_df():
+    import pandas as pd
+    return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
+
 FEATURE_COLS = ["atr14_m15_pct","rvol15","ret_15m","usd_basket_d1h_pct","tod_min","dow"]
 # H1 feature set for next-hour predictions
 FEATURE_COLS_H1 = ["atr14_h1_pct","rvol_h1","ret_1h","usd_basket_h1_pct","tod_min","dow"]
@@ -36,6 +43,141 @@ FEATURE_COLS_H4 = ["atr14_h4_pct", "rvol_h4", "ret_4h", "usd_basket_h4_pct", "to
 R = get_client()
 _XGB = None   # (cls, reg) cache
 _XGB_H4 = None  # (cls, reg) cache for 4h horizon
+
+def _snap_key(dev_id: str, sym_u: str, tf_u: str) -> str:
+    return f"xtl:ohlc:snap:{dev_id}:{sym_u}:{tf_u}"
+
+def _latest_ptr_key(sym_u: str, tf_u: str) -> str:
+    return f"xtl:ohlc:latest:{sym_u}:{tf_u}"
+
+def _get_latest_dev(sym_u: str, tf_u: str) -> str | None:
+    try:
+        v = R.get(_latest_ptr_key(sym_u, tf_u))
+    except Exception:
+        v = None
+    if not v:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        v = v.decode("utf-8", "ignore")
+    v = str(v).strip()
+    return v or None
+
+def _get_latest_snap_raw(sym_u: str, tf_u: str) -> tuple[str | None, str | None]:
+    """
+    Returns (raw_json, dev_id) or (None, None)
+
+    Robust behavior:
+      1) Try latest device via _get_latest_dev + device-scoped snap key.
+      2) If missing, try "any device" by scanning snap keys for this sym/tf.
+         (This prevents models from going dead when latest-dev pointer is missing.)
+    """
+    sym_u = (sym_u or "").upper().strip()
+    tf_u = (tf_u or "").upper().strip()
+    if not sym_u or not tf_u:
+        return None, None
+
+    # ---- 1) Preferred: latest device pointer ----
+    dev_id = None
+    try:
+        dev_id = _get_latest_dev(sym_u, tf_u)
+    except Exception:
+        dev_id = None
+
+    if dev_id:
+        try:
+            raw = R.get(_snap_key(dev_id, sym_u, tf_u))
+        except Exception:
+            raw = None
+
+        if raw:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "ignore")
+            return raw, dev_id
+
+    # ---- 2) Fallback: scan for any device snap for this sym/tf ----
+    # We intentionally do NOT rely on _get_latest_dev here.
+    # This is used when the pointer key is missing/stale.
+    try:
+        # Build a pattern that matches your snap keys.
+        # We don't know exact _snap_key format, but we can use it to infer pattern:
+        #
+        # If _snap_key(dev,sym,tf) -> e.g. "xtl:ohlc:snap:{dev}:{sym}:{tf}"
+        # then pattern should be "xtl:ohlc:snap:*:{sym}:{tf}"
+        #
+        # We'll attempt to infer it by calling _snap_key with a wildcard-like dev.
+        sample = _snap_key("DEVWILDCARD", sym_u, tf_u)
+        # Replace the inserted dev id with a glob '*'
+        pattern = sample.replace("DEVWILDCARD", "*")
+
+        # Use SCAN MATCH pattern (non-blocking-ish)
+        cursor = 0
+        best_key = None
+        best_raw = None
+
+        # small bounded scan to avoid heavy load
+        for _ in range(6):  # ~6 * COUNT=200 => ~1200 keys max
+            cursor, keys = R.scan(cursor=cursor, match=pattern, count=200)
+            if keys:
+                # pick the first key that has data (good enough)
+                for k in keys:
+                    try:
+                        v = R.get(k)
+                    except Exception:
+                        v = None
+                    if not v:
+                        continue
+                    best_key = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
+                    best_raw = v
+                    break
+            if best_raw is not None or cursor == 0:
+                break
+
+        if best_raw:
+            if isinstance(best_raw, (bytes, bytearray)):
+                best_raw = best_raw.decode("utf-8", "ignore")
+
+            # Try to parse dev_id back out of key if possible, else None
+            found_dev = None
+            try:
+                # Many key formats are like "...:{dev}:{sym}:{tf}"
+                parts = str(best_key).split(":")
+                # heuristic: dev_... is usually present
+                for p in parts:
+                    if p.startswith("dev_"):
+                        found_dev = p
+                        break
+            except Exception:
+                found_dev = None
+
+            return best_raw, (found_dev or dev_id)
+
+    except Exception:
+        pass
+
+    return None, dev_id
+
+def _b2s(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, (bytes, bytearray)):
+        return x.decode("utf-8", "ignore")
+    return str(x)
+
+def _latest_dev_for(sym: str, tf: str) -> str:
+    try:
+        k = f"xtl:ohlc:latest:{sym}:{tf}"
+        return _b2s(R.get(k)).strip()
+    except Exception:
+        return ""
+
+def _get_snap_raw(dev_id: str, sym: str, tf: str) -> str:
+    if not dev_id:
+        return ""
+    try:
+        k = f"xtl:ohlc:snap:{dev_id}:{sym}:{tf}"
+        return _b2s(R.get(k))
+    except Exception:
+        return ""
 
 def _load_models():
     """Load xgboost lazily so app boot doesn't require it."""
@@ -108,42 +250,79 @@ def _norm_tf(s: str) -> str:
     if s in ("4H","H4"): return "H4"
     return "M15"
 
-def _scan_keys(symbol: str) -> List[str]:
-    pats = [f"xtl:ohlc:snap:*:{symbol}:*", f"xtl:trend:snap:*:{symbol}:*"]
-    keys: List[str] = []
-    cur = 0
-    for pat in pats:
-        cur = 0
-        while True:
-            cur, batch = R.scan(cursor=cur, match=pat, count=200)
-            for k in batch:
-                ks = k.decode() if isinstance(k, (bytes,bytearray)) else k
-                keys.append(ks)
-            if cur == 0: break
-    keys = sorted(set(keys), key=lambda x: (0 if ":ohlc:" in x else 1, x))
-    return keys
+def _latest_snap_key(symbol: str, tf: str, kind: str = "ohlc"):
+    """
+    Returns deterministic key:
+    xtl:{kind}:snap:{device}:{symbol}:{tf}
+    """
+    symbol = symbol.upper()
+    tf = _norm_tf(tf)
 
-def _parse(val: str):
-    try:
-        d = json.loads(val)
-    except Exception:
-        return None, None
-    bars = d.get("bars") or []
-    if not bars: return None, None
+    dev = R.get(f"xtl:{kind}:latest:{symbol}:{tf}")
+    if not dev:
+        return None
+
+    dev = dev.decode() if isinstance(dev, (bytes, bytearray)) else dev
+    return f"xtl:{kind}:snap:{dev}:{symbol}:{tf}"
+def _parse(raw: str):
+    """
+    Parses snapshot JSON written by /{dev_id}/ohlc.
+    Expected shape:
+      {
+        "serverNow": <ms>,
+        "lastClosedTs": <ms>,
+        "nextCloseTs": <ms>,
+        "bars": [{"t": <seconds OR ms>, "o":..,"h":..,"l":..,"c":..,"v":..}]
+      }
+    Returns: (df, meta_dict)
+      df columns: ts_ms, open, high, low, close, volume
+    """
+    import json
     import pandas as pd
-    df = pd.DataFrame(bars)
-    if "ts_ms" not in df.columns and "t" in df.columns:
-        df = df.rename(columns={"t":"ts_ms"})
-    if "open" not in df.columns and "o" in df.columns:
-        df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
-    if "ts_ms" not in df.columns: return None, None
-    if (df["ts_ms"] < 2_000_000_000_000).any():
-        df["ts_ms"] = df["ts_ms"].astype("int64") * 1000
-    keep = [c for c in ["ts_ms","open","high","low","close","volume"] if c in df.columns]
-    df = df[keep].dropna().drop_duplicates().sort_values("ts_ms")
-    tf = d.get("tf") or d.get("timeframe") or d.get("TF")
-    tf = _norm_tf(str(tf)) if tf else None
-    return df, tf
+
+    try:
+        obj = json.loads(raw) if raw else {}
+    except Exception:
+        obj = {}
+
+    bars = obj.get("bars") or []
+    if not isinstance(bars, list) or not bars:
+        return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"]), obj
+
+    rows = []
+    for b in bars:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("t") or 0
+        try:
+            t = int(t)
+        except Exception:
+            t = 0
+        if t <= 0:
+            continue
+
+        # 't' may be seconds (10 digits) or ms (13 digits)
+        ts_ms = t if t >= 10_000_000_000 else t * 1000
+
+        try:
+            o = float(b.get("o") or 0.0)
+            h = float(b.get("h") or 0.0)
+            l = float(b.get("l") or 0.0)
+            c = float(b.get("c") or 0.0)
+            v = int(b.get("v") or 0)
+        except Exception:
+            continue
+
+        rows.append((ts_ms, o, h, l, c, v))
+
+    if not rows:
+        return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"]), obj
+
+    df = pd.DataFrame(rows, columns=["ts_ms", "open", "high", "low", "close", "volume"])
+    df = df.sort_values("ts_ms").drop_duplicates(subset=["ts_ms"]).reset_index(drop=True)
+    return df, obj
+
+
 
 def _resample_m15(df_in, tf):
     if tf == "M15": return df_in.copy()
@@ -200,62 +379,79 @@ def _resample_h4(df_in, tf):
 
 
 
-def pull_latest_h1(symbol: str, need_rows: int = 60):
+def pull_latest_h1(symbol: str, need_rows: int = 120):
     import pandas as pd
-    keys = _scan_keys(symbol)
-    frames = []
-    for k in keys:
-        raw = R.get(k)
-        if not raw:
-            continue
-        raw = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else raw
-        df, tf = _parse(raw)
-        if df is None or df.empty:
-            continue
-        tf = tf or _norm_tf(k.split(":")[-1])
-        frames.append(_resample_h1(df, tf))
-    if not frames:
+    sym_u = (symbol or "").upper().strip()
+    if not sym_u:
         return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
-    out = pd.concat(frames, ignore_index=True)
-    out = out.sort_values("ts_ms").drop_duplicates(subset=["ts_ms"]).reset_index(drop=True)
-    return out.tail(max(need_rows, 8))
 
-def pull_latest_h4(symbol: str, need_rows: int = 60):
-    import pandas as pd
-    keys = _scan_keys(symbol)
-    frames = []
-    for k in keys:
-        raw = R.get(k)
+    tf_try = ["H1", "M15", "M5", "M1"]
+
+    for tf_u in tf_try:
+        raw, _dev = _get_latest_snap_raw(sym_u, tf_u)
         if not raw:
             continue
-        raw = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else raw
-        df, tf = _parse(raw)
+
+        df, _meta = _parse(raw)
         if df is None or df.empty:
             continue
-        tf = tf or _norm_tf(k.split(":")[-1])
-        frames.append(_resample_h4(df, tf))
-    if not frames:
+
+        # ? IMPORTANT: if native H1, return it DIRECTLY (no resample)
+        if tf_u == "H1":
+            return df.tail(max(need_rows, 8))
+
+        df1 = _resample_h1(df, tf_u)
+        if df1 is not None and not df1.empty:
+            return df1.tail(max(need_rows, 8))
+
+    return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
+
+
+def pull_latest_h4(symbol: str, need_rows: int = 120):
+    import pandas as pd
+    sym_u = (symbol or "").upper().strip()
+    if not sym_u:
         return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
-    out = pd.concat(frames, ignore_index=True)
-    out = out.sort_values("ts_ms").drop_duplicates(subset=["ts_ms"]).reset_index(drop=True)
-    return out.tail(max(need_rows, 8))
+
+    tf_try = ["H4", "H1", "M15", "M5", "M1"]
+
+    for tf_u in tf_try:
+        raw, _dev = _get_latest_snap_raw(sym_u, tf_u)
+        if not raw:
+            continue
+
+        df, _meta = _parse(raw)
+        if df is None or df.empty:
+            continue
+
+        # ? IMPORTANT: if native H4, return it DIRECTLY (no resample)
+        if tf_u == "H4":
+            return df.tail(max(need_rows, 8))
+
+        df4 = _resample_h4(df, tf_u)
+        if df4 is not None and not df4.empty:
+            return df4.tail(max(need_rows, 8))
+
+    return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
 
 
 def pull_latest_m15(symbol: str, need_rows: int = 60):
     import pandas as pd
-    keys = _scan_keys(symbol)
-    frames = []
-    for k in keys:
-        raw = R.get(k)
-        if not raw: continue
-        raw = raw.decode("utf-8","ignore") if isinstance(raw, (bytes,bytearray)) else raw
-        df, tf = _parse(raw)
-        if df is None or df.empty: continue
-        tf = tf or _norm_tf(k.split(":")[-1])
-        frames.append(_resample_m15(df, tf))
-    if not frames: 
-        return pd.DataFrame(columns=["ts_ms","open","high","low","close","volume"])
-    out = pd.concat(frames, ignore_index=True)
+
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
+
+    dev = _latest_dev_for(sym, "M15")
+    raw = _get_snap_raw(dev, sym, "M15")
+    if not raw:
+        return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
+
+    df, tf = _parse(raw)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
+
+    out = _resample_m15(df, tf or "M15")
     out = out.sort_values("ts_ms").drop_duplicates(subset=["ts_ms"]).reset_index(drop=True)
     return out.tail(max(need_rows, 8))
 
@@ -603,9 +799,12 @@ def predict_next_hour(
 
 
     if np.isfinite(move_pct):
-        move_pct = float(np.clip(move_pct, -clip, clip))
+       # --- SOFT CLIP (prevents flatlining at cap) ---
+       # This keeps move_pct within [-clip, clip] but preserves variability
+       move_pct = float(clip * np.tanh(move_pct / clip))
     else:
-        move_pct = 0.0
+       move_pct = 0.0
+
 
     target_price = last_close * (1.0 + move_pct / 100.0)
 
@@ -679,6 +878,7 @@ def predict_next_4h(
 
     # 1) Per-symbol / global scale
     scale = float(cal.get("per_symbol", {}).get(symbol, cal.get("global_scale", 1.0)))
+    scale = max(0.25, min(scale, 2.0))
     move_pct *= scale
 
     # 2) RVOL + ATR scaling (gentler than H1)

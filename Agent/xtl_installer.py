@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes, json, os, re, shutil, subprocess, sys, time, threading, queue, signal
 import typing as t
 
+import threading
 
 
 from typing import Optional, Tuple
@@ -34,7 +35,7 @@ _LAST_PUSH: dict[tuple[str, str], int] = {}
 
 # packaged layout: xtl/agent_ohlc.py
 from xtl.agent_ohlc import push_ohlc_once as agent_push_ohlc_once
-
+from xtl.agent_price import start_price_publisher
 # ---------- constants / paths ----------
 APP_NAME = "XTL"
 DEFAULT_API_BASE = "https://api.xautrendlab.com"
@@ -3275,24 +3276,26 @@ def read_config() -> dict:
 
 def _maybe_mt5_worker(api_base: str) -> None:
     """
-    MT5 OHLC worker that delegates to agent_ohlc.push_ohlc_once(),
-    which normalizes NumPy/Pandas safely (no ndarray truthiness checks).
+    MT5 worker:
+    - OHLC push loop delegates to agent_ohlc.push_ohlc_once_compat()
+    - ALSO starts MT5 command worker that polls /devices/{device_id}/mt5/next and acks
     """
     try:
         # Read config (fallback to {})
-        cfg = read_config() if 'read_config' in globals() else {}
+        cfg = read_config() if "read_config" in globals() else {}
         mt5_cfg = (cfg.get("mt5") if isinstance(cfg, dict) else {}) or {}
 
         # Ensure MT5 terminal path (auto-detect if missing)
         mt5_path = (reg_get("MT5.TerminalPath") or reg_get("MT5Path") or "").strip()
         if not mt5_path:
-            guess = find_mt5_terminal() if 'find_mt5_terminal' in globals() else None
+            guess = find_mt5_terminal() if "find_mt5_terminal" in globals() else None
             if guess:
                 mt5_path = guess
                 alog(f"MT5: auto-detected terminal at {mt5_path}")
             else:
                 alog("MT5: no terminal detected; worker disabled (this is OK).")
                 return  # graceful skip
+
             # Persist MT5 path for service + user + machine (HKU LS + HKCU + HKLM)
             _persist_mt5_path_all(mt5_path)
 
@@ -3315,20 +3318,81 @@ def _maybe_mt5_worker(api_base: str) -> None:
 
         # Device creds (LocalSystem hive)
         device_id, device_token = "", ""
+
         # Wait up to ~10 minutes for bind to complete (service just triggered it)
-        for _ in range(600):  # 600 * 1s = 10 minutes; tune if you like
-            device_id    = (_hku_ls_get("DeviceId") or "").strip()
+        for _ in range(600):  # 600 * 1s = 10 minutes
+            device_id = (_hku_ls_get("DeviceId") or "").strip()
             device_token = (_hku_ls_get("DeviceToken") or "").strip()
             if device_id and device_token:
-               break
+                break
             alog("OHLC: waiting for bind (no DeviceId/DeviceToken yet). Will retry in 1s…")
             time.sleep(1)
 
         if not device_id or not device_token:
-           alog("OHLC: still not bound after wait; worker exiting (supervisor will respawn).")
-           return
+            alog("OHLC: still not bound after wait; worker exiting (supervisor will respawn).")
+            return
 
-    # Cadence
+
+
+        # ---------------- NEW: start MT5 command worker ----------------
+        # This polls /devices/{device_id}/mt5/next and posts /mt5/ack.
+        try:
+            # Start only once (avoid duplicate polling threads if worker restarts)
+            global _MT5_CMD_STARTED
+            try:
+                _MT5_CMD_STARTED
+            except Exception:
+                _MT5_CMD_STARTED = False
+
+            if not _MT5_CMD_STARTED:
+                start_mt5_cmd_worker = None
+
+                # 1) normal import (preferred)
+                try:
+                    from xtl.agent_ohlc import start_mt5_cmd_worker  # type: ignore
+                except Exception:
+                    start_mt5_cmd_worker = None
+
+                # 2) fallback: load by file path (your layout: wizard\xtl\agent_ohlc.py)
+                if start_mt5_cmd_worker is None:
+                    import importlib.util
+                    here = os.path.dirname(os.path.abspath(__file__))
+
+                    candidates = [
+                        os.path.join(here, "xtl", "agent_ohlc.py"),
+                        os.path.join(here, "agent_ohlc.py"),
+                    ]
+                    p = next((x for x in candidates if os.path.exists(x)), None)
+                    if not p:
+                        raise RuntimeError(f"agent_ohlc.py not found. Tried: {candidates}")
+
+                    spec = importlib.util.spec_from_file_location("agent_ohlc", p)
+                    mod = importlib.util.module_from_spec(spec)  # type: ignore
+                    assert spec and spec.loader
+                    spec.loader.exec_module(mod)  # type: ignore
+                    start_mt5_cmd_worker = getattr(mod, "start_mt5_cmd_worker", None)
+
+                if not callable(start_mt5_cmd_worker):
+                    raise RuntimeError("start_mt5_cmd_worker not callable")
+
+                start_mt5_cmd_worker(
+                    api_base=api_base,
+                    device_id=device_id,
+                    token=device_token,
+                    poll_sec=2,
+                )
+                _MT5_CMD_STARTED = True
+                alog("MT5 CMD: worker started (polling /mt5/next)")
+            else:
+                alog("MT5 CMD: worker already started; skipping")
+        except Exception as e:
+            alog(f"MT5 CMD: failed to start worker: {type(e).__name__}: {e}")
+        # ---------------- END NEW BLOCK ----------------
+
+
+
+
+        # Cadence
         s_per_cycle = int(mt5_cfg.get("period_sec") or 60)
         if s_per_cycle < 15:
             s_per_cycle = 15
@@ -3453,6 +3517,34 @@ def agent_main_foreground() -> None:
         t.start()
         return t
 
+    def _spawn_price() -> threading.Thread:
+        # Use bound creds and registry symbols (same as OHLC)
+        try:
+            dev_id = (_hku_ls_get("DeviceId") or "").strip()
+            dev_tok = (_hku_ls_get("DeviceToken") or "").strip()
+        except Exception:
+            dev_id, dev_tok = "", ""
+
+        syms = []
+        try:
+            syms_raw = (reg_get("Symbols") or "").strip()
+            syms = [s.strip().upper() for s in syms_raw.split(",") if s.strip()]
+        except Exception:
+            syms = []
+
+        if not syms:
+            syms = ["XAUUSD", "EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDCHF"]
+
+        t = threading.Thread(
+            target=start_price_publisher,
+            args=(api_base, dev_id, dev_tok, syms),
+            kwargs={"interval_sec": 0.25},
+            daemon=True,
+            name="price",
+        )
+        t.start()
+        return t
+
     def _spawn_mt5() -> threading.Thread:
         t = threading.Thread(
             target=_maybe_mt5_worker,
@@ -3465,6 +3557,7 @@ def agent_main_foreground() -> None:
 
     # 5) Start threads
     th_hb = _spawn_hb()
+    th_price = _spawn_price()
     th_mt5 = _spawn_mt5()
 
     # 6) Lightweight watchdog: if a worker dies unexpectedly, respawn it
@@ -3472,6 +3565,9 @@ def agent_main_foreground() -> None:
         if not th_hb.is_alive():
             alog("watchdog: heartbeat thread died; respawning")
             th_hb = _spawn_hb()
+        if not th_price.is_alive():
+            alog("watchdog: price thread died; respawning")
+            th_price = _spawn_price()
         if not th_mt5.is_alive():
             alog("watchdog: mt5 worker thread died; respawning")
             th_mt5 = _spawn_mt5()

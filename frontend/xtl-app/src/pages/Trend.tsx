@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * XTL · Trend Page — Live (H1/H4) Final
+ * XTL   Trend Page   Live (H1/H4) Final
  * - One-click: Detect Trend ? then Live auto-refresh at TF boundaries
  * - Status row: Last updated / Next bar in / Live toggle
  * - Primary button states: Detect Trend ? Stop Live ? Apply & Restart ? Resume Live
@@ -13,12 +13,13 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 export type TfLabel = "15m" | "1h" | "4h";
 export type FinalLabel = "Strong Bullish" | "Bullish" | "Bearish" | "Strong Bearish";
 type TrendBar = { t:number; o:number; h:number; l:number; c:number; complete?:boolean };
-const REFRESH_MS = 15000; // 15s; use 5000–30000 based on taste
+const REFRESH_MS = 10000; 
 
 
 
 type TrendResp = {
-  preview?: { bars?: TrendBar[] };
+  preview?: { bars?: TrendBar[]; overlays?: ChartOverlays };
+  chart?: { overlays?: ChartOverlays }; 
   nextCloseTs?: number;
   lastClosedTs?: number;
   serverNow?: number;
@@ -28,6 +29,30 @@ type TrendResp = {
   stale?: boolean;
   pollAfterMs?: number;
 };
+
+type SrZone = {
+  lo: number;
+  hi: number;
+  tf?: string;
+  kind?: string;     // "S"/"R" or "support"/"resistance" etc
+  score?: number;
+  label?: string;
+};
+
+type TradeOverlay = {
+  decision?: string;         // "BUY"/"SELL"/"WAIT"
+  entry_price?: number | null;
+  tp_price?: number | null;
+  sl_price?: number | null;
+  entry_ts_ms?: number | null;
+};
+
+type ChartOverlays = {
+  sr_zones?: SrZone[];
+  trade?: TradeOverlay;
+  entry_context?: { reason?: string | null };
+};
+
 
 type PreviewBarT = {
   t_open_ms: number;
@@ -58,6 +83,8 @@ function normalizeBroker(b: any): BrokerMeta | null {
   const name = (b?.tz_name ?? b?.tz_abbr ?? "").trim() || null;
   return (name || off !== null) ? { tz_name: name, tz_offset_min: off } : null;
 }
+
+
 
 // ---- time helpers ----
 
@@ -139,13 +166,13 @@ function decimalsFromPrice(price: number): number {
 
   const p = Math.abs(price);
 
-  // Metals / indices (XAU etc.) – usually 2 decimals
+  // Metals / indices (XAU etc.)   usually 2 decimals
   if (p >= 200) return 2;
 
-  // JPY-style FX pairs (e.g. 150.xxx) – typically 3 decimals
+  // JPY-style FX pairs (e.g. 150.xxx)   typically 3 decimals
   if (p >= 20) return 3;
 
-  // Majors around 1.x (EURUSD, GBPUSD, etc.) – 5 decimals
+  // Majors around 1.x (EURUSD, GBPUSD, etc.)   5 decimals
   return 5;
 }
 
@@ -435,7 +462,7 @@ export function formatInBrokerOffsetOnly(
 export function formatBrokerWall(
   msWall: number | null | undefined
 ): string {
-  if (!msWall || !Number.isFinite(msWall)) return "—";
+  if (!msWall || !Number.isFinite(msWall)) return " ";
   return new Intl.DateTimeFormat("en-GB", {
     timeZone: "UTC", // do NOT reapply broker offset; value is already wall-time
     year: "numeric",
@@ -457,7 +484,7 @@ const DEFAULT_CFG = {
     method: "zigzag_atr" as "zigzag_atr" | "fractal",
     // Threshold mode: "atr" uses kTrend * ATR(14); "percent" uses pivotPct (%)
     mode: "atr" as "atr" | "percent",
-    kTrend: 1.5,          // ATR× when mode="atr"
+    kTrend: 1.5,          // ATR  when mode="atr"
     pivotPct: 0.40,       // % reversal when mode="percent" (e.g., 0.40 = 0.40%)
     minBarsTrend: 4,      // backstep: minimum bars between pivots
   },
@@ -555,7 +582,7 @@ function nextBoundary(tf: TfLabel, from = new Date()) {
 }
 
 function fmtTime(ts?: number | Date) {
-  if (!ts) return "—";
+  if (!ts) return " ";
   const d = typeof ts === "number" ? new Date(ts) : ts;
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
@@ -596,10 +623,11 @@ function MiniCandleChart({
   bars,
   broker,
   tfMs,
-  height = 280,
+  height,
   pivots,
   showPivots,
   maPreview,
+  overlays,
 }: {
   bars: {
     t_open_ms: number;
@@ -621,6 +649,7 @@ function MiniCandleChart({
   }[];
   showPivots?: boolean;
   maPreview?: { fast: number[]; slow: number[]; times: number[] };
+  overlays?: ChartOverlays;
 }) {
   const mp = maPreview ?? { fast: [], slow: [], times: [] };
 
@@ -642,9 +671,9 @@ function MiniCandleChart({
   const padB = 28;
 
   const W = Math.max(600, bars.length * 6) + padL + padR;
-  const H = height;
+  const H = Number.isFinite(height as number) ? (height as number) : 280;
 
-  // keep a right gutter so pivots / MAs don’t hug the edge
+  // keep a right gutter so pivots / MAs don t hug the edge
   const PANEL_W = 148;
   const PANEL_MARGIN_R = 4;
   const PLOT_TO_PANEL_GAP = 16;
@@ -652,22 +681,237 @@ function MiniCandleChart({
 
   const crisp = (v: number) => Math.round(v) + 0.5;
 
+  // infer which TF this preview chart represents (for labels + matching SR)
+  const tfWanted =
+    tfMs >= 4 * 60 * 60 * 1000
+      ? "H4"
+      : tfMs >= 1 * 60 * 60 * 1000
+      ? "H1"
+      : tfMs >= 15 * 60 * 1000
+      ? "M15"
+      : "";
+
   const ys = bars.flatMap((b) => [b.h, b.l]);
+
+  // =====================================================
+// SR ZONES (Pulse EXACT):
+// - Pulse cards/banner use `server.sr` (top-level state2.sr).
+// - Preview chart must read the SAME payload.
+// - Do NOT use sr_zones for Pulse match.
+// =====================================================
+  const srPayloadAny: any =
+    (overlays as any)?.__sr_payload ||
+    (overlays as any)?.__sr || // legacy
+    null;
+
+  // optional summary (some endpoints also include a compact sr_summary)
+  const srSummaryAny: any =
+    (overlays as any)?.__sr_summary ||
+    (overlays as any)?.sr_summary ||
+    null;
+
+  // Pick TF slice from the *payload* first (state2.sr.{h1,h4}),
+  // else fall back to summary if thatâ€™s all we have.
+  const srTf: any = (() => {
+    const want = String(tfWanted || "").toLowerCase(); // "h1" | "h4" | "m15"
+    if (srPayloadAny && typeof srPayloadAny === "object") {
+       return srPayloadAny[want] ?? srPayloadAny[tfWanted] ?? null;
+    }
+    return null;
+   
+  })();
+
+  const toNumArr = (v: any): number[] => {
+    if (v == null) return [];
+    if (typeof v === "number" || typeof v === "string") {
+      const n = Number(v);
+      return Number.isFinite(n) ? [n] : [];
+    }
+    if (!Array.isArray(v)) return [];
+    const out: number[] = [];
+    for (const it of v) {
+      if (typeof it === "number" || typeof it === "string") {
+        const n = Number(it);
+        if (Number.isFinite(n)) out.push(n);
+        continue;
+      }
+      if (it && typeof it === "object") {
+        const n = Number((it as any).level ?? (it as any).price);
+        if (Number.isFinite(n)) out.push(n);
+        continue;
+      }
+    }
+    return out;
+  };
+
+  const uniqLevels = (arr: number[]) => {
+    const out: number[] = [];
+    const seen = new Set<string>();
+    for (const v of arr) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) continue;
+      const r = Number(n.toFixed(dec));
+      const k = r.toFixed(dec);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(r);
+    }
+    return out;
+  };
+
+  // --- Pulse contract for chart ---
+  // Near (actionable): 1 support + 1 resistance
+  // Major (strong): up to 3 supports + up to 1 resistance
+  //
+  // We take these *exactly* from state2.sr.{h1,h4}:
+  //   - supports_major / resistances_major (preferred)
+  //   - supports_near / resistances_near (for near)
+  // If majors are empty but nearest_* exists, use nearest_* as the single level.
+
+  const pickFirstNonEmptyNums = (...vals: any[]): number[] => {
+    for (const v of vals) {
+      const a = toNumArr(v);
+      if (a.length) return a;
+    }
+    return [];
+  };
+  // Pick nearest-to-price levels (so chart matches Pulse banner logic)
+  const refPx =
+    Number(
+      (overlays as any)?.refPx ??
+      (overlays as any)?.ref_px ??
+      (overlays as any)?.price ??
+      (overlays as any)?.last_price ??
+      (srPayloadAny as any)?.price ??
+      (srPayloadAny as any)?.last_price ??
+      samplePrice ??
+      bars[bars.length - 1]?.c ??
+      0
+    ) || 0;
+
+
+  const sortSupportsNearest = (a: number[]) =>
+    a
+      .slice()
+      .sort((x, y) => y - x); // higher support first (closest below)
+
+  const sortResistsNearest = (a: number[]) =>
+    a
+      .slice()
+      .sort((x, y) => x - y); // lower resistance first (closest above)
+
+
+  const nearSupport = (() => {
+    const a0 = uniqLevels(
+      pickFirstNonEmptyNums(srTf?.supports_near, srTf?.support_near)
+    );
+
+    const a = sortSupportsNearest(a0);
+    if (a.length) return a[0];
+
+    const n = Number((srPayloadAny as any)?.nearest_support);
+    return Number.isFinite(n) ? Number(n.toFixed(dec)) : null;
+  })();
+
+  const nearResist = (() => {
+    const a0 = uniqLevels(
+      pickFirstNonEmptyNums(srTf?.resistances_near, srTf?.resistance_near)
+    );
+
+    const a = sortResistsNearest(a0);
+    if (a.length) return a[0];
+
+    const n = Number((srPayloadAny as any)?.nearest_resistance);
+    return Number.isFinite(n) ? Number(n.toFixed(dec)) : null;
+  })();
+
+  const majorSupports = (() => {
+    const a0 = uniqLevels(
+      pickFirstNonEmptyNums(
+        srTf?.supports_major,
+        srTf?.support_major,
+        srTf?.major?.supports,
+        srTf?.major?.support
+      )
+    );
+
+    const a = sortSupportsNearest(a0);
+    return a.slice(0, 3); // keep as-is (Pulse shows up to 3)
+  })();
+
+  const majorResists = (() => {
+    const a0 = uniqLevels(
+      pickFirstNonEmptyNums(
+        srTf?.resistances_major,
+        srTf?.resistance_major,
+        srTf?.major?.resistances,
+        srTf?.major?.resistance
+      )
+    );
+
+    const a = sortResistsNearest(a0);
+    return a.slice(0, 3); // IMPORTANT: do not force 1; Pulse shows multiple
+  })();
+
+  const majorSupportsFinal = majorSupports;
+  const majorResistsFinal = majorResists;
+
+
+  // Build thin bands so they render as visible rectangles.
+  const bandFor = (p: number) => {
+    const d = decimalsFromPrice(p);
+    const eps = Math.pow(10, -d);
+    return Math.max(eps * 10, Math.abs(p) * 1e-6);
+  };
+
+  // Final chart SR zones: ONLY Pulse levels (no sr_zones).
+  let srZones: any[] = [];
+
+  for (const p of majorSupportsFinal) {
+    const b = bandFor(p);
+    srZones.push({ level: p, lo: p , hi: p , kind: "S", tf: tfWanted, strength: "major",src: "pulse" });
+  }
+  for (const p of majorResistsFinal) {
+    const b = bandFor(p);
+    srZones.push({ level: p, lo: p , hi: p , kind: "R", tf: tfWanted, strength: "major",src: "pulse" });
+  }
+
+  // Near levels (1 each) â€“ draw only if different from major to avoid duplicates.
+  if (nearSupport != null && !srZones.some((z) => z.kind === "S" && Math.abs(Number(z.level) - nearSupport) < 1e-9)) {
+    const b = bandFor(nearSupport);
+    srZones.push({ level: nearSupport, lo: nearSupport - b, hi: nearSupport + b, kind: "S", tf: tfWanted, strength: "near",src: "pulse" });
+  }
+  if (nearResist != null && !srZones.some((z) => z.kind === "R" && Math.abs(Number(z.level) - nearResist) < 1e-9)) {
+    const b = bandFor(nearResist);
+    srZones.push({ level: nearResist, lo: nearResist - b, hi: nearResist + b, kind: "R", tf: tfWanted, strength: "near", src: "pulse"});
+  }
+
+  
+  // Use srZones in Y-range (so chart matches Pulse SR)
+  for (const z of srZones) {
+    const lvl = Number((z as any)?.level);
+    const lo = Number((z as any)?.low ?? (z as any)?.lo ?? lvl);
+    const hi = Number((z as any)?.high ?? (z as any)?.hi ?? lvl);
+    if (Number.isFinite(lo)) ys.push(lo);
+    if (Number.isFinite(hi)) ys.push(hi);
+  }
+
   const yMin = Math.min(...ys);
   const yMax = Math.max(...ys);
-  const yRange = yMax - yMin || 1;
+
+  // padding so zones don t sit on the edge
+  const padY = (yMax - yMin) * 0.02;
+  const yMin2 = yMin - padY;
+  const yMax2 = yMax + padY;
+  const yRange2 = yMax2 - yMin2 || 1;
 
   const plotRight = padR + RIGHT_GUTTER;
   const xw = (W - padL - plotRight) / bars.length;
   const bodyW = Math.max(2, Math.floor(xw * 0.45));
-
-  const y = (p: number) =>
-    padT + (H - padT - padB) * (1 - (p - yMin) / yRange);
+  const y = (p: number) => padT + (H - padT - padB) * (1 - (p - yMin2) / yRange2);
 
   // -------- hover state --------
-  const [hover, setHover] = React.useState<null | { i: number; x: number }>(
-    null,
-  );
+  const [hover, setHover] = React.useState<null | { i: number; x: number }>(null);
 
   const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = e.currentTarget as SVGSVGElement;
@@ -687,34 +931,34 @@ function MiniCandleChart({
 
   const onLeave = () => setHover(null);
 
-  
-  // -------- helper: format bar time to match MT5 row --------
-  const formatBarTime = (b: {
-    t_open_ms: number;
-    t_close_ms: number;
-    [k: string]: any;
-  }): string => {
-    const rawOpenMs = barOpenMs(
-      {
-        t_open_ms: b.t_open_ms,
-        t_close_ms: b.t_close_ms,
-        t: (b as any).t,
-      },
-      tfMs,
-    );
-    if (!rawOpenMs || !Number.isFinite(rawOpenMs)) return "—";
+  const lastClosedIdx = React.useMemo(() => {
+    if (!bars.length) return -1;
+    for (let i = bars.length - 1; i >= 0; i--) {
+      const b: any = bars[i];
+      if (!b) continue;
+      if (b.complete === false) continue;
+      return i;
+    }
+    return bars.length - 1;
+  }, [bars]);
 
-    
-
-    // preview.t_open_ms is already broker wall-time ms ? format directly
-    return formatBrokerWall(rawOpenMs);
+  const formatBarTime = (b: { t_open_ms: number; t_close_ms: number; [k: string]: any }): string => {
+    let openMs = 0;
+    if (typeof b.t_open_ms === "number" && Number.isFinite(b.t_open_ms) && b.t_open_ms > 0) {
+      openMs = b.t_open_ms;
+    } else if (typeof b.t_close_ms === "number" && Number.isFinite(b.t_close_ms) && b.t_close_ms > 0) {
+      openMs = b.t_close_ms - tfMs;
+    } else if (typeof (b as any).t === "number" && Number.isFinite((b as any).t) && (b as any).t > 0) {
+      openMs = (b as any).t * 1000;
+    }
+    if (!openMs || !Number.isFinite(openMs)) return " ";
+    return formatBrokerWall(openMs);
   };
 
   return (
     <div className="w-full rounded-xl border border-slate-800/60 bg-slate-950/60">
-      {/* Header with active bar OHLC – stays visible while scrolling horizontally */}
       {(() => {
-        const idx = hover ? hover.i : bars.length - 1;
+        const idx = hover ? hover.i : lastClosedIdx >= 0 ? lastClosedIdx : bars.length - 1;
         const i = Math.max(0, Math.min(bars.length - 1, idx));
         const b = bars[i];
         if (!b) return null;
@@ -751,42 +995,173 @@ function MiniCandleChart({
           onMouseLeave={onLeave}
           style={{ cursor: "crosshair", display: "block" }}
         >
-          {/* top / bottom frame */}
-          <line
-            x1={padL}
-            y1={crisp(padT)}
-            x2={W - plotRight}
-            y2={crisp(padT)}
-            stroke="#1f2937"
-          />
-          <line
-            x1={padL}
-            y1={crisp(H - padB)}
-            x2={W - plotRight}
-            y2={crisp(H - padB)}
-            stroke="#1f2937"
-          />
+          <line x1={padL} y1={crisp(padT)} x2={W - plotRight} y2={crisp(padT)} stroke="#1f2937" />
+          <line x1={padL} y1={crisp(H - padB)} x2={W - plotRight} y2={crisp(H - padB)} stroke="#1f2937" />
 
-          {/* y labels + guides */}
           {[0, 0.5, 1].map((p, i) => {
-            const v = yMin + p * yRange;
+            const v = yMin2 + p * yRange2;
             const yv = y(v);
             return (
               <g key={i}>
-                <line
-                  x1={padL}
-                  y1={yv}
-                  x2={W - plotRight}
-                  y2={yv}
-                  stroke="#111827"
-                  opacity={0.5}
-                />
+                <line x1={padL} y1={yv} x2={W - plotRight} y2={yv} stroke="#111827" opacity={0.5} />
                 <text x={8} y={yv + 4} fill="#64748b" fontSize={10}>
                   {v.toFixed(dec)}
                 </text>
               </g>
             );
           })}
+
+          {/* overlays: SR zones (shaded blocks) + trade lines */}
+          {(() => {
+            // Only use pulse-aligned SR list
+            const zones = (Array.isArray(srZones) ? srZones : []).filter((z: any) => {
+              if (!z) return false;
+
+              // ONLY draw Pulse-derived zones (prevents stray sr_zones / legacy overlays)
+              if (String((z as any)?.src || "") !== "pulse") return false;
+
+              const ztf = String(z?.tf || z?.timeframe || "").toUpperCase();
+              if (tfWanted && ztf && ztf !== tfWanted) return false;
+
+              return true;
+            });
+
+
+            const ZONE_TAIL_BARS = 25;
+            const startI = Math.max(0, bars.length - ZONE_TAIL_BARS);
+            const plotX1 = padL + startI * xw;
+            const plotX2 = W - plotRight;
+            const plotW = plotX2 - plotX1;
+
+            const refPx = Number(
+              (overlays as any)?.refPx ??
+              (overlays as any)?.ref_px ??
+              (overlays as any)?.price ??
+              (overlays as any)?.last_price ??
+              (srPayloadAny as any)?.price ??
+              (srPayloadAny as any)?.last_price ??
+              bars[bars.length - 1]?.c ??
+              0
+            );
+
+
+            const entry = Number((overlays as any)?.entry ?? (overlays as any)?.trade?.entry);
+            const tp = Number((overlays as any)?.tp ?? (overlays as any)?.trade?.tp);
+            const sl = Number((overlays as any)?.sl ?? (overlays as any)?.trade?.sl);
+
+            const hLine = (p: number, label: string, dashed: boolean) => {
+              if (!Number.isFinite(p)) return null;
+              const yy = y(p);
+              return (
+                <g key={`hl-${label}`} pointerEvents="none">
+                  <line
+                    x1={padL}
+                    y1={yy}
+                    x2={W - plotRight}
+                    y2={yy}
+                    stroke="rgba(148,163,184,0.55)"
+                    strokeWidth={1}
+                    strokeDasharray={dashed ? "6 4" : undefined}
+                  />
+                  <text
+                    x={W - plotRight + 10}
+                    y={yy + 4}
+                    textAnchor="start"
+                    fill="rgba(148,163,184,0.92)"
+                    fontSize={10}
+                  >
+                    {label}
+                  </text>
+                </g>
+              );
+            };
+
+            const zoneItems = zones
+              .map((z: any, i: number) => {
+                const lvl0 = Number(z?.level);
+                if (!Number.isFinite(lvl0)) return null;
+                const decimals = Math.abs(lvl0) >= 100 ? 2 : 5;
+                const lvl = Number(lvl0.toFixed(decimals));
+                let lo = Number(z?.low ?? z?.lo ?? lvl);
+                let hi = Number(z?.high ?? z?.hi ?? lvl);
+                if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;
+                if (hi < lo) [lo, hi] = [hi, lo];
+
+                
+
+                // If Pulse already gave kind, keep it. Else classify vs current refPx.
+                const kindRaw = String(z?.kind ?? "").toUpperCase();
+                const kind =
+                  kindRaw === "S" || kindRaw === "R"
+                    ? kindRaw
+                    : Number.isFinite(refPx) && refPx > 0
+                    ? lvl >= refPx
+                      ? "R"
+                      : "S"
+                    : "";
+
+                const y1 = y(hi);
+                const y2 = y(lo);
+                const h = Math.max(2, y2 - y1);
+
+                const fill = kind === "R" ? "rgba(239,68,68,0.18)" : "rgba(34,197,94,0.18)";
+                const stroke = kind === "R" ? "rgba(239,68,68,0.55)" : "rgba(34,197,94,0.55)";
+
+                const tag = `${tfWanted} ${kind === "R" ? "RESISTANCE" : "SUPPORT"}`.trim();
+                
+                
+                const labelTxt = `${tag} ${lvl.toFixed(decimals)}`;
+
+
+                return { i, y1, h, fill, stroke, labelTxt, labelY: y1 + 12 };
+              })
+              .filter(Boolean) as any[];
+
+            // resolve label collisions
+            zoneItems.sort((a, b) => a.labelY - b.labelY);
+            const MIN_LABEL_GAP = 0;
+            let lastY = -1e9;
+            for (const it of zoneItems) {
+              let yy = it.labelY;
+              if (yy < lastY + MIN_LABEL_GAP) yy = lastY + MIN_LABEL_GAP;
+              yy = Math.max(padT + 12, Math.min(H - padB - 4, yy));
+              it.labelYAdj = yy;
+              lastY = yy;
+            }
+
+            const zoneRects = zoneItems.map((it: any) => (
+              <g key={`sr-zone-${it.i}`} pointerEvents="none">
+                <rect
+                  x={plotX1}
+                  y={it.y1}
+                  width={plotW}
+                  height={it.h}
+                  fill={it.fill}
+                  stroke={it.stroke}
+                  strokeDasharray="6 4"
+                  rx={2}
+                />
+                <text
+                  x={plotX2 + 10}
+                  y={it.labelYAdj}
+                  textAnchor="start"
+                  fill="rgba(148,163,184,0.92)"
+                  fontSize={10}
+                >
+                  {it.labelTxt}
+                </text>
+              </g>
+            ));
+
+            return (
+              <>
+                {zoneRects}
+                {hLine(entry, "ENTRY", false)}
+                {hLine(tp, "TP", true)}
+                {hLine(sl, "SL", true)}
+              </>
+            );
+          })()}
 
           {/* candles */}
           {bars.map((b, i) => {
@@ -928,7 +1303,7 @@ function MiniCandleChart({
               })()}
             </g>
           )}
-
+          
           {/* MA preview overlays */}
           {mp.fast.length > 0 && (
             <path
@@ -1033,32 +1408,104 @@ export default function Trend() {
   const activeKeyRef = React.useRef<string>("");
   const timeoutRef = React.useRef<number | null>(null);
   const boundaryLockRef = React.useRef(0);
+  const lastClosedTsRef = React.useRef<number>(0);
+  // Fast-poll around TF boundary (2s) until new bar appears
+  const fastPollActiveRef = React.useRef(false);
+  const fastPollTimeoutRef = React.useRef<number | null>(null);
+  
+  // Cleanup fast poll on unmount
+  React.useEffect(() => {
+    return () => {
+      fastPollActiveRef.current = false;
+      if (fastPollTimeoutRef.current) {
+        window.clearTimeout(fastPollTimeoutRef.current);
+        fastPollTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
+  // Start a short-lived 2s polling loop after TF boundary
+  const startFastPoll = React.useCallback(() => {
+    if (fastPollActiveRef.current) return; // already running
 
+    fastPollActiveRef.current = true;
+    const prevLastClosed = lastClosedTsRef.current || 0;
+    const startedAt = Date.now();
+    const MAX_FAST_MS = 60_000; // safety cap: 1 minute
+    const FAST_MS = 2000;       // 2s polling
 
-  // keep latest detectNow without re-creating scheduleOnce
+    const run = () => {
+      if (!fastPollActiveRef.current) return;
+
+      // Stop if Live turned off
+      if (!liveRef.current) {
+        fastPollActiveRef.current = false;
+        if (fastPollTimeoutRef.current) {
+          window.clearTimeout(fastPollTimeoutRef.current);
+          fastPollTimeoutRef.current = null;
+        }
+        return;
+      }
+
+      const curLast = lastClosedTsRef.current || 0;
+
+      // New bar detected ? stop fast polling
+      if (curLast > prevLastClosed) {
+        fastPollActiveRef.current = false;
+        if (fastPollTimeoutRef.current) {
+          window.clearTimeout(fastPollTimeoutRef.current);
+          fastPollTimeoutRef.current = null;
+        }
+        return;
+      }
+
+      // Safety: stop after 60s even if bar never comes
+      if (Date.now() - startedAt > MAX_FAST_MS) {
+        fastPollActiveRef.current = false;
+        if (fastPollTimeoutRef.current) {
+          window.clearTimeout(fastPollTimeoutRef.current);
+          fastPollTimeoutRef.current = null;
+        }
+        return;
+      }
+
+      // Fire a detect if nothing is running
+      if (!fetchingRef.current && detectNowRef.current) {
+        void detectNowRef.current("schedule");
+      }
+
+      fastPollTimeoutRef.current = window.setTimeout(run, FAST_MS);
+    };
+
+    fastPollTimeoutRef.current = window.setTimeout(run, FAST_MS);
+  }, []);
+
+  
   // keep latest detectNow without re-creating scheduleOnce
   const detectNowRef = React.useRef<null | ((src?: any, overrideCfg?: any) => Promise<void>)>(null);
  
 
 
   const scheduleOnce = React.useCallback((ms: number) => {
-    // clear any previous timer
-    if (timeoutRef.current) {
-      window.clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-    // clamp 1.2s..60s to avoid hammering
-    const wait = Math.max(1200, Math.min(ms || 0, 60_000));
-    const key = activeKeyRef.current;          // pin symbol|tf at schedule time
+  // clear any previous timer
+  if (timeoutRef.current) {
+    window.clearTimeout(timeoutRef.current);
+    timeoutRef.current = null;
+  }
 
-    timeoutRef.current = window.setTimeout(() => {
-      if (!liveRef.current) return;            // Live toggled off
-      if (activeKeyRef.current !== key) return;// user switched symbol/TF
-      const fn = detectNowRef.current;
-      if (fn) void fn("schedule");             // call latest detectNow
-    }, wait);
-  }, []);
+  // Never hammer; minimum 1.2s. We do NOT upper-clamp here;
+  // the caller (msUntilNext / retry logic) decides the max.
+  const wait = Math.max(1200, ms || 0);
+  const key = activeKeyRef.current; // pin symbol|tf at schedule time
+
+  timeoutRef.current = window.setTimeout(() => {
+    if (!liveRef.current) return;             // Live toggled off
+    if (activeKeyRef.current !== key) return; // user switched symbol/TF
+    const fn = detectNowRef.current;
+    if (fn) void fn("schedule");              // call latest detectNow
+  }, wait);
+}, []);
+
 
   const liveRef = React.useRef(live);
   React.useEffect(() => { liveRef.current = live; }, [live]);
@@ -1153,7 +1600,7 @@ React.useEffect(() => {
     } catch {}
   }
 }, [server?.broker]);
-// derived value you’ll use everywhere in the UI (prefer agent/preview broker)
+// derived value you ll use everywhere in the UI (prefer agent/preview broker)
 const displayBroker =
   normalizeBroker((server as any)?.preview?.broker ?? server?.broker ?? cachedBroker ?? getBrokerOverride()) ?? null;
 
@@ -1176,38 +1623,42 @@ React.useEffect(() => {
 
 
 useEffect(() => { saveCfg(cfg); }, [cfg]);
-// Passive preview auto-refresh (keeps last closed =60 candles up to date)
-// - Runs even when Live is off
-// - Uses the same detectNow("schedule") path (no overlapping calls)
-// - Refreshes on mount and every REFRESH_MS while the tab is visible
-useEffect(() => {
-  
-  return () => {};
-}, [cfg.symbol, cfg.trendTF]);
-
 
 // countdown ticker (for Next bar in)
 useEffect(() => {
-  if (!live || !nextAt) return;
-  const id = window.setInterval(() => {
+  const tick = () => {
     const nowMs = Date.now();
     setNow(nowMs);
-    const delta = nextAt.getTime() - nowMs;
 
-    if (delta <= 0) {
-      
-      window.clearInterval(id);
-      setNextAt(null);                               // disarm before fetch
-      if (timeoutRef.current) {                      // ensure no pending one-shot
-        window.clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
+    if (nextAt) {
+      const delta = nextAt.getTime() - nowMs;
+
+      if (delta <= 0) {
+        setNextAt(null);
+
+        if (timeoutRef.current) {
+          window.clearTimeout(timeoutRef.current);
+          timeoutRef.current = null;
+        }
+
+        if (liveRef.current && detectNowRef.current) {
+          // 1) Boundary fetch
+          void detectNowRef.current("boundary");
+          // 2) Start 2s fast polling until new lastClosedTs
+          startFastPoll();
+        }
       }
-      scheduleOnce(1200);                              // single re-arm to fetch new bar
-      return;
     }
-  }, 1000);
-  return () => window.clearInterval(id);
-}, [live, nextAt, scheduleOnce]);
+
+    tickRef.current = requestAnimationFrame(tick);
+  };
+
+  tickRef.current = requestAnimationFrame(tick);
+  return () => {
+    if (tickRef.current) cancelAnimationFrame(tickRef.current);
+  };
+}, [nextAt, startFastPoll]);
+
 
 // whenever serverNow/nextCloseTs change, set the absolute boundary
 useEffect(() => {
@@ -1221,12 +1672,19 @@ useEffect(() => {
 
 
 // helper: compute safe delay until next boundary (or backend hint)
+// helper: compute safe delay until next boundary (or backend hint)
 const msUntilNext = (resp: TrendResp, tfLabel: TfLabel) => {
   // Map timeframe label ? milliseconds (support a few aliases)
   const tfMap: Record<string, number> = {
-    M15: 15 * 60 * 1000,  H1: 60 * 60 * 1000,  H4: 4 * 60 * 60 * 1000,
-    "15M": 15 * 60 * 1000, "1H": 60 * 60 * 1000, "4H": 4 * 60 * 60 * 1000,
-    "15m": 15 * 60 * 1000, "1h": 60 * 60 * 1000, "4h": 4 * 60 * 60 * 1000,
+    M15: 15 * 60 * 1000,
+    H1: 60 * 60 * 1000,
+    H4: 4 * 60 * 60 * 1000,
+    "15M": 15 * 60 * 1000,
+    "1H": 60 * 60 * 1000,
+    "4H": 4 * 60 * 1000 * 60,
+    "15m": 15 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "4h": 4 * 60 * 60 * 1000,
   };
 
   // Derive TF strictly from label; default to H1 if unknown
@@ -1236,55 +1694,83 @@ const msUntilNext = (resp: TrendResp, tfLabel: TfLabel) => {
   const next = Number(resp?.nextCloseTs ?? 0);
   const last = Number(resp?.lastClosedTs ?? 0);
 
-  // clamp helper: min 2s, max 1.5× TF
-  const clamp = (ms: number) => Math.max(2000, Math.min(ms, Math.round(1.5 * tfMs)));
+  // clamp helper: min 2s, max 1.5 TF
+  const clamp = (ms: number) =>
+    Math.max(2000, Math.min(ms, Math.round(1.5 * tfMs)));
 
-  // 1) backend-provided next boundary wins
-  if (next > now) return clamp(next - now);
-
-  // 2) otherwise, step from lastClosedTs by one TF
-  if (last > 0) {
-    const cand = last + tfMs;
-    if (cand > now) return clamp(cand - now);
+  // 1) If backend gives us a nextCloseTs
+  if (next > 0) {
+    if (next > now) {
+      // Normal: we are before the close ? sleep until boundary
+      return clamp(next - now);
+    } else {
+      // We are already past the reported boundary but apparently
+      // still showing the previous bar (agent/backend catching up).
+      // ? short warm retry so we don't lag a full TF behind.
+      return 5_000; // 5 seconds
+    }
   }
 
-  // 3) otherwise, align from "now" to the next TF slot
+  // 2) Fallback: no nextCloseTs, derive from lastClosedTs
+  if (last > 0) {
+    const cand = last + tfMs;
+    if (cand > now) {
+      return clamp(cand - now);
+    }
+    // already past last+TF ? lagging, use warm retry
+    return 5_000;
+  }
+
+  // 3) Last resort: align from "now" to the next TF slot
   const slot = Math.floor(now / tfMs) * tfMs + tfMs;
   return clamp(slot - now);
 };
 
-useEffect(() => () => {
-  if (tickRef.current) cancelAnimationFrame(tickRef.current);
-  if (timeoutRef.current) window.clearTimeout(timeoutRef.current);
+useEffect(() => {
+  return () => {
+    if (tickRef.current) {
+      cancelAnimationFrame(tickRef.current);
+    }
+    if (timeoutRef.current) {
+      window.clearTimeout(timeoutRef.current);
+    }
+  };
 }, []);
 
   const detectNow = async (
   source: "manual" | "schedule" | "boundary" = "manual",
   overrideCfg?: any
 ) => {
-  
+  const isManual = source === "manual";
+
   // ignore non-manual calls if not live
-  if (!live && source !== "manual") return;
-  if (fetchingRef.current) return;           // prevent overlap
+  if (!live && !isManual) return;
+
+  // prevent overlap
+  if (fetchingRef.current) return;
   fetchingRef.current = true;
 
-  setLoading(true);
-  setError(null);
-
-  const base = overrideCfg ?? cfg;
-  const safe = clampCfg(base);
-
-  // On manual start, pin key and enable Live
-  if (source === "manual") {
-    setLive(true);
-    activeKeyRef.current = `${safe.symbol}|${safe.trendTF}`;
+  if (isManual) {
+    setLoading(true);
+    setError(null);
   }
 
-  // Ignore if selection changed mid-flight
-  const currentKey = `${safe.symbol}|${safe.trendTF}`;
-
   try {
-    const tfParam = safe.trendTF === "15m" ? "M15" : safe.trendTF === "1h" ? "H1" : "H4";
+    const base = overrideCfg ?? cfg;
+    const safe = clampCfg(base);
+
+    // On manual start, pin key and enable Live
+    if (isManual) {
+      setLive(true);
+      activeKeyRef.current = `${safe.symbol}|${safe.trendTF}`;
+    }
+
+    const currentKey = `${safe.symbol}|${safe.trendTF}`;
+
+    const tfParam =
+      safe.trendTF === "15m" ? "M15" :
+      safe.trendTF === "1h"  ? "H1"  : "H4";
+
     const qp = new URLSearchParams({
       symbol: safe.symbol,
       tf: tfParam,
@@ -1301,18 +1787,27 @@ useEffect(() => () => {
     qp.set("maSlow", String(safe.ma?.slow ?? 20));
 
     const url = `/_api/trend/state2?${qp.toString()}`;
-    const res = await fetch(url, { headers: { Accept: "application/json" }, credentials: "include" });
+    const res = await fetch(url, {
+      headers: { Accept: "application/json" },
+      credentials: "include",
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const j = await res.json();
 
     // If user switched symbol/TF while we fetched, bail & schedule a gentle retry
     if (activeKeyRef.current && activeKeyRef.current !== currentKey) {
-      setLoading(false);
+      if (isManual) setLoading(false);
       fetchingRef.current = false;
+
       if (timeoutRef.current) window.clearTimeout(timeoutRef.current);
       const hint = Number(j?.pollAfterMs ?? 0);
-      scheduleOnce(Math.max(1500, Math.min(hint > 0 ? hint : warmRetryMsRef.current, 30000)));
+      scheduleOnce(
+        Math.max(
+          1500,
+          Math.min(hint > 0 ? hint : warmRetryMsRef.current, 30000)
+        )
+      );
       warmRetryMsRef.current = Math.min(warmRetryMsRef.current * 2, 30000);
       return;
     }
@@ -1320,41 +1815,41 @@ useEffect(() => () => {
     // State & broker
     setState(j);
     setServer(j);
-    setUsingDevice(((j as any)?.usingDevice as string) ?? ((j as any)?.preview?.broker?.device_id as string) ?? null);
-    setBroker(normalizeBroker(j?.preview?.broker ?? j?.broker) ?? getBrokerOverride());
-    setError(null);
-    // --- re-arm next fetch from server anchors (serverNow/nextCloseTs) ---
-    const now  = Number(j?.serverNow ?? 0);
-    const next = Number(j?.nextCloseTs ?? 0);
-    const hint = Number(j?.pollAfterMs ?? 0);
+    setUsingDevice(
+      ((j as any)?.usingDevice as string) ??
+      ((j as any)?.preview?.broker?.device_id as string) ??
+      null
+    );
+    setBroker(
+      normalizeBroker(j?.preview?.broker ?? j?.broker) ?? getBrokerOverride()
+    );
+    if (isManual) setError(null);
 
-    // prefer exact server boundary; fallback to server hint
-    if (Number.isFinite(now) && Number.isFinite(next) && next > now) {
-      scheduleOnce(Math.max(0, next - now) + 250);
-    } else if (hint > 0) {
-      scheduleOnce(hint);
-    }
-
-
-    // compute skew (serverNow - clientNow)
     const clientNow = Date.now();
-    const serverNowMs = typeof j?.serverNow === "number" ? j.serverNow : clientNow;
+    const serverNowMs =
+      typeof j?.serverNow === "number" ? j.serverNow : clientNow;
     skewRef.current = serverNowMs - clientNow;
 
     // local TF (prefer server tf_ms)
     const tfMsLocal =
       j?.tf_ms ??
-      ((safe.trendTF === "15m" ? 15 : safe.trendTF === "1h" ? 60 : 240) * 60 * 1000);
+      ((safe.trendTF === "15m" ? 15 : safe.trendTF === "1h" ? 60 : 240) *
+        60 *
+        1000);
 
     // Normalize warming if preview bars already exist
     const hasPreview =
-      Array.isArray(j?.preview) ? j.preview.length > 0
-      : Array.isArray(j?.preview?.bars) ? j.preview.bars.length > 0
-      : false;
-    if (j?.warming && hasPreview) j.warming = false;
+      Array.isArray(j?.preview)
+        ? j.preview.length > 0
+        : Array.isArray(j?.preview?.bars)
+        ? j.preview.bars.length > 0
+        : false;
+
+    if (j?.warming && hasPreview) {
+      j.warming = false;
+    }
 
     // Merge local override into broker meta only if server omits pieces
-    // Merge local override; let override WIN (so a correct +120 beats stale +330)
     const ov = getBrokerOverride();
     if (ov && (ov.tz_name || Number.isFinite(ov.tz_offset_min))) {
       j.broker = { ...(j.broker || {}), ...ov };
@@ -1362,8 +1857,6 @@ useEffect(() => () => {
       j.broker = j.broker ?? null;
     }
 
-
-    
     // ---------- WARMING ----------
     if (j?.warming) {
       setNotice(j.message || "Warming up - awaiting bars from agent");
@@ -1371,24 +1864,32 @@ useEffect(() => () => {
 
       // Prefer broker last closed candle close time; fallback to serverNow
       const lastClosedCloseMs =
-        typeof j?.lastClosedTs === "number" ? j.lastClosedTs
-        : (typeof j?.lastClosedTS === "number" ? j.lastClosedTS : 0);
+        typeof j?.lastClosedTs === "number"
+          ? j.lastClosedTs
+          : typeof j?.lastClosedTS === "number"
+          ? j.lastClosedTS
+          : 0;
       const lastUpdatedMs = lastClosedCloseMs || serverNowMs;
 
       setLastUpdated(new Date(lastUpdatedMs));
-      setLastUpdatedLabel(formatInBrokerTZ(lastUpdatedMs, displayBroker));
+      setLastUpdatedLabel(
+        formatInBrokerTZ(lastUpdatedMs, displayBroker)
+      );
       setUsingDevice(j?.usingDevice ?? null);
 
       let nextCloseMs =
-        typeof j?.nextCloseTs === "number" ? j.nextCloseTs
-        : (Math.floor(serverNowMs / tfMsLocal) + 1) * tfMsLocal;
+        typeof j?.nextCloseTs === "number"
+          ? j.nextCloseTs
+          : (Math.floor(serverNowMs / tfMsLocal) + 1) * tfMsLocal;
       if (nextCloseMs - serverNowMs < 1000) nextCloseMs += tfMsLocal;
       setNextAtLabel(formatInBrokerTZ(nextCloseMs, displayBroker));
       setNextAt(new Date(nextCloseMs));
 
       // Optional verify (kept noop if disabled)
       try {
-        const lastClosedOpenMs = lastClosedCloseMs ? lastClosedCloseMs - tfMsLocal : 0;
+        const lastClosedOpenMs = lastClosedCloseMs
+          ? lastClosedCloseMs - tfMsLocal
+          : 0;
         if (ENABLE_BROKER_VERIFY && lastClosedOpenMs) {
           await verifyLastBarAgainstBrokerSafely({
             symbol: safe.symbol ?? "XAUUSD",
@@ -1397,12 +1898,22 @@ useEffect(() => () => {
             set: setBrokerCheck,
           });
         }
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
 
       // schedule guarded retry (hint or backoff)
       const hint = Number(j?.pollAfterMs ?? 0);
-      scheduleOnce(Math.max(1500, Math.min(hint > 0 ? hint : warmRetryMsRef.current, 30000)));
-      warmRetryMsRef.current = Math.min(warmRetryMsRef.current * 2, 30000);
+      const retryMs = Math.max(
+        1500,
+        Math.min(hint > 0 ? hint : warmRetryMsRef.current, 30000)
+      );
+      scheduleOnce(retryMs);
+      warmRetryMsRef.current = Math.min(
+        warmRetryMsRef.current * 2,
+        30000
+      );
+
       return;
     }
 
@@ -1413,24 +1924,35 @@ useEffect(() => () => {
 
     // Prefer broker last closed candle time; fallback to serverNow
     const lastClosedCloseMs =
-      typeof j?.lastClosedTs === "number" ? j.lastClosedTs
-      : (typeof j?.lastClosedTS === "number" ? j.lastClosedTS : 0);
+      typeof j?.lastClosedTs === "number"
+        ? j.lastClosedTs
+        : typeof j?.lastClosedTS === "number"
+        ? j.lastClosedTS
+        : 0;
     const lastUpdatedMs = lastClosedCloseMs || serverNowMs;
+
+    // Track lastClosedTs across calls so we can detect "no rotation" at boundary
+    const prevLastClosed = lastClosedTsRef.current || 0;
+    if (lastClosedCloseMs && lastClosedCloseMs > prevLastClosed) {
+      lastClosedTsRef.current = Math.max(prevLastClosed, lastClosedCloseMs);
+    }
 
     setLastUpdated(new Date(lastUpdatedMs));
     setLastUpdatedLabel(formatInBrokerTZ(lastUpdatedMs, displayBroker));
     setUsingDevice(j?.usingDevice ?? null);
-
     let nextCloseMs =
-      typeof j?.nextCloseTs === "number" ? j.nextCloseTs
-      : (Math.floor(serverNowMs / tfMsLocal) + 1) * tfMsLocal;
+      typeof j?.nextCloseTs === "number"
+        ? j.nextCloseTs
+        : (Math.floor(serverNowMs / tfMsLocal) + 1) * tfMsLocal;
     if (nextCloseMs - serverNowMs < 1000) nextCloseMs += tfMsLocal;
     setNextAtLabel(formatInBrokerTZ(nextCloseMs, displayBroker));
     setNextAt(new Date(nextCloseMs));
 
     // Optional verify
     try {
-      const lastClosedOpenMs = lastClosedCloseMs ? lastClosedCloseMs - tfMsLocal : 0;
+      const lastClosedOpenMs = lastClosedCloseMs
+        ? lastClosedCloseMs - tfMsLocal
+        : 0;
       if (ENABLE_BROKER_VERIFY && lastClosedOpenMs) {
         await verifyLastBarAgainstBrokerSafely({
           symbol: safe.symbol ?? "XAUUSD",
@@ -1439,22 +1961,60 @@ useEffect(() => () => {
           set: setBrokerCheck,
         });
       }
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
 
-    // --- schedule ONCE at the correct boundary/backoff ---
-    scheduleOnce(msUntilNext(j, cfg.trendTF as TfLabel));
+    // --- schedule ONCE with "boundary warm retry" logic ---
+    if (liveRef.current) {
+      let nextMs: number;
+
+      // Did this call come from the boundary countdown?
+      const isBoundary = source === "boundary";
+
+      // If we hit exactly at boundary but lastClosedTs did NOT advance,
+      // backend/agent is still catching up ? use a short warm retry.
+      const unchangedAtBoundary =
+        isBoundary &&
+        lastClosedCloseMs > 0 &&
+        prevLastClosed > 0 &&
+        lastClosedCloseMs <= prevLastClosed;
+
+      if (unchangedAtBoundary) {
+        // Candle should have closed but lastClosedTs did not move:
+        // start a short 2s fast-poll loop to catch the new bar quickly.
+        startFastPoll();
+
+        // Also schedule the next *normal* boundary so long-term live keeps working
+        nextMs = msUntilNext(j, safe.trendTF as TfLabel);
+      } else {
+        // Normal behaviour: sleep until the real next boundary
+        nextMs = msUntilNext(j, safe.trendTF as TfLabel);
+      }
+
+      scheduleOnce(nextMs);
+    }
+
 
   } catch (e: any) {
-    setError(e?.message || "Failed to detect trend");
+    if (isManual) {
+      setError(e?.message || "Failed to detect trend");
+    } else {
+      console.warn("detectNow background error:", e);
+    }
     // backoff retry
     scheduleOnce(warmRetryMsRef.current);
-    warmRetryMsRef.current = Math.min(warmRetryMsRef.current * 2, 30000);
+    warmRetryMsRef.current = Math.min(
+      warmRetryMsRef.current * 2,
+      30000
+    );
   } finally {
     fetchingRef.current = false;
-    setLoading(false);
+    if (isManual) {
+      setLoading(false);
+    }
   }
 };
-
 
 
      
@@ -1562,8 +2122,8 @@ const maPreview = React.useMemo(() => {
 
 
 
-// Derive reversal threshold as a PERCENT (either from ATR× or fixed %)
-// ---- ATR% × K threshold (always in percent) ----
+// Derive reversal threshold as a PERCENT (either from ATR  or fixed %)
+// ---- ATR%   K threshold (always in percent) ----
 const thresholdPct = React.useMemo(() => {
   // use ATR mode only when selected
   const mode = (cfg?.swings?.mode ?? "atr") as "atr" | "percent";
@@ -1571,7 +2131,7 @@ const thresholdPct = React.useMemo(() => {
     return Number(cfg?.swings?.pivotPct ?? 0.40); // e.g., 0.40 = 0.40%
   }
 
-  // ATR% × K
+  // ATR%   K
   const closes = previewBars.map(b => b.c).filter(Number.isFinite);
   if (!closes.length) return 0.40;
 
@@ -1591,7 +2151,7 @@ const thresholdPct = React.useMemo(() => {
   for (let i = 1; i < trs.length; i++) rma = rma * (1 - alpha) + trs[i] * alpha;
 
   const atrPct = (rma / refClose) * 100;     // ATR% of price
-  return atrPct * k;                          // ATR% × K (your slider)
+  return atrPct * k;                          // ATR%   K (your slider)
 }, [cfg?.swings?.mode, cfg?.swings?.pivotPct, cfg?.swings?.kTrend, previewBars]);
 
 // backstep comes from UI config (min bars between pivots)
@@ -1659,7 +2219,7 @@ const tfMs = React.useMemo(() => {
       ? formatBrokerWall(lastSessionTsMs)
       : server?.server_now_ms != null
       ? formatInBrokerTZ(server.server_now_ms, brokerMeta)
-      : "—";
+      : " ";
 
 
 
@@ -1696,7 +2256,7 @@ const tfMs = React.useMemo(() => {
               <p className="text-slate-400 text-sm mt-1">Uses your settings below. Badge reflects the last closed {cfg.trendTF.toUpperCase()} bar.</p>
             </div>
             <div className="flex items-center gap-2">
-              <button onClick={onPrimary} disabled={loading} className="h-10 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60">{loading?"Detecting…":primaryLabel}</button>
+              <button onClick={onPrimary} disabled={loading} className="h-10 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60">{loading?"Detecting ":primaryLabel}</button>
               <button onClick={secondary.action} className="h-10 px-4 rounded-xl border border-slate-600/60 bg-slate-800/40 hover:bg-slate-800/60">{secondary.label}</button>
               <label className="flex items-center gap-2 text-xs text-slate-400 pl-2">
                 <input
@@ -1705,7 +2265,7 @@ const tfMs = React.useMemo(() => {
                   checked={showPivots}
                   onChange={(e) => setShowPivots(e.target.checked)}
                 />
-                Zigzag pivots
+                Structure
               </label>
 
             </div>
@@ -1826,7 +2386,7 @@ const tfMs = React.useMemo(() => {
   const lastUpdatedLabel =
     brokerMeta && wallMs && Number.isFinite(wallMs)
       ? formatBrokerWall(wallMs) // ms is already broker wall-time here
-      : "—";
+      : " ";
 
 
   return (
@@ -1849,7 +2409,7 @@ const tfMs = React.useMemo(() => {
       <div className="text-center font-semibold tabular-nums text-slate-300">
         Next bar in:{" "}
         <span className="inline-block min-w-[5ch]">
-          {live && nextAt ? fmtCountdown(nextInMs) : "—"}
+          {live && nextAt ? fmtCountdown(nextInMs) : " "}
         </span>
       </div>
 
@@ -1876,7 +2436,7 @@ const tfMs = React.useMemo(() => {
 {brokerCheck.kind !== "idle" && (
   <div className="mt-2 text-xs">
     {brokerCheck.kind === "checking" && (
-      <span className="text-slate-400">Broker check…</span>
+      <span className="text-slate-400">Broker check </span>
     )}
     {brokerCheck.kind === "aligned" && (
       <span className="text-emerald-300">Broker OHLC aligned.</span>
@@ -1889,7 +2449,7 @@ const tfMs = React.useMemo(() => {
     {brokerCheck.kind === "mismatch" && (
       <span className="text-rose-300">
         Mismatch @ {formatInBrokerTZ(brokerCheck.t * 1000, broker)}
-        {brokerCheck.fields.map((f) => `${f.field}:${f.app}?${f.broker}`).join(" · ")}
+        {brokerCheck.fields.map((f) => `${f.field}:${f.app}?${f.broker}`).join("   ")}
       </span>
     )}
     {brokerCheck.kind === "error" && (
@@ -1947,24 +2507,50 @@ const tfMs = React.useMemo(() => {
 
 </div>
 
-        {/* ===== Preview ===== */}
+{/* ===== Preview ===== */}
 <Panel title="Preview">
   {hasBars ? (
     <MiniCandleChart
       bars={previewBars}
       broker={brokerMeta}
+      height={280}
       maPreview={maPreview}
       tfMs={tfMs}
       pivots={pivots}
       showPivots={showPivots}
+	      overlays={(() => {
+        const base: any =
+          (server as any)?.preview?.overlays ??
+          (server as any)?.preview?.overlay ??
+          (server as any)?.preview ??
+          (server as any)?.chart?.overlays ??
+          (server as any)?.chart?.overlay ??
+          (server as any)?.chart ??
+          (server as any)?.overlays ??
+          (server as any)?.overlay ??
+          null;
+
+        // Inject the exact SR payload used by Pulse cards/banner.
+        // This lets the preview chart read the same SR source (server.sr),
+        // instead of relying on sr_zones (which can differ).
+        const sr_payload: any = (server as any)?.sr ?? null;
+        const sr_summary: any = (server as any)?.sr_summary ?? null;
+
+        return {
+          ...(base && typeof base === "object" ? base : {}),
+          __sr_payload: sr_payload,
+          __sr_summary: sr_summary,
+        };
+      })()}
+
     />
   ) : isLoadingPreview ? (
     <div className="aspect-[16/9] w-full rounded-xl bg-slate-950/60 border border-slate-800/60 grid place-items-center">
-      <div className="text-slate-500 text-sm">Loadingâ€¦</div>
+      <div className="text-slate-500 text-sm">Loading</div>
     </div>
   ) : (
     <div className="aspect-[16/9] w-full rounded-xl bg-slate-950/60 border border-slate-800/60 grid place-items-center">
-      <div className="text-slate-500 text-sm">No preview yet â€” click Detect Trend</div>
+      <div className="text-slate-500 text-sm">No preview yet  click Detect Trend</div>
     </div>
   )}
 
@@ -1978,14 +2564,14 @@ const tfMs = React.useMemo(() => {
             previewBars[previewBars.length - 1];
 
           const from = first
-            ? formatInBrokerTZ(first.t_open_ms, brokerMeta)
+            ? formatBrokerWall(first.t_open_ms)
             : "";
           const to =
             lastComplete && lastComplete.t_close_ms
-              ? formatInBrokerTZ(lastComplete.t_close_ms, brokerMeta)
+              ? formatBrokerWall(lastComplete.t_close_ms)
               : "";
 
-          return from && to ? <> • Window: {from} · {to}</> : null;
+          return from && to ? <>  Window: {from}  {to}</> : null;
         })()
       : ""}
   </div>
@@ -1999,7 +2585,7 @@ const tfMs = React.useMemo(() => {
         {/* ===== Controls: Devices-style Cards ===== */}
 <div className="mt-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 items-stretch">
 
-  {/* Card — Regime */}
+  {/* Card   Regime */}
 <Panel
   title="Regime"
   right={
@@ -2081,7 +2667,7 @@ const tfMs = React.useMemo(() => {
 </Panel>
 
 
-  {/* Card — Slope */}
+  {/* Card   Slope */}
   <Panel title="Slope" className="h-full">
     <div className="grid grid-cols-2 gap-3">
       <div>
@@ -2108,7 +2694,7 @@ const tfMs = React.useMemo(() => {
     </div>
   </Panel>
 
-  {/* Card — Structure (Swings) */}
+  {/* Card   Structure (Swings) */}
   <Panel title="Structure (Swings)" className="h-full">
     <div className="grid grid-cols-2 gap-3">
       {/* Detector */}
@@ -2132,7 +2718,7 @@ const tfMs = React.useMemo(() => {
             checked={(cfg.swings.mode ?? "atr") === "atr"}
             onChange={() => applySetting({ ...cfg, swings: { ...cfg.swings, mode: "atr" as const } })}
           />
-          ATR×
+          ATR 
         </label>
         <label className="flex items-center gap-2">
           <input
@@ -2144,10 +2730,10 @@ const tfMs = React.useMemo(() => {
         </label>
       </div>
 
-      {/* ZigZag ATR× (Trend TF) */}
+      {/* ZigZag ATR  (Trend TF) */}
       <div className="col-span-2">
         <label className="text-xs text-slate-400 flex justify-between">
-          <span>ZigZag ATR× (Trend TF)</span>
+          <span>ZigZag ATR  (Trend TF)</span>
           <span className="text-slate-300">{Number(cfg.swings.kTrend).toFixed(2)}</span>
         </label>
         <input
@@ -2189,7 +2775,7 @@ const tfMs = React.useMemo(() => {
     </div>
   </Panel>
 
-  {/* Card — Strength & Thresholds */}
+  {/* Card   Strength & Thresholds */}
   <Panel title="Strength & Thresholds" className="h-full">
     <div className="grid grid-cols-3 gap-3">
       {/* ADX Period */}

@@ -124,6 +124,16 @@ def _decode(b):
 def _hkey(dev_id: str) -> str:
     return f"{DEVICE_PREFIX}{dev_id}"
 
+# ---- MT5 command queue (device pulls) -----------------------------------------
+
+def _mt5_cmdq_key(dev_id: str) -> str:
+    return f"xtl:mt5:cmdq:{dev_id}"
+
+
+def _mt5_ack_key(job_id: str) -> str:
+    job_id = (job_id or "").strip()
+    return f"xtl:mt5:ack:{job_id}"
+
 def _redis_device_state(dev_id: str) -> dict:
     """Return a merged device dict with normalized heartbeat timestamps."""
     h = R.hgetall(_hkey(dev_id)) or {}
@@ -476,6 +486,156 @@ from typing import List, Optional, Annotated
 from pydantic import BaseModel
 from fastapi import APIRouter, Body, Header, HTTPException
 
+class Mt5AckPayload(BaseModel):
+    job_id: str
+    ok: bool = True
+    error: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+    # NEW: preserve who this ack belongs to
+    user_id: Optional[str] = None
+    model_config = ConfigDict(extra="ignore")
+
+
+@r.get("/{dev_id}/mt5/next")
+def mt5_next(
+    dev_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    # device auth (same style as post_ohlc)
+    token = ""
+    if authorization:
+        parts = authorization.split()
+        token = parts[-1] if parts else authorization.strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing token")
+    _assert_device_token(dev_id, token)
+
+    try:
+        raw = R.lpop(_mt5_cmdq_key(dev_id))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"redis_error:{type(e).__name__}")
+
+    if not raw:
+        return {"ok": True, "cmd": None}
+
+    try:
+        cmd = json.loads(raw)
+    except Exception:
+        cmd = {"type": "unknown", "raw": raw}
+
+    return {"ok": True, "cmd": cmd}
+
+
+@r.post("/{dev_id}/mt5/ack")
+def mt5_ack(
+    dev_id: str,
+    payload: Mt5AckPayload,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+):
+    token = ""
+    if authorization:
+        parts = authorization.split()
+        token = parts[-1] if parts else authorization.strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing token")
+    _assert_device_token(dev_id, token)
+
+    job_id = (payload.job_id or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="missing job_id")
+    owner = (payload.user_id or (payload.result or {}).get("user_id") or "").strip()
+
+    ack = {
+        "job_id": job_id,
+        "ok": bool(payload.ok),
+        "error": payload.error,
+        "result": payload.result or {},
+        "user_id": owner,
+        "acked_at_ms": int(time.time() * 1000),
+    }
+
+    try:
+       # ack by job_id (1 hour)
+       R.setex(_mt5_ack_key(job_id), 3600, json.dumps(ack))
+
+       # ALSO store per-device+job (1 hour) ? super useful for debugging
+       R.setex(f"xtl:mt5:ack:{dev_id}:{job_id}", 3600, json.dumps(ack))
+
+       # last ack by device (1 day)
+       R.setex(f"xtl:mt5:last_ack:{dev_id}", 86400, json.dumps(ack))
+    except Exception as e:
+       raise HTTPException(status_code=503, detail=f"redis_error:{type(e).__name__}")
+
+    return {"ok": True}
+
+@r.get("/{dev_id}/mt5/ack/{job_id}")
+def mt5_get_ack(
+    dev_id: str,
+    job_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    token = ""
+    if authorization:
+        parts = authorization.split()
+        token = parts[-1] if parts else authorization.strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing token")
+    _assert_device_token(dev_id, token)
+
+    jid = (job_id or "").strip()
+    if not jid:
+        raise HTTPException(status_code=400, detail="missing job_id")
+
+    try:
+        raw = R.get(_mt5_ack_key(jid))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"redis_error:{type(e).__name__}")
+
+    if not raw:
+        return {"ok": True, "ack": None}
+
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+        ack = json.loads(raw)
+    except Exception:
+        ack = {"raw": raw}
+
+    return {"ok": True, "ack": ack}
+
+
+@r.get("/{dev_id}/mt5/last-ack")
+def mt5_last_ack(
+    dev_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    token = ""
+    if authorization:
+        parts = authorization.split()
+        token = parts[-1] if parts else authorization.strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing token")
+    _assert_device_token(dev_id, token)
+
+    try:
+        raw = R.get(f"xtl:mt5:last_ack:{dev_id}")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"redis_error:{type(e).__name__}")
+
+    if not raw:
+        return {"ok": True, "ack": None}
+
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+        ack = json.loads(raw)
+    except Exception:
+        ack = {"raw": raw}
+
+    return {"ok": True, "ack": ack}
+
+
 
 
 class OhlcBar(BaseModel):
@@ -489,6 +649,16 @@ class OhlcBar(BaseModel):
     # make sure we never reject unknown/extra fields
     model_config = ConfigDict(extra="ignore")
 
+class Mt5CmdResp(BaseModel):
+    ok: bool = True
+    cmd: Optional[dict] = None
+
+class Mt5AckReq(BaseModel):
+    job_id: str
+    ok: bool = True
+    result: dict = {}
+
+
 class OhlcPayload(BaseModel):
     symbol: str
     timeframe: str
@@ -497,6 +667,9 @@ class OhlcPayload(BaseModel):
     bars: List[OhlcBar]
     broker: Optional[Dict[str, Any]] = None
     # tolerate extra top-level keys like device_id
+    account: Optional[Dict[str, Any]] = None
+    terminal: Optional[Dict[str, Any]] = None
+    
     model_config = ConfigDict(extra="ignore")
 
 
@@ -510,10 +683,29 @@ except Exception:
 
 @r.post("/{dev_id}/ohlc", summary="Ingest OHLC from agent")
 def post_ohlc(
+
     dev_id: str,
     payload: Annotated[OhlcPayload, Body(...)],
     authorization: Optional[str] = Header(default=None),
 ):
+    try:
+        # payload may be Pydantic model OR dict; log both safely
+        if hasattr(payload, "dict"):
+            p = payload.dict()
+        elif isinstance(payload, dict):
+            p = payload
+        else:
+            p = None
+
+        log.error(
+            "POST_OHLC PAYLOAD dev_id=%s payload_type=%s keys=%s",
+            dev_id,
+            type(payload).__name__,
+            list(p.keys()) if isinstance(p, dict) else None,
+        )
+    except Exception:
+        log.exception("POST_OHLC PAYLOAD log failed dev_id=%s", dev_id)
+
     import os, json, time
 
     # --- breadcrumbs: prove route is hit ---
@@ -549,21 +741,58 @@ def post_ohlc(
         log.info(f"[OHLC] token verify error (continuing): {e}")
         owner_id = None
 
+    
     # --- persist minimal device facts (non-fatal) ---
     try:
-        last_t = payload.bars[-1].t if payload.bars else 0
         now_ms = int(time.time() * 1000)
-        R.hset(_hkey(dev_id), mapping={
-            "last_ohlc_symbol": payload.symbol,
-            "last_ohlc_tf": (payload.timeframe or "").upper(),
-            "last_ohlc_count": str(getattr(payload, "count", len(payload.bars or []))),
-            "last_ohlc_t": str(last_t),
-            "last_ohlc_written_at": str(now_ms),
-        })
+
+        # derive from normalized payload dict (never from attributes)
+        p = payload.dict() if hasattr(payload, "dict") else payload if isinstance(payload, dict) else {}
+        bars_p = p.get("bars") or []
+
+        last_t = 0
+        if isinstance(bars_p, list) and bars_p:
+            b_last = bars_p[-1]
+            # prefer explicit ms fields, fallback to seconds
+            last_t = (
+                b_last.get("t_open_ms")
+                or b_last.get("t")
+                or 0
+            )
+
+        R.hset(
+            _hkey(dev_id),
+            mapping={
+                "last_ohlc_symbol": p.get("symbol"),
+                "last_ohlc_tf": (p.get("timeframe") or "").upper(),
+                "last_ohlc_count": str(p.get("count", len(bars_p))),
+                "last_ohlc_t": str(int(last_t)),
+                "last_ohlc_written_at": str(now_ms),
+            },
+        )
         R.expire(_hkey(dev_id), 600)
     except Exception:
         pass
 
+    # --- SAFETY NET: Treat OHLC as heartbeat (prevents offline during heavy work / market closed) ---
+    try:
+        now_sec = int(time.time())
+        now_ms = now_sec * 1000
+        R.hset(_hkey(dev_id), mapping={
+            "status": "online",
+            "last_heartbeat": str(now_sec),
+            "last_heartbeat_ms": str(now_ms),
+            "last_heartbeat_iso": datetime.utcfromtimestamp(now_sec).isoformat() + "Z",
+        })
+        R.expire(_hkey(dev_id), 600)
+
+        # optional debug breadcrumb (helps prove this path runs)
+        R.setex(f"xtl:debug:last_hb:{dev_id}", 300, str(now_ms))
+    except Exception:
+        pass
+
+    
+    
     # Also track membership set for hydration
     try:
         if owner_id:
@@ -632,6 +861,8 @@ def post_ohlc(
 
         bars_sec: list[dict] = []
         last_close_ms_seen = 0
+        last_open_ms_for_last_close = 0
+        last_close_px = None
 
         for b in payload.bars:
             # prefer explicit ms fields if present (agent may send them)
@@ -652,10 +883,157 @@ def post_ohlc(
 
             if t_close_ms > last_close_ms_seen:
                 last_close_ms_seen = t_close_ms
-
+                last_open_ms_for_last_close = t_open_ms
+                try:
+                   last_close_px = float(getattr(b, "c", 0.0))
+                except Exception:
+                   last_close_px = None
         # trim to a sane maximum (defensive)
         if len(bars_sec) > 1000:
             bars_sec = bars_sec[-1000:]
+        # -------------------------------
+        # NEW: validate bars before overwriting snapshots
+        # Prevent SR flicker when MT5 fetch returns short/dirty series during reconnect.
+        # -------------------------------
+        def _is_ok_bar(d: dict) -> bool:
+            try:
+                o = float(d.get("o", 0.0))
+                h = float(d.get("h", 0.0))
+                l = float(d.get("l", 0.0))
+                c = float(d.get("c", 0.0))
+                t = int(d.get("t", 0))
+                if t <= 0:
+                    return False
+                if not (o > 0 and h > 0 and l > 0 and c > 0):
+                    return False
+                if h < l:
+                    return False
+                return True
+            except Exception:
+                return False
+
+        valid_bars = [d for d in bars_sec if _is_ok_bar(d)]
+
+        MIN_BARS_BY_TF = {
+            "H1": 120,   # ~5 days of H1 bars
+            "H4": 80,    # ~13 days of H4 bars
+            "M15": 200,
+            "M5": 300,
+            "M1": 240,
+            "D1": 30,
+        }
+        min_bars = int(MIN_BARS_BY_TF.get(tf, 80))
+
+        # If series is too short/dirty, DO NOT overwrite last-good snaps
+        if len(valid_bars) < min_bars:
+            try:
+                R.setex(
+                    f"xtl:debug:ohlc:{dev_id}:skip_short",
+                    600,
+                    f"sym={sym} tf={tf} raw={len(bars_sec)} valid={len(valid_bars)} min={min_bars}",
+                )
+            except Exception:
+                pass
+
+            log.warning(
+                "[OHLC] skip overwrite snaps sym=%s tf=%s raw=%s valid=%s min=%s (kept last-good)",
+                sym, tf, len(bars_sec), len(valid_bars), min_bars,
+            )
+            return {"ok": True, "received": len(payload.bars or []), "snap": "skip-short"}
+
+        # use validated bars from here onward
+        bars_sec = valid_bars
+
+        # ==================================================
+        # ==================================================
+        # PHASE 2: WS PRICE PUBLISH + CACHE (JSON)
+        # ==================================================
+        # 
+        # Publishes: xtl:pub:price:{owner_id}
+        # Caches:    xtl:price:{dev_id}:{SYMBOL}  (preferred)
+        #            xtl:price:{SYMBOL}           (fallback)
+        # Value:     {"price": <float>, "ts_ms": <int>}
+        # ts_ms must be LAST CLOSED BAR CLOSE TIME (not server time)
+        
+        # ==================================================
+        # ==================================================
+        # PHASE 2: WS PRICE PUBLISH + CACHE (FINAL, SAFE)
+        # ==================================================
+        try:
+            if isinstance(bars_sec, list) and bars_sec:
+                sym_u = (sym or "").upper().strip()
+
+                # last CLOSED bar close
+                # Choose ONE meaning and keep it consistent:
+                # If you want MT5 candle label time -> OPEN time:
+                try:
+                    live_px = float(last_close_px) if last_close_px is not None else None
+                except Exception:
+                    live_px = None
+
+                # timestamp = bar CLOSE time (not server time)
+                # timestamp = LAST CLOSED BAR OPEN time (MT5 candle time)
+                # (If instead you want "close boundary time", use last_close_ms_seen)
+                # ts_ms = int(last_close_ms_seen) if last_close_ms_seen else None
+                try:
+                    ts_ms = int(last_open_ms_for_last_close) if last_open_ms_for_last_close else None
+                except Exception:
+                    ts_ms = None
+
+                if sym_u and isinstance(live_px, (int, float)) and live_px > 0 and ts_ms:
+                    val = json.dumps({"price": live_px, "ts_ms": ts_ms, "src": f"ohlc_{tf.lower()}_close"}, separators=(",", ":"), ensure_ascii=False)
+
+                    ttl = 7 * 24 * 3600  # 7 days persistence
+
+                    # device-scoped (preferred)
+                    def _set_if_newer(key: str, new_ts_ms: int) -> None:
+                        old = R.get(key)
+                        if old:
+                            try:
+                                oldj = json.loads(old)
+                                old_ts = int(oldj.get("ts_ms") or 0)
+                                if old_ts > 0 and old_ts >= new_ts_ms:
+                                    return  # keep newer existing
+                            except Exception:
+                                pass
+                        R.setex(key, ttl, val)
+
+                    # device-scoped (preferred) — only overwrite if ts_ms is newer
+                    _set_if_newer(f"xtl:price:{dev_id}:{sym_u}", int(ts_ms))
+
+
+                    # DO NOT write global price from OHLC.
+                    # Global xtl:price:{SYMBOL} must come only from /price (tick).
+                    # R.setex(f"xtl:price:{sym_u}", ttl, val)
+                    # pubsub (only if owner exists)
+                    if owner_id:
+                        R.publish(
+                            f"xtl:pub:price:{owner_id}",
+                            json.dumps(
+                                {
+                                    "type": "ohlc_price",
+                                    "symbol": sym_u,
+                                    "price": live_px,
+                                    "device_id": dev_id,
+                                    "ts_ms": ts_ms,
+                                    "src": f"ohlc_{tf.lower()}_close",
+                                },
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                            ),
+                        )
+
+                    log.info(
+                        "PH2 price_cache OK dev=%s sym=%s px=%s ts=%s owner=%s",
+                        dev_id,
+                        sym_u,
+                        live_px,
+                        ts_ms,
+                        owner_id,
+                    )
+        except Exception:
+            log.exception("PH2 price_cache failed dev=%s sym=%s", dev_id, sym)
+
 
         # derive last/next in ms using the **CLOSE** boundary
         last_closed_ms = int(last_close_ms_seen)
@@ -678,6 +1056,8 @@ def post_ohlc(
             "nextCloseTs": next_close_ms,
             "bars": bars_sec,                              # <<< seconds here
             "broker": (getattr(payload, "broker", None) or {}),
+            "account": (getattr(payload, "account", None) or {}),
+            "terminal": (getattr(payload, "terminal", None) or {}),
         }
         # persist broker tz into the device hash so /trend/state2 can fall back to it
         try:
@@ -692,33 +1072,98 @@ def post_ohlc(
         except Exception:
            pass
 
+        # --- NEW: also persist MT5 account/terminal (agent sends top-level account/terminal) ---
+        try:
+            acct = getattr(payload, "account", None) or {}
+            term = getattr(payload, "terminal", None) or {}
+            
+
+            def _s(x, n=200):
+                try:
+                    return str(x)[:n]
+                except Exception:
+                    return ""
+
+            mapping3 = {}
+            if isinstance(acct, dict) and acct:
+                for k in (
+                    "login", "server", "currency", "trade_mode", "leverage",
+                    "balance", "equity", "profit", "trade_allowed", "trade_expert"
+                ):
+                    if k in acct and acct.get(k) is not None:
+                        mapping3[f"mt5_account_{k}"] = _s(acct.get(k), 256)
+
+            if isinstance(term, dict) and term:
+                for k in (
+                    "name", "company", "connected", "trade_allowed", "dlls_allowed",
+                    "build", "path", "data_path"
+                ):
+                    if k in term and term.get(k) is not None:
+                        mapping3[f"mt5_terminal_{k}"] = _s(term.get(k), 512)
+            # --- ensure these core fields always exist for Devices UI ---
+            try:
+                if getattr(payload, "version", None):
+                    mapping3["version"] = _s(getattr(payload, "version"), 64)
+            except Exception:
+                pass
+
+            try:
+                if getattr(payload, "label", None):
+                    mapping3["label"] = _s(getattr(payload, "label"), 128)
+            except Exception:
+                pass
+
+            # mt5_ok: derive from terminal.connected if not explicitly provided
+            try:
+                mt5_ok_val = getattr(payload, "mt5_ok", None)
+                if mt5_ok_val is None:
+                    mt5_ok_val = bool(term.get("connected")) if isinstance(term, dict) else None
+                if mt5_ok_val is not None:
+                    mapping3["mt5_ok"] = "1" if bool(mt5_ok_val) else "0"
+            except Exception:
+                pass
+
+
+            if mapping3:
+                mapping3["mt5_snapshot_at_ms"] = str(int(time.time() * 1000))
+                R.hset(_hkey(dev_id), mapping=mapping3)
+                R.expire(_hkey(dev_id), 600)
+        except Exception:
+            log.exception("[OHLC] persist mt5 account/terminal failed dev=%s", dev_id)
 
         # write device snapshot (primary writer)
-        R.setex(f"xtl:ohlc:snap:{dev_id}:{sym}:{tf}", 900, json.dumps(snap_val))
+        R.set(f"xtl:ohlc:snap:{dev_id}:{sym}:{tf}", json.dumps(snap_val))
+        # --- NEW: latest pointer (kills Redis SCAN in infer_rt.py) ---
+        try:
+            R.set(f"xtl:ohlc:latest:{sym}:{tf}", dev_id)
+        except Exception:
+            pass
 
 
 
         
         # --- remember which device last pushed OHLC for this user/symbol/tf ---
-        owner_id = str(user_id)
+        # owner_id is already resolved from DB earlier (may be None)
+        if owner_id:
 
-        # (A1) Sticky pointer with NO expiry (persists across hours/days)
-        R.set(f"xtl:sticky_device:{owner_id}:{sym}:{tf}", dev_id)
 
-        # (A2) Freshness pointer with short TTL (useful for tie-breaking / recency)
-        R.setex(f"xtl:last_push_device:{owner_id}:{sym}:{tf}", 7200, dev_id)
+            # (A1) Sticky pointer with NO expiry (persists across hours/days)
+            R.set(f"xtl:sticky_device:{owner_id}:{sym}:{tf}", dev_id)
 
-        # (A3) Optional metadata for debugging/inspection
-        R.hset(
-            f"xtl:last_push_device_meta:{owner_id}:{sym}:{tf}",
-            mapping={"device_id": dev_id, "written_at": str(int(time.time() * 1000))}
-        )
+            # (A2) Freshness pointer with short TTL (useful for tie-breaking / recency)
+            R.setex(f"xtl:last_push_device:{owner_id}:{sym}:{tf}", 7200, dev_id)
+
+            # (A3) Optional metadata for debugging/inspection
+            R.hset(
+                f"xtl:last_push_device_meta:{owner_id}:{sym}:{tf}",
+                mapping={"device_id": dev_id, "written_at": str(int(time.time() * 1000))}
+            )
 
 
         # write user snapshot (what Trend reads)
         if owner_id:
             kuser = f"xtl:trend:snap:{owner_id}:{sym}:{tf}"
-            R.setex(kuser, 900, json.dumps(snap_val))
+            R.set(kuser, json.dumps(snap_val))
             R.setex(
                 f"xtl:broker:meta:{owner_id}:{sym}",
                 3600,
@@ -735,6 +1180,167 @@ def post_ohlc(
         log.info(f"[OHLC] snapshot write error (ignored): {e}")
 
     return {"ok": True, "received": len(payload.bars or [])}
+
+@r.post("/{dev_id}/price", summary="Ingest live price from agent (compat)")
+def post_price(
+    dev_id: str,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+    x_device_token: Optional[str] = Header(default=None, alias="X-Device-Token"),
+    device_token_hdr: Optional[str] = Header(default=None, alias="Device-Token"),
+    x_device_id: Optional[str] = Header(default=None, alias="X-Device-Id"),
+):
+    import os, json, time
+
+    # normalize device id (some agents send X-Device-Id)
+    dev = (x_device_id or dev_id or "").strip()
+
+    # gather token from multiple possible headers
+    token = ""
+    for candidate in (authorization, x_device_token, device_token_hdr):
+        if not candidate:
+            continue
+        parts = str(candidate).split()
+        token = parts[-1].strip() if parts else str(candidate).strip()
+        if token:
+            break
+
+    if not token:
+        # breadcrumb: missing token (so we know why 401)
+        try:
+            R.setex(f"xtl:debug:price_auth:{dev}", 120, "missing_token")
+        except Exception:
+            pass
+        raise HTTPException(status_code=401, detail="missing token")
+
+    owner_id: Optional[str] = None
+
+    # ---- (A) Primary auth: Postgres devices table ----
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT user_id::text, device_token FROM devices WHERE id=%s", (dev,))
+            row = cur.fetchone()
+            if row and str(row[1]) == token:
+                owner_id = row[0]
+            else:
+                owner_id = None
+    except Exception:
+        owner_id = None
+
+    # ---- (B) Fallback auth: Redis device hash (prefix) ----
+    # This matches how some of your agent/device metadata is stored.
+    if owner_id is None:
+        try:
+            prefix = os.getenv("XTL_DEVICE_KEY_PREFIX", "device:")
+            meta = R.hgetall(f"{prefix}{dev}") or {}
+            # meta could contain device_token + owner_id/user_id depending on your implementation
+            meta_token = (meta.get("device_token") or meta.get("token") or "")
+            meta_owner = (meta.get("owner_id") or meta.get("user_id") or None)
+            if meta_token and str(meta_token) == token and meta_owner:
+                owner_id = str(meta_owner)
+        except Exception:
+            pass
+
+    if owner_id is None:
+        # breadcrumb: token mismatch (so we can inspect quickly)
+        try:
+            R.setex(f"xtl:debug:price_auth:{dev}", 120, "bad_token_or_unknown_device")
+        except Exception:
+            pass
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    sym_u = str(payload.get("symbol") or "").upper().strip()
+    try:
+        price = float(payload.get("price") or 0.0)
+    except Exception:
+        price = 0.0
+    # --- ts_ms: prefer tick time from agent; fallback to server time ---
+    server_now_ms = int(time.time() * 1000)
+
+    def _coerce_ts_ms(p: dict, default_ms: int) -> int:
+        # Prefer ms fields
+        for k in ("ts_ms", "time_msc", "tick_ts_ms"):
+            try:
+                v = p.get(k)
+                if v is None:
+                    continue
+                v = int(v)
+                if v > 10_000_000_000:  # ms
+                    return v
+            except Exception:
+                pass
+
+        # Seconds ? ms
+        for k in ("ts", "time"):
+            try:
+                v = p.get(k)
+                if v is None:
+                    continue
+                v = int(v)
+                if 1_000_000_000 <= v <= 10_000_000_000:
+                    return v * 1000
+            except Exception:
+                pass
+
+        return int(default_ms)
+
+    ts_ms = _coerce_ts_ms(payload if isinstance(payload, dict) else {}, server_now_ms)
+
+    if not sym_u or price <= 0:
+        return {"ok": True, "ignored": True}
+
+    # Weekend-safe persistence (keep last tick)
+    ttl = 7 * 24 * 3600  # 7 days
+
+    val = json.dumps({"price": float(price), "ts_ms": int(ts_ms), "src": "tick"}, separators=(",", ":"), ensure_ascii=False)
+
+    # cache (state) — only overwrite if newer
+    try:
+        def _set_if_newer(key: str) -> None:
+            old = R.get(key)
+            if old:
+                try:
+                    oldj = json.loads(old)
+                    old_ts = int(oldj.get("ts_ms") or 0)
+                    if old_ts > 0 and old_ts >= ts_ms:
+                        return  # keep newer existing
+                except Exception:
+                    pass
+            R.setex(key, ttl, val)
+
+        _set_if_newer(f"xtl:price:{dev}:{sym_u}")
+        _set_if_newer(f"xtl:price:{sym_u}")
+    except Exception:
+        pass
+
+
+    # pubsub (event)
+    try:
+        evt = {
+            "type": "price",
+            "symbol": sym_u,
+            "price": float(price),
+            "device_id": dev,
+            "ts_ms": int(ts_ms),
+            "src": "agent_price",
+        }
+        R.publish(f"xtl:pub:price:{owner_id}", json.dumps(evt, separators=(",", ":"), ensure_ascii=False))
+    except Exception:
+        pass
+
+    # membership (optional)
+    try:
+        R.sadd(f"xtl:user:{owner_id}:devices", dev)
+    except Exception:
+        pass
+
+    # breadcrumb: auth OK
+    try:
+        R.setex(f"xtl:debug:price_auth:{dev}", 120, "ok")
+    except Exception:
+        pass
+
+    return {"ok": True}
 
 
 @r.post("/{dev_id}/heartbeat", summary="Agent heartbeat; nudges a push when user snapshot is missing/stale")
@@ -769,6 +1375,52 @@ def device_heartbeat(
         R.expire(_hkey(dev_id), 600)
     except Exception:
         pass
+    
+    # --- NEW: persist MT5 account/terminal snapshot (best-effort) ---
+    try:
+       # prefer explicit payload fields; fallback to payload.broker if you ever nest it
+       acct = getattr(payload, "account", None) or {}
+       term = getattr(payload, "terminal", None) or {}
+       if (not acct) and isinstance(getattr(payload, "broker", None), dict):
+           acct = (payload.broker or {}).get("account") or {}
+       if (not term) and isinstance(getattr(payload, "broker", None), dict):
+           term = (payload.broker or {}).get("terminal") or {}
+       def _s(x, n=256):
+           try:
+              return str(x)[:n]
+           except Exception:
+              return ""
+
+       mapping3 = {}
+
+       # ---- account_info ----
+       if isinstance(acct, dict) and acct:
+           # common keys from MetaTrader5.account_info()._asdict()
+           for k in (
+               "login", "server", "currency", "trade_mode", "leverage",
+               "balance", "equity", "profit", "trade_allowed", "trade_expert"
+           ):
+               if k in acct and acct.get(k) is not None:
+                    mapping3[f"mt5_account_{k}"] = _s(acct.get(k), 256)
+
+       # ---- terminal_info ----
+       if isinstance(term, dict) and term:
+           for k in (
+               "name", "company", "connected", "trade_allowed", "dlls_allowed",
+               "build", "path", "data_path"
+           ):
+               if k in term and term.get(k) is not None:
+                  mapping3[f"mt5_terminal_{k}"] = _s(term.get(k), 512)
+
+       # raw JSON (optional, handy for debugging)
+       if mapping3:
+            mapping3["mt5_snapshot_at_ms"] = str(int(time.time() * 1000))
+
+            R.hset(_hkey(dev_id), mapping=mapping3)
+            R.expire(_hkey(dev_id), 600)
+    except Exception:
+        pass
+
 
     # --- who owns this device? ---
     owner_id: Optional[str] = None
@@ -852,7 +1504,7 @@ def device_heartbeat(
                     except Exception:
                         cur_len = 0
                     if (not cur_len) or cur_len < 1000:
-                        R.setex(kuser, 900, best_raw)
+                        R.setex(kuser,best_raw)
 
                     # seed tiny broker meta the UI fetches
                     meta = {"symbol": symU, "timeframe": tfU, "source": "broker", "from_device": best_dev}
