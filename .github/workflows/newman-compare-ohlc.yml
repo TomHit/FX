@@ -3,11 +3,12 @@ name: newman-compare-ohlc
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "30 3 * * 1-5"  # 09:00 IST Mon-Fri (GitHub cron is UTC)
+    - cron: "30 3 * * 1-5" # 09:00 IST Mon-Fri (GitHub cron is UTC)
 
 jobs:
   run-newman:
     runs-on: ubuntu-latest
+
     env:
       BASE_URL: ${{ secrets.BASE_URL }}
       USERNAME_OR_EMAIL: ${{ secrets.USERNAME_OR_EMAIL }}
@@ -23,21 +24,33 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install dependencies (newman + speakeasy)
+      - name: Install Newman + reporters
         run: |
           npm i -g newman
-          npm i speakeasy
+          npm i -g newman-reporter-htmlextra
 
       - name: Generate TOTP
         id: totp
         run: |
-          echo "TOTP=$(node xtl-tests/gen_totp.js)" >> $GITHUB_ENV
+          node datacontract/gen_totp.js "$TOTP_SECRET_BASE32" > /tmp/totp.txt
+          echo "TOTP=$(cat /tmp/totp.txt)" >> $GITHUB_ENV
 
-      - name: Run Newman
+      - name: Run Newman (Contract)
         run: |
-          newman run xtl-tests/XTL.postman_collection.json \
-            -e xtl-tests/XTL.postman_environment.json \
-            --env-var "base_url=${BASE_URL}" \
-            --env-var "username_or_email=${USERNAME_OR_EMAIL}" \
-            --env-var "password=${PASSWORD}" \
-            --env-var "totp=${TOTP}"
+          mkdir -p artifacts
+          newman run "datacontract/Contract_Testing.postman_collection.json" \
+            -e "datacontract/XTL.postman_environment.json" \
+            --env-var "base_url=$BASE_URL" \
+            --env-var "username_or_email=$USERNAME_OR_EMAIL" \
+            --env-var "password=$PASSWORD" \
+            --env-var "totp=$TOTP" \
+            --reporters cli,htmlextra,junit \
+            --reporter-htmlextra-export "artifacts/newman-report.html" \
+            --reporter-junit-export "artifacts/newman-junit.xml"
+
+      - name: Upload artifacts (report)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: newman-contract-report
+          path: artifacts/
