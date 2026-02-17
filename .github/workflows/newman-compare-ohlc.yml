@@ -1,0 +1,43 @@
+name: newman-compare-ohlc
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "30 3 * * 1-5"  # 09:00 IST Mon-Fri (GitHub cron is UTC)
+
+jobs:
+  run-newman:
+    runs-on: ubuntu-latest
+    env:
+      BASE_URL: ${{ secrets.BASE_URL }}
+      USERNAME_OR_EMAIL: ${{ secrets.USERNAME_OR_EMAIL }}
+      PASSWORD: ${{ secrets.PASSWORD }}
+      TOTP_SECRET_BASE32: ${{ secrets.TOTP_SECRET_BASE32 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies (newman + speakeasy)
+        run: |
+          npm i -g newman
+          npm i speakeasy
+
+      - name: Generate TOTP
+        id: totp
+        run: |
+          echo "TOTP=$(node xtl-tests/gen_totp.js)" >> $GITHUB_ENV
+
+      - name: Run Newman
+        run: |
+          newman run xtl-tests/XTL.postman_collection.json \
+            -e xtl-tests/XTL.postman_environment.json \
+            --env-var "base_url=${BASE_URL}" \
+            --env-var "username_or_email=${USERNAME_OR_EMAIL}" \
+            --env-var "password=${PASSWORD}" \
+            --env-var "totp=${TOTP}"
