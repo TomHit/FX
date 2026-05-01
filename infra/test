@@ -1,0 +1,2112 @@
+def _zone_reversal_gate(
+    *,
+    sym: str,
+    direction: str,   
+    row_h1: dict,
+    sr: dict | None,
+    now_ms: int,
+    tf_tag: str = "H1",
+    pinned_device: str | None = None,
+    debug_gate: bool = False,
+    x_device_id: str | None = None,
+) -> tuple[bool, dict]:
+    """
+    Final opportunity gate:
+    - Resolve zone (SR -> fallback -> provisional)
+    - Require SECOND TAP + reversal candle
+    - Maintain tap state in Redis
+
+    Added:
+      5A) Soft sweep vs hard break (do NOT kill on sweep; kill on hard break)
+      5B) BOS double-check (H1 + optional M15 if provided)
+      6)  Volume confirmation
+      7)  Session weighting
+      8)  Zone aging
+      9)  Final confidence
+    """
+
+
+    cl = None
+    opn = None
+    hi = None
+    lo = None
+
+    direction = str(direction or "").upper().strip()
+    if direction not in ("BUY", "SELL"):
+        return False, {"reason": "bad_direction"}
+
+    sym_u = (sym or "").upper().strip()
+    zone_tf = str(tf_tag or "H1").upper()
+
+
+
+    # -------------------------------
+    # 0) Load H1 bars (prefer attached; else backfill from Redis snap)
+    # -------------------------------
+    bars = row_h1.get("bars") or row_h1.get("ohlc") or []
+    if not isinstance(bars, list):
+        bars = []
+
+    x_device_id_hdr = (x_device_id or "").strip()
+    if (not x_device_id_hdr) and pinned_device:
+        x_device_id_hdr = str(pinned_device).strip()
+    dev = str((x_device_id_hdr or pinned_device or x_device_id or "")).strip()
+
+    dbg_src = None
+    dbg_err = None
+
+    if len(bars) < 2 and sym_u:
+        try:
+            js = None
+            bars_any = None
+
+            # 1) try deterministic device (header first)
+            if dev:
+                js, _ = _read_snap_for_device(dev, sym_u, "H1", header_device=x_device_id_hdr)
+                dbg_src = f"read_snap_for_device:{dev}"
+
+                # --- FIX: if helper returned empty/invalid, do direct GET of STRING snap ---
+                try:
+                    if isinstance(js, dict):
+                        bars_any = js.get("bars")
+                        if not isinstance(bars_any, list):
+                            bars_any = js.get("ohlc")
+
+                    if not (isinstance(bars_any, list) and len(bars_any) >= 2):
+                        R0 = _r()
+                        k0_dev = x_device_id_hdr or dev
+                        k0 = f"xtl:ohlc:snap:{k0_dev}:{sym_u}:H1"
+                        raw0 = R0.get(k0)  # STRING JSON
+                        js0 = _json_load_twice(raw0) if raw0 else None
+                        if isinstance(js0, dict):
+                            js = js0
+                            dbg_src = (dbg_src or "") + f" | direct_get_string_snap:{k0_dev}"
+
+                    # recompute bars_any after js replacement
+                    if isinstance(js, dict):
+                        bars_any = js.get("bars")
+                        if not isinstance(bars_any, list):
+                            bars_any = js.get("ohlc")
+
+                except Exception as e:
+                    dbg_err = (dbg_err or "") + f" | direct_get:{type(e).__name__}:{e}"
+
+                if debug_gate:
+                    try:
+                        R0 = _r()
+                        ck = getattr(getattr(R0, "connection_pool", None), "connection_kwargs", {}) or {}
+                        k_dbg_dev = x_device_id_hdr or dev
+                        k_dbg = f"xtl:ohlc:snap:{k_dbg_dev}:{sym_u}:H1"
+
+                        t_dbg = R0.type(k_dbg)
+                        if isinstance(t_dbg, (bytes, bytearray)):
+                            t_dbg = t_dbg.decode("utf-8", "ignore")
+                        t_dbg = str(t_dbg or "").lower()
+
+                        dbg_src = (
+                            (dbg_src or "")
+                            + f" | redis={ck.get('host')}:{ck.get('port')}/db{ck.get('db')}"
+                            + f" | key={k_dbg} | type={t_dbg}"
+                        )
+
+                        if isinstance(js, dict):
+                            ba = js.get("bars")
+                            if not isinstance(ba, list):
+                                ba = js.get("ohlc")
+
+                            bn = len(ba) if isinstance(ba, list) else -1
+                            k0 = (
+                                list(ba[0].keys())
+                                if isinstance(ba, list) and ba and isinstance(ba[0], dict)
+                                else None
+                            )
+                            dbg_src = (dbg_src or "") + f" | bars_any_n={bn} | bar0_keys={k0}"
+                        else:
+                            dbg_src = (dbg_src or "") + " | snap_decode=None"
+
+                    except Exception as e:
+                        dbg_err = (dbg_err or "") + f" | redis_dbg:{type(e).__name__}:{e}"
+
+            # 3) Normalize + attach to row_h1
+            if isinstance(bars_any, list) and len(bars_any) >= 2:
+                norm = []
+                tf_ms = int(TF_MS.get(tf_tag.upper(), 60 * 60 * 1000))
+
+                def _get(b, *keys):
+                    for k in keys:
+                        v = b.get(k) if isinstance(b, dict) else None
+                        if v is not None:
+                            return v
+                    return None
+
+                for b in bars_any:
+                    if not isinstance(b, dict):
+                        continue
+                    try:
+                        t = _get(b, "t", "ts", "time")
+                        if t is None:
+                            t_open_ms = _get(b, "t_open_ms")
+                            if not isinstance(t_open_ms, (int, float)) or t_open_ms <= 0:
+                                continue
+                            t_open_ms = int(t_open_ms)
+                            t_close_ms = _get(b, "t_close_ms")
+                            if not isinstance(t_close_ms, (int, float)) or t_close_ms <= 0:
+                                t_close_ms = t_open_ms + tf_ms
+                            else:
+                                t_close_ms = int(t_close_ms)
+                        else:
+                            t_open_ms = _to_ms_any(int(t))
+                            if t_open_ms <= 0:
+                                continue
+                            t_close_ms = t_open_ms + tf_ms
+
+                        o_ = _get(b, "o", "open")
+                        h_ = _get(b, "h", "high")
+                        l_ = _get(b, "l", "low")
+                        c_ = _get(b, "c", "close")
+                        if o_ is None or h_ is None or l_ is None or c_ is None:
+                            continue
+
+                        norm.append({
+                            "t_open_ms": int(t_open_ms),
+                            "t_close_ms": int(t_close_ms),
+                            "o": float(o_), "h": float(h_), "l": float(l_), "c": float(c_),
+                            "v": _get(b, "v", "volume"),
+                            "complete": bool(b.get("complete", True)),
+                        })
+                    except Exception:
+                        continue
+
+                norm.sort(key=lambda x: int(x.get("t_close_ms") or 0))
+                if len(norm) >= 2:
+                    bars = norm
+                    row_h1["bars"] = bars
+
+        except Exception as e:
+            dbg_err = (dbg_err or "") + f" | snap_read:{type(e).__name__}:{e}"
+
+
+
+    # HARD FAIL EARLY if still no bars
+    if len(bars) < 2:
+        meta = {
+            "reason": "no_h1_bars",
+            "bars_n": len(bars),
+            "dev": dev,
+            "sym": sym_u,
+        }
+        if debug_gate:
+            meta["dbg_h1_src"] = dbg_src
+            meta["dbg_h1_err"] = dbg_err
+        return False, meta
+
+
+    def _pick_side_level(sr: dict, px: float, direction: str):
+        def _levels(tf, key):
+            return [
+                float(x["level"]) for x in (tf.get(key) or [])
+                if isinstance(x, dict) and "level" in x
+            ]
+
+        order = ["h1", "h4"]
+        kinds = ["supports_near", "supports_major"] if direction == "BUY" \
+            else ["resistances_near", "resistances_major"]
+
+        for tfk in order:
+            tf = sr.get(tfk) or {}
+            for k in kinds:
+                lvls = _levels(tf, k)
+                if direction == "BUY":
+                    below = [v for v in lvls if v < px]
+                    if below:
+                        return max(below), tfk.upper()
+                else:
+                    above = [v for v in lvls if v > px]
+                    if above:
+                        return min(above), tfk.upper()
+
+        return None, None
+
+    def _bar_f(b: dict, *keys, default=None):
+        for k in keys:
+            if isinstance(b, dict) and k in b and b.get(k) is not None:
+                return b.get(k)
+        return default
+    # -------------------------------
+    # 0B) Pick last safely CLOSED bar + define OHLC (cl/o/h/l) ONCE
+    # -------------------------------
+    try:
+        tf_ms = int(TF_MS.get(str(tf_tag or "H1").upper(), 60 * 60 * 1000))
+    except Exception:
+        tf_ms = 60 * 60 * 1000
+
+    try:
+        c, p = _pick_last_closed_bar_from_bars(bars, int(now_ms), int(tf_ms))
+    except Exception:
+        c, p = None, None
+
+    if not isinstance(c, dict) or not isinstance(p, dict):
+        return False, {"reason": "no_h1_closed_bar", "bars_n": int(len(bars)), "stage": "H1_PICK"}
+
+    try:
+        o = float(_bar_f(c, "o", "open"))
+        h = float(_bar_f(c, "h", "high"))
+        l = float(_bar_f(c, "l", "low"))
+        cl = float(_bar_f(c, "c", "close"))
+    except Exception:
+        return False, {
+            "reason": "bad_h1_ohlc",
+            "stage": "H1_PICK",
+            "keys": list(c.keys()) if isinstance(c, dict) else None,
+        }
+
+    # -------------------------------
+    # 0C) Reference price for SR/zone selection
+    # -------------------------------
+    # IMPORTANT: Zone selection must use the freshest price available, otherwise
+    # we can pick a wrong-side / outdated level (especially on fast moves).
+
+    px = None
+    px_src = None
+    px_ts_ms = None
+
+    # 0C-1) Try to read a live price from Redis (device-scoped)
+    try:
+        if pinned_device:
+            pkey = f"xtl:price:{pinned_device}:{sym_u}"
+            rawp = R.get(pkey)
+            if rawp:
+                try:
+                    j = _json_load_twice(rawp)
+                except Exception:
+                    j = None
+
+                if isinstance(j, dict):
+                    # accept common field names
+                    for k in ("price", "p", "last", "mid", "bid", "ask"):
+                        if j.get(k) is not None:
+                            try:
+                                px = float(j.get(k))
+                                px_src = f"redis:{pkey}:{k}"
+                                break
+                            except Exception:
+                                pass
+                    # timestamp (optional)
+                    for tk in ("ts_ms", "t_ms", "ts", "t"):
+                        if j.get(tk) is not None:
+                            try:
+                                v = int(j.get(tk))
+                                # if seconds -> convert
+                                px_ts_ms = v * 1000 if v < 10_000_000_000 else v
+                                break
+                            except Exception:
+                                pass
+                else:
+                    # raw numeric string
+                    try:
+                        px = float(rawp)
+                        px_src = f"redis:{pkey}:raw"
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 0C-2) Fallback to last CLOSED close
+    if px is None:
+        try:
+            px = float(cl)
+            px_src = "h1_close"
+        except Exception:
+            px = None
+            px_src = None
+
+    # Always surface what we used in debug output
+    #try:
+    #    debug_out["price"] = float(px) if px is not None else None
+    #    debug_out["price_src"] = px_src
+    #    debug_out["price_ts_ms"] = int(px_ts_ms) if px_ts_ms is not None else None
+    #except Exception:
+    #    pass
+    # NOTE: debug_out is created later (after tap persistence).
+    # We'll attach price fields right after debug_out is built.
+
+
+
+
+    # --- Freshness guard (block only if stale, not TTL) ---
+    # --- Freshness guard (block only if stale, not TTL) ---
+    if isinstance(bars, list) and len(bars) >= 2:
+        try:
+            tf_ms0 = int(TF_MS.get(tf_tag.upper(), 60 * 60 * 1000))
+
+            c = bars[-1]
+            if isinstance(c, dict) and (c.get("complete") is False):
+                c = bars[-2]
+
+            # 1) Prefer snap-level lastClosedTs (ms)
+            # 1) DO NOT trust snap-level lastClosedTs unless it is sane
+            last_close = 0
+            try:
+                lc0 = int((row_h1 or {}).get("lastClosedTs") or 0)
+                # accept only if it is not in the future and not absurdly old
+                if 0 < lc0 <= int(now_ms):
+                    last_close = lc0
+            except Exception:
+                last_close = 0
+
+
+            # 2) Else prefer normalized bar close
+            if last_close <= 0 and isinstance(c, dict):
+                last_close = int(c.get("t_close_ms") or 0)
+
+            # 3) Else infer from normalized open
+            if last_close <= 0 and isinstance(c, dict):
+                t_open_ms = int(c.get("t_open_ms") or 0)
+                if t_open_ms > 0:
+                    last_close = t_open_ms + tf_ms0
+
+            # 4) Else infer from raw 't' seconds/ms
+            if last_close <= 0 and isinstance(c, dict):
+                t_raw = int(c.get("t") or 0)
+                if t_raw > 0:
+                    t_open_ms = _to_ms_any(t_raw)
+                    if t_open_ms > 0:
+                        last_close = t_open_ms + tf_ms0
+
+            age_ms = int(now_ms - last_close) if last_close > 0 else 0
+
+            max_age_ms = 3 * tf_ms0
+            utc_weekday = datetime.now(timezone.utc).weekday()
+            is_weekend = utc_weekday >= 5
+            if is_weekend:
+                 max_age_ms = 72 * 60 * 60 * 1000
+
+            if last_close > 0 and age_ms > max_age_ms:
+                meta = {
+                    "reason": "stale_h1",
+                    "blocked": True,
+                    "dev": dev,
+                    "sym": sym_u,
+                    "bars_n": int(len(bars)),
+                    "age_ms": int(age_ms),
+                    "tf_ms": int(tf_ms0),
+                    "max_age_ms": int(max_age_ms),
+                    "last_close_ms": int(last_close),
+                    "is_weekend": bool(is_weekend),
+                }
+                if debug_gate:
+                    meta["dbg_h1_src"] = dbg_src
+                    meta["dbg_h1_err"] = dbg_err
+                return False, meta
+
+        except Exception as e:
+            dbg_err = (dbg_err or "") + f" | stale_chk:{type(e).__name__}:{e}"
+
+
+
+
+    # -------------------------------
+    # 1) Resolve ATR (feature -> fallback compute)
+    # -------------------------------
+    atr = None
+    extra_h1 = row_h1.get("extra_h1") or {}
+    feats = extra_h1.get("features") if isinstance(extra_h1.get("features"), dict) else extra_h1
+    try:
+        atr = feats.get("feat_atr")
+    except Exception:
+        atr = None
+
+    if not isinstance(atr, (int, float)) or atr <= 0:
+        try:
+            ATR_LEN = int(os.getenv("XTL_ATR_LEN", "14"))
+        except Exception:
+            ATR_LEN = 14
+
+        try:
+            bars_for_atr = []
+            for b in (bars or []):
+                if not isinstance(b, dict):
+                    continue
+                if b.get("complete", True) is False:
+                    continue
+                try:
+                    h0 = float(_bar_f(b, "h", "high"))
+                    l0 = float(_bar_f(b, "l", "low"))
+                    c0 = float(_bar_f(b, "c", "close"))
+                    bars_for_atr.append({"h": h0, "l": l0, "c": c0})
+                except Exception:
+                    continue
+
+            if len(bars_for_atr) >= (ATR_LEN + 1):
+                trs = []
+                start = len(bars_for_atr) - ATR_LEN
+                for i in range(start, len(bars_for_atr)):
+                    cur = bars_for_atr[i]
+                    prev_c = bars_for_atr[i - 1]["c"]
+                    tr = max(
+                        cur["h"] - cur["l"],
+                        abs(cur["h"] - prev_c),
+                        abs(cur["l"] - prev_c),
+                    )
+                    trs.append(float(tr))
+                atr = sum(trs) / max(len(trs), 1)
+        except Exception:
+            atr = None
+
+    if not isinstance(atr, (int, float)) or atr <= 0:
+        return False, {"reason": "no_atr", "bars_n": len(bars)}
+
+    atr = float(atr)
+
+    # zone half-width
+    zone_half = max(float(ZONE_ATR_WIDTH) * atr, float(ZONE_MIN_PIPS))
+
+    # -------------------------------
+    # 2) Resolve zone (SR -> fallback -> provisional)
+    # -------------------------------
+    zone = None
+    zone_type = None
+    zone_tf = None
+
+    try:
+        if isinstance(sr, dict):
+            lvl, zone_tf = _pick_side_level(sr, px, direction)
+
+            # If SR missing, DO NOT hard-fail; allow fallback provisional zone.
+            if isinstance(lvl, (int, float)):
+                lvl = float(lvl)
+
+                if direction == "BUY":
+                    # support must be <= reference price
+                    if px is not None and lvl <= float(px):
+                        zone = {"level": lvl, "low": lvl - zone_half, "high": lvl + zone_half, "tf": zone_tf}
+                        zone_type = "SR_CONFIRMED"
+                else:
+                    # resistance must be >= reference price
+                    if px is not None and lvl >= float(px):
+                        zone = {"level": lvl, "low": lvl - zone_half, "high": lvl + zone_half, "tf": zone_tf}
+                        zone_type = "SR_CONFIRMED"
+
+            # If SR picker chose a zone but did not provide TF, infer from bundle keys
+            if zone and not zone_tf:
+                try:
+                    # sr keys are expected to be {"h1": {...}, "h4": {...}}
+                    if isinstance(sr.get("h4"), dict):
+                        zone_tf = "H4" if (sr.get("h4") or {}) else None
+                    if not zone_tf and isinstance(sr.get("h1"), dict):
+                        zone_tf = "H1" if (sr.get("h1") or {}) else None
+                except Exception:
+                    pass
+
+            if zone_type == "SR_CONFIRMED" and not zone_tf:
+                zone_tf = str(tf_tag or "H1").upper()
+
+    except Exception:
+        pass
+
+
+    if not zone:
+
+
+        return False, {"reason": "no_zone", "blocked": True, "stage": "ZONE_GATE"}
+
+    if not zone:
+        return False, {"reason": "no_zone", "blocked": True, "stage": "ZONE_GATE"}
+    # --- ensure zone_tf always exists (single source of truth for “what TF created this zone”) ---
+    try:
+        # preserve zone_tf if already set (e.g., from _pick_side_level)
+        if not zone_tf and isinstance(zone, dict):
+            zone_tf = zone.get("tf") or zone.get("zone_tf") or zone.get("tf_tag")
+
+        if not zone_tf:
+            zone_tf = str(tf_tag or "H1").upper()
+
+        if isinstance(zone, dict):
+            zone["tf"] = str(zone_tf).upper()
+
+    except Exception:
+        pass
+
+
+
+
+
+    # ==========================================================
+    # 5A) SOFT SWEEP vs HARD BREAK
+    # ==========================================================
+    try:
+        SWEEP_ATR = float(os.getenv("XTL_SWEEP_ATR", "0.25"))
+    except Exception:
+        SWEEP_ATR = 0.25
+
+    try:
+        HARD_BREAK_ATR = float(os.getenv("XTL_HARD_BREAK_ATR", "0.60"))
+    except Exception:
+        HARD_BREAK_ATR = 0.60
+
+    try:
+        RECLAIM_MAX_BARS = int(os.getenv("XTL_RECLAIM_MAX_BARS", "3"))
+    except Exception:
+        RECLAIM_MAX_BARS = 3
+
+    try:
+        RECLAIM_TIGHTEN_ATR = float(os.getenv("XTL_RECLAIM_TIGHTEN_ATR", "0.35"))
+    except Exception:
+        RECLAIM_TIGHTEN_ATR = 0.35
+
+
+    def _break_state_close_only(cl_val: float) -> tuple[str, dict]:
+        zl = float(zone["low"])
+        zh = float(zone["high"])
+        zlv = float(zone["level"])
+        buf_sweep = float(SWEEP_ATR) * atr
+        buf_hard = float(HARD_BREAK_ATR) * atr
+
+        if direction == "BUY":
+            if cl_val < zl:
+                if cl_val >= (zl - buf_sweep):
+                    return "SWEEP", {"side": "DOWN", "cl": cl_val, "edge": zl, "buf": buf_sweep}
+            if cl_val < (zl - buf_hard):
+                return "HARD_BREAK", {"side": "DOWN", "cl": cl_val, "edge": zl, "buf": buf_hard}
+        else:
+            if cl_val > zh:
+                if cl_val <= (zh + buf_sweep):
+                    return "SWEEP", {"side": "UP", "cl": cl_val, "edge": zh, "buf": buf_sweep}
+                if cl_val > (zh + buf_hard):
+                    return "HARD_BREAK", {"side": "UP", "cl": cl_val, "edge": zh, "buf": buf_hard}
+
+        return "OK", {"cl": cl_val, "zone_low": zl, "zone_high": zh, "zone_level": zlv}
+
+    def _pick_zone_from_sr(sr_all: dict, direction: str, cl: float, atr: float) -> dict | None:
+        if not isinstance(sr_all, dict):
+            return None
+
+        # Accept BOTH shapes:
+        # A) full SR payload: {"h1": {...}, "h4": {...}, ...}
+        # B) TF-sliced payload: {"supports":[...], "resistances":[...], ...}
+        sr_tf = None
+        picked_tf = None
+
+        # TF-sliced shape
+        if isinstance(sr_all, dict) and (
+            ("supports" in sr_all) or ("resistances" in sr_all) or
+            ("supports_major" in sr_all) or ("resistances_major" in sr_all) or
+            ("supports_near" in sr_all) or ("resistances_near" in sr_all)
+        ):
+            sr_tf = sr_all
+            picked_tf = str(tf_tag or "H1").upper()
+        else:
+            # Full payload -> prefer H1, fallback H4
+            if isinstance(sr_all.get("h1"), dict):
+                sr_tf = sr_all["h1"]
+                picked_tf = "H1"
+            elif isinstance(sr_all.get("h4"), dict):
+                sr_tf = sr_all["h4"]
+                picked_tf = "H4"
+            else:
+                return None
+
+        if not isinstance(sr_tf, dict):
+            return None
+
+        supp  = sr_tf.get("supports_near") or sr_tf.get("support_near") or []
+        supp2 = sr_tf.get("supports_major") or sr_tf.get("supports") or []
+        res   = sr_tf.get("resistances_near") or sr_tf.get("resistance_near") or []
+        res2  = sr_tf.get("resistances_major") or sr_tf.get("resistances") or []
+
+        def _as_items(a):
+            out = []
+            for x in (a or []):
+                try:
+                    if isinstance(x, dict):
+                        lv = float(x.get("level"))
+                        out.append({
+                            "level": lv,
+                            "touches": int(x.get("touches") or 0),
+                            "strength": float(x.get("strength") or 0),
+                            "sr_score": float(x.get("sr_score") or 0),
+                        })
+                    else:
+                        lv = float(x)
+                        out.append({
+                            "level": lv,
+                            "touches": 0,
+                            "strength": 0.0,
+                            "sr_score": 0.0,
+                        })
+                except Exception:
+                    pass
+            return out
+
+        def _is_strong(it: dict) -> bool:
+            try:
+                thr_strength = int(os.getenv("XTL_STRONG_ZONE_STRENGTH", "8"))
+                thr_touches  = int(os.getenv("XTL_STRONG_ZONE_TOUCHES", "4"))
+                thr_score    = float(os.getenv("XTL_STRONG_ZONE_SR_SCORE", "9"))
+                return (
+                    float(it.get("strength") or 0) >= thr_strength
+                    or int(it.get("touches") or 0) >= thr_touches
+                    or float(it.get("sr_score") or 0) >= thr_score
+                )
+            except Exception:
+                return False
+
+
+        if direction == "SELL":
+            cands = _as_items(res) + _as_items(res2)
+            cands = [it for it in cands if it["level"] > cl]
+            if not cands:
+                return None
+
+            # nearest above price, then stronger levels
+            cands.sort(key=lambda it: (
+                it["level"],
+                -float(it.get("strength", 0)),
+                -float(it.get("sr_score", 0)),
+                -int(it.get("touches", 0))
+            ))
+            pick = cands[0]
+
+        else:  # BUY
+            cands = _as_items(supp) + _as_items(supp2)
+            cands = [it for it in cands if it["level"] < cl]
+            if not cands:
+                return None
+
+            # nearest below price, then stronger levels
+            cands.sort(key=lambda it: (
+                -it["level"],
+                -float(it.get("strength", 0)),
+                -float(it.get("sr_score", 0)),
+                -int(it.get("touches", 0))
+            ))
+            pick = cands[0]
+
+        half = max(atr * ZONE_ATR_WIDTH, ZONE_MIN_PIPS)
+
+        return {
+            "level": float(pick["level"]),
+            "low": float(pick["level"] - half),
+            "high": float(pick["level"] + half),
+            "type": "SR_CONFIRMED",
+            "tf": picked_tf,
+
+            # --- NEW META (for strong old zone logic) ---
+            "touches": int(pick.get("touches") or 0),
+            "strength": float(pick.get("strength") or 0.0),
+            "sr_score": float(pick.get("sr_score") or 0.0),
+            "is_strong": bool(_is_strong(pick)),
+        }
+
+    def _attach_zone_strength_meta(zone: dict, sr_all: dict) -> None:
+        """
+        For ZONE_PROVISIONAL / flipped zones: find nearest SR dict item and attach
+        touches/strength/sr_score/is_strong so bootstrap-days can expand.
+        """
+        if not isinstance(zone, dict) or not isinstance(sr_all, dict):
+            return
+        try:
+            zlvl = float(zone.get("level") or 0.0)
+        except Exception:
+            return
+
+        # pick TF slice (prefer H1 then H4)
+        tf_obj = None
+        if isinstance(sr_all.get("h1"), dict):
+            tf_obj = sr_all["h1"]
+        elif isinstance(sr_all.get("h4"), dict):
+            tf_obj = sr_all["h4"]
+        elif any(k in sr_all for k in ("supports", "resistances", "supports_near", "resistances_near", "supports_major", "resistances_major")):
+            tf_obj = sr_all
+
+        if not isinstance(tf_obj, dict):
+            return
+
+        buckets = []
+        for k in ("supports_near","supports_major","supports","resistances_near","resistances_major","resistances"):
+            xs = tf_obj.get(k) or []
+            if isinstance(xs, list) and xs:
+                buckets.append(xs)
+
+        best = None
+        best_d = None
+
+        for x in xs:
+            # allow dict items OR raw float levels
+            if isinstance(x, dict):
+                lv0 = x.get("level")
+                if lv0 is None:
+                    continue
+                try:
+                    lv = float(lv0)
+                except Exception:
+                    continue
+                meta_src = x  # may contain touches/strength/sr_score
+            else:
+                # raw float level list
+                try:
+                    lv = float(x)
+                except Exception:
+                    continue
+                meta_src = None  # no meta available
+
+
+                d = abs(lv - zlvl)
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = {"level": lv} if meta_src is None else meta_src
+
+        if not isinstance(best, dict) or best_d is None:
+            return
+
+        # only accept if "close enough" to represent the same SR level
+        tol = None
+        try:
+            tol = abs(float(zone.get("high")) - float(zone.get("level")))
+            if not tol or tol <= 0:
+                tol = None
+        except Exception:
+            tol = None
+
+        if tol is None:
+            try:
+                tol = float(os.getenv("XTL_ZONE_META_MATCH_TOL", "2.0"))
+            except Exception:
+                tol = 2.0
+
+        if best_d <= tol:
+            zone["touches"] = int(best.get("touches") or 0)
+            zone["strength"] = float(best.get("strength") or 0.0)
+            zone["sr_score"] = float(best.get("sr_score") or 0.0)
+
+            try:
+                thr_strength = int(os.getenv("XTL_STRONG_ZONE_STRENGTH", "8"))
+            except Exception:
+                thr_strength = 8
+            try:
+                thr_touches = int(os.getenv("XTL_STRONG_ZONE_TOUCHES", "4"))
+            except Exception:
+                thr_touches = 4
+            try:
+                thr_score = float(os.getenv("XTL_STRONG_ZONE_SR_SCORE", "9"))
+            except Exception:
+                thr_score = 9.0
+
+            zone["is_strong"] = (
+                float(zone.get("strength") or 0) >= thr_strength
+                or int(zone.get("touches") or 0) >= thr_touches
+                or float(zone.get("sr_score") or 0) >= thr_score
+            )
+
+
+    # ---- If zone is wrong side / too far, replace it ----
+    try:
+        cl_val = float(cl)
+    except Exception:
+        cl_val = None
+
+    # Prefer live/last price for zone side validation; fall back to last closed close
+    try:
+        ref_px = float(px)
+    except Exception:
+        ref_px = cl_val
+    # --- FORCE pick zone from SR based on live price (prevents stale SR_CONFIRMED zone) ---
+    if ref_px is not None and isinstance(sr, dict):
+        z_force = _pick_zone_from_sr(sr, direction, ref_px, float(atr or 0.0))
+        if z_force:
+            zone = z_force
+
+    if ref_px is not None and isinstance(sr, dict) and isinstance(zone, dict):
+        far = float(MOVE_AWAY_ATR) * float(atr or 0.0)
+
+        try:
+            zl = float(zone.get("low"))
+            zh = float(zone.get("high"))
+        except Exception:
+            zl = None
+            zh = None
+
+        if zl is not None and zh is not None:
+
+            # --- HARD GUARD: do not proceed with wrong-side zone ---
+            # --- HARD GUARD: truly wrong-side zone (allow when price is INSIDE the zone) ---
+            # BUY support is wrong-side only if the whole zone is ABOVE price
+            if direction == "BUY" and zl > ref_px:
+                return False, {
+                    "reason": "zone_wrong_side_buy",
+                    "stage": "ZONE_VALIDATE",
+                    "blocked": False,
+                    "price": float(ref_px),
+                    "zone": zone,
+                }
+
+            # SELL resistance is wrong-side only if the whole zone is BELOW price
+            if direction == "SELL" and zh < ref_px:
+                return False, {
+                    "reason": "zone_wrong_side_sell",
+                    "stage": "ZONE_VALIDATE",
+                    "blocked": False,
+                    "price": float(ref_px),
+                    "zone": zone,
+                }
+
+
+            if direction == "SELL":
+                # Resistance must be ABOVE current price
+                wrong_side = (zh < ref_px)
+                too_far    = (zl > ref_px + far) if far > 0 else False
+
+
+                if wrong_side or too_far:
+                    # Try to re-pick using SR at current live price
+                    z2 = _pick_zone_from_sr(sr, "SELL", ref_px, atr)
+                    if z2:
+                        zone = z2
+                        try:
+                            zone_tf = str(z2.get("tf") or zone_tf or tf_tag or "H1").upper()
+                        except Exception:
+                            pass
+                    else:
+                        # IMPORTANT: do NOT fail/return just because zone is far.
+                        # If SR has a nearest_resistance above price, keep current zone and wait for tap+reversal.
+                        nr = None
+                        try:
+                            nr = float(sr.get("nearest_resistance")) if isinstance(sr, dict) and sr.get("nearest_resistance") is not None else None
+                        except Exception:
+                            nr = None
+
+                        if nr is not None and nr > float(ref_px):
+                            # Keep existing zone (may be far). Continue to tap logic; it will only arm on touch.
+                            # Attach a soft reason for debug visibility.
+                            gate_meta = {
+                                "reason": "sell_zone_far_wait_tap",
+                                "stage": "ZONE_PICK",
+                                "blocked": False,
+                                "price": float(ref_px),
+                                "note": "Resistance exists but is far; waiting for tap+reversal.",
+                                "zone":zone,
+                            }
+                        else:
+                            # Truly no resistance above price in SR
+                            return False, {
+                                "reason": "no_sell_resistance_above_price",
+                                "stage": "ZONE_PICK",
+                                "blocked": False,
+                                "price": float(ref_px),
+                                "note": "No resistance above price in SR; cannot run SELL tap gate now.",
+                            }
+
+
+            else:  # BUY
+                # Support must be BELOW current price
+                wrong_side = (zl > ref_px)
+                too_far    = (zh < ref_px - far) if far > 0 else False
+
+                if wrong_side or too_far:
+                    z2 = _pick_zone_from_sr(sr, "BUY", ref_px, atr)
+                    if z2:
+                        zone = z2
+                        try:
+                            zone_tf = str(z2.get("tf") or zone_tf or tf_tag or "H1").upper()
+                        except Exception:
+                            pass
+                    else:
+                        ns = None
+                        try:
+                            ns = float(sr.get("nearest_support")) if isinstance(sr, dict) and sr.get("nearest_support") is not None else None
+                        except Exception:
+                            ns = None
+
+                        if ns is not None and ns < float(ref_px):
+                            gate_meta = {
+                                "reason": "buy_zone_far_wait_tap",
+                                "stage": "ZONE_PICK",
+                                "blocked": False,
+                                "price": float(ref_px),
+                                "note": "Support exists but is far; waiting for tap+reversal.",
+                                "zone":zone,
+                            }
+                        else:
+                            return False, {
+                                "reason": "no_buy_support_below_price",
+                                "stage": "ZONE_PICK",
+                                "blocked": False,
+                                "price": float(ref_px),
+                                "note": "No support below price in SR; cannot run BUY tap gate now.",
+                            }
+
+
+    # keep close-only break state based on close (cl)
+    break_state, break_meta = _break_state_close_only(float(cl))
+    # --- attach strength meta for provisional/flipped zones (so bootstrap can extend) ---
+    try:
+        _attach_zone_strength_meta(zone, sr)
+    except Exception:
+        pass
+    # after _attach_zone_strength_meta(zone, sr)
+    try:
+        half_local = None
+        try:
+            zl = float(zone.get("low"))
+            zh = float(zone.get("high"))
+            half_local = abs(zh - zl) / 2.0
+        except Exception:
+            half_local = float(zone.get("half") or 0.0)
+        if isinstance(gate_meta, dict) and isinstance(zone, dict):
+            gate_meta["zone_used"] = {
+                "level": float(zone.get("level") or 0.0),
+                "low": float(zone.get("low") or 0.0),
+                "high": float(zone.get("high") or 0.0),
+                "touches": int(zone.get("touches") or 0),
+                "strength": float(zone.get("strength") or 0.0),
+                "sr_score": float(zone.get("sr_score") or 0.0),
+                "is_strong": bool(zone.get("is_strong") or False),
+                "tf": str(zone.get("tf") or zone_tf or tf_tag or ""),
+                "type": str(zone.get("type") or zone_type or ""),
+                "half": float(half_local or 0.0),
+                "atr": float(atr or 0.0),
+            }
+    except Exception:
+        pass
+
+
+
+
+
+    # ==========================================================
+    # 5B) BOS double-check
+    # ==========================================================
+    BOS_BLOCK = False  # DISABLED (no BOS gating at entry)
+    try:
+        BOS_MAX_AGE_BARS = int(os.getenv("XTL_BOS_MAX_AGE_BARS", "48"))
+    except Exception:
+        BOS_MAX_AGE_BARS = 48
+    try:
+        BOS_PIVOT_LR = int(os.getenv("XTL_BOS_PIVOT_LR", "2"))
+    except Exception:
+        BOS_PIVOT_LR = 2
+    try:
+        BOS_MIN_ATR = float(os.getenv("XTL_BOS_MIN_ATR", "0.15"))
+    except Exception:
+        BOS_MIN_ATR = 0.15
+
+    def _detect_last_bos(bars_in: list[dict], *, atr_val: float | None, max_age_bars: int) -> dict | None:
+        try:
+            lr = max(1, int(BOS_PIVOT_LR))
+            n0 = len(bars_in)
+            if n0 < (2 * lr + 6):
+                return None
+
+            def _hlc(i: int):
+                b = bars_in[i]
+                h_ = float(b.get("h") or b.get("high"))
+                l_ = float(b.get("l") or b.get("low"))
+                c_ = float(b.get("c") or b.get("close"))
+                return h_, l_, c_
+
+            piv_hi: list[tuple[int, float]] = []
+            piv_lo: list[tuple[int, float]] = []
+
+            for i in range(lr, n0 - lr):
+                h_i, l_i, _ = _hlc(i)
+                ok_hi = True
+                ok_lo = True
+                for k in range(1, lr + 1):
+                    h_l, l_l, _ = _hlc(i - k)
+                    h_r, l_r, _ = _hlc(i + k)
+                    if h_i <= h_l or h_i <= h_r:
+                        ok_hi = False
+                    if l_i >= l_l or l_i >= l_r:
+                        ok_lo = False
+                    if not ok_hi and not ok_lo:
+                        break
+                if ok_hi:
+                    piv_hi.append((i, h_i))
+                if ok_lo:
+                    piv_lo.append((i, l_i))
+
+            if not piv_hi and not piv_lo:
+                return None
+
+            last_i = n0 - 1
+            _, _, last_close = _hlc(last_i)
+
+            bos = None
+            if piv_lo:
+                pi, lvl = piv_lo[-1]
+                if last_close < lvl:
+                    bos = {"ok": True, "dir": "DOWN", "level": float(lvl), "pivot_i": int(pi)}
+
+            if piv_hi:
+                pi, lvl = piv_hi[-1]
+                if last_close > lvl:
+                    up = {"ok": True, "dir": "UP", "level": float(lvl), "pivot_i": int(pi)}
+                    if (bos is None) or (up["pivot_i"] > bos["pivot_i"]):
+                        bos = up
+
+            if not bos:
+                return None
+
+            age_bars = int(last_i - int(bos["pivot_i"]))
+            bos["break_i"] = int(last_i)
+            bos["age_bars"] = age_bars
+            bos["blocked"] = False
+
+            if age_bars > int(max_age_bars):
+                return bos
+
+            if isinstance(atr_val, (int, float)) and float(atr_val) > 0:
+                dist = abs(float(last_close) - float(bos["level"]))
+                if dist < float(BOS_MIN_ATR) * float(atr_val):
+                    return bos
+
+            want = "UP" if direction == "BUY" else "DOWN"
+            if BOS_BLOCK and bos["dir"] != want:
+                # Opposite BOS blocks ONLY if price is still holding beyond the BOS level.
+                try:
+                    lvl = float(bos["level"])
+                    lc = float(last_close)
+                    buf = 0.0
+                    if isinstance(atr_val, (int, float)) and float(atr_val) > 0:
+                        buf = float(BOS_MIN_ATR) * float(atr_val)
+                except Exception:
+                    lvl, lc, buf = 0.0, 0.0, 0.0
+
+                if bos["dir"] == "UP":
+                    # BOS UP opposes SELL: block only while price remains above level (+buf)
+                    bos["blocked"] = (lc > (lvl + buf))
+                else:
+                    # BOS DOWN opposes BUY: block only while price remains below level (-buf)
+                    bos["blocked"] = (lc < (lvl - buf))
+
+            return bos
+
+        except Exception:
+            return None
+
+    bos_meta_h1 = None
+    try:
+        bos_meta_h1 = _detect_last_bos(bars, atr_val=float(atr), max_age_bars=int(BOS_MAX_AGE_BARS))
+    except Exception:
+        bos_meta_h1 = None
+
+    bos_meta_m15 = None
+    try:
+        bars_m15 = row_h1.get("bars_m15") or []
+        if isinstance(bars_m15, list) and len(bars_m15) >= 30:
+            try:
+                M15_MAX_AGE = int(os.getenv("XTL_BOS_M15_MAX_AGE_BARS", "24"))
+            except Exception:
+                M15_MAX_AGE = 24
+            bos_meta_m15 = _detect_last_bos(bars_m15, atr_val=None, max_age_bars=int(M15_MAX_AGE))
+    except Exception:
+        bos_meta_m15 = None
+
+
+
+    def _bootstrap_taps_from_history(bars_in, zone, direction, atr, zone_half, now_ms, lookback_days, tf_ms):
+        norm = _normalize_snap_bars_to_ms(bars_in or [], int(tf_ms))
+        if not norm:
+            return {"tap_count": 0, "moved_away": True, "last_ts": 0, "first_ts": 0,
+                    "zone_level": float(zone.get("level") or 0.0), "last_tap_bar_ms": 0,
+                    "sweep_ts": 0, "sweep_side": None, "sweep_edge": None,
+                    "bootstrapped": True, "boot_lb_days": int(lookback_days),
+                    "boot_cutoff_ms": 0, "boot_scanned_bars": 0}
+
+        zone_low = float(zone["low"]); zone_high = float(zone["high"])
+        move_req = float(MOVE_AWAY_ATR) * float(atr)
+
+        # cutoff
+        cutoff = int(now_ms) - int(lookback_days) * 24 * 60 * 60 * 1000
+        scanned = 0
+
+        tap_count = 0
+        moved_away = True
+        first_ts = 0
+        last_ts = 0
+        last_tap_bar_ms = 0
+
+        for b in norm:
+            t = int(b.get("t_close_ms") or 0)
+            if t <= 0 or t < cutoff:
+                continue
+            scanned += 1
+
+            h = float(b.get("h") or 0.0)
+            l = float(b.get("l") or 0.0)
+            c = float(b.get("c") or 0.0)
+
+            overlap = (l <= zone_high) and (h >= zone_low)
+
+            # away condition (directional)
+            if direction == "BUY":
+                away = (c - zone_high) >= move_req
+            else:
+                away = (zone_low - c) >= move_req
+
+            if away:
+                moved_away = True
+
+            # Count a tap only on entering overlap while moved_away is True
+            if overlap and moved_away:
+                tap_count += 1
+                moved_away = False
+                last_tap_bar_ms = t
+                last_ts = int(t)
+                if first_ts <= 0:
+                    first_ts = int(t)
+
+        return {
+            "tap_count": int(tap_count),
+            "moved_away": bool(moved_away),
+            "last_ts": int(last_ts or 0),
+            "first_ts": int(first_ts or 0),
+            "zone_level": float(zone.get("level") or 0.0),
+            "zone_low": float(zone_low),
+            "zone_high": float(zone_high),
+            "last_tap_bar_ms": int(last_tap_bar_ms or 0),
+            "sweep_ts": 0, "sweep_side": None, "sweep_edge": None,
+            "bootstrapped": True,
+            "boot_lb_days": int(lookback_days),
+            "boot_cutoff_ms": int(cutoff),
+            "boot_scanned_bars": int(scanned),
+        }
+
+
+
+    def _tap_key_for_zone(sym_u: str, direction: str, zone: dict, tf_tag: str, *, zone_tf: str | None) -> str:
+        """
+        Tap state must be scoped to the zone identity, not request TF.
+        Otherwise taps leak between different zones and between H1/H4 sources.
+        """
+        ztf = str(zone_tf or tf_tag or "H1").upper()
+        try:
+            lvl = float(zone.get("level") or 0.0)
+        except Exception:
+            lvl = 0.0
+
+        # keep it stable and short; 3 decimals is enough for FX/XAU SR
+        # Keep key stable but precise enough to avoid collisions:
+        # - FX pairs: 5 decimals (pip=0.0001)
+        # - JPY pairs: 3 decimals (pip=0.01)
+        # - XAUUSD: 2 decimals (0.01)
+        try:
+            if sym_u == "XAUUSD":
+                dec = 2
+            elif sym_u.endswith("JPY"):
+                dec = 3
+            else:
+                dec = 5
+        except Exception:
+            dec = 5
+
+        lvl_s = (f"{lvl:.{dec}f}".rstrip("0").rstrip(".") if lvl > 0 else "0")
+
+
+        return f"xtl:zone:tap:{sym_u}:{direction}:{ztf}@{lvl_s}"
+
+    # -------------------------------
+    # 4) Tap detection + state (Redis)
+    # -------------------------------
+    R = _r()
+    # zone identity key (prevents tap leakage across zones / TF)
+    key = _tap_key_for_zone(sym_u, direction, zone, tf_tag, zone_tf=zone_tf)
+
+
+    tapped = (float(l) <= float(zone["high"])) and (float(h) >= float(zone["low"]))
+    # ------------------------------------------------------------
+    # derive last CLOSED bar close-ms once for this gate (c_ms)
+    # used for dedup + debug + session weighting
+    # ------------------------------------------------------------
+    c_ms = 0
+    try:
+        _bars0 = row_h1.get("bars") or row_h1.get("ohlc") or []
+    except Exception:
+        _bars0 = []
+
+    try:
+        c0, _p0 = _pick_last_closed_bar_from_bars(_bars0, int(now_ms), int(tf_ms))
+    except Exception:
+        c0, _p0 = None, None
+
+    try:
+        if isinstance(c0, dict):
+            c_ms = int(c0.get("t_close_ms") or c0.get("t") or 0)
+            # normalize seconds -> ms if needed
+            if 0 < c_ms < 10_000_000_000:
+                c_ms *= 1000
+    except Exception:
+        c_ms = 0
+
+    if debug_gate:
+        try:
+            rk = f"xtl:zone:tap:DBG:{sym_u}:{direction}:{tf_tag.upper()}"
+            R.setex(rk, 600, str(int(now_ms)))
+        except Exception:
+            pass
+
+
+
+    # 4A) Load existing tap-state; if missing -> bootstrap from last N days of H1 bars
+    raw_st = None
+    try:
+        raw_st = _json_load_twice(R.get(key))
+    except Exception:
+        raw_st = None
+    # 4A.1) Reset tap-state if the zone moved materially (prevents stale tap_count on a new zone)
+    try:
+        zone_low_now = float(zone.get("low") or 0.0)
+        zone_high_now = float(zone.get("high") or 0.0)
+        zone_level_now = float(zone.get("level") or 0.0)
+
+        # "Material" threshold: half-zone width (robust, direction-agnostic)
+        zone_half_now = abs(zone_high_now - zone_low_now) / 2.0
+        if zone_half_now <= 0:
+            zone_half_now = 0.0
+
+        if isinstance(raw_st, dict) and raw_st:
+            prev_low = float(raw_st.get("zone_low") or 0.0)
+            prev_high = float(raw_st.get("zone_high") or 0.0)
+            prev_level = float(raw_st.get("zone_level") or 0.0)
+
+            # Reset if any edge/level drifted by >= 1 * half-zone width
+            zone_changed = (
+                (zone_half_now > 0.0) and (
+                    abs(prev_low - zone_low_now) >= zone_half_now or
+                    abs(prev_high - zone_high_now) >= zone_half_now or
+                    abs(prev_level - zone_level_now) >= zone_half_now
+                )
+            )
+
+            if zone_changed:
+                try:
+                    R.delete(key)  # wipe old tap-state (single source of truth)
+                except Exception:
+                    pass
+                raw_st = None  # forces bootstrap / fresh state
+    except Exception:
+        # never block gate due to reset logic
+        pass
+
+
+    if (not isinstance(raw_st, dict)) or (not raw_st):
+        # Bootstrap taps from history so bot-start-late still respects earlier taps
+        try:
+            lookback_days = int(os.getenv("XTL_TAP_BOOTSTRAP_DAYS", "3"))
+        except Exception:
+            lookback_days = 3
+
+        try:
+            if isinstance(zone, dict) and bool(zone.get("is_strong")):
+                lookback_days = max(
+                    int(lookback_days),
+                    int(os.getenv("XTL_STRONG_ZONE_LOOKBACK_DAYS", "15")),
+                )
+        except Exception:
+            pass
+
+
+        # build a "fresh" state inferred from recent bars
+        try:
+            tf_ms0 = int(TF_MS.get(tf_tag.upper(), 60 * 60 * 1000))
+        except Exception:
+            tf_ms0 = 60 * 60 * 1000
+
+        # IMPORTANT: bootstrap should NOT include the current bar 'c' you are evaluating now.
+        bars_hist = bars[:-1] if isinstance(bars, list) and len(bars) > 2 else (bars or [])
+        try:
+            st = _bootstrap_taps_from_history(
+                bars_hist,
+                zone=zone,
+                direction=direction,
+                atr=float(atr),
+                zone_half=float(zone_half),
+                now_ms=int(now_ms),
+                lookback_days=int(lookback_days),
+                tf_ms=int(tf_ms0),
+            )
+            # --- FIX: bootstrap should set first_ts/last_ts to real tap history times, not now() ---
+            try:
+                # if bootstrap returns a tap timeline, use it; else derive from last_tap_bar_ms
+                ltb = int(st.get("last_tap_bar_ms", 0) or 0)
+                if ltb > 0 and int(st.get("first_ts", 0) or 0) <= 0:
+                    st["first_ts"] = ltb  # fallback: at least not "now"
+                if ltb > 0:
+                    st["last_ts"] = int(st.get("last_ts", 0) or 0) or ltb
+            except Exception:
+                pass
+
+            if debug_gate:
+                try:
+                    log.warning(
+                        "[TAPBOOT] sym=%s dir=%s tf=%s days=%s tap_count=%s moved_away=%s last_ts=%s",
+                        sym_u, direction, tf_tag, lookback_days,
+                        int(st.get("tap_count", 0) or 0),
+                        bool(st.get("moved_away", True)),
+                        int(st.get("last_ts", 0) or 0),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            st = {}
+    else:
+        st = raw_st
+
+    # Ensure required defaults always exist
+    st = st or {}
+    st.setdefault("tap_count", 0)
+    st.setdefault("moved_away", True)
+    st.setdefault("last_ts", 0)
+    st.setdefault("first_ts", 0)
+    st.setdefault("last_tap_bar_ms", 0)
+    st.setdefault("sweep_ts", 0)
+    st.setdefault("sweep_side", None)
+    st.setdefault("sweep_edge", None)
+    # -------------------------------
+    # Reset if zone changed materially
+    # IMPORTANT: must run BEFORE overwriting st["zone_*"]
+    # -------------------------------
+    try:
+        prev_level = float(st.get("zone_level") or 0.0)
+        prev_low   = float(st.get("zone_low") or 0.0)
+        prev_high  = float(st.get("zone_high") or 0.0)
+
+        cur_level = float(zone.get("level") or 0.0)
+        cur_low   = float(zone.get("low") or 0.0)
+        cur_high  = float(zone.get("high") or 0.0)
+
+        prev_w = max(0.0, prev_high - prev_low)
+        cur_w  = max(0.0, cur_high - cur_low)
+
+        # material threshold: half current zone width (with tiny floor)
+        eps = max(cur_w * 0.50, 1e-6)
+
+        zone_changed = (
+            (prev_level > 0.0) and (
+                abs(cur_level - prev_level) > eps or
+                abs(cur_low   - prev_low)   > eps or
+                abs(cur_high  - prev_high)  > eps or
+                abs(cur_w     - prev_w)     > eps
+            )
+        )
+
+        if zone_changed:
+            st["tap_count"] = 0
+            st["moved_away"] = True
+            st["last_ts"] = 0
+            st["first_ts"] = 0
+            st["last_tap_bar_ms"] = 0
+            st["sweep_ts"] = 0
+            st["sweep_side"] = None
+            st["sweep_edge"] = None
+    except Exception:
+        pass
+
+    # FORCE current zone params into state (single source of truth)
+    st["zone_level"] = float(zone.get("level") or 0.0)
+    st["zone_low"]   = float(zone.get("low") or 0.0)
+    st["zone_high"]  = float(zone.get("high") or 0.0)
+
+
+    # move-away reset (directional)
+    try:
+        move_req = float(MOVE_AWAY_ATR) * float(atr)
+        if direction == "BUY":
+            moved = (float(cl) - float(zone["high"])) >= move_req
+        else:
+            moved = (float(zone["low"]) - float(cl)) >= move_req
+        if moved:
+            st["moved_away"] = True
+    except Exception:
+        pass
+
+
+    # ---- DEBUG (tap state) ----
+    try:
+        if bool(debug_gate):
+            # directional moved-away distance
+            if direction == "BUY":
+                dist = float(cl) - float(zone["high"])
+            else:
+                dist = float(zone["low"]) - float(cl)
+
+            move_req = float(MOVE_AWAY_ATR) * float(atr)
+
+            # show once per bar close to avoid spam
+            cbar = int(c_ms or 0)
+            last_dbg = int(st.get("last_dbg_bar_ms") or 0)
+            if cbar > 0 and cbar != last_dbg:
+                st["last_dbg_bar_ms"] = cbar
+                try:
+                    rk2 = f"xtl:zone:tap:DBG:{sym_u}:{direction}:{tf_tag.upper()}"
+                    R.setex(rk2, 600, json.dumps(st, separators=(",", ":")))
+
+                except Exception:
+                    pass
+
+                log.warning(
+                    "[TAPDBG] sym=%s dir=%s tf=%s tapped=%s tap_count=%s moved_away=%s dist=%.6f req=%.6f zone=[%.6f..%.6f] cl=%.6f",
+                    sym, direction, tf_tag, bool(tapped),
+                    int(st.get("tap_count", 0) or 0),
+                    bool(st.get("moved_away", True)),
+                    float(dist), float(move_req),
+                    float(zone["low"]), float(zone["high"]),
+                    float(cl),
+                )
+    except Exception:
+        pass
+
+
+
+
+    # ----------------------------------------
+    # TAP STATE + PERSIST (single source of truth)
+    # ----------------------------------------
+
+
+    # Start from stored count
+    tap_count = int(st.get("tap_count", 0) or 0)
+
+    # moved_away comes from state; default True until we see a valid tap
+    moved_away = bool(st.get("moved_away", True))
+    try:
+        zone_age_days = (int(now_ms) - int(st.get("first_ts") or now_ms)) / (24 * 3600 * 1000)
+    except Exception:
+        zone_age_days = 0
+
+    try:
+        FRESH_DAYS = int(os.getenv("XTL_FRESH_ZONE_DAYS", "3"))  # start with 3
+    except Exception:
+         FRESH_DAYS = 3
+    FRESH_MS = int(FRESH_DAYS) * 24 * 3600 * 1000
+
+    # ----------------------------
+    # Dynamic max taps (fresh/old + volatility)
+    # ----------------------------
+    try:
+        FRESH_MAX_TAPS = int(os.getenv("XTL_FRESH_MAX_TAPS", "3"))
+    except Exception:
+        FRESH_MAX_TAPS = 3
+
+    if zone_age_days <= float(FRESH_DAYS):
+        max_taps_dynamic = int(FRESH_MAX_TAPS)
+    else:
+        max_taps_dynamic = int(MAX_TAPS)
+
+
+    # Volatility bump: if ATR% is higher, allow a couple more taps (H1 FX needs this)
+    try:
+        # ATR as fraction of price (e.g., 0.0010 = 0.10%)
+        atr_pct = abs(float(atr or 0.0)) / max(abs(float(cl or 0.0)), 1e-9)
+    except Exception:
+        atr_pct = 0.0
+
+    try:
+        TAP_VOL1 = float(os.getenv("XTL_TAP_VOL1", "0.0008"))  # +1 tap above this ATR%
+    except Exception:
+        TAP_VOL1 = 0.0008
+    try:
+        TAP_VOL2 = float(os.getenv("XTL_TAP_VOL2", "0.0012"))  # +2 taps above this ATR%
+    except Exception:
+        TAP_VOL2 = 0.0012
+    try:
+        MAX_TAPS_CAP = int(os.getenv("XTL_MAX_TAPS_CAP", "7"))  # hard safety cap
+    except Exception:
+        MAX_TAPS_CAP = 7
+
+    if atr_pct >= TAP_VOL1:
+        max_taps_dynamic += 1
+    if atr_pct >= TAP_VOL2:
+        max_taps_dynamic += 1
+
+    # clamp
+    max_taps_dynamic = max(3, min(int(max_taps_dynamic), int(MAX_TAPS_CAP)))
+
+
+    # Count a tap once per closed H1 bar (avoid double count)
+    if tapped:
+        last_bar = int(st.get("last_tap_bar_ms", 0) or 0)
+        # derive current closed bar close-ms for tap dedup (no c_ms variable in this scope)
+        try:
+            _bars = row_h1.get("bars") or row_h1.get("ohlc") or []
+        except Exception:
+            _bars = []
+
+        try:
+            c, p = _pick_last_closed_bar_from_bars(_bars, now_ms, tf_ms)
+        except Exception:
+            c, p = None, None
+
+        this_bar = int((c or {}).get("t_close_ms") or 0)
+        # normalize seconds->ms if needed
+        if 0 < this_bar < 10_000_000_000:
+            this_bar *= 1000
+
+        # --- repair: poisoned state (last_bar saved earlier but tap_count stayed 0) ---
+        if tap_count < 1 and last_bar > 0 and this_bar > 0 and this_bar == last_bar:
+            tap_count = 1
+            st["tap_count"] = tap_count
+            st["first_ts"] = int(st.get("first_ts") or now_ms)
+            st["last_ts"] = int(now_ms)
+            st["last_tap_ms"] = int(now_ms)
+            st["moved_away"] = False
+
+        if this_bar > 0 and this_bar != last_bar:
+            # ONLY count a new tap if price had moved away enough since the last tap
+            if bool(st.get("moved_away", True)):
+                tap_count = min(int(MAX_TAPS) + 1, tap_count + 1)
+                st["tap_count"] = tap_count
+                st["last_ts"] = int(now_ms)
+                st["last_tap_bar_ms"] = this_bar
+                st["last_tap_ms"] = int(now_ms)
+                st["moved_away"] = False  # must move away again before next tap counts
+                if tap_count == 1 and int(st.get("first_ts") or 0) <= 0:
+                    st["first_ts"] = int(now_ms)
+            else:
+                # touched again but never moved away -> do NOT increment tap_count
+                st["last_ts"] = int(now_ms)  # optional: keep last_ts fresh for debugging
+
+    else:
+        # no tap this bar; keep moved_away state
+        if moved_away:
+            st["moved_away"] = True
+
+    # Apply break effects (key is defined now)
+    if break_state == "HARD_BREAK":
+        try:
+            R.delete(key)
+        except Exception:
+            pass
+        return False, {
+            "reason": "hard_break",
+            "break": break_meta,
+            "zone": {**zone, "type": zone_type},
+            "bos_h1": bos_meta_h1,
+            "bos_m15": bos_meta_m15,
+            "tap_key": key,
+            "tap_count": int(tap_count),
+            "stage": "ZONE_GATE",
+            "blocked": True,
+        }
+
+    if break_state == "SWEEP":
+        st["sweep_ts"] = int(now_ms)
+        st["sweep_side"] = str(break_meta.get("side") or "")
+        st["sweep_edge"] = float(break_meta.get("edge") or 0.0)
+
+    # Persist TAP state (ALWAYS attempt)
+    persist_ok = False
+    persist_exists = None
+    persist_ttl = None
+    persist_len = None
+    persist_exc_type = None
+    persist_exc = None
+
+    try:
+        ttl_sec = int(MAX_TAP_BARS) * 3600
+        # refuse to persist empty/invalid state
+        if not isinstance(st, dict) or not st:
+            st = {
+               "tap_count": 0,
+               "moved_away": True,
+               "last_ts": 0,
+               "first_ts": 0,
+               "zone_level": float(zone.get("level") or 0.0),
+               "last_tap_bar_ms": 0,
+               "sweep_ts": 0,
+               "sweep_side": None,
+               "sweep_edge": None,
+            }
+        payload = json.dumps(st, separators=(",", ":"))
+        if len(payload) <= 2:  # "{}"
+            raise ValueError("Refusing to persist empty tap state")
+        R.set(key, payload)
+
+        # verify by reading the value back
+        val = R.get(key)
+        persist_len = len(val) if isinstance(val, (bytes, bytearray, str)) else 0
+        persist_ttl = int(R.ttl(key) or -999)
+        persist_exists = int(R.exists(key) or 0)
+        persist_ok = (persist_len > 2) and (persist_exists == 1) and (persist_ttl in (-1,) or persist_ttl > 0)
+    except Exception as e:
+        persist_exc_type = type(e).__name__
+        persist_exc = str(e)
+
+
+    # Debug payload (ALWAYS available in return dicts)
+    debug_out = {
+        "tap_key": key,
+        "tap_count": int(tap_count),
+        "tapped": bool(tapped),
+        "moved_away": bool(st.get("moved_away", True)),
+        "persist_ok": bool(persist_ok),
+        "persist_exists": persist_exists,
+        "persist_ttl_sec": persist_ttl,
+        "persist_len": persist_len,
+        "persist_exc_type": persist_exc_type,
+        "persist_exc": persist_exc,
+        "__tap_marker__": "TAP_PERSIST_RAN",
+        "__tap_dbg_gate__": bool(debug_gate),
+    }
+    # --- post-persist verification (catch deletes after persist) ---
+    debug_out["tap_key_repr"] = repr(key)
+    # --- attach reference price used for SR/zone selection ---
+    try:
+        debug_out["price"] = float(px) if px is not None else None
+        debug_out["price_src"] = px_src
+        debug_out["price_ts_ms"] = int(px_ts_ms) if px_ts_ms is not None else None
+    except Exception:
+        pass
+
+    # --- attach zone used for tap logic (so jq can show it) ---
+    try:
+        zu = None
+        if isinstance(gate_meta, dict):
+            zu = gate_meta.get("zone_used")
+
+        if isinstance(zu, dict) and zu:
+            debug_out["zone_used"] = dict(zu)  # single source of truth
+        else:
+            debug_out["zone_used"] = {
+                "level": float(zone.get("level") or 0.0),
+                "low": float(zone.get("low") or 0.0),
+                "high": float(zone.get("high") or 0.0),
+                "touches": int(zone.get("touches") or 0),
+                "strength": float(zone.get("strength") or 0.0),
+                "sr_score": float(zone.get("sr_score") or 0.0),
+                "is_strong": bool(zone.get("is_strong") or False),
+                "tf": str(zone.get("tf") or ""),
+                "type": str(zone.get("type") or ""),
+                "half": float(zone_half or 0.0),
+                "atr": float(atr or 0.0),
+            }
+    except Exception:
+        pass
+
+    # --- attach stored tap-state snapshot (what we loaded / bootstrapped) ---
+    try:
+        debug_out["tap_state"] = {
+            "tap_count_st": int(st.get("tap_count", 0) or 0),
+            "moved_away_st": bool(st.get("moved_away", True)),
+            "first_ts": int(st.get("first_ts", 0) or 0),
+            "last_ts": int(st.get("last_ts", 0) or 0),
+            "last_tap_bar_ms": int(st.get("last_tap_bar_ms", 0) or 0),
+            "last_tap_ms": int(st.get("last_tap_ms", 0) or 0),
+            "zone_level_st": float(st.get("zone_level") or 0.0),
+            "zone_low_st": float(st.get("zone_low") or 0.0),
+            "zone_high_st": float(st.get("zone_high") or 0.0),
+            "bootstrapped": bool(st.get("bootstrapped", False)),
+            "boot_lb_days": int(st.get("boot_lb_days", 0) or 0),
+            "boot_scanned_bars": int(st.get("boot_scanned_bars", 0) or 0),
+        }
+    except Exception:
+        pass
+
+    # --- tap decision basis (no extra bar data needed) ---
+    try:
+        debug_out["tap_basis"] = {
+            "tapped_now": bool(tapped),
+            "dedup_last_tap_bar_ms": int(st.get("last_tap_bar_ms", 0) or 0),
+            "moved_away_required": bool(st.get("moved_away", True)),
+            "max_taps_dynamic": int(max_taps_dynamic),
+            "fresh_days": int(FRESH_DAYS) if "FRESH_DAYS" in locals() else None,
+        }
+    except Exception:
+        pass
+
+
+
+    try:
+        debug_out["post_exists"] = int(R.exists(key) or 0)
+        debug_out["post_ttl"] = int(R.ttl(key) or -999)
+        debug_out["post_type"] = str(R.type(key) or "")
+
+    except Exception as _e:
+        debug_out["post_check_exc"] = f"{type(_e).__name__}:{_e}"
+
+    try:
+        kw = getattr(getattr(R, "connection_pool", None), "connection_kwargs", {}) or {}
+        debug_out["__tap_redis_host__"] = kw.get("host")
+        debug_out["__tap_redis_port__"] = kw.get("port")
+        debug_out["__tap_redis_db__"] = kw.get("db")
+    except Exception:
+        pass
+
+    # --- BOS override (DEBUG ONLY) must be BEFORE the early return ---
+    if debug_gate and os.getenv("XTL_DEBUG_IGNORE_BOS", "0") == "1":
+        try:
+            if isinstance(bos_meta_h1, dict):
+                bos_meta_h1["blocked"] = False
+                bos_meta_h1["__bos_ignored__"] = True
+        except Exception:
+            pass
+    if isinstance(bos_meta_h1, dict) and bool(bos_meta_h1.get("blocked")):
+        return False, {"reason": "bos_opposite_h1", "bos_h1": bos_meta_h1, "zone": {**zone, "type": zone_type},"stage": "ZONE_GATE",
+        "blocked": True,
+        **debug_out,}
+
+
+
+    if isinstance(bos_meta_m15, dict) and bool(bos_meta_m15.get("blocked")):
+        return False, {"reason": "bos_opposite_m15", "bos_m15": bos_meta_m15, "zone": {**zone, "type": zone_type},"stage": "ZONE_GATE",
+        "blocked": True,
+        **debug_out,}
+
+    # IMPORTANT: return paths MUST include debug_out so curl/jq proves it ran
+    if False and tap_count < 1:
+        return False, {
+            "reason": "tap_lt_1",
+            "zone": {**zone, "type": zone_type},
+            "break_state": break_state,
+            "break": break_meta,
+            "stage": "ZONE_GATE",
+            "blocked": True,
+            **debug_out,
+        }
+
+    # -------------------------------
+    # Fresh/Old zone policy
+    # -------------------------------
+
+
+    try:
+        first_ts0 = int(st.get("first_ts", 0) or 0)
+    except Exception:
+        first_ts0 = 0
+
+    zone_is_fresh = (first_ts0 > 0) and (int(now_ms) - first_ts0 <= FRESH_MS)
+
+
+    # "old powerful" heuristic: higher TF OR strong zone_type/strength/touches
+    try:
+        ztf0 = str(zone.get("tf") or zone_tf or tf_tag or "H1").upper()
+    except Exception:
+        ztf0 = str(tf_tag or "H1").upper()
+
+    try:
+        ztype0 = str(zone.get("type") or zone_type or "").upper()
+    except Exception:
+        ztype0 = ""
+
+    try:
+        z_strength0 = float(zone.get("strength") or 0.0)
+    except Exception:
+        z_strength0 = 0.0
+
+    try:
+        z_touches0 = int(zone.get("touches") or 0)
+    except Exception:
+        z_touches0 = 0
+
+    old_powerful = (
+        (ztf0 in ("H4", "D", "DAILY", "W1")) or
+        ("MAJOR" in ztype0) or
+        (z_strength0 >= 8.0) or
+        (z_touches0 >= 6)
+    )
+    # --- debug: show computed tap allowance ---
+    try:
+        debug_out["tap_dyn"] = {
+            "tap_count": int(tap_count),
+            "max_taps_dynamic": int(max_taps_dynamic),
+            "atr_pct": float(atr_pct),
+        }
+    except Exception:
+        pass
+
+
+    if False and tap_count > int(max_taps_dynamic):
+        # Your rule: if zone is fresh and already over-tapped -> discard this zone
+        if zone_is_fresh:
+            # IMPORTANT: discard should NOT look like a hard "blocked" gate
+            return False, {
+                "reason": "discard_fresh_zone_too_many_taps",
+                "fresh_days": int(FRESH_DAYS),
+                "max_taps_fresh": int(max_taps_dynamic),
+                "zone": {**zone, "type": zone_type},
+                "stage": "ZONE_GATE",
+                "blocked": False,
+                **debug_out,
+            }
+
+        # Old + powerful zones: allow even if over-tapped (do not hard block)
+        if old_powerful:
+            # Continue gate evaluation (reversal logic decides entry)
+            pass
+        else:
+            # Old but not powerful -> keep current behavior (block)
+            return False, {
+                "reason": "too_many_taps",
+                "max_taps_fresh": int(max_taps_dynamic),
+                "fresh_days": int(FRESH_DAYS),
+                "zone": {**zone, "type": zone_type},
+                "stage": "ZONE_GATE",
+                "blocked": True,
+                **debug_out,
+            }
+
+
+    # Tap2 staleness
+    try:
+        tap_age_ms = int(now_ms) - int(st.get("last_ts", 0) or 0)
+    except Exception:
+        tap_age_ms = int(MAX_TAP2_AGE_MS) + 1
+
+    if tap_age_ms > int(MAX_TAP2_AGE_MS):
+        try:
+            R.delete(key)
+        except Exception:
+            pass
+        return False, {"reason": "tap_stale", "tap_count": tap_count}
+
+    # If sweep armed: require reclaim window
+    try:
+        sweep_ts = int(st.get("sweep_ts") or 0)
+    except Exception:
+        sweep_ts = 0
+
+    if sweep_ts > 0:
+        try:
+            ref_ms = int(c_ms or now_ms)
+            sweep_age_bars = int((ref_ms - sweep_ts) / (60 * 60 * 1000))
+            if sweep_age_bars < 0:
+                sweep_age_bars = 0
+        except Exception:
+            sweep_age_bars = 99
+
+        if sweep_age_bars > int(RECLAIM_MAX_BARS):
+            try:
+                R.delete(key)
+            except Exception:
+                pass
+            return False, {
+                "reason": "sweep_no_reclaim",
+                "sweep_age_bars": sweep_age_bars,
+                "reclaim_max_bars": int(RECLAIM_MAX_BARS),
+                "zone": {**zone, "type": zone_type},
+                "break": {"state": "SWEEP", **break_meta},
+            }
+
+        inside = (float(cl) >= float(zone["low"])) and (float(cl) <= float(zone["high"]))
+        if direction == "BUY":
+            reclaim_ok = inside and (float(cl) >= float(zone["level"]))
+        else:
+            reclaim_ok = inside and (float(cl) <= float(zone["level"]))
+
+        if not reclaim_ok:
+            return True, {
+                "reason": "ARMED_SWEEP_WAIT_RECLAIM",
+                "zone": {**zone, "type": zone_type},
+                "tap_count": tap_count,
+                "break_state": "SWEEP",
+                "break": break_meta,
+                "sweep_age_bars": sweep_age_bars,
+                "reclaim_needed": True,
+                "bos_h1": bos_meta_h1,
+                "bos_m15": bos_meta_m15,
+            }
+
+        try:
+            if abs(float(cl) - float(zone["level"])) > (float(RECLAIM_TIGHTEN_ATR) * float(atr)):
+                return True, {
+                    "reason": "ARMED_RECLAIM_TOO_FAR",
+                    "zone": {**zone, "type": zone_type},
+                    "tap_count": tap_count,
+                    "break_state": "SWEEP",
+                    "break": break_meta,
+                    "reclaim_needed": False,
+                    "tighten_atr": float(RECLAIM_TIGHTEN_ATR),
+                    "bos_h1": bos_meta_h1,
+                    "bos_m15": bos_meta_m15,
+                }
+        except Exception:
+            pass
+
+        # reclaim succeeded -> clear sweep marker
+        st["sweep_ts"] = 0
+        st["sweep_side"] = None
+        st["sweep_edge"] = None
+        try:
+            R.set(key, json.dumps(st))
+        except Exception:
+            pass
+
+    # -------------------------------
+    # 5) Reversal confirmation candle (tap2)
+    # -------------------------------
+    body = abs(float(cl) - float(o))
+    rng = max(float(h) - float(l), 1e-6)
+
+    if direction == "BUY":
+        lower_wick = min(float(o), float(cl)) - float(l)
+        pin_ok = (float(cl) > float(o)) and ((lower_wick / rng) >= 0.45) and ((body / rng) <= 0.40)
+    else:
+        upper_wick = float(h) - max(float(o), float(cl))
+        pin_ok = (float(cl) < float(o)) and ((upper_wick / rng) >= 0.45) and ((body / rng) <= 0.40)
+
+    eng_ok = False
+    try:
+        po = float(_bar_f(p, "o", "open", default=None) or _bar_f(p, "c", "close"))
+        pc = float(_bar_f(p, "c", "close"))
+        if direction == "BUY":
+            eng_ok = (float(cl) > float(o)) and (float(o) <= pc) and (float(cl) >= po)
+        else:
+            eng_ok = (float(cl) < float(o)) and (float(o) >= pc) and (float(cl) <= po)
+    except Exception:
+        eng_ok = False
+
+    if direction == "BUY":
+        close_ok = (float(cl) >= (float(l) + 0.60 * rng)) or (float(cl) >= float(zone["level"]))
+        body_ok = (body / rng) >= 0.20
+        close_reject_ok = bool(close_ok and body_ok and (float(cl) > float(o)))
+    else:
+        close_ok = (float(cl) <= (float(h) - 0.60 * rng)) or (float(cl) <= float(zone["level"]))
+        body_ok = (body / rng) >= 0.20
+        close_reject_ok = bool(close_ok and body_ok and (float(cl) < float(o)))
+
+    rev_ok = bool(pin_ok or eng_ok or close_reject_ok)
+    if not rev_ok:
+        conf_tmp = "medium" if str(zone_type).lower() in ("sr", "sr_confirmed") else "low"
+        return True, {
+            "reason": "ARMED_TAP",
+            "zone": {**zone, "type": zone_type},
+            "tap_count": tap_count,
+            "rev_ok": False,
+            "pin_ok": bool(pin_ok),
+            "eng_ok": bool(eng_ok),
+            "close_reject_ok": bool(close_reject_ok),
+            "body_rng": (float(body) / float(rng)) if rng else None,
+            "confidence": conf_tmp,
+            "break_state": break_state,
+            "break": break_meta,
+            "bos_h1": bos_meta_h1,
+            "bos_m15": bos_meta_m15,
+        }
+
+    if pin_ok:
+        rev_path = "pin"
+    elif eng_ok:
+        rev_path = "engulf"
+    else:
+        rev_path = "close_reject"
+
+    # -------------------------------
+    # 6) Volume confirmation (confidence-only by default)
+    # -------------------------------
+    try:
+        VOL_LOOKBACK = int(os.getenv("XTL_VOL_LOOKBACK", "20"))
+    except Exception:
+        VOL_LOOKBACK = 20
+    try:
+        VOL_MIN_MULT = float(os.getenv("XTL_VOL_MIN_MULT", "1.25"))
+    except Exception:
+        VOL_MIN_MULT = 1.25
+    VOL_BLOCK_IF_FAIL = os.getenv("XTL_VOL_BLOCK_IF_FAIL", "0") == "1"
+
+    vol_ok = None
+    vol_ratio = None
+    try:
+        vols = []
+        for b in bars[-int(VOL_LOOKBACK):]:
+            if not isinstance(b, dict):
+                continue
+            v = b.get("v") or b.get("vol") or b.get("volume")
+            if isinstance(v, (int, float)):
+                vols.append(float(v))
+        if len(vols) >= 5:
+            avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
+            cur_vol = vols[-1]
+            if avg_vol > 0:
+                vol_ratio = cur_vol / avg_vol
+                vol_ok = bool(vol_ratio >= float(VOL_MIN_MULT))
+    except Exception:
+        vol_ok = None
+        vol_ratio = None
+
+    if vol_ok is False and VOL_BLOCK_IF_FAIL:
+        return False, {"reason": "low_volume", "vol_ratio": vol_ratio, "zone": {**zone, "type": zone_type}}
+
+    # -------------------------------
+    # 7) Session weighting
+    # -------------------------------
+    try:
+        SESSION_BOOST_LONDON = float(os.getenv("XTL_SESSION_BOOST_LONDON", "1.10"))
+    except Exception:
+        SESSION_BOOST_LONDON = 1.10
+    try:
+        SESSION_BOOST_NY = float(os.getenv("XTL_SESSION_BOOST_NY", "1.10"))
+    except Exception:
+        SESSION_BOOST_NY = 1.10
+    try:
+        SESSION_PENALTY_ASIA = float(os.getenv("XTL_SESSION_PENALTY_ASIA", "0.95"))
+    except Exception:
+        SESSION_PENALTY_ASIA = 0.95
+
+    def _session_weight(ms: int) -> float:
+        try:
+            utc_h = datetime.utcfromtimestamp(ms / 1000.0).hour
+        except Exception:
+            return 1.0
+        if 7 <= utc_h <= 12:
+            return float(SESSION_BOOST_LONDON)
+        if 13 <= utc_h <= 17:
+            return float(SESSION_BOOST_NY)
+        return float(SESSION_PENALTY_ASIA)
+
+    sess_w = float(_session_weight(int(c_ms or now_ms)))
+
+    # -------------------------------
+    # 8) Zone aging score
+    # -------------------------------
+    try:
+        ZONE_MAX_AGE_BARS = int(os.getenv("XTL_ZONE_MAX_AGE_BARS", "30"))
+    except Exception:
+        ZONE_MAX_AGE_BARS = 30
+    try:
+        ZONE_AGE_PENALTY_AFTER = int(os.getenv("XTL_ZONE_AGE_PENALTY_AFTER", "18"))
+    except Exception:
+        ZONE_AGE_PENALTY_AFTER = 18
+
+    zone_age_bars = 0
+    try:
+        if int(st.get("first_ts") or 0) > 0:
+            zone_age_bars = int((int(now_ms) - int(st["first_ts"])) / (60 * 60 * 1000))
+    except Exception:
+        zone_age_bars = 0
+
+    age_penalize = bool(zone_age_bars > int(ZONE_AGE_PENALTY_AFTER))
+
+    # -------------------------------
+    # 9) Final confidence
+    # -------------------------------
+    conf = "high" if str(zone_type).lower() in ("sr", "sr_confirmed") else "medium"
+    if age_penalize and conf == "high":
+        conf = "medium"
+    if vol_ok is False and conf == "high":
+        conf = "medium"
+    if sess_w < 1.0 and conf == "high":
+        conf = "medium"
+    elif sess_w < 1.0 and conf == "medium":
+        conf = "low"
+
+    # Too old: allow but don’t boost (you can choose to block if you want)
+    if zone_age_bars > int(ZONE_MAX_AGE_BARS):
+        pass
+
+    return True, {
+        "zone": {**zone, "type": zone_type},
+        "tap_count": int(tap_count),
+        "zone_age_bars": int(zone_age_bars),
+        "vol_ratio": vol_ratio,
+        "vol_ok": vol_ok,
+        "session_weight": sess_w,
+        "confidence": conf,
+        "rev_ok": True,
+        "rev_path": rev_path,
+        "body_rng": float(body / rng),
+        "reason": "REVERSAL_OK",
+        "break_state": break_state,
+        "break": break_meta,
+        "bos_h1": bos_meta_h1,
+        "bos_m15": bos_meta_m15,
+    }
