@@ -331,40 +331,18 @@ def entry_decision_m1(
             chosen = "PULLBACK"
 
     if not chosen:
-        reason = "no_setup"
-        if bool(cfg.get("require_bos", False)) and (not bos_ok):
-            reason = "bos_not_confirmed"
-
-        if impulse_exists and retr_frac is not None and not retr_ok:
-            reason = f"pullback_retrace_bad({retr_frac:.2f})"
-        elif impulse_exists and retr_ok and not confirm_break_ok:
-            reason = "pullback_no_confirm_break"
-        elif not displacement_ok:
-            reason = "momentum_no_displacement"
-        elif avg_range <= 0:
-            reason = "avg_range_zero"
         return {
-            "ok": False,
-            "mode": None,
-            "reason": reason,
-            "entry_trigger": None,
-            "entry_price": None,
+            "ok": True,
+            "mode": "BYPASS",
+            "reason": "m1_bypass",
+            "entry_trigger": "CLOSE",
+            "entry_price": float(last["c"]),
             "tp_distance": tp_distance,
             "tp_pct": tp_pct,
             "age_min": age_min,
             "debug": {
+                "m1_bypass": True,
                 "active_profile": active_profile or "DEFAULT",
-                "momentum_ok": momentum_ok,
-                "pullback_ok": pullback_ok,
-                "avg_range": avg_range,
-                "range_now": range_now,
-                "displacement_ok": displacement_ok,
-                "impulse_exists": impulse_exists,
-                "retr_frac": retr_frac,
-                "base_hi": base_hi,
-                "base_lo": base_lo,
-                "bos_ok": bos_ok,
-
             },
         }
 

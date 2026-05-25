@@ -16,6 +16,8 @@ import MFASetup from "@/pages/MFASetup";
 import OpportunitiesDashboard from "@/pages/OpportunitiesDashboard";
 import AIForecasts from "@/pages/Dashboard";
 import PerformancePages from "@/pages/PerformancePages";
+import ConfluenceIntelligence from "@/pages/Confluence";
+
 
 // ✅ Knowledge Base
 import KBLayout from "@/pages/kb/KBLayout";
@@ -112,6 +114,15 @@ export default function App() {
                 </RouteBoundary>
               }
             />
+            <Route
+              path="/Confluence-Intelligence"
+              element={
+                <RouteBoundary>
+                  <ConfluenceIntelligence />
+                </RouteBoundary>
+              }
+            />
+
 
             <Route
               path="/onboarding"

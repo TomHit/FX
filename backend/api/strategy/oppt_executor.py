@@ -139,6 +139,17 @@ def _get_enabled_user_ids(limit: int = 500) -> list[str]:
     return out
 
 
+def _zone_watch_key(sym: str, side: str, tf: str = "H1") -> str:
+    return f"xtl:zone:watch:{(sym or '').upper().strip()}:{(side or '').upper().strip()}:{(tf or 'H1').upper().strip()}"
+
+def _clear_zone_watch_on_entry(sym: str, side: str, tf: str = "H1") -> None:
+    try:
+        wk = _zone_watch_key(sym, side, tf)
+        R.delete(wk)
+    except Exception:
+        pass
+
+
 def _pick_device_for_symbol(user_id: str, sym: str) -> str | None:
     sym_u = (sym or "").upper().strip()
     if not sym_u:
@@ -440,6 +451,28 @@ def _alert_to_event(row: dict) -> Optional[dict]:
     if sl <= 0:
         sl = _sf(raw.get("sl_price"), 0.0)
 
+    eg = row.get("entry_gate") if isinstance(row.get("entry_gate"), dict) else {}
+    zone_used = (
+        eg.get("zone_used")
+        or eg.get("zone")
+        or row.get("zone_used")
+        or row.get("active_zone")
+        or {}
+    )
+
+    entry_zone = zone_used if isinstance(zone_used, dict) else {}
+
+    entry_zone_meta = {
+        "entry_zone": entry_zone or None,
+        "entry_zone_low": _sf(entry_zone.get("low"), 0.0) if entry_zone else None,
+        "entry_zone_high": _sf(entry_zone.get("high"), 0.0) if entry_zone else None,
+        "entry_zone_level": _sf(entry_zone.get("level"), 0.0) if entry_zone else None,
+        "entry_zone_tf": entry_zone.get("tf") if entry_zone else None,
+        "entry_zone_kind": entry_zone.get("kind") if entry_zone else None,
+        "entry_gate_reason": eg.get("reason"),
+        "trade_state": "ENTRY_READY",
+    }
+
     # ---- EXIT ----
     if status in ("hit", "expired", "sl_hit", "closed"):
         reason = "HIT" if status == "hit" else ("SL_HIT" if status == "sl_hit" else "EXPIRED")
@@ -497,35 +530,175 @@ def _alert_to_event(row: dict) -> Optional[dict]:
             },
         }
 
+    
     # ---- ENTRY ----
-    if status == "active" and bool(row.get("entry_triggered")):
-        side = str(row.get("entry_signal") or "").upper().strip()
+    if status == "active":
+        side = str(row.get("entry_signal") or row.get("decision") or "").upper().strip()
+        raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
 
-        entry_price = _sf(row.get("entry_price"), 0.0)
-        if entry_price <= 0:
-            entry_price = _sf(entry_meta.get("entry_price"), 0.0)
+        last_price = _sf(
+            raw.get("lastClose")
+            or raw.get("last_close")
+            or raw.get("ltp")
+            or raw.get("price")
+            or row.get("last_price")
+            or row.get("price"),
+            0.0,
+        )
 
-        if side not in ("BUY", "SELL") or entry_price <= 0:
-            return None
+        # 1) Normal entry (already triggered upstream)
+        if bool(row.get("entry_triggered")):
+            entry_price = _sf(row.get("entry_price"), 0.0)
+            if entry_price <= 0:
+                entry_price = _sf(entry_meta.get("entry_price"), 0.0)
 
-        score = _sf(row.get("opp_score") or row.get("score"), 0.0)
-        conf = str(row.get("opp_confidence") or row.get("confidence") or "").lower().strip()
+            if side not in ("BUY", "SELL") or entry_price <= 0:
+                return None
 
-        return {
-            "type": "ENTRY",
-            "uid": uid,
-            "trade_id": trade_id,
-            "symbol": sym,
-            "side": side,
-            "entry_price": entry_price,
-            "tp_price": tp,
-            "sl_price": sl,
-            "score": score,
-            "confidence": conf,
-            "entry_ts_ms": entry_ts,
-        }
+            score = _sf(row.get("opp_score") or row.get("score"), 0.0)
+            conf = str(row.get("opp_confidence") or row.get("confidence") or "").lower().strip()
+
+            return {
+                "type": "ENTRY",
+                "uid": uid,
+                "trade_id": trade_id,
+                "symbol": sym,
+                "side": side,
+                "entry_price": entry_price,
+                "tp_price": tp,
+                "sl_price": sl,
+                "score": score,
+                "confidence": conf,
+                "entry_ts_ms": entry_ts,
+                **entry_zone_meta,
+            }
+
+        
+        # 2) ENTRY_READY / REV_OK = immediate execution
+        eg = row.get("entry_gate") if isinstance(row.get("entry_gate"), dict) else {}
+        reason = str(eg.get("reason") or "").upper().strip()
+        stage = str(eg.get("stage") or "").upper().strip()
+        trade_state = str(row.get("trade_state") or "").upper().strip()
+
+        if (
+            (reason in ("REV_OK", "ENTRY_READY") or stage == "REV" or trade_state == "ENTRY_READY")
+            and side in ("BUY", "SELL")
+            and last_price > 0
+        ):
+            now_e = now_ms()
+
+            try:
+                hkey = f"{ALERT_HASH_PREFIX}{alert_id}"
+                R.hset(
+                    hkey,
+                    mapping={
+                        "entry_triggered": json.dumps(True),
+                        "entry_signal": json.dumps(side),
+                        "entry_price": json.dumps(float(last_price)),
+                        "entry_ts_ms": json.dumps(int(now_e)),
+                        "entry_reason": json.dumps("ENTRY_READY_IMMEDIATE"),
+                        "entry_trigger_type": json.dumps("ENTRY_READY_IMMEDIATE"),
+                        "trade_state": json.dumps("ENTRY_READY"),
+                    },
+                )
+                R.expire(hkey, 7 * 24 * 3600)
+            except Exception:
+                pass
+
+            score = _sf(row.get("opp_score") or row.get("score"), 0.0)
+            conf = str(row.get("opp_confidence") or row.get("confidence") or "").lower().strip()
+
+            return {
+                "type": "ENTRY",
+                "uid": uid,
+                "trade_id": trade_id,
+                "symbol": sym,
+                "side": side,
+                "entry_price": float(last_price),
+                "tp_price": tp,
+                "sl_price": sl,
+                "score": score,
+                "confidence": conf,
+                "entry_ts_ms": int(now_e),
+                "trigger_type": "ENTRY_READY_IMMEDIATE",
+                "live_px": float(last_price),
+                **entry_zone_meta,
+            }
+            trig_hi = _sf(rs.get("rev_ok_bar_hi"), 0.0)
+            trig_lo = _sf(rs.get("rev_ok_bar_lo"), 0.0)
+
+            crossed = False
+            trig_level = 0.0
+            if side == "BUY" and trig_hi > 0 and last_price >= trig_hi:
+                crossed = True
+                trig_level = trig_hi
+            elif side == "SELL" and trig_lo > 0 and last_price <= trig_lo:
+                crossed = True
+                trig_level = trig_lo
+
+            if crossed:
+                now_e = now_ms()
+
+                # Freeze entry into the alert hash so future polls show entry_triggered=true
+                try:
+                    hkey = f"{ALERT_HASH_PREFIX}{alert_id}"
+                    R.hset(
+                        hkey,
+                        mapping={
+                            "entry_triggered": json.dumps(True),
+                            "entry_signal": json.dumps(side),
+                            "entry_price": json.dumps(float(last_price)),  # LIVE price
+                            "entry_ts_ms": json.dumps(int(now_e)),
+                            "entry_reason": json.dumps(f"REV_OK_BREAK({float(trig_level)})"),
+                            "entry_trigger_level": json.dumps(float(trig_level)),
+                            "entry_trigger_type": json.dumps("REV_OK_BAR_BREAK"),
+                            "entry_trigger_side": json.dumps("HIGH" if side == "BUY" else "LOW"),
+                            "entry_live_px_at_trigger": json.dumps(float(last_price)),
+                            "trade_state": json.dumps("ENTRY_READY"),
+                            "entry_zone": json.dumps(entry_zone_meta.get("entry_zone")),
+                            "entry_zone_low": json.dumps(entry_zone_meta.get("entry_zone_low")),
+                            "entry_zone_high": json.dumps(entry_zone_meta.get("entry_zone_high")),
+                            "entry_zone_level": json.dumps(entry_zone_meta.get("entry_zone_level")),
+                            "entry_zone_tf": json.dumps(entry_zone_meta.get("entry_zone_tf")),
+                            "entry_zone_kind": json.dumps(entry_zone_meta.get("entry_zone_kind")),
+                        },
+                    )
+                    R.expire(hkey, 7 * 24 * 3600)
+                except Exception:
+                    pass
+
+                # IMPORTANT: delete watch key after entry (so next zone can be used later)
+                try:
+                    wkey = eg.get("watch_key") or rs.get("watch_key")
+                    if wkey:
+                        R.delete(str(wkey))
+                except Exception:
+                    pass
+
+                score = _sf(row.get("opp_score") or row.get("score"), 0.0)
+                conf = str(row.get("opp_confidence") or row.get("confidence") or "").lower().strip()
+
+                return {
+                    "type": "ENTRY",
+                    "uid": uid,
+                    "trade_id": trade_id,
+                    "symbol": sym,
+                    "side": side,
+                    "entry_price": float(last_price),
+                    "tp_price": tp,
+                    "sl_price": sl,
+                    "score": score,
+                    "confidence": conf,
+                    "entry_ts_ms": int(now_e),
+                    "trigger_type": "REV_OK_BAR_BREAK",
+                    "trigger_level": float(trig_level),
+                    "trigger_side": "HIGH" if side == "BUY" else "LOW",
+                    "live_px": float(last_price),
+                    **entry_zone_meta,
+                }
 
     return None
+
 
 # -----------------------------------------------------------------------------
 # Paper trading store helpers
@@ -647,6 +820,7 @@ def tick_user(uid: str) -> None:
 
             if bool(ack.get("ok")):
                 pos["status"] = "filled"
+                pos["trade_state"] = "TRADE_ACTIVE"
                 try:
                     res = ack.get("result") or {}
                     # optional: keep MT5 ticket/price if available
@@ -666,6 +840,12 @@ def tick_user(uid: str) -> None:
                     pass
 
                 _open_trade(uid, pos)  # update stored open trade
+                try:
+                    _clear_zone_watch_on_entry(pos.get("symbol"), pos.get("side"), "H1")
+                except Exception:
+                    pass
+
+
                 # mark executed ONLY when MT5 ack ok (filled)
                 try:
                     ex_key2 = EXECUTED_KEY.format(uid=uid)
@@ -912,8 +1092,9 @@ def tick_user(uid: str) -> None:
                        ev.get("entry_price"), ev.get("tp_price"), ev.get("sl_price"))
             dbg_n += 1
 
-        if len(open_trades) >= 20:
+        if len(open_trades) >= max_positions:
             break
+
 
         tid = str(ev.get("trade_id") or "").strip()
         sym = str(ev.get("symbol") or "").upper().strip()
@@ -984,8 +1165,8 @@ def tick_user(uid: str) -> None:
                 side=side,
                 volume=qty_use,
                 trade_id=tid,
-                sl= None,
-                tp= None,
+                sl=float(sl_price) if sl_price > 0 else None,
+                tp=float(tp_price) if tp_price > 0 else None,
                 comment=f"XTL {side} {sym}",
                 mt5_account=mt5_account,
             )
@@ -1024,9 +1205,21 @@ def tick_user(uid: str) -> None:
                 "mt5_job_id": enq.get("job_id"),
                 "device_id": enq.get("device_id"),
                 "status": "sent",
+                "trade_state": "ORDER_PENDING" if exec_mode == "mt5" else "TRADE_ACTIVE",
+                "entry_zone": ev.get("entry_zone"),
+                "entry_zone_low": ev.get("entry_zone_low"),
+                "entry_zone_high": ev.get("entry_zone_high"),
+                "entry_zone_level": ev.get("entry_zone_level"),
+                "entry_zone_tf": ev.get("entry_zone_tf"),
+                "entry_zone_kind": ev.get("entry_zone_kind"),
+                "entry_gate_reason": ev.get("entry_gate_reason"),
+                "trigger_type": ev.get("trigger_type"),
+                "trigger_level": ev.get("trigger_level"),
             }
 
             _open_trade(uid, pos)
+            
+
             
 
             open_trades = _list_open_trades(uid)
@@ -1046,9 +1239,20 @@ def tick_user(uid: str) -> None:
                 "sl_price": float(sl_price) if sl_price > 0 else None,
                 "opened_at_ms": now_ms(),
                 "source": "oppt",
+                "trade_state": "ORDER_PENDING" if exec_mode == "mt5" else "TRADE_ACTIVE",
+                "entry_zone": ev.get("entry_zone"),
+                "entry_zone_low": ev.get("entry_zone_low"),
+                "entry_zone_high": ev.get("entry_zone_high"),
+                "entry_zone_level": ev.get("entry_zone_level"),
+                "entry_zone_tf": ev.get("entry_zone_tf"),
+                "entry_zone_kind": ev.get("entry_zone_kind"),
+                "entry_gate_reason": ev.get("entry_gate_reason"),
+                "trigger_type": ev.get("trigger_type"),
+                "trigger_level": ev.get("trigger_level"),
             }
 
             _open_trade(uid, pos)
+            _clear_zone_watch_on_entry(sym, side, "H1")
             open_trades = _list_open_trades(uid)
             open_by_id = {t.get("trade_id"): t for t in open_trades if t.get("trade_id")}
 

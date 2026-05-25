@@ -6,6 +6,7 @@ import { useAuth } from "@/context/AuthContext";
 const LINKS = [
   { to: "/dashboard",  label: "Dashboard" },
   { to: "/ai-forecasts",  label: "AI-powered forecasts" },
+  { to: "/Confluence-Intelligence",  label: "Confluence Intelligence" },
   { to: "/onboarding", label: "Onboarding" },
   { to: "/devices",    label: "Devices" },
   { to: "/strategy",   label: "Strategy" },

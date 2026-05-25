@@ -141,8 +141,13 @@ def _cluster_levels(
     tol: float,
 ) -> List[Dict[str, Any]]:
     """
-    Cluster raw levels that are within 'tol' of each other.
-    Returns clusters with mean level, touch count, and strength.
+    Cluster raw levels within 'tol'.
+
+    Robust SR bands:
+      - level = median (robust center)
+      - low/high from IQR (Q1..Q3) with adaptive widening
+      - optional Tukey outlier removal (touches>=5)
+      - enforce minimum width based on tol (prevents collapsed bands)
     """
     if not levels:
         return []
@@ -161,18 +166,95 @@ def _cluster_levels(
         clusters.append(current)
 
     out: List[Dict[str, Any]] = []
+
+    # Minimum band width safety (smaller than your tol/2.0)
+    # tol is ~0.25*ATR in your caller; this yields a modest minimum band.
+    min_half_width = max(0.10 * float(tol), 1e-6)
+
     for cluster in clusters:
-        lvl = float(np.mean(cluster))
-        touches = len(cluster)
+        xs = np.array(cluster, dtype=float)
+        touches = int(xs.size)
+
+        xs_used = xs
+        outliers_removed = 0
+
+        # Tukey outlier filter for stability (only when enough points)
+        if touches >= 5:
+            q1_raw = float(np.percentile(xs, 25))
+            q3_raw = float(np.percentile(xs, 75))
+            iqr_raw = float(q3_raw - q1_raw)
+            if iqr_raw > 0:
+                lo_fence = q1_raw - 1.5 * iqr_raw
+                hi_fence = q3_raw + 1.5 * iqr_raw
+                mask = (xs >= lo_fence) & (xs <= hi_fence)
+                xs_f = xs[mask]
+                # keep at least 3 samples; otherwise keep original
+                if xs_f.size >= 3:
+                    outliers_removed = int(xs.size - xs_f.size)
+                    xs_used = xs_f
+
+        lvl = float(np.median(xs_used))
+
+        q1 = float(np.percentile(xs_used, 25))
+        q3 = float(np.percentile(xs_used, 75))
+        iqr = float(q3 - q1)
+
+        # Adaptive band based on strength (touches)
+        if touches >= 5:
+            zone_low = q1
+            zone_high = q3
+            band_type = "tight_iqr"
+        elif touches >= 3:
+            buffer = 0.25 * iqr
+            zone_low = q1 - buffer
+            zone_high = q3 + buffer
+            band_type = "medium_iqr"
+        else:
+            buffer = 0.50 * iqr
+            zone_low = q1 - buffer
+            zone_high = q3 + buffer
+            band_type = "wide_iqr"
+
+        # Enforce minimum width
+        cur_half = float(zone_high - zone_low) / 2.0
+        if (not np.isfinite(zone_low)) or (not np.isfinite(zone_high)) or cur_half < float(min_half_width):
+            zone_low = float(lvl) - float(min_half_width)
+            zone_high = float(lvl) + float(min_half_width)
+            band_type = f"{band_type}_expanded"
+
+        # Debug cluster stats (use original cluster, not filtered)
+        cmin = float(np.min(xs)) if xs.size else lvl
+        cmax = float(np.max(xs)) if xs.size else lvl
+
         out.append(
             {
-                "level": lvl,
-                "touches": touches,
-                "strength": touches,  # can weight by timeframe later
+                # Core (what gate/picker/watch expects)
+                "level": float(lvl),
+                "low": float(zone_low),
+                "high": float(zone_high),
+
+                # Strength
+                "touches": int(touches),
+                "strength": int(touches),
+
+                # Helpful metadata
+                "band_width": float(zone_high - zone_low),
+                "band_type": str(band_type),
+                "q1": float(q1),
+                "q3": float(q3),
+                "iqr": float(iqr),
+                "median": float(lvl),
+                "outliers_removed": int(outliers_removed),
+
+                # Cluster debug
+                "cluster_min": float(cmin),
+                "cluster_max": float(cmax),
+                "cluster_range": float(cmax - cmin),
+                "cluster_std": float(np.std(xs)) if xs.size else 0.0,
             }
         )
-    # strongest first
-    out.sort(key=lambda x: (-x["strength"], x["level"]))
+
+    out.sort(key=lambda x: (-int(x.get("strength") or 0), float(x.get("level") or 0.0)))
     return out
 
 
@@ -180,7 +262,7 @@ def compute_sr_for_frame(
     df: pd.DataFrame,
     tf_label: Literal["H1", "H4"],
     pip_factor: float,
-    max_levels_per_side: int = 5,
+    max_levels_per_side: int = 10,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Compute SR levels for a single timeframe (H1 or H4).
@@ -241,8 +323,8 @@ def summarize_sr_multi_tf(
     """
     out: Dict[str, Any] = {
         "symbol": symbol,
-        "h4": [],
-        "h1": [],
+        "h4": {},
+        "h1": {},
         "nearest_support": None,
         "nearest_resistance": None,
         "distance_pips": {"support": None, "resistance": None},
@@ -375,12 +457,29 @@ def summarize_sr_multi_tf(
         ys.sort(key=lambda x: (float(x.get("distance_atr") or 1e9), -float(x.get("sr_score") or 0.0),
                               -float(x.get("strength") or 0.0), -int(x.get("touches") or 0)))
         return ys[:NEAR_TOPK]
-
+    
     def _major(xs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        ys = [x for x in xs if x.get("side_ok")]
-        ys.sort(key=lambda x: (-float(x.get("sr_score") or 0.0), -float(x.get("strength") or 0.0),
-                               -int(x.get("touches") or 0), float(x.get("distance_atr") or 1e9)))
+        # Active MAJOR levels only:
+        # support must be below/near current price
+        # resistance must be above/near current price
+        # stale/broken levels are excluded from active dashboard/gate display.
+        ys = [
+            x for x in xs
+            if isinstance(x, dict)
+            and x.get("side_ok")
+            and not x.get("stale")
+        ]
+
+        ys.sort(
+            key=lambda x: (
+               -float(x.get("sr_score") or 0.0),
+               -float(x.get("strength") or 0.0),
+               -int(x.get("touches") or 0),
+               float(x.get("distance_atr") or 1e9),
+            )
+        )
         return ys[:MAJOR_TOPK]
+
 
     # annotate each TF list
     h4_supp_a = _annotate(h4_sr.get("supports") or [], "support", "H4")
@@ -402,62 +501,155 @@ def summarize_sr_multi_tf(
     out["h4"] = h4_sr
     out["h1"] = h1_sr
 
+    
     # ---- Nearest computations ----
-    supp_candidates = [x for x in (h4_supp_a + h1_supp_a) if x.get("side_ok") and not x.get("stale") and isinstance(x.get("distance_atr"), (int, float))]
-    res_candidates  = [x for x in (h4_res_a  + h1_res_a)  if x.get("side_ok") and not x.get("stale") and isinstance(x.get("distance_atr"), (int, float))]
+    # Major-first: prefer strongest (MAJOR) levels (H4 then H1) for nearest_* metrics.
+    # If majors are absent, fall back to NEAR, then to annotated ALL.
 
+    # Nearest_* depends on CURRENT price -> never trust cached values
+    try:
+        out["nearest_support"] = None
+        out["nearest_resistance"] = None
+        if isinstance(out.get("distance_pips"), dict):
+            out["distance_pips"]["support"] = None
+            out["distance_pips"]["resistance"] = None
+        if isinstance(out.get("distance_atr"), dict):
+            out["distance_atr"]["support"] = None
+            out["distance_atr"]["resistance"] = None
+    except Exception:
+        pass
+
+    major_supp = (h4_sr.get("supports_major") or []) + (h1_sr.get("supports_major") or [])
+    major_res  = (h4_sr.get("resistances_major") or []) + (h1_sr.get("resistances_major") or [])
+    near_supp  = (h4_sr.get("supports_near") or []) + (h1_sr.get("supports_near") or [])
+    near_res   = (h4_sr.get("resistances_near") or []) + (h1_sr.get("resistances_near") or [])
+
+    def _valid(xs):
+        return [x for x in (xs or []) if isinstance(x, dict) and isinstance(x.get("distance_atr"), (int, float))]
+    def _lvl(x):
+        try:
+            return float(x.get("level"))
+        except Exception:
+            return None
+
+    # Side-aware buffer for nearest_* (liquidity sweep tolerance)
+    try:
+        buf = max(float(cross_buf or 0.0), 0.10 * float(atr or 0.0))
+    except Exception:
+        buf = float(cross_buf or 0.0) if cross_buf is not None else 0.0
+
+    px_for_support = float(price) + float(buf)   # allow support slightly ABOVE price
+    px_for_resist  = float(price) - float(buf)   # allow resistance slightly BELOW price
+
+    # For nearest metrics: enforce correct side using level vs price (+ buffer) and not stale.
+    supp_candidates = [
+        x for x in _valid(major_supp)
+        if (not x.get("stale")) and (_lvl(x) is not None) and (_lvl(x) <= px_for_support)
+    ]
+    res_candidates = [
+        x for x in _valid(major_res)
+        if (not x.get("stale")) and (_lvl(x) is not None) and (_lvl(x) >= px_for_resist)
+    ]
+
+    if not supp_candidates:
+        supp_candidates = [
+            x for x in _valid(near_supp)
+            if (not x.get("stale")) and (_lvl(x) is not None) and (_lvl(x) <= px_for_support)
+        ]
+    if not res_candidates:
+        res_candidates = [
+            x for x in _valid(near_res)
+            if (not x.get("stale")) and (_lvl(x) is not None) and (_lvl(x) >= px_for_resist)
+        ]
+
+    if not supp_candidates:
+        supp_candidates = [
+            x for x in _valid(h4_supp_a + h1_supp_a)
+            if (not x.get("stale")) and (_lvl(x) is not None) and (_lvl(x) <= px_for_support)
+        ]
+    if not res_candidates:
+        res_candidates = [
+            x for x in _valid(h4_res_a + h1_res_a)
+            if (not x.get("stale")) and (_lvl(x) is not None) and (_lvl(x) >= px_for_resist)
+        ]
+    # ------------------------------------------------------------
+    # Set nearest_* from candidates (major -> near -> annotated ALL)
+    # ------------------------------------------------------------
     if supp_candidates:
-        ns = min(supp_candidates, key=lambda r: float(r.get("distance_atr") or 1e9))
-        lvl = float(ns.get("level"))
-        dist = price - lvl
-        out["nearest_support"] = lvl
-        out["distance_pips"]["support"] = float(dist / pip_factor)
-        out["distance_atr"]["support"] = float(dist / atr)
+        try:
+            lvl = max([_lvl(x) for x in supp_candidates if _lvl(x) is not None])
+            dist = float(price) - float(lvl)
+            out["nearest_support"] = float(lvl)
+            out["distance_pips"]["support"] = float(dist / pip_factor) if pip_factor else None
+            out["distance_atr"]["support"] = float(dist / atr) if atr else None
+        except Exception:
+            pass
 
     if res_candidates:
-        nr = min(res_candidates, key=lambda r: float(r.get("distance_atr") or 1e9))
-        lvl = float(nr.get("level"))
-        dist = lvl - price
-        out["nearest_resistance"] = lvl
-        out["distance_pips"]["resistance"] = float(dist / pip_factor)
-        out["distance_atr"]["resistance"] = float(dist / atr)
+        try:
+            lvl = min([_lvl(x) for x in res_candidates if _lvl(x) is not None])
+            dist = float(lvl) - float(price)
+            out["nearest_resistance"] = float(lvl)
+            out["distance_pips"]["resistance"] = float(dist / pip_factor) if pip_factor else None
+            out["distance_atr"]["resistance"] = float(dist / atr) if atr else None
+        except Exception:
+            pass
 
+
+
+
+    
     # Fallback: legacy RAW supports/resistances
+    # Use soft-cross buffer so "slightly below support" still counts as interacting.
     if out["nearest_support"] is None or out["nearest_resistance"] is None:
         all_supp = (h4_sr.get("supports") or []) + (h1_sr.get("supports") or [])
         all_res  = (h4_sr.get("resistances") or []) + (h1_sr.get("resistances") or [])
+
+        # soft buffer (in price units) – prefer SR's cross_buf if available
+        try:
+            buf = max(float(cross_buf or 0.0), 0.10 * float(atr or 0.0))
+        except Exception:
+            buf = float(cross_buf or 0.0) if cross_buf is not None else 0.0
+
+        px_for_support = float(price) + buf
+        px_for_resist  = float(price) - buf
 
         if all_supp and out["nearest_support"] is None:
             supp_below = []
             for row in all_supp:
                 try:
-                    if float(row.get("level")) <= price:
-                        supp_below.append(row)
+                    lvl = float(row.get("level"))
+                    # side-aware with buffer: allow support slightly ABOVE price
+                    if lvl <= px_for_support:
+                        supp_below.append(lvl)
                 except Exception:
                     continue
+
             if supp_below:
-                ns = max(supp_below, key=lambda r: float(r.get("level")))
-                lvl = float(ns.get("level"))
-                dist = price - lvl
-                out["nearest_support"] = lvl
-                out["distance_pips"]["support"] = float(dist / pip_factor)
-                out["distance_atr"]["support"] = float(dist / atr)
+                lvl = max(supp_below)
+                dist = float(price) - float(lvl)
+                out["nearest_support"] = float(lvl)
+                out["distance_pips"]["support"] = float(dist / pip_factor) if pip_factor else None
+                out["distance_atr"]["support"] = float(dist / atr) if atr else None
 
         if all_res and out["nearest_resistance"] is None:
             res_above = []
             for row in all_res:
                 try:
-                    if float(row.get("level")) >= price:
-                        res_above.append(row)
+                    lvl = float(row.get("level"))
+                    # side-aware with buffer: allow resistance slightly BELOW price
+                    if lvl >= px_for_resist:
+                        res_above.append(lvl)
                 except Exception:
                     continue
+
             if res_above:
-                nr = min(res_above, key=lambda r: float(r.get("level")))
-                lvl = float(nr.get("level"))
-                dist = lvl - price
-                out["nearest_resistance"] = lvl
-                out["distance_pips"]["resistance"] = float(dist / pip_factor)
-                out["distance_atr"]["resistance"] = float(dist / atr)
+                lvl = min(res_above)
+                dist = float(lvl) - float(price)
+                out["nearest_resistance"] = float(lvl)
+                out["distance_pips"]["resistance"] = float(dist / pip_factor) if pip_factor else None
+                out["distance_atr"]["resistance"] = float(dist / atr) if atr else None
+
 
     # safety classification (use closest side)
     distances_atr: List[float] = []
