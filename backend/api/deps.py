@@ -1,6 +1,4 @@
 # api/deps.py
-# -*- coding: utf-8 -*-
-
 from fastapi import Depends, HTTPException, Cookie, Header, Request,status
 from typing import Optional,Set
 import psycopg2, psycopg2.extras, os
@@ -120,7 +118,7 @@ def has_perm(user, perm: str) -> bool:
     return bool(uid and (perm in _resolve_perms(uid)))
 
 def require_perm(perm: str):
-    # FIX: depend on get_current_user (require_user isnï¿½t defined here)
+    # FIX: depend on get_current_user (require_user isn’t defined here)
     def _dep(user = Depends(get_current_user)):
         if not has_perm(user, perm):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")

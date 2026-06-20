@@ -74,7 +74,7 @@ log.info(f"[ROUTES] module={__file__}")
 log.info(f"[ROUTES] REDIS_URL={REDIS_URL}")
 DEVICE_PREFIX = os.getenv("XTL_DEVICE_KEY_PREFIX", "device:")
 
-DEFAULT_TFS = ["M15","H1","H4"]
+DEFAULT_TFS = ["M1","M15","H1","H4"]
 DEFAULT_TFS_CSV = ",".join(DEFAULT_TFS)
 
 
@@ -495,6 +495,12 @@ class Mt5AckPayload(BaseModel):
     user_id: Optional[str] = None
     model_config = ConfigDict(extra="ignore")
 
+class Mt5PositionsPayload(BaseModel):
+    positions: list = []
+    mt5_account: str = "demo"
+
+    model_config = ConfigDict(extra="ignore")
+
 
 @r.get("/{dev_id}/mt5/next")
 def mt5_next(
@@ -525,6 +531,121 @@ def mt5_next(
 
     return {"ok": True, "cmd": cmd}
 
+@r.post("/{dev_id}/mt5/positions")
+def mt5_positions(
+    dev_id: str,
+    payload: Mt5PositionsPayload,
+    authorization: Optional[str] = Header(default=None),
+):
+    token = ""
+    if authorization:
+        parts = authorization.split()
+        token = parts[-1] if parts else authorization.strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="missing token")
+
+    _assert_device_token(dev_id, token)
+
+    acct = (payload.mt5_account or "demo").lower().strip()
+    if acct not in ("demo", "live"):
+        acct = "demo"
+
+    positions = payload.positions if isinstance(payload.positions, list) else []
+    key = f"xtl:mt5:pos:{dev_id}:{acct}"
+
+    try:
+        # Keep MT5 position snapshot long enough for executor reconciliation.
+        # Agent may push every ~60s, executor may tick later, so 60s TTL is too tight.
+        R.setex(key, 900, json.dumps(positions, default=str))
+        R.setex(f"xtl:mt5:pos:last:{dev_id}:{acct}", 900, key)
+        R.hset(
+            _hkey(dev_id),
+            mapping={
+                "last_mt5_pos_ms": str(int(time.time() * 1000)),
+                "last_mt5_pos_count": str(len(positions)),
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"redis_error:{type(e).__name__}")
+
+    return {"ok": True, "count": len(positions), "key": key}
+
+class Mt5AccountPayload(BaseModel):
+    account: dict = {}
+    mt5_account: str = "demo"
+    model_config = ConfigDict(extra="ignore")
+
+
+@r.post("/{dev_id}/mt5/account")
+def mt5_account(
+    dev_id: str,
+    payload: Mt5AccountPayload,
+    authorization: Optional[str] = Header(default=None),
+):
+    token = ""
+    if authorization:
+        parts = authorization.split()
+        token = parts[-1] if parts else authorization.strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="missing token")
+
+    _assert_device_token(dev_id, token)
+
+    acct_type = (payload.mt5_account or "demo").lower().strip()
+    if acct_type not in ("demo", "live"):
+        acct_type = "demo"
+
+    account = payload.account if isinstance(payload.account, dict) else {}
+
+    key = f"xtl:mt5:account:{dev_id}:{acct_type}"
+
+    try:
+        R.setex(
+            key,
+            900,
+            json.dumps(account, default=str)
+        )
+
+        R.setex(
+            f"xtl:mt5:account:last:{dev_id}:{acct_type}",
+            900,
+            key
+        )
+        R.setex(
+            f"xtl:mt5:account:last_user:{dev_id}",
+            900,
+            json.dumps(account, default=str)
+        )
+
+        R.hset(
+            _hkey(dev_id),
+            mapping={
+                "last_mt5_account_ms": str(int(time.time() * 1000)),
+                "mt5_balance": str(account.get("balance", "")),
+                "mt5_equity": str(account.get("equity", "")),
+                "mt5_floating_pnl": str(account.get("floating_pnl", "")),
+                "mt5_margin": str(account.get("margin", "")),
+                "mt5_free_margin": str(account.get("free_margin", "")),
+                "mt5_leverage": str(account.get("leverage", "")),
+                "mt5_login": str(account.get("login", "")),
+                "mt5_server": str(account.get("server", "")),
+            },
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"redis_error:{type(e).__name__}"
+        )
+
+    return {
+        "ok": True,
+        "key": key,
+        "equity": account.get("equity"),
+        "balance": account.get("balance"),
+    }
 
 @r.post("/{dev_id}/mt5/ack")
 def mt5_ack(
@@ -780,6 +901,7 @@ def post_ohlc(
         now_ms = now_sec * 1000
         R.hset(_hkey(dev_id), mapping={
             "status": "online",
+            "mt5_ok": "1",
             "last_heartbeat": str(now_sec),
             "last_heartbeat_ms": str(now_ms),
             "last_heartbeat_iso": datetime.utcfromtimestamp(now_sec).isoformat() + "Z",
@@ -889,8 +1011,8 @@ def post_ohlc(
                 except Exception:
                    last_close_px = None
         # trim to a sane maximum (defensive)
-        if len(bars_sec) > 1000:
-            bars_sec = bars_sec[-1000:]
+        if len(bars_sec) > 1500:
+            bars_sec = bars_sec[-1500:]
         # -------------------------------
         # NEW: validate bars before overwriting snapshots
         # Prevent SR flicker when MT5 fetch returns short/dirty series during reconnect.
@@ -1115,11 +1237,8 @@ def post_ohlc(
 
             # mt5_ok: derive from terminal.connected if not explicitly provided
             try:
-                mt5_ok_val = getattr(payload, "mt5_ok", None)
-                if mt5_ok_val is None:
-                    mt5_ok_val = bool(term.get("connected")) if isinstance(term, dict) else None
-                if mt5_ok_val is not None:
-                    mapping3["mt5_ok"] = "1" if bool(mt5_ok_val) else "0"
+                # OHLC arriving from MT5 means MT5 is working
+                mapping3["mt5_ok"] = "1"
             except Exception:
                 pass
 
@@ -1369,7 +1488,7 @@ def device_heartbeat(
             "status": "online",
             "version": str(payload.get("version", "")),
             "label": (payload.get("label") or "")[:64],
-            "mt5_ok": "1" if str(payload.get("mt5_ok", "")).lower() in ("1","true","yes") else "0",
+            "mt5_ok": R.hget(_hkey(dev_id), "mt5_ok") or "1",
             "autostart_ok": "1" if str(payload.get("autostart_ok", "")).lower() in ("1","true","yes") else "0",
         })
         R.expire(_hkey(dev_id), 600)
@@ -1438,8 +1557,13 @@ def device_heartbeat(
     # prefer last seen symbol; fall back to payload or XAUUSD
     sym = ((R.hget(_hkey(dev_id), "last_ohlc_symbol") or payload.get("symbol") or "XAUUSD")).upper()
 
-    # default TFs if not provided by agent
-    tfs = payload.get("tfs") or ["M15", "H1", "H4"]
+    
+    # default TFs: prefer device hash trend_tfs, then payload, then DEFAULT_TFS
+    _stored_tfs = str(R.hget(_hkey(dev_id), "trend_tfs") or "").strip() if R else ""
+    if _stored_tfs:
+        tfs = [t.strip().upper() for t in _stored_tfs.split(",") if t.strip()]
+    else:
+        tfs = payload.get("tfs") or DEFAULT_TFS
     # --- best-effort hydration from the FRESHEST device snapshot for this user ---
     try:
         if owner_id:
@@ -1584,11 +1708,24 @@ def device_heartbeat(
         need_push = True  # be safe—ask once
 
     # --- build response the agent understands ---
+    # Read symbols and interval from device hash
+    _stored_syms = str(R.hget(_hkey(dev_id), "trend_symbols") or "").strip() if R else ""
+    _stored_iv = str(R.hget(_hkey(dev_id), "trend_interval_sec") or "").strip() if R else ""
+    if _stored_syms:
+        trend_symbols = [s.strip().upper() for s in _stored_syms.split(",") if s.strip()]
+    else:
+        trend_symbols = [sym]  # fallback to last_ohlc_symbol
+    try:
+        trend_interval = int(_stored_iv) if _stored_iv else 60
+        trend_interval = max(15, min(trend_interval, 600))
+    except Exception:
+        trend_interval = 60
+
     trend_cfg = {
         "active": True,
-        "symbols": [sym],
+        "symbols": trend_symbols,
         "tfs": tfs,
-        "interval_sec": 60,
+        "interval_sec": trend_interval,
         "push_now": bool(need_push),
     }
 

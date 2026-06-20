@@ -36,6 +36,8 @@ _LAST_PUSH: dict[tuple[str, str], int] = {}
 # packaged layout: xtl/agent_ohlc.py
 from xtl.agent_ohlc import push_ohlc_once as agent_push_ohlc_once
 from xtl.agent_price import start_price_publisher
+
+
 # ---------- constants / paths ----------
 APP_NAME = "XTL"
 DEFAULT_API_BASE = "https://api.xautrendlab.com"
@@ -53,6 +55,8 @@ HKU_LS = r"S-1-5-18\Software\XTL"
 # Disable any installer-side OHLC test pushes (agent will own posting)
 ENABLE_INSTALLER_OHLC_TEST = False
 # Program Files target: C:\Program Files\XTL\dist\xtl
+
+
 try:
     _PF = os.environ.get("PROGRAMFILES", r"C:\Program Files")
 except Exception:
@@ -1484,7 +1488,16 @@ def push_ohlc_once_compat(api_base: str, device_id: str | None = None, token: st
     for k, v in kw.items():
         if k in allowed: call_kw[k] = v
 
-    return agent_push_ohlc_once(**call_kw)
+    
+    res = agent_push_ohlc_once(**call_kw)
+
+    try:
+        from xtl.agent_ohlc import push_mt5_positions_once
+        push_mt5_positions_once(api_base, device_id, token, mt5_account="demo")
+    except Exception as e:
+        alog(f"MT5 positions push failed: {e}")
+
+    return res
 
 
 # Compatibility shims used throughout this file
@@ -3035,6 +3048,29 @@ def post_device_heartbeat(api_base: str,
     except Exception as e:
         return 599, f"{type(e).__name__}: {e}"
 
+def mt5_account_sync_loop(api_base: str, device_id: str, device_token: str, _stop, mt5_account: str = "demo"):
+    """
+    Fast prop-mode account sync.
+    Pushes balance/equity/margin/free_margin/floating_pnl every 2 seconds.
+    """
+    while not _stop.is_set():
+        try:
+            from xtl.agent_ohlc import push_mt5_account_once
+
+            push_mt5_account_once(
+                api_base=api_base,
+                dev_id=device_id,
+                token=device_token,
+                mt5_account=mt5_account,
+            )
+
+        except Exception as e:
+            try:
+                alog(f"MT5_ACCOUNT_SYNC failed: {e}")
+            except Exception:
+                pass
+
+        _stop.wait(2)
 
 def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
     s = _rq_session()
@@ -3047,6 +3083,7 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
     next_ohlc_at = 0.0  # force an early push after first HB parse
     last_symbols = ["XAUUSD"]
     last_tfs = ["M15","H1","H4"]
+    account_sync_started = False
 
     made_online = False
     attempts_with_online_flag = 0  # send a few explicit "online" edges early
@@ -3121,6 +3158,15 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
                     ensure_device_attached(api_base)
                 except Exception as e:
                     alog(f"attach: ensure_device_attached error: {e}")
+                    
+            if mt5_ok_flag and device_id and device_token and not account_sync_started:
+                threading.Thread(
+                    target=mt5_account_sync_loop,
+                    args=(api_base, device_id, device_token, _stop, "demo"),
+                    daemon=True,
+                ).start()
+                account_sync_started = True
+                alog("MT5_ACCOUNT_SYNC started every 2 sec")
 
             dev_for_log = device_id or (_hku_ls_get("DeviceId") or "")
             alog(f"heartbeat /devices/{dev_for_log or '<id>'}/heartbeat {code} {(resp or '')[:160]}")
@@ -3193,9 +3239,33 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
                                 _mark_pushed(sym, tfu, now_s)
                             except Exception as e:
                                 alog(f"HB: cadence ohlc error {sym}/{tfu}: {e!s}")
+            
+            
+            # -------------------------------------------------
+            # Push MT5 open positions + account snapshot
+            # -------------------------------------------------
+            
 
-            _stop.wait(interval_sec)
-            continue
+            if mt5_ok_flag and device_id and device_token:
+                try:
+                    from xtl.agent_ohlc import push_mt5_positions_once
+                        
+                    
+
+                    
+
+                    # positions
+                    push_mt5_positions_once(
+                        api_base=api_base,
+                        dev_id=device_id,
+                        token=device_token,
+                        mt5_account="demo",
+                    )
+
+                    
+                except Exception as e:
+                    alog(f"HB: mt5 push failed: {e}")
+                            
 
         except Exception as e:
             alog(f"heartbeat error: {e!s}")
@@ -3544,6 +3614,52 @@ def agent_main_foreground() -> None:
         )
         t.start()
         return t
+        
+    def _spawn_mt5_positions() -> threading.Thread:
+        def _loop():
+            try:
+                from xtl.agent_ohlc import push_mt5_positions_once
+            except Exception as e:
+                alog(f"MT5_POS: import failed: {e}")
+                return
+
+            # immediate startup push
+            last_log = 0.0
+
+            while not _stop.is_set():
+                try:
+                    dev_id = (_hku_ls_get("DeviceId") or "").strip()
+                    dev_tok = (_hku_ls_get("DeviceToken") or "").strip()
+
+                    if dev_id and dev_tok:
+                        ok = push_mt5_positions_once(
+                            api_base,
+                            dev_id,
+                            dev_tok,
+                            mt5_account="demo",
+                        )
+                        now = time.time()
+                        if ok or (now - last_log) > 60:
+                            alog(f"MT5_POS: pushed ok={ok}")
+                            last_log = now
+                    else:
+                        alog("MT5_POS: missing DeviceId/DeviceToken")
+
+                except Exception as e:
+                    alog(f"MT5_POS: push error: {type(e).__name__}: {e}")
+
+                for _ in range(20):
+                    if _stop.is_set():
+                        break
+                    time.sleep(1)
+
+        t = threading.Thread(
+            target=_loop,
+            daemon=True,
+            name="mt5-pos",
+        )
+        t.start()
+        return t
 
     def _spawn_mt5() -> threading.Thread:
         t = threading.Thread(
@@ -3559,18 +3675,26 @@ def agent_main_foreground() -> None:
     th_hb = _spawn_hb()
     th_price = _spawn_price()
     th_mt5 = _spawn_mt5()
+    th_mt5_pos = _spawn_mt5_positions()
 
     # 6) Lightweight watchdog: if a worker dies unexpectedly, respawn it
     while not _stop.is_set():
         if not th_hb.is_alive():
             alog("watchdog: heartbeat thread died; respawning")
             th_hb = _spawn_hb()
+
         if not th_price.is_alive():
             alog("watchdog: price thread died; respawning")
             th_price = _spawn_price()
+
         if not th_mt5.is_alive():
             alog("watchdog: mt5 worker thread died; respawning")
             th_mt5 = _spawn_mt5()
+
+        if not th_mt5_pos.is_alive():
+            alog("watchdog: mt5-pos thread died; respawning")
+            th_mt5_pos = _spawn_mt5_positions()
+
         _stop.wait(1.0)
 
 

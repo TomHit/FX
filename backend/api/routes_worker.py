@@ -103,25 +103,35 @@ def heartbeat(hb: HeartbeatIn, dev: dict = Depends(require_device)):
     now = _now()
 
     mapping = {
-         
        "last_heartbeat": now,
-       "version": hb.version or "",
-       "mt5_ok": "1" if hb.mt5_ok else "0",
        "api_ok": "1" if hb.api_ok else "0",
        "autostart_ok": "1" if hb.autostart_ok else "0",
        "status": "online",
        "last_error": hb.last_error or "",
     }
-    R.hset(f"device:{hb.device_id}", mapping=mapping)
+
+    if hb.version is not None:
+        mapping["version"] = hb.version
+
+    # mt5_ok should not be forced to 0 when OHLC is flowing.
+    if hb.mt5_ok is True:
+        mapping["mt5_ok"] = "1"
+    elif hb.mt5_ok is False:
+       try:
+           last_ohlc_ms = int(R.hget(dkey, "last_ohlc_written_at") or 0)
+           now_ms = int(time.time() * 1000)
+           mapping["mt5_ok"] = "1" if last_ohlc_ms and (now_ms - last_ohlc_ms <= 180000) else "0"
+       except Exception:
+           mapping["mt5_ok"] = "0"
 
     # optional: one-time seeding on first sight
-    R.hsetnx(f"device:{hb.device_id}", "active", "1")  # only if missing
+    R.hsetnx(dkey, "active", "1")
     
      
 
 
     if hb.api_ok is not None:        mapping["api_ok"] = int(bool(hb.api_ok))
-    if hb.mt5_ok is not None:        mapping["mt5_ok"] = int(bool(hb.mt5_ok))
+    # mt5_ok handled above; do not overwrite it here
     if hb.autostart_ok is not None:  mapping["autostart_ok"] = int(bool(hb.autostart_ok))
     if hb.version is not None:       mapping["version"] = hb.version
     if hb.mt5_build is not None:     mapping["mt5_build"] = hb.mt5_build

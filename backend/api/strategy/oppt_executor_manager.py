@@ -14,6 +14,27 @@ _thread: threading.Thread | None = None
 ENABLED_USERS_KEY = "xtl:strategy:oppt:enabled_users"
 
 
+def _sync_enabled_users_on_startup() -> None:
+    """Scan all user state keys on startup and populate enabled_users set."""	
+    try:
+        import json
+        keys = R.keys("xtl:strategy:oppt:state:*") or []
+        for key in keys:
+            try:
+                uid = str(key).split(":")[-1]
+                raw = R.get(key)
+                if not raw:
+                    continue
+                st = json.loads(raw)
+                if isinstance(st, dict) and st.get("enabled"):
+                    R.sadd(ENABLED_USERS_KEY, uid)
+                    log.info("[OPPT] startup: added uid=%s to enabled_users", uid)
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("[OPPT] startup sync failed: %r", e)
+
+
 def start_oppt_executor_manager() -> None:
     """
     Starts one background thread per API process.
@@ -35,6 +56,7 @@ def start_oppt_executor_manager() -> None:
         return
 
     _started = True
+    _sync_enabled_users_on_startup()
 
     def loop() -> None:
         pid = os.getpid()

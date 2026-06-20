@@ -23,7 +23,7 @@ import logging
 log = logging.getLogger("xtl.agent")
 # at module top (once):
 _last_sent_bar: dict[tuple[str, str], int] = {}  # (symbol, TF) -> last 't' sent
-
+from xtl.mt5_client import mt5_init, mt5_fetch_rates, get_mt5_tick_price_and_ts, mt5_get_open_positions
 
 # Force-pack critical modules under PyInstaller
 try:
@@ -40,17 +40,17 @@ except Exception:
 
 try:
     # Running as package (PyInstaller / pip-style)
-    from xtl.mt5_client import mt5_init, mt5_fetch_rates, get_mt5_tick_price_and_ts
+    from xtl.mt5_client import mt5_init, mt5_fetch_rates, get_mt5_tick_price_and_ts, mt5_get_open_positions
 except ImportError:
     # Running directly from source folder
     try:
-        from .mt5_client import mt5_init, mt5_fetch_rates, get_mt5_tick_price_and_ts  # type: ignore
+        from .mt5_client import mt5_init, mt5_fetch_rates, get_mt5_tick_price_and_ts, mt5_get_open_positions
     except Exception:
 
         sys.path.append(os.path.dirname(__file__))
-        from mt5_client import mt5_init, mt5_fetch_rates  # type: ignore
+        from mt5_client import mt5_init, mt5_fetch_rates, mt5_get_open_positions
 
-DEFAULT_TFS = ["M1","M5"]
+DEFAULT_TFS = ["M1","M15","H1","H4"]
 # Self-contained registry getter (prefers registry, falls back to env)
 def reg_get(name: str) -> Optional[str]:
     try:
@@ -127,6 +127,182 @@ def _find_bundled_ca() -> Optional[str]:
     return None
 
 TF_SEC = {"M1":60, "M5":300, "M15":900, "H1":3600,"H2": 7200,"H4":14400}
+
+def push_mt5_positions_once(api_base: str, dev_id: str, token: str, mt5_account: str = "demo") -> bool:
+    try:
+        positions = mt5_get_open_positions()
+        log.warning("MT5_POS_PUSH_START dev=%s acct=%s positions=%s", dev_id, mt5_account, len(positions or []))
+
+        payload = {
+            "device_id": dev_id,
+            "mt5_account": mt5_account,
+            "positions": positions,
+            "ts_ms": int(time.time() * 1000),
+        }
+
+        r = api_post(
+            api_base,
+            f"/devices/{dev_id}/mt5/positions",
+            payload,
+            token=token,
+            timeout=10,
+        )
+
+        return bool(getattr(r, "status_code", 0) == 200)
+    except Exception as e:
+        try:
+            log.warning("push_mt5_positions_once failed: %s", e)
+        except Exception:
+            pass
+        return False
+        
+def push_mt5_account_once(api_base: str, dev_id: str, token: str, mt5_account: str = "demo") -> bool:
+    try:
+        account = _mt5_account_meta()
+        if not account:
+            log.warning("MT5_ACCOUNT_PUSH_SKIP empty account meta dev=%s acct=%s", dev_id, mt5_account)
+            return False
+
+        payload = {
+            "device_id": dev_id,
+            "mt5_account": mt5_account,
+            "account": account,
+            "ts_ms": int(time.time() * 1000),
+        }
+
+        r = api_post(
+            api_base,
+            f"/devices/{dev_id}/mt5/account",
+            payload,
+            token=token,
+            timeout=10,
+        )
+
+        log.warning(
+            "MT5_ACCOUNT_PUSH dev=%s acct=%s balance=%s equity=%s margin=%s free=%s pnl=%s code=%s",
+            dev_id,
+            mt5_account,
+            account.get("balance"),
+            account.get("equity"),
+            account.get("margin"),
+            account.get("free_margin"),
+            account.get("floating_pnl"),
+            getattr(r, "status_code", 0),
+        )
+
+        return bool(getattr(r, "status_code", 0) == 200)
+    except Exception as e:
+        try:
+            log.warning("push_mt5_account_once failed: %s", e)
+        except Exception:
+            pass
+        return False
+
+def _mt5_account_meta() -> dict:
+        """
+        MT5 account identity so backend can validate demo/live before trading.
+
+        Uses MetaTrader5.account_info() when available.
+        Never throws; returns {} on any failure.
+        """
+        try:
+            import MetaTrader5 as mt5
+        except Exception:
+            return {}
+
+        try:
+           ai = mt5.account_info()
+        except Exception:
+           ai = None
+
+        if not ai:
+            return {}
+
+        # ai is typically a namedtuple-like object. Use getattr safely.
+        login = getattr(ai, "login", None)
+        server = getattr(ai, "server", None)
+        company = getattr(ai, "company", None)
+        currency = getattr(ai, "currency", None)
+        leverage = getattr(ai, "leverage", None)
+        balance = getattr(ai, "balance", None)
+        equity = getattr(ai, "equity", None)
+        trade_mode = getattr(ai, "trade_mode", None)  # numeric (when exposed)
+        margin = getattr(ai, "margin", None)
+        free_margin = getattr(ai, "margin_free", None)
+        margin_level = getattr(ai, "margin_level", None)
+        profit = getattr(ai, "profit", None)
+        credit = getattr(ai, "credit", None)
+
+        # --- robust demo/live detection ---
+        is_demo = None
+        account_type = None
+
+        # 1) Prefer MT5 constants when present
+        try:
+            tm = int(trade_mode) if trade_mode is not None else None
+        except Exception:
+            tm = None
+
+        try:
+            TM_DEMO = getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", None)
+            TM_REAL = getattr(mt5, "ACCOUNT_TRADE_MODE_REAL", None)
+            TM_CONTEST = getattr(mt5, "ACCOUNT_TRADE_MODE_CONTEST", None)
+
+            if tm is not None and (TM_DEMO is not None or TM_REAL is not None or TM_CONTEST is not None):
+                if TM_DEMO is not None and tm == int(TM_DEMO):
+                    is_demo = True
+                    account_type = "DEMO"
+                elif TM_REAL is not None and tm == int(TM_REAL):
+                    is_demo = False
+                    account_type = "LIVE"
+                elif TM_CONTEST is not None and tm == int(TM_CONTEST):
+                    # contest behaves like demo for risk purposes (no live trading)
+                    is_demo = True
+                    account_type = "CONTEST"
+        except Exception:
+            pass
+
+        # 2) Fallback heuristic (server text) only if still unknown
+        if is_demo is None:
+            try:
+                s = str(server or "").lower()
+                if s:
+                     if "demo" in s:
+                         is_demo = True
+                         account_type = account_type or "DEMO"
+                     elif "real" in s or "live" in s:
+                         is_demo = False
+                         account_type = account_type or "LIVE"
+            except Exception:
+                pass
+
+        if account_type is None:
+            account_type = "UNKNOWN"
+
+        out = {
+            "login": int(login) if login is not None else None,
+            "server": str(server) if server is not None else None,
+            "company": str(company) if company is not None else None,
+            "currency": str(currency) if currency is not None else None,
+            "leverage": int(leverage) if leverage is not None else None,
+
+            # Prop firm source of truth
+            "balance": float(balance) if balance is not None else None,
+            "equity": float(equity) if equity is not None else None,
+            "margin": float(margin) if margin is not None else None,
+            "free_margin": float(free_margin) if free_margin is not None else None,
+            "margin_level": float(margin_level) if margin_level is not None else None,
+            "floating_pnl": float(profit) if profit is not None else None,
+            "credit": float(credit) if credit is not None else None,
+
+            "trade_mode": int(tm) if tm is not None else None,
+            "is_demo": is_demo,
+            "account_type": account_type,
+        }
+
+        # remove None values to keep payload small/clean
+        return {k: v for k, v in out.items() if v is not None}
+
 
 def aggregate_from_m1(m1_bars, tf_label, broker_offset_min=0, max_out=200):
     """
@@ -220,7 +396,7 @@ def _http_session() -> requests.Session:
         _SESS = s
     return _SESS
 # -------------------------------------------------------------------
-# ⚠️ DEPRECATED
+# ?? DEPRECATED
 # Price publishing is handled ONLY by agent_price.py
 # This function must never be started.
 # -------------------------------------------------------------------
@@ -439,7 +615,7 @@ def _reg_delete_value(root, subkey, name):
     except Exception:
         pass
 
-def reset_registry_tf_symbols(include_latest="0", symbols="XAUUSD,EURUSD,USDJPY,GBPUSD,USDCAD,USDCHF", timeframes="M1,M15,H1,H2,H4"):
+def reset_registry_tf_symbols(include_latest="0", symbols="XAUUSD,EURUSD,USDJPY,GBPUSD,USDCAD,USDCHF", timeframes="M1,M15,H1,H4"):
     """
     Hard reset the three user-tunable keys under HKU\S-1-5-18\Software\XTL.
     Called on 'new installation' or when XTL_RESET_REGISTRY=1.
@@ -465,7 +641,7 @@ def maybe_reset_registry_on_new_install():
     force   = (os.environ.get("XTL_RESET_REGISTRY","").strip() in ("1","true","TRUE","yes","YES"))
     if force or str(cur_ver) != str(CONFIG_VERSION):
         # reset to our intended defaults (M1-only + closed bars by default)
-        reset_registry_tf_symbols(include_latest="0", timeframes="M1,M15,H1,H2,H4")
+        reset_registry_tf_symbols(include_latest="0", timeframes="M1,M15,H1,H4")
         _reg_set_value(winreg.HKEY_USERS, subkey, "ConfigVersion", CONFIG_VERSION)
         try:
             log.info("registry reset applied (ConfigVersion %s -> %s, force=%s)", cur_ver, CONFIG_VERSION, force)
@@ -496,10 +672,10 @@ def _agent_pull_cfg():
         tfs_raw = "M1,M15,H1,H2,H4"
 
     syms = [s.strip().upper() for s in syms_raw.split(",") if s.strip()]
-    tf_set = {"M1", "M15", "H1", "H2", "H4"}  # allow future toggles
+    tf_set = {"M1", "M15", "H1", "H4"}  # allow future toggles
     tfs = [t.upper().strip() for t in tfs_raw.split(",") if t.upper().strip() in tf_set]
     if not tfs:
-        tfs = ["M1","M5", "M15", "H1", "H2", "H4"]  # safe fallback, preserves your M1 default
+        tfs = ["M1", "M15", "H1", "H4"]  # safe fallback, preserves your M1 default
 
     include_latest = inc_raw in ("1", "true", "TRUE", "yes", "YES")
     return syms, tfs, include_latest
@@ -610,7 +786,7 @@ def push_rates_batch(api_base, device_id, token, symbol, tf, bars, include_lates
         """
         Normalize epoch-like value to milliseconds.
 
-        - MT5 'time' is in seconds since epoch (≈1e9) -> we multiply by 1000
+        - MT5 'time' is in seconds since epoch (˜1e9) -> we multiply by 1000
         - If something is already large (>=1e12), treat as milliseconds
         """
         try:
@@ -619,7 +795,7 @@ def push_rates_batch(api_base, device_id, token, symbol, tf, bars, include_lates
                return 0
 
             # If already very large, assume it's in milliseconds (or finer) and keep it.
-            # 1e12 ms ≈ year 2001, so any normal ms timestamp will be >= this.
+            # 1e12 ms ˜ year 2001, so any normal ms timestamp will be >= this.
             if t >= 1_000_000_000_000:
                return t  # already ms (or bigger; we don't expect µs/ns here)
 
@@ -659,98 +835,7 @@ def push_rates_batch(api_base, device_id, token, symbol, tf, bars, include_lates
     extras = {}
     raw_last = (bars or [])[-1] if (bars or []) else None
 
-    def _mt5_account_meta() -> dict:
-        """
-        MT5 account identity so backend can validate demo/live before trading.
-
-        Uses MetaTrader5.account_info() when available.
-        Never throws; returns {} on any failure.
-        """
-        try:
-            import MetaTrader5 as mt5
-        except Exception:
-            return {}
-
-        try:
-           ai = mt5.account_info()
-        except Exception:
-           ai = None
-
-        if not ai:
-            return {}
-
-        # ai is typically a namedtuple-like object. Use getattr safely.
-        login = getattr(ai, "login", None)
-        server = getattr(ai, "server", None)
-        company = getattr(ai, "company", None)
-        currency = getattr(ai, "currency", None)
-        leverage = getattr(ai, "leverage", None)
-        balance = getattr(ai, "balance", None)
-        equity = getattr(ai, "equity", None)
-        trade_mode = getattr(ai, "trade_mode", None)  # numeric (when exposed)
-
-        # --- robust demo/live detection ---
-        is_demo = None
-        account_type = None
-
-        # 1) Prefer MT5 constants when present
-        try:
-            tm = int(trade_mode) if trade_mode is not None else None
-        except Exception:
-            tm = None
-
-        try:
-            TM_DEMO = getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", None)
-            TM_REAL = getattr(mt5, "ACCOUNT_TRADE_MODE_REAL", None)
-            TM_CONTEST = getattr(mt5, "ACCOUNT_TRADE_MODE_CONTEST", None)
-
-            if tm is not None and (TM_DEMO is not None or TM_REAL is not None or TM_CONTEST is not None):
-                if TM_DEMO is not None and tm == int(TM_DEMO):
-                    is_demo = True
-                    account_type = "DEMO"
-                elif TM_REAL is not None and tm == int(TM_REAL):
-                    is_demo = False
-                    account_type = "LIVE"
-                elif TM_CONTEST is not None and tm == int(TM_CONTEST):
-                    # contest behaves like demo for risk purposes (no live trading)
-                    is_demo = True
-                    account_type = "CONTEST"
-        except Exception:
-            pass
-
-        # 2) Fallback heuristic (server text) only if still unknown
-        if is_demo is None:
-            try:
-                s = str(server or "").lower()
-                if s:
-                     if "demo" in s:
-                         is_demo = True
-                         account_type = account_type or "DEMO"
-                     elif "real" in s or "live" in s:
-                         is_demo = False
-                         account_type = account_type or "LIVE"
-            except Exception:
-                pass
-
-        if account_type is None:
-            account_type = "UNKNOWN"
-
-        out = {
-            "login": int(login) if login is not None else None,
-            "server": str(server) if server is not None else None,
-            "company": str(company) if company is not None else None,
-            "currency": str(currency) if currency is not None else None,
-            "leverage": int(leverage) if leverage is not None else None,
-            "balance": float(balance) if balance is not None else None,
-            "equity": float(equity) if equity is not None else None,
-            "trade_mode": int(tm) if tm is not None else None,
-            "is_demo": is_demo,                 # True/False/None
-            "account_type": account_type,       # DEMO/LIVE/CONTEST/UNKNOWN
-        }
-
-        # remove None values to keep payload small/clean
-        return {k: v for k, v in out.items() if v is not None}
-
+    
     def _safe_float(x):
         try:
             return float(x)
@@ -854,14 +939,33 @@ def push_rates_batch(api_base, device_id, token, symbol, tf, bars, include_lates
     except Exception:
         acct = {}
 
+    # Compute serverNow as max of system clock and last bar close time
+    # This prevents gate from treating recent closed bars as "future" candles
+    _server_now = int(now_ms)
+    try:
+        if arr_closed:
+            _lb = arr_closed[-1]
+            _lb_open = int(
+                _lb.get("t_open_ms") or _lb.get("t", 0) * 1000
+                if _lb.get("t_open_ms") or _lb.get("t")
+                else 0
+            )
+            _lb_close = int(_lb.get("t_close_ms") or (_lb_open + tf_ms) if _lb_open else 0)
+            if _lb_close > _server_now:
+                _server_now = _lb_close
+    except Exception:
+        pass
+
     payload = {
         "symbol": (symbol or "").upper(),
-        "timeframe": tf_s,                 # "M1" | "M5" | "M10" | "M15" | "H1" | "H4"
-        "bars": arr_closed,                # CLOSED-only, normalized list
+        "timeframe": tf_s,
+        "bars": arr_closed,
         "count": len(arr_closed),
-        "written_at": now_ms,              # REQUIRED
+        "written_at": now_ms,
+        "serverNow": _server_now,        # ? ADD: used by gate bar picker
+        "lastClosedTs": _server_now,     # ? ADD: reference for gate diagnostics
         "device_id": str(device_id),
-        "source": "broker",                # optional but useful
+        "source": "broker",
         "broker": _broker_tz_meta(),
         "account": acct,
         "extra": extras or {},
@@ -1194,12 +1298,19 @@ def _ohlc_loop(api_base, device_id, token, symbols, tfs, bars, period_sec):
         try:
             tick_start = time.time()
             log.info("OHLC: tick begin")
+
             _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars)
+
+            try:
+                push_mt5_positions_once(api_base, device_id, token, mt5_account="demo")
+            except Exception as e:
+                log.warning("MT5 positions push failed: %s", e)
+
             took = time.time() - tick_start
             log.info(f"OHLC: tick done in {took:.2f}s")
         except Exception as e:
             log.info(f"OHLC: tick exception: {e}\n{traceback.format_exc()}")
-        # drift-free scheduling
+
         next_run += period_sec
         time.sleep(max(0, next_run - time.time()))
 
@@ -1242,7 +1353,7 @@ def _mt5_cmd_loop(api_base, device_id, token, poll_sec):
             # normalize result
             res = result if isinstance(result, dict) else {"ok": False, "error": "bad_result"}
 
-            # 🔑 embed user_id INSIDE result (this is what backend stores)
+            # ?? embed user_id INSIDE result (this is what backend stores)
             res["user_id"] = cmd.get("user_id")
             ack = {
                 "job_id": job_id,
@@ -1354,7 +1465,7 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
     def _to_sec(t_any):
         try:
             t = int(t_any or 0)
-            return (t // 1000) if t >= 1_000_000_000_000 else t  # ms→s else already s
+            return (t // 1000) if t >= 1_000_000_000_000 else t  # ms?s else already s
         except Exception:
             return 0
 
@@ -1362,7 +1473,8 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
         for tf in tflist:
             # --- fetch with guard (closed bars + optional forming tail) ---
             try:
-                rates = mt5_fetch_rates(sym, tf, count=int(bars or 300), include_latest=include_latest)
+                tf_bars = 1500 if tf.upper() == "H1" else int(bars or 300)
+                rates = mt5_fetch_rates(sym, tf, count=tf_bars, include_latest=include_latest)
                 n_raw = (len(rates) if hasattr(rates, "__len__") else 0)
                 log.info("worker/fetch %s/%s -> %s rows", sym, tf, n_raw)
             except Exception as e:
@@ -1392,7 +1504,7 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
                     base, device_id, token,
                     sym, tf, rates,
                     include_latest=include_latest,
-                    count=bars  # soft cap; push_rates_batch trims if needed
+                    count=tf_count  # soft cap; push_rates_batch trims if needed
                 )
                 if sent:
                     _last_sent_bar[key] = last_t_s
@@ -1427,7 +1539,7 @@ def push_ohlc_once(
     #  - M1: live / dashboard / preview
     #  - M15: model update cadence
     #  - H1 / H2 / H4: horizon for prediction meter
-    FIXED_TFS = ["M1","M5", "M15", "H1", "H2", "H4"]
+    FIXED_TFS = ["M1", "M15", "H1", "H4"]
 
     # --- ensure defaults exist (no-op if already present) ---
     try:
@@ -1483,7 +1595,7 @@ def push_ohlc_once(
     def _to_sec(t_any):
         try:
             t = int(t_any or 0)
-            return (t // 1000) if t >= 1_000_000_000_000 else t  # ms→s else already s
+            return (t // 1000) if t >= 1_000_000_000_000 else t  # ms?s else already s
         except Exception:
             return 0
 
@@ -1492,7 +1604,8 @@ def push_ohlc_once(
         for tfu in tflist:
             # fetch CLOSED bars (+ tail if include_latest=True)
             try:
-                arr_raw = mt5_fetch_rates(s, tfu, count=int(bars or 300), include_latest=include_latest)
+                tf_count = 1500 if str(tfu).upper() == "H1" else int(bars or 300)
+                arr_raw = mt5_fetch_rates(s, tfu, count=tf_count, include_latest=include_latest)
                 n_raw = (len(arr_raw) if hasattr(arr_raw, "__len__") else 0)
                 log.info("OHLC fetch: %s/%s -> %s rows", s, tfu, n_raw)
             except Exception as e:

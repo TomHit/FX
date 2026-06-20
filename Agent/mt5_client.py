@@ -54,6 +54,41 @@ def _find_running_mt5_exe() -> str | None:
     except Exception:
         pass
     return None
+    
+def mt5_get_open_positions() -> list[dict]:
+    if not mt5_init():
+        return []
+
+    try:
+        positions = MT5.positions_get()
+        if positions is None:
+            return []
+
+        out = []
+        for p in positions:
+            try:
+                out.append({
+                    "ticket": int(getattr(p, "ticket", 0) or 0),
+                    "symbol": str(getattr(p, "symbol", "") or "").upper(),
+                    "type": int(getattr(p, "type", 0) or 0),
+                    "side": "BUY" if int(getattr(p, "type", 0) or 0) == 0 else "SELL",
+                    "volume": float(getattr(p, "volume", 0.0) or 0.0),
+                    "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
+                    "price_current": float(getattr(p, "price_current", 0.0) or 0.0),
+                    "profit": float(getattr(p, "profit", 0.0) or 0.0),
+                    "sl": float(getattr(p, "sl", 0.0) or 0.0),
+                    "tp": float(getattr(p, "tp", 0.0) or 0.0),
+                    "magic": int(getattr(p, "magic", 0) or 0),
+                    "comment": str(getattr(p, "comment", "") or ""),
+                    "time": int(getattr(p, "time", 0) or 0),
+                    "time_msc": int(getattr(p, "time_msc", 0) or 0),
+                })
+            except Exception:
+                continue
+
+        return out
+    except Exception:
+        return []
 
 # ---------- logging ----------
 def _ts():

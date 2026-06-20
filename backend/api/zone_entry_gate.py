@@ -64,74 +64,46 @@ def _pick_last_closed_bar_from_bars(
     tf_ms: int,
 ) -> Tuple[Optional[dict], Optional[dict]]:
     """
-    Canonical closed candle picker.
-
-    Supports:
-    - explicit close-time bars: t_close_ms / tCloseMs / t_close / tClose
-    - explicit open-time bars: t_open_ms / tOpenMs / ts_ms / t / time
-    - no timestamp bars: use second-last as closed
+    Pick the last CLOSED bar.
+    Priority: complete=True > clock fallback
+    MT5 sends future bars complete=True — filter by open_ms <= sys_now.
     """
+    import time as _t
     try:
         if not isinstance(bars, list) or len(bars) < 2:
             return (None, None)
-
-        now_ms = int(now_ms or 0)
         tf_ms = int(tf_ms or 0)
-
-        if now_ms <= 0 or tf_ms <= 0:
+        if tf_ms <= 0:
             return (None, None)
-
+        sys_now = int(now_ms or 0)
+        if sys_now <= 0:
+            sys_now = int(_t.time() * 1000)
         bs = [b for b in bars if isinstance(b, dict)]
         if len(bs) < 2:
             return (None, None)
-
-        def _close_ms(b: dict) -> int:
-            # 1) explicit close time: do NOT add tf_ms
-            for k in ("t_close_ms", "tCloseMs", "t_close", "tClose", "close_time_ms"):
+        def _om(b):
+            for k in ("t_open_ms","tOpenMs","open_time_ms","ts_ms","t","time","ts"):
                 v = _to_ms_any(b.get(k))
-                if v > 0:
-                    return int(v)
-
-            # 2) explicit open time: add tf_ms
-            for k in ("t_open_ms", "tOpenMs", "open_time_ms", "ts_ms", "t", "time", "ts"):
-                v = _to_ms_any(b.get(k))
-                if v > 0:
-                    return int(v + tf_ms)
-
+                if v > 0: return int(v)
             return 0
-
-        def _sort_ms(b: dict) -> int:
-            cm = _close_ms(b)
-            return cm if cm > 0 else 0
-
-        has_ts = any(_sort_ms(b) > 0 for b in bs[-5:])
-
+        has_ts = any(_om(b) > 0 for b in bs[-5:])
         if not has_ts:
-            if len(bs) < 3:
-                return (None, None)
-            return (bs[-2], bs[-3])
-
-        bs.sort(key=_sort_ms)
-
-        for i in range(len(bs) - 1, -1, -1):
-            b = bs[i]
-
+            return (bs[-2], bs[-3]) if len(bs) >= 3 else (None, None)
+        bs_sorted = sorted(bs, key=lambda b: _om(b) or 0)
+        for i in range(len(bs_sorted) - 1, -1, -1):
+            b = bs_sorted[i]
             if b.get("complete") is False:
                 continue
-
-            cm = _close_ms(b)
-            if cm <= 0:
-                continue
-
-            # last closed candle only
-            if cm > now_ms:
-                continue
-
-            prev = bs[i - 1] if i - 1 >= 0 else None
+            om = _om(b)
+            if om <= 0:
+                continue 
+            is_complete = b.get("complete") is True
+            closed_by_clock = (om + tf_ms) <= sys_now
+            if not is_complete and not closed_by_clock:
+                continue  # still forming
+            prev = bs_sorted[i-1] if i-1 >= 0 else None
             return (b, prev)
-
         return (None, None)
-
     except Exception:
         return (None, None)
 
@@ -160,6 +132,44 @@ def _pick_level_from_lists(levels: List[Any], direction: str, cl: float) -> Opti
         above = [v for v in vals if v >= cl]
         return min(above) if above else None
 
+def _pick_best_scored_zone(sr_all: dict, direction: str, cl: float) -> dict | None:
+    if not isinstance(sr_all, dict):
+        return None
+
+    dir_u = str(direction or "").upper().strip()
+    key = "best_support" if dir_u == "BUY" else "best_resistance"
+
+    z = sr_all.get(key)
+    if not isinstance(z, dict):
+        return None
+
+    try:
+        lvl = float(z.get("level"))
+        low = float(z.get("low"))
+        high = float(z.get("high"))
+        px = float(cl)
+    except Exception:
+        return None
+
+    if lvl <= 0 or low >= high:
+        return None
+
+    if z.get("side_ok") is False or z.get("stale") is True:
+        return None
+
+    if dir_u == "BUY" and high > px:
+        return None
+
+    if dir_u == "SELL" and low < px:
+        return None
+    
+
+    out = dict(z)
+    out["zone_source"] = "BEST_SCORED_SR"
+    out["selection_model"] = "BEST_SR_THEN_H1_H4_MAJOR_FALLBACK"
+    out["zone_role"] = "BEST_SUPPORT" if dir_u == "BUY" else "BEST_RESISTANCE"
+    return out
+
 def _pick_zone_from_sr(sr_all: dict, direction: str, cl: float, atr: float, tf_tag: str) -> dict | None:
     """
     Strong SR zone picker with quality filtering.
@@ -172,7 +182,7 @@ def _pick_zone_from_sr(sr_all: dict, direction: str, cl: float, atr: float, tf_t
     1. H4 major (strength>=8 OR touches>=4 OR sr_score>=10) within cap_h4_major ATR
     2. H1 strong (strength>=6 OR touches>=3 OR sr_score>=9) within cap_h1_strong ATR
     3. H1 acceptable (strength>=3 OR touches>=2 OR sr_score>=6) within cap_h1_acc ATR
-    4. H1 any (touches>=2) within cap_h1_min ATR
+    4. H1 any (touches>=1 if tight+sr_score>=4, else touches>=2) within cap_h1_min ATR
 
     Side rules:
     - Normal: BUY prefers supports BELOW price; SELL prefers resistances ABOVE price.
@@ -245,7 +255,15 @@ def _pick_zone_from_sr(sr_all: dict, direction: str, cl: float, atr: float, tf_t
         )
 
     def _is_minimum(z: dict) -> bool:
-        return int(z.get("touches") or 0) >= 2
+        touches = int(z.get("touches") or 0)
+        if touches >= 2:
+            return True
+        if touches == 1:
+            # Accept 1-touch only if zone is tight and has structural significance
+            band_type = str(z.get("band_type") or "")
+            sr_score = float(z.get("sr_score") or 0)
+            return sr_score >= 4.0 and "wide" not in band_type
+        return False
 
     def _composite_score(z: dict, dist_atr: float, tf: str) -> float:
         touches = int(z.get("touches") or 0)
@@ -358,6 +376,25 @@ def _pick_zone_from_sr(sr_all: dict, direction: str, cl: float, atr: float, tf_t
 
             dist_atr = abs(float(cl) - float(lvl)) / float(atr)
             zz = _ensure_zone_band(z, tf_name)
+            try:
+                zl_pick = float(zz.get("low") if zz.get("low") is not None else zz.get("level"))
+                zh_pick = float(zz.get("high") if zz.get("high") is not None else zz.get("level"))
+                if zl_pick > zh_pick:
+                    zl_pick, zh_pick = zh_pick, zl_pick
+
+                if float(cl) < zl_pick:
+                    band_dist = zl_pick - float(cl)
+                elif float(cl) > zh_pick:
+                    band_dist = float(cl) - zh_pick
+                else:
+                    band_dist = 0.0
+
+                max_pick_dist = min(max(2.0 * float(atr), 3.0), 12.0) if str(sym_u).upper() == "XAUUSD" else 2.0 * float(atr)
+
+                if band_dist > max_pick_dist:
+                    continue
+            except Exception:
+                pass
             zz["tf"] = str(tf_name).upper()
             zz["kind"] = "support" if dir_u == "BUY" else "resistance"
             zz["zone_role"] = "H1_PRIMARY" if str(tf_name).upper() == "H1" else "H4_FALLBACK"
@@ -380,13 +417,17 @@ def _pick_zone_from_sr(sr_all: dict, direction: str, cl: float, atr: float, tf_t
             "best_level": float(best.get("level")),
             "best_dist_atr": float(best.get("dist_atr") or 0.0),
         }
-
+    
+    
+    
     h1_major_zone, h1_dbg = _pick_best_major(_get_levels(h1, major_key), "H1")
     h4_major_zone, h4_dbg = _pick_best_major(_get_levels(h4, major_key), "H4")
 
     # Active zone remains H1-first for Phase 1. If H1 major is absent, use H4.
-    # Phase 2 will use h1_major_zone/h4_major_zone to implement H1_MISSED -> WATCH_H4.
-    zone = h1_major_zone if isinstance(h1_major_zone, dict) else h4_major_zone
+    # PHASE-1 SAFETY:
+    # Do not execute H4 zone using H1 reversal candles.
+    # H4 execution requires H4 candle picker, handled in Phase 2.
+    zone = h1_major_zone
 
     if not isinstance(zone, dict) or zone.get("level") is None:
         return None
@@ -622,6 +663,9 @@ def _pick_display_zones_from_sr(sr_all: dict, price: float, atr: float, tf_tag: 
 def _watch_key(sym: str, direction: str, tf_tag: str) -> str:
     return f"xtl:zone:watch:{(sym or '').upper().strip()}:{(direction or '').upper().strip()}:{(tf_tag or 'H1').upper().strip()}"
 
+def _zone_cooldown_key(sym: str, direction: str, tf_tag: str) -> str:
+    return f"xtl:zone:cooldown:{(sym or '').upper().strip()}:{(direction or '').upper().strip()}:{(tf_tag or 'H1').upper().strip()}"
+
 def _json_load(raw):
     try:
         if raw is None:
@@ -739,7 +783,10 @@ def zone_reversal_gate(
 
     
     # If missing bars, pull from Redis snap: xtl:ohlc:snap:<DEV>:<SYM>:H1
-    if not isinstance(bars, list) or len(bars) < 2:
+    # PHASE-1 FIX:
+    # Always prefer latest device Redis snap.
+    # row_h1 bars may be stale from trend_endpoints snapshot.
+    if True:
         dev = (str(x_device_id or "").strip() or str(pinned_device or "").strip())
         if dev:
             try:
@@ -769,11 +816,38 @@ def zone_reversal_gate(
                     # IMPORTANT:
                     # Use serverNow/current clock to decide which candle is closed.
                     # Do NOT use lastClosedTs as now_ms_pick, otherwise picker can lag by 1-2 candles.
-                    if snap_server_now > 0:
-                        now_ms_pick = int(snap_server_now)
-                        snap_repaired = False
-                    else:
+                    # Fix: serverNow can be stale (MT5 bridge doesn't update it every tick)
+                    # Use max of serverNow, last bar close time, and system now
+                    # This prevents the bar picker from treating recent closed bars as "future"
+                    _snap_server_now = int(snap_server_now) if snap_server_now > 0 else 0
+                    _last_bar_close_ms = 0
+                    try:
+                        if isinstance(bars, list) and bars:
+                            _lb = bars[-1]
+                            _lb_t = _to_ms_any(
+                                _lb.get("t_close_ms") or _lb.get("tCloseMs") or
+                                _lb.get("t") or _lb.get("ts") or _lb.get("time") or 0
+                            )
+                            if _lb_t and int(_lb_t) > 0:
+                                # If bar key is open time, add tf_ms to get close time
+                                _lb_close = int(_lb_t)
+                                if _lb_close < int(now_ms) - tf_ms:
+                                    # looks like open time — add tf_ms
+                                    _lb_close = _lb_close + int(tf_ms)
+                                _last_bar_close_ms = _lb_close
+                    except Exception:
+                        _last_bar_close_ms = 0
+
+                    # Use the largest of: serverNow, last bar close, system now
+                    # Ensures bar picker never skips a genuinely closed candle
+                    now_ms_pick = max(
+                        _snap_server_now,
+                        _last_bar_close_ms,
+                        int(now_ms or 0)
+                    )
+                    if now_ms_pick <= 0:
                         now_ms_pick = int(now_ms)
+                    snap_repaired = False
 
                     # lastClosedTs is debug/reference only
                     if snap_last_closed > 0 and snap_server_now > 0 and snap_last_closed > (snap_server_now + 120_000):
@@ -1030,12 +1104,37 @@ def zone_reversal_gate(
 
         candidates = []
 
-        for side, z in (
-            ("BUY", display_zones.get("h1_buy_zone")),
-            ("BUY", display_zones.get("h4_buy_zone")),
-            ("SELL", display_zones.get("h1_sell_zone")),
-            ("SELL", display_zones.get("h4_sell_zone")),
-        ):
+        # ------------------------------------------------------------
+        # Best scored SR feeds direction resolver first.
+        # H4 is confirmation only, not execution.
+        # Fallback to legacy H1 display zones only if best scored zone missing.
+        # ------------------------------------------------------------
+        best_buy_zone = (sr or {}).get("best_support") if isinstance(sr, dict) else None
+        best_sell_zone = (sr or {}).get("best_resistance") if isinstance(sr, dict) else None
+
+        candidate_sources = []
+
+        if isinstance(best_buy_zone, dict):
+            bz = dict(best_buy_zone)
+            bz["tf"] = str(bz.get("tf") or "H1").upper()
+            bz["kind"] = "support"
+            bz["zone_source"] = "BEST_SCORED_SR"
+            bz["selection_model"] = "BEST_SR_DIRECTION_RESOLVER"
+            candidate_sources.append(("BUY", bz))
+        else:
+            candidate_sources.append(("BUY", display_zones.get("h1_buy_zone")))
+
+        if isinstance(best_sell_zone, dict):
+            bz = dict(best_sell_zone)
+            bz["tf"] = str(bz.get("tf") or "H1").upper()
+            bz["kind"] = "resistance"
+            bz["zone_source"] = "BEST_SCORED_SR"
+            bz["selection_model"] = "BEST_SR_DIRECTION_RESOLVER"
+            candidate_sources.append(("SELL", bz))
+        else:
+            candidate_sources.append(("SELL", display_zones.get("h1_sell_zone")))
+
+        for side, z in candidate_sources:
             if not isinstance(z, dict):
                 continue
 
@@ -1061,6 +1160,29 @@ def zone_reversal_gate(
             preferred_zone = candidates[0]["zone"]
         else:
             resolved_dir = "WATCHING"
+        if resolved_dir in ("BUY", "SELL"):
+            best_key = "best_support" if resolved_dir == "BUY" else "best_resistance"
+            best_zone = sr.get(best_key) if isinstance(sr, dict) else None
+
+            if isinstance(best_zone, dict):
+                try:
+                    bz = dict(best_zone)
+                    if (
+                        bz.get("level") is not None
+                        and bz.get("low") is not None
+                        and bz.get("high") is not None
+                        and float(bz.get("low")) < float(bz.get("high"))
+                        and bz.get("side_ok") is not False
+                        and bz.get("stale") is not True
+                    ):
+                        bz["zone_source"] = "BEST_SCORED_SR"
+                        bz["selection_model"] = "BEST_SR_DIRECTION_RESOLVED"
+                        bz["execution_tf"] = "H1"
+                        bz["zone_role"] = "BEST_SUPPORT" if resolved_dir == "BUY" else "BEST_RESISTANCE"
+                        bz["actionable_dist"] = _zone_band_dist(bz, float(decision_px)) or 0.0
+                        preferred_zone = bz
+                except Exception:
+                    pass
 
         gate["resolved_dir"] = resolved_dir
         gate["dir_input"] = dir_u
@@ -1074,6 +1196,9 @@ def zone_reversal_gate(
                 "low": x["zone"].get("low"),
                 "high": x["zone"].get("high"),
                 "dist": x["dist"],
+                "zone_source": x["zone"].get("zone_source"),
+                "selection_model": x["zone"].get("selection_model"),
+                "quality_score": x["zone"].get("quality_score"),
             }
             for x in candidates[:4]
         ]
@@ -1138,6 +1263,59 @@ def zone_reversal_gate(
 
         if isinstance(watch, dict) and isinstance(watch.get("zone_used"), dict):
             zone_used = watch.get("zone_used")
+    # ------------------------------------------------------------
+    # WATCH INTEGRITY REPAIR
+    # If rev_ok and state are inconsistent (one set but not the other),
+    # repair them so the REV_OK early-return lock fires correctly.
+    # This prevents the gate from falling through and re-evaluating
+    # on every tick after REV_OK was already confirmed.
+    # ------------------------------------------------------------
+    if isinstance(watch, dict):
+        w_state = str(watch.get("state") or "").upper()
+        w_rev_ok = bool(watch.get("rev_ok"))
+        if w_rev_ok and w_state != "REV_OK":
+            watch["state"] = "REV_OK"
+        if w_state == "REV_OK" and not w_rev_ok:
+            watch["rev_ok"] = True
+        # Also ensure rev_ok_bar_hi/lo exist if state is REV_OK
+        if w_state == "REV_OK" or w_rev_ok:
+            if not watch.get("rev_ok_bar_hi") and watch.get("last_checked_high"):
+                watch["rev_ok_bar_hi"] = float(watch["last_checked_high"])
+            if not watch.get("rev_ok_bar_lo") and watch.get("last_checked_low"):
+                watch["rev_ok_bar_lo"] = float(watch["last_checked_low"])
+        # ------------------------------------------------------------
+        # RC CANDLE VALIDITY CHECK
+        # If watch is in REV_OK state but the RC candle close time
+        # is in the future (forming candle was incorrectly used as RC),
+        # auto-repair: roll back to REV_WATCH, clear only RC fields.
+        # Keep zone_used, started_ms, direction — zone freeze is valid.
+        # ------------------------------------------------------------
+        if w_rev_ok or w_state == "REV_OK":
+            rev_ok_ms = int(watch.get("rev_ok_ms") or 0)
+            if rev_ok_ms > 0 and rev_ok_ms > int(now_ms_pick or 0):
+                # RC candle close time is in the future — forming candle was used
+                # Roll back to REV_WATCH cleanly
+                watch["state"] = "REV_WATCH"
+                watch["rev_ok"] = False
+                watch["rev_ok_ms"] = 0
+                watch["rev_ok_bar_hi"] = None
+                watch["rev_ok_bar_lo"] = None
+                watch["rev_ok_bar_close"] = None
+                # Persist the rollback immediately
+                try:
+                    R.set(wkey, json.dumps(
+                        {k: v for k, v in watch.items() if v is not None},
+                        separators=(",", ":")
+                    ), ex=7 * 24 * 3600)
+                except Exception:
+                    pass
+                if debug_gate:
+                    gate["dbg_rc_rollback"] = {
+                        "reason": "forming_candle_used_as_rc",
+                        "rev_ok_ms": rev_ok_ms,
+                        "now_ms_pick": int(now_ms_pick or 0),
+                        "rolled_back_to": "REV_WATCH",
+                    }     
 
 
     # Normalize frozen zone_used: old watches may be level-only.
@@ -1188,35 +1366,37 @@ def zone_reversal_gate(
             return None
 
         # do we need a band repair?
+        # FREEZE RULE: if zone_used already has a valid low/high band, NEVER touch it.
+        # Only repair truly missing or collapsed bands (legacy watches).
         need_band = False
         try:
             zl = zone_used.get("low")
             zh = zone_used.get("high")
             if zl is None or zh is None or float(zl) >= float(zh):
                 need_band = True
+            # Valid band exists — lock it, do not rehydrate from SR
+            else:
+                need_band = False
         except Exception:
             need_band = True
 
-        # 1) try rehydrate from SR
-        band = None
+        # 1) try rehydrate from SR — ONLY for legacy watches missing a band
         if need_band and lvl0 is not None:
             kind0 = str(zone_used.get("kind") or ("support" if resolved_dir == "BUY" else "resistance")).lower()
             band = _rehydrate_band_from_sr_level(sr or {}, tfu, kind0, float(lvl0))
             if band is not None:
                 zone_used["low"] = float(band[0])
                 zone_used["high"] = float(band[1])
+                need_band = False
 
-        # 2) if still missing/collapsed, synthesize (never collapse)
-        try:
-            zl = zone_used.get("low")
-            zh = zone_used.get("high")
-            if lvl0 is not None and (zl is None or zh is None or float(zl) >= float(zh)):
+        # 2) if still missing/collapsed, synthesize from ATR (last resort only)
+        if need_band and lvl0 is not None:
+            try:
                 ztmp = _level_to_zone(float(lvl0), tfu, sym_u, float(atr))
                 zone_used["low"] = float(ztmp["low"])
                 zone_used["high"] = float(ztmp["high"])
-        except Exception:
-            pass
-
+            except Exception:
+                pass
 
 
     # ------------------------------------------------------------
@@ -1228,6 +1408,34 @@ def zone_reversal_gate(
         gate["zone_used"] = dict(zone_used)
     else:
         zone = None
+
+    # ------------------------------------------------------------
+    # HARD STOP: active MT5 trade must not enter rediscovery/DIST_GUARD
+    # ------------------------------------------------------------
+    try:
+        _trade_state = str((watch or {}).get("trade_state") or "").upper()
+        _state = str((watch or {}).get("state") or "").upper()
+
+        if _trade_state == "TRADE_ACTIVE" or _state == "TRADE_ACTIVE":
+            _zu = (watch or {}).get("zone_used") or (watch or {}).get("planned_zone")
+
+            gate["blocked"] = False
+            gate["reason"] = "TRADE_ACTIVE"
+            gate["stage"] = "MANAGE_TRADE"
+            gate["trade_state"] = "TRADE_ACTIVE"
+            gate["zone"] = dict(_zu) if isinstance(_zu, dict) else None
+            gate["zone_used"] = dict(_zu) if isinstance(_zu, dict) else None
+            gate["planned_zone"] = dict(_zu) if isinstance(_zu, dict) else None
+            gate["entry_triggered"] = bool((watch or {}).get("entry_triggered"))
+            gate["entry_price"] = (watch or {}).get("entry_price")
+            gate["entry_ts_ms"] = (watch or {}).get("entry_ts_ms")
+            gate["mt5_job_id"] = (watch or {}).get("mt5_job_id")
+            gate["mt5_ticket"] = (watch or {}).get("mt5_ticket")
+            gate["rev_state"] = dict(watch or {})
+
+            return True, gate
+    except Exception:
+        pass
     
     # Persist repaired band ONLY when we truly repaired a legacy watch (once)
     try:
@@ -1260,7 +1468,7 @@ def zone_reversal_gate(
 
             if legacy and new_ok:
                 watch["zone_used"] = dict(zone_used)
-                R.set(wkey, json.dumps(watch, separators=(",", ":")))
+                R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
                 did_repair = True
 
         if debug_gate:
@@ -1269,7 +1477,61 @@ def zone_reversal_gate(
         pass
 
 
-    
+    # ------------------------------------------------------------
+    # FALLBACK: watch key missing but open registry has active trade.
+    # Do not hardcode user_id; scan open registries and match symbol.
+    # ------------------------------------------------------------
+    try:
+        if (
+            not isinstance(watch, dict)
+            or str(watch.get("trade_state") or "").upper() != "TRADE_ACTIVE"
+        ):
+            for open_key in R.scan_iter("xtl:strategy:oppt:open:*"):
+                open_map = R.hgetall(open_key)
+                for _k, _v in (open_map or {}).items():
+                    if isinstance(_v, (bytes, bytearray)):
+                        _v = _v.decode("utf-8", "ignore")
+                    tr = json.loads(_v) if isinstance(_v, str) else _v
+                    if not isinstance(tr, dict):
+                        continue
+
+                    if str(tr.get("symbol") or "").upper() != sym_u:
+                        continue
+                    if str(tr.get("trade_state") or "").upper() != "TRADE_ACTIVE":
+                        continue
+
+                    _side = str(tr.get("side") or "").upper()
+                    if _side not in ("BUY", "SELL"):
+                        continue
+
+                    _zu = tr.get("entry_zone")
+                    if not isinstance(_zu, dict):
+                        _zu = {
+                            "level": tr.get("entry_zone_level"),
+                            "low": tr.get("entry_zone_low"),
+                            "high": tr.get("entry_zone_high"),
+                            "tf": tr.get("entry_zone_tf") or tfu,
+                            "kind": tr.get("entry_zone_kind"),
+                        }
+
+                    gate["blocked"] = False
+                    gate["reason"] = "TRADE_ACTIVE"
+                    gate["stage"] = "MANAGE_TRADE"
+                    gate["trade_state"] = "TRADE_ACTIVE"
+                    gate["resolved_dir"] = _side
+                    gate["zone"] = dict(_zu) if isinstance(_zu, dict) else None
+                    gate["zone_used"] = dict(_zu) if isinstance(_zu, dict) else None
+                    gate["planned_zone"] = dict(_zu) if isinstance(_zu, dict) else None
+                    gate["entry_triggered"] = True
+                    gate["entry_price"] = tr.get("entry_price")
+                    gate["entry_ts_ms"] = tr.get("opened_at_ms")
+                    gate["mt5_job_id"] = tr.get("mt5_job_id")
+                    gate["mt5_ticket"] = tr.get("mt5_ticket")
+                    gate["rev_state"] = tr
+
+                    return True, gate
+    except Exception:
+        pass
     
     
     # ------------------------------------------------------------
@@ -1291,26 +1553,52 @@ def zone_reversal_gate(
             gate["blocked"] = False
 
             # show next valid zones, but do not trade
-            gate["zone"] = (
-                display_zones.get("h1_buy_zone")
-                or display_zones.get("h4_buy_zone")
-                or display_zones.get("h1_sell_zone")
-                or display_zones.get("h4_sell_zone")
-            )
-            gate["planned_zone"] = gate["zone"]
+            # No actionable near/major SR.
+            # Do NOT expose far/display zone as executable gate zone.
+            gate["zone"] = None
+            gate["planned_zone"] = None
             gate["zone_used"] = None
-            return False, gate
 
+            # Optional display-only fields for UI/debug, never used by executor.
+            # Optional display-only fields for UI/debug, never used by executor.
+            # Direction-aware: never show opposite-side zone in strategy row.
+            if dir_u == "BUY":
+                gate["display_zone"] = (
+                    display_zones.get("h1_buy_zone")
+                    or display_zones.get("h4_buy_zone")
+                )
+            elif dir_u == "SELL":
+                gate["display_zone"] = (
+                    display_zones.get("h1_sell_zone")
+                    or display_zones.get("h4_sell_zone")
+                )
+            else:
+                gate["display_zone"] = None
+
+            return False, gate
         if isinstance(preferred_zone, dict) and preferred_zone.get("level") is not None:
             zone = dict(preferred_zone)
+            # PHASE-1 SAFETY:
+            # Do not execute H4 zone with H1 reversal candle.
+            # H4 zones are display/watch only until H4 candle execution is implemented.
+            if str(zone.get("tf") or "").upper() == "H4":
+                gate["reason"] = "H4_ZONE_EXECUTION_DISABLED_PHASE1"
+                gate["stage"] = "ZONE_PICK"
+                gate["blocked"] = False
+                gate["zone"] = dict(zone)
+                gate["planned_zone"] = dict(zone)
+                gate["zone_used"] = None
+                gate["resolved_dir"] = "WATCHING"
+                return False, gate
         else:
-            zone = _pick_zone_from_sr(
-              sr or {},
-              resolved_dir,
-              float(decision_px),
-              float(atr),
-              tfu,
-            )
+            gate["reason"] = "WATCHING_NO_NEAR_ACTIONABLE_ZONE"
+            gate["stage"] = "ZONE_PICK"
+            gate["blocked"] = False
+            gate["zone"] = None
+            gate["planned_zone"] = None
+            gate["zone_used"] = None
+            gate["resolved_dir"] = "WATCHING"
+            return False, gate
 
     if not isinstance(zone, dict) or zone.get("level") is None:
         # If a watch exists, never hard-fail with no_buy/no_sell.
@@ -1434,11 +1722,25 @@ def zone_reversal_gate(
     gate["dist_gate_model"] = "ZONE_BAND_ACTIONABLE_DISTANCE_CAP"
 
     if dist > (max_dist + eps):
-        gate["reason"] = "ZONE_TOO_FAR_NO_SETUP"
+        # ------------------------------------------------------------
+        # FAR-ZONE DISCOVERY RESET:
+        # If selected zone is too far from live/current price, do not keep
+        # old far zone as actionable. Clear non-REV watch and allow fresh
+        # nearest H1 zone discovery on next cycle.
+        # ------------------------------------------------------------
+        try:
+            if isinstance(watch, dict):
+                st = str(watch.get("state") or "").upper()
+                # Protect REV_WATCH and WATCH states — zone is frozen, do not delete
+                if st not in ("WATCH", "REV_WATCH", "REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE"):
+                    R.delete(wkey)
+        except Exception:
+            pass
+
+        gate["reason"] = "ZONE_TOO_FAR_RESET_FOR_REDISCOVERY"
         gate["stage"] = "DIST_GUARD"
         gate["blocked"] = False
 
-        # show planned major zone immediately on UI
         gate["zone"] = dict(zone)
         gate["planned_zone"] = dict(zone)
         gate["zone_used"] = None
@@ -1448,8 +1750,52 @@ def zone_reversal_gate(
         gate["over"] = float(dist - max_dist)
         gate["eps"] = float(eps)
         gate["dist_atr"] = float(dist / float(atr)) if float(atr) > 0 else None
-        return False, gate
+        gate["rediscovery_required"] = True
+        # hard reset stale zone/watch — but NEVER reset a frozen watch
+        try:
+            _st = str((watch or {}).get("state") or "").upper()
+            # Also check raw Redis key — watch may be loaded without zone_used
+            _raw_watch = None
+            try:
+                if wkey:
+                    _raw = R.get(str(wkey))
+                    if _raw:
+                        _raw_watch = json.loads(_raw) if isinstance(_raw, str) else _raw
+                        if isinstance(_raw_watch, dict) and not _st:
+                            _st = str(_raw_watch.get("state") or "").upper()
+            except Exception:
+                pass
+            _has_frozen = _st in ("WATCH", "REV_WATCH", "REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE")
 
+            if not _has_frozen:
+                gate["zone"] = None
+                gate["planned_zone"] = None
+                gate["zone_used"] = None
+                gate["resolved_dir"] = "WATCHING"
+                gate["h1_buy_zone"] = None
+                gate["h4_buy_zone"] = None
+                gate["h1_sell_zone"] = None
+                gate["h4_sell_zone"] = None
+                gate["rev_state"] = None
+                gate["rev_basis"] = None
+                gate["touch_basis"] = None
+                if wkey:
+                    try:
+                        for _s in ("BUY", "SELL"):
+                            for _t in ("H1", "H4"):
+                                R.delete(f"xtl:zone:watch:{sym_u}:{_s}:{_t}")
+                    except Exception:
+                        pass
+            else:
+                # frozen watch active — preserve zone and direction
+                gate["zone"] = dict(watch.get("zone_used") or {})
+                gate["zone_used"] = dict(watch.get("zone_used") or {})
+                gate["planned_zone"] = dict(watch.get("zone_used") or {})
+                gate["resolved_dir"] = str((watch or {}).get("direction") or "WATCHING").upper()
+                gate["rev_state"] = watch
+        except Exception:
+            pass
+        return False, gate
     # Optional: keep visibility that we were near the threshold
     gate["dist"] = float(dist)
     gate["max_dist"] = float(max_dist)
@@ -1492,13 +1838,47 @@ def zone_reversal_gate(
     except Exception:
         z_level = float(zone["level"])
 
-    # Touch condition: candle must break into the zone
-    # BUY: candle low breaks zone.high (enters support zone from above)
-    # SELL: candle high breaks zone.low (enters resistance zone from below)
-    if resolved_dir == "BUY":
-        touched = (float(lo) <= zh)  # Low breaks zone.high
-    else:
-        touched = (float(hi) >= zl)  # High breaks zone.low
+    # Touch condition must prove price actually entered the frozen zone.
+    # BUY support touch:
+    #   - current/last candle low <= zone_high, OR live price is inside/below zone_high
+    # SELL resistance touch:
+    #   - current/last candle high >= zone_low, OR live price is inside/above zone_low
+    #
+    # IMPORTANT:
+    # Do not freeze just because direction resolved near a zone.
+    # REV_OK must never happen before actual touch.
+    try:
+        _candle_touched_buy = bool(float(lo) <= float(zh) and float(hi) >= float(zl))
+        _candle_touched_sell = bool(float(hi) >= float(zl) and float(lo) <= float(zh))
+    except Exception:
+        _candle_touched_buy = False
+        _candle_touched_sell = False
+
+    try:
+        _live_inside_zone = bool(float(zl) <= float(px_live) <= float(zh))
+    except Exception:
+        _live_inside_zone = False
+
+    # STRICT H1 TOUCH + LIVE TOUCH FREEZE:
+    # - CLOSED H1 candle range touch is accepted.
+    # - LIVE price inside zone is also accepted so REV_WATCH starts immediately.
+    # - REV_OK still waits for closed H1 candle later.
+    try:
+        _closed_bar_touched = bool(
+            float(lo) <= float(zh)
+            and float(hi) >= float(zl)
+        )
+    except Exception:
+        _closed_bar_touched = False
+
+    try:
+        _live_touched = bool(
+            float(zl) <= float(px_live) <= float(zh)
+        )
+    except Exception:
+        _live_touched = False
+
+    touched = bool(_closed_bar_touched or _live_touched)
 
     if debug_gate:
         gate["touch_basis"] = {
@@ -1509,8 +1889,10 @@ def zone_reversal_gate(
             "zone_low": zl,
             "zone_high": zh,
             "zone_level": float(zone.get("level") or 0.0),
+            "closed_bar_touched": bool(_closed_bar_touched),
+            "live_touched": bool(_live_touched),
             "touched_now": bool(touched),
-            "touch_method": "CLOSED_BAR_LOHI_VS_ZONE_BOUNDARIES",
+            "touch_method": "CLOSED_BAR_OR_LIVE_PRICE_VS_ZONE_BOUNDARIES",
         }
 
         if gate.get("dbg_h1_bars_n") is not None:
@@ -1521,7 +1903,15 @@ def zone_reversal_gate(
     # ------------------------------------------------------------
     # 5) start watch if not started yet
     # ------------------------------------------------------------
-    if zone_used is None:
+    # FREEZE GUARD: never re-enter the freeze block if a watch already exists.
+    # If watch.started_ms is set, the zone was already frozen in a previous tick.
+    # Re-entering would reset started_ms and wipe the invalidation clock.
+    _watch_already_started = (
+        isinstance(watch, dict)
+        and bool(watch.get("started_ms"))
+        and isinstance(watch.get("zone_used"), dict)
+    )
+    if zone_used is None and not _watch_already_started:
         if not touched:
             gate["reason"] = "WAIT_ZONE_TOUCH"
             gate["stage"] = "TOUCH"
@@ -1549,88 +1939,100 @@ def zone_reversal_gate(
         except Exception:
             pass
 
+        try:
+            import time as _t2
+            _sys_now_touch = int(_t2.time() * 1000)
+            _forming_open_ms = 0
+            try:
+                if isinstance(bars, list) and bars:
+                    for _fb in reversed(bars):
+                        _fb_t = _to_ms_any(
+                            _fb.get("t_open_ms") or _fb.get("tOpenMs") or
+                            _fb.get("open_time_ms") or _fb.get("t") or 0
+                        )
+                        if _fb_t and int(_fb_t) > 0 and int(_fb_t) <= _sys_now_touch:
+                            _forming_open_ms = int(_fb_t)
+                            break
+            except Exception:
+                _forming_open_ms = 0
+            if _forming_open_ms > 0:
+                touch_open_ms  = int(_forming_open_ms)
+            else:
+                touch_open_ms  = int((_sys_now_touch // tf_ms) * tf_ms)
+            touch_close_ms = int(touch_open_ms + tf_ms)
+        except Exception:
+            touch_open_ms  = int((int(now_ms or now_ms_pick) // tf_ms) * tf_ms)
+            touch_close_ms = int(touch_open_ms + tf_ms)
+
+        # Extract touch candle open_ms from the closed bar for precise RC boundary.
+        # RC candle must have opened at or after touch_candle_open_ms.
+        # This rejects any candle already forming when the zone was frozen
+        # (including the big drop/touch candle itself).
+        _touch_bar_open_ms = 0
+        try:
+            for _ok in ("t_open_ms", "tOpenMs", "open_time_ms", "ts_ms", "t", "time", "ts"):
+                _v = _to_ms_any((c or {}).get(_ok))
+                if _v and int(_v) > 0:
+                    _touch_bar_open_ms = int(_v)
+                    break
+        except Exception:
+            _touch_bar_open_ms = int(touch_open_ms)
+
+        # Fallback: use computed touch_open_ms if bar timestamp not found
+        if not _touch_bar_open_ms:
+            _touch_bar_open_ms = int(touch_open_ms)
+        try:
+            cd_key = _zone_cooldown_key(sym_u, resolved_dir, tfu)
+            cd_raw = R.get(cd_key) if R is not None else None
+            if cd_raw:
+                ttl = R.ttl(cd_key)
+                gate["reason"] = f"ZONE_COOLDOWN_AFTER_CLOSE | {ttl}s"
+                gate["stage"] = "ZONE_COOLDOWN"
+                gate["blocked"] = False
+                gate["zone_cooldown_key"] = cd_key
+                gate["zone_cooldown_ttl_sec"] = int(ttl or 0)
+                gate["resolved_dir"] = resolved_dir
+                return False, gate
+        except Exception:
+            pass
+
         watch = {
             "state": "WATCH",
-            "started_ms": int(closed_ms) if int(closed_ms or 0) > 0 else int(now_ms_pick),
+            "started_ms": int(now_ms_pick),
+            "touch_open_ms": int(touch_open_ms),
+            "touch_close_ms": int(touch_close_ms),
+            "touch_candle_open_ms": int(_touch_bar_open_ms),  # ← NEW: RC boundary
+            "min_reclaim_close_ms": int(touch_close_ms),
             "direction": resolved_dir,
             "tf": tfu,
             "zone_used": zone_used,
+            # Set to now_ms_pick so only FUTURE closed candles are evaluated
+            # Prevents old closed candles from being used as RC on fresh watch
+            "watch_created_ms": int(now_ms_pick or 0),
+            "last_checked_closed_ms": int(now_ms_pick or 0),
+            "touch_source": "LIVE_TOUCH",
         }
-
         try:
             R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
         except Exception:
             pass
-        # ------------------------------------------------------------
-        # SAME-CANDLE RECLAIM FIX
-        # If the candle that first touched/entered the zone also closes
-        # back beyond the reclaim boundary, REV_OK is valid immediately.
-        #
-        # BUY: touched support and closed above zone_high
-        # SELL: touched resistance and closed below zone_low
-        # ------------------------------------------------------------
-        try:
-            zl_now = float(zone_used.get("low") or zone_used.get("level") or 0.0)
-            zh_now = float(zone_used.get("high") or zone_used.get("level") or 0.0)
-
-            same_candle_rev_ok = False
-            if resolved_dir == "BUY":
-                same_candle_rev_ok = bool(touched and float(cl) > float(zh_now))
-            elif resolved_dir == "SELL":
-                same_candle_rev_ok = bool(touched and float(cl) < float(zl_now))
-
-            if same_candle_rev_ok:
-                try:
-                    watch["state"] = "REV_OK"
-                    watch["rev_ok"] = True
-                    watch["rev_ok_ms"] = int(closed_ms)
-                    watch["rev_ok_bar_hi"] = float(hi)
-                    watch["rev_ok_bar_lo"] = float(lo)
-                    R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
-                except Exception:
-                    pass
-
-                gate["zone_used"] = zone_used
-                gate["rev_ok"] = True
-                gate["watch_key"] = str(wkey)
-                gate["rev_state"] = {
-                    "state": "REV_OK",
-                    "started_ms": int(watch.get("started_ms") or now_ms_pick),
-                    "rev_ok_ms": int(closed_ms),
-                    "direction": resolved_dir,
-                    "tf": tfu,
-                    "rev_ok_bar_hi": float(hi),
-                    "rev_ok_bar_lo": float(lo),
-                }
-                gate["rev_trigger"] = {
-                    "entry_above": float(hi),
-                    "entry_below": float(lo),
-                }
-                gate["reason"] = (
-                    f"REV_OK | FZ {float(zl_now):.2f}-{float(zh_now):.2f} "
-                    f"| RC {float(cl):.2f} "
-                    f"| entry > {float(hi):.2f}"
-                    if resolved_dir == "BUY"
-                    else
-                    f"REV_OK | FZ {float(zl_now):.5f}-{float(zh_now):.5f} "
-                    f"| RC {float(cl):.5f} "
-                    f"| entry < {float(lo):.5f}"
-                )
-                gate["reason"] = f"{gate.get('reason')} | PCB C={float(cl):.2f} tf={tfu}"
-                gate["stage"] = "REV"
-                gate["blocked"] = False
-                return True, gate
-        except Exception as e:
-            if debug_gate:
-                gate["dbg_same_candle_reclaim_exc"] = f"{type(e).__name__}:{e}"
-
-    gate["zone_used"] = zone_used
-    gate["rev_state"] = {
-        "state": "WATCH",
-        "started_ms": int((watch or {}).get("started_ms") or now_ms_pick),
-        "direction": str((watch or {}).get("direction") or resolved_dir),
-        "tf": str((watch or {}).get("tf") or tfu),
-    }
+        gate["zone_used"] = zone_used
+        gate["watch_key"] = str(wkey)
+        gate["rev_state"] = {
+            "state": "WATCH",
+            "started_ms": int(watch.get("started_ms") or now_ms_pick),
+            "touch_open_ms": int(watch.get("touch_open_ms") or 0),
+            "touch_close_ms": int(watch.get("touch_close_ms") or 0),
+            "min_reclaim_close_ms": int(watch.get("min_reclaim_close_ms") or 0),
+            "direction": resolved_dir,
+            "tf": tfu,
+        }
+        gate["reason"] = "REV_WATCH | LIVE_TOUCH_STARTED | WAIT_TOUCH_CANDLE_CLOSE"
+        gate["stage"] = "WATCH"
+        gate["blocked"] = False
+        return False, gate
+        
+      
 
     # ------------------------------------------------------------
     # SAFETY: zone_used must be a dict from here on
@@ -1652,9 +2054,324 @@ def zone_reversal_gate(
     # 5) reversal confirmation: reclaim only (CLOSED candle after watch started)
     zl = float(zone_used.get("low") or zone_used.get("level") or 0.0)
     zh = float(zone_used.get("high") or zone_used.get("level") or 0.0)
-
-
     started_ms = int((watch or {}).get("started_ms") or 0)
+    # ------------------------------------------------------------
+    # LOCK REV_OK:
+    # REV_OK remains armed, but latest valid RC can refresh trigger.
+    # This prevents stale/yesterday RC from staying locked forever.
+    # ------------------------------------------------------------
+    if isinstance(watch, dict) and bool(watch.get("rev_ok")) and str(watch.get("state") or "").upper() == "REV_OK":
+        # ------------------------------------------------------------
+        # LATEST RC ALWAYS WINS
+        # If watch is already REV_OK, still allow a newer closed candle
+        # to replace the old RC before returning RC_LOCKED.
+        # ------------------------------------------------------------
+        try:
+            _cur_closed_ms = int(closed_ms or 0)
+            _old_rev_ms = int(watch.get("rev_ok_ms") or 0)
+
+            _newer_rc = False
+            _rc_reject_reason = None
+ 
+            if _cur_closed_ms > _old_rev_ms:
+                _dir = str(watch.get("direction") or resolved_dir).upper()
+         
+                if _dir == "SELL":
+                    # Latest SELL RC wins only if candle touched/entered resistance zone
+                    # and closed back below zone low.
+                    _newer_rc = bool(float(hi) >= float(zl) and float(cl) < float(zl))
+                    if not _newer_rc:
+                        _rc_reject_reason = {
+                            "need": "SELL: hi>=zone_low and close<zone_low",
+                            "hi": float(hi),
+                            "close": float(cl),
+                            "zone_low": float(zl),
+                            "zone_high": float(zh),
+                        }
+                else:
+                     # Latest BUY RC wins only if candle touched/entered support zone
+                     # and closed back above zone high.
+                     _newer_rc = bool(float(lo) <= float(zh) and float(cl) > float(zh))
+                     if not _newer_rc:
+                         _rc_reject_reason = {
+                             "need": "BUY: lo<=zone_high and close>zone_high",
+                             "lo": float(lo),
+                             "close": float(cl),
+                             "zone_low": float(zl),
+                             "zone_high": float(zh),
+                         }
+            else:
+                _rc_reject_reason = {
+                    "need": "closed candle newer than stored RC",
+                    "cur_closed_ms": int(_cur_closed_ms),
+                    "old_rev_ok_ms": int(_old_rev_ms),
+                }
+
+            if debug_gate and _rc_reject_reason:
+                gate["dbg_latest_rc_not_refreshed"] = _rc_reject_reason
+
+            if _newer_rc:
+                watch["state"] = "REV_OK"
+                watch["rev_ok"] = True
+                watch["rev_ok_ms"] = int(_cur_closed_ms)
+                watch["last_checked_closed_ms"] = int(_cur_closed_ms)
+                watch["last_checked_close"] = float(cl)
+                watch["last_checked_high"] = float(hi)
+                watch["last_checked_low"] = float(lo)
+
+                watch["rev_ok_bar_hi"] = float(hi)
+                watch["rev_ok_bar_lo"] = float(lo)
+                watch["rev_ok_bar_close"] = float(cl)
+
+                R.set(
+                    wkey,
+                    json.dumps(watch, separators=(",", ":")),
+                    ex=7 * 24 * 3600,
+                )
+
+                gate["dbg_latest_rc_refreshed"] = {
+                    "old_rev_ok_ms": int(_old_rev_ms),
+                    "new_rev_ok_ms": int(_cur_closed_ms),
+                    "close": float(cl),
+                    "high": float(hi),
+                    "low": float(lo),
+                    "direction": str(watch.get("direction") or resolved_dir).upper(),
+                }
+
+        except Exception as e:
+            if debug_gate:
+                gate["dbg_latest_rc_refresh_exc"] = f"{type(e).__name__}:{e}"
+
+        # ------------------------------------------------------------
+        # RE-VALIDATE STORED RC CANDLE
+        # Even though REV_OK is locked, verify the stored RC actually
+        # touched the zone. If not → auto-rollback to REV_WATCH.
+        # This runs on every tick so bad RCs are self-healing without
+        # needing Redis deletes.
+        # ------------------------------------------------------------
+        _stored_rc_valid = True
+        try:
+            _stored_zl = float((watch.get("zone_used") or {}).get("low") or zl or 0)
+            _stored_zh = float((watch.get("zone_used") or {}).get("high") or zh or 0)
+            _stored_rc_hi = float(watch.get("rev_ok_bar_hi") or 0)
+            _stored_rc_lo = float(watch.get("rev_ok_bar_lo") or 0)
+            _stored_direction = str(watch.get("direction") or resolved_dir).upper()
+            _stored_rc_ms = int(watch.get("rev_ok_ms") or 0)
+            _stored_started_ms = int(watch.get("started_ms") or 0)
+            _stored_watch_created_ms = int(watch.get("watch_created_ms") or _stored_started_ms or 0)
+
+            if _stored_direction == "SELL":
+                # RC candle high must have reached zone_low
+                if _stored_rc_hi > 0 and _stored_zh > 0:
+                    if _stored_rc_hi < _stored_zl:
+                        _stored_rc_valid = False
+            else:  # BUY
+                
+                # BUY RC candle low must have reached zone_high
+                if _stored_rc_lo > 0 and _stored_zh > 0:
+                    if _stored_rc_lo > _stored_zh:
+                       _stored_rc_valid = False
+
+            # RC candle close time must be after watch creation
+            if _stored_rc_ms > 0 and _stored_watch_created_ms > 0:
+                if _stored_rc_ms <= _stored_watch_created_ms:
+                    _stored_rc_valid = False
+
+        except Exception:
+            _stored_rc_valid = True  # validation error — don't block
+
+        if not _stored_rc_valid:
+            # Auto-rollback — clear RC fields, roll back to REV_WATCH
+            watch["state"] = "REV_WATCH"
+            watch["rev_ok"] = False
+            watch["rev_ok_ms"] = 0
+            watch["rev_ok_bar_hi"] = None
+            watch["rev_ok_bar_lo"] = None
+            watch["rev_ok_bar_close"] = None
+            try:
+                _rollback_payload = {k: v for k, v in watch.items() if v is not None}
+                _rollback_json = json.dumps(_rollback_payload, separators=(",", ":"))
+                _set_ok = R.set(wkey, _rollback_json, ex=7 * 24 * 3600)
+
+                if debug_gate:
+                    gate["dbg_rc_rollback_persist"] = {
+                        "wkey": str(wkey),
+                        "set_ok": bool(_set_ok),
+                        "state_written": _rollback_payload.get("state"),
+                        "rev_ok_written": _rollback_payload.get("rev_ok"),
+                        "rev_ok_ms_written": _rollback_payload.get("rev_ok_ms"),
+                    }
+            except Exception as e:
+                if debug_gate:
+                    gate["dbg_rc_rollback_persist_exc"] = f"{type(e).__name__}:{e}"
+            if debug_gate:
+                gate["dbg_rc_revalidation_rollback"] = {
+                    "reason": "stored_rc_did_not_touch_zone",
+                    "stored_rc_hi": float(_stored_rc_hi or 0),
+                    "stored_rc_lo": float(_stored_rc_lo or 0),
+                    "zone_low": _stored_zl,
+                    "zone_high": _stored_zh,
+                    "direction": _stored_direction,
+                    "rolled_back_to": "REV_WATCH",
+                }
+            # Redis updated — return REV_WATCH cleanly
+            # Next tick will re-evaluate with fresh closed candle
+            gate["reason"] = (
+                f"REV_WATCH | FZ {float(zl):.5f}-{float(zh):.5f}"
+                f" | RC_INVALID_ROLLBACK | WAIT_VALID_RC"
+                f" | TF={tfu}"
+            )
+            gate["stage"] = "REV_WATCH"
+            gate["blocked"] = False
+            gate["rev_ok"] = False
+            gate["zone_used"] = zone_used
+            return False, gate
+                
+
+        
+        # ------------------------------------------------------------
+
+        gate["zone_used"] = zone_used
+        gate["rev_ok"] = True
+        gate["watch_key"] = str(wkey)
+        gate["rev_state"] = {
+            "state": "REV_OK",
+            "started_ms": int(watch.get("started_ms") or started_ms or now_ms_pick),
+            "rev_ok_ms": int(watch.get("rev_ok_ms") or 0),
+            "direction": str(watch.get("direction") or resolved_dir),
+            "tf": str(watch.get("tf") or tfu),
+            "rev_ok_bar_hi": float(watch.get("rev_ok_bar_hi") or 0.0),
+            "rev_ok_bar_lo": float(watch.get("rev_ok_bar_lo") or 0.0),
+            "rev_ok_bar_close": float(watch.get("rev_ok_bar_close") or watch.get("last_checked_close") or 0.0),
+        }
+        gate["rev_trigger"] = {
+            "entry_above": float(watch.get("rev_ok_bar_hi") or 0.0),
+            "entry_below": float(watch.get("rev_ok_bar_lo") or 0.0),
+        }
+
+        try:
+            import datetime
+            _tz_offset = datetime.timedelta(hours=-1)
+            _freeze_dt = (datetime.datetime.utcfromtimestamp(
+                int(watch.get("started_ms") or started_ms or 0) / 1000
+            ) + _tz_offset).strftime("%m/%d %H:%M")
+            _rc_dt = (datetime.datetime.utcfromtimestamp(
+                int(watch.get("rev_ok_ms") or 0) / 1000
+            ) + _tz_offset).strftime("%m/%d %H:%M")
+        except Exception:
+            _freeze_dt = "?"
+            _rc_dt = "?"
+
+        _w_dir = str(watch.get("direction") or resolved_dir).upper()
+        gate["reason"] = (
+            f"REV_OK | FZ {float(zl):.5f}-{float(zh):.5f} "
+            f"| FREEZE@{_freeze_dt} | RC@{_rc_dt} "
+            f"| RC {float(watch.get('rev_ok_bar_close') or watch.get('last_checked_close') or 0.0):.5f} "
+            f"| ENTRY < {float(watch.get('rev_ok_bar_lo') or 0.0):.5f}"
+            if _w_dir == "SELL"
+            else
+            f"REV_OK | FZ {float(zl):.5f}-{float(zh):.5f} "
+            f"| FREEZE@{_freeze_dt} | RC@{_rc_dt} "
+            f"| RC {float(watch.get('rev_ok_bar_close') or watch.get('last_checked_close') or 0.0):.5f} "
+            f"| ENTRY > {float(watch.get('rev_ok_bar_hi') or 0.0):.5f}"
+        )
+        gate["reason"] = f"{gate['reason']} | RC_LOCKED | LIVE_BREAKOUT_ONLY | TF={tfu}"
+        gate["stage"] = "REV_LOCKED"
+        gate["blocked"] = False
+
+        # Check invalidation even in REV_OK state
+        # Same logic as main invalidation — trust complete=True
+        try:
+            import time as _t5
+            _sys_now_roi = int(_t5.time() * 1000)
+            _freeze_roi = int(watch.get("started_ms") or 0)
+            _inv_consec = 0
+            _bs_roi = sorted(
+                [b for b in (bars or []) if isinstance(b, dict)],
+                key=lambda b: _to_ms_any(b.get("t_open_ms") or b.get("tOpenMs") or
+                                          b.get("open_time_ms") or b.get("t") or 0) or 0
+            )
+            for _cb in reversed(_bs_roi):
+                _om_roi = _to_ms_any(
+                    _cb.get("t_open_ms") or _cb.get("tOpenMs") or
+                    _cb.get("open_time_ms") or _cb.get("t") or 0
+                )
+                if not _om_roi or int(_om_roi) <= int(_freeze_roi or 0):
+                    break
+                _is_comp = _cb.get("complete") is True
+                _clk_roi = (int(_om_roi) + int(tf_ms)) <= _sys_now_roi
+                if not _is_comp and not _clk_roi:
+                    continue
+                _cv = _bar_f(_cb, "c", "close")
+                if _cv is None:
+                    break
+                _cv = float(_cv)
+                if resolved_dir == "SELL":
+                    _bad = _cv >= float(zh)
+                else:
+                    _bad = _cv <= float(zl)
+                if _bad:
+                    _inv_consec += 1
+                else:
+                    break
+                if _inv_consec >= int(hard_close_bars):
+                    break
+            if _inv_consec >= int(hard_close_bars):
+                try:
+                    for _s in ("BUY", "SELL"):
+                        for _t in ("H1", "H4"):
+                            R.delete(f"xtl:zone:watch:{sym_u}:{_s}:{_t}")
+                except Exception:
+                    pass
+                gate["reason"] = f"INVALIDATED | REV_OK_CANCELLED | {_inv_consec} closes beyond zone | FZ {float(zl):.5f}-{float(zh):.5f}"
+                gate["stage"] = "INVALIDATED"
+                gate["blocked"] = True
+                gate["rev_ok"] = False
+                return False, gate
+        except Exception:
+            pass
+
+        return True, gate
+
+   
+   
+    # ------------------------------------------------------------
+    # PHASE-1 FIX:
+    # A frozen REV_WATCH must NOT stay stuck on an old candle.
+    # Every new CLOSED candle must be evaluated against frozen zone.
+    # IMPORTANT: only update last_checked fields — never touch
+    # rev_ok / state / zone_used / rev_ok_bar_* here.
+    # REV_OK state is written only in the rev_ok confirmation block below.
+    # ------------------------------------------------------------
+    try:
+        last_checked_ms = int((watch or {}).get("last_checked_closed_ms") or 0)
+    except Exception:
+        last_checked_ms = 0
+
+    # Only write candle refresh if this is genuinely a new closed candle
+    # and the watch is NOT already in REV_OK state (REV_OK lock handles its own write)
+    _watch_is_rev_ok = (
+        isinstance(watch, dict)
+        and bool(watch.get("rev_ok"))
+        and str(watch.get("state") or "").upper() == "REV_OK"
+    )
+    if not _watch_is_rev_ok:
+        try:
+            if isinstance(watch, dict) and int(closed_ms or 0) >= int(last_checked_ms or 0):
+                watch["last_checked_closed_ms"] = int(closed_ms or 0)
+                watch["last_checked_close"] = float(cl)
+                watch["last_checked_high"] = float(hi)
+                watch["last_checked_low"] = float(lo)
+                R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
+        except Exception:
+            pass
+    if debug_gate:
+        gate["dbg_watch_candle_refresh"] = {
+            "last_checked_ms_before": int(last_checked_ms),
+            "current_closed_ms": int(closed_ms or 0),
+            "new_closed_candle": bool(int(closed_ms or 0) > int(last_checked_ms or 0)),
+            "current_close": float(cl),
+        }
 
     
 
@@ -1666,11 +2383,169 @@ def zone_reversal_gate(
             "zl": float(zl),
             "zh": float(zh),
         }
+    try:
+        min_reclaim_close_ms = int((watch or {}).get("min_reclaim_close_ms") or 0)
+    except Exception:
+        min_reclaim_close_ms = 0
+    # HARD RULE:
+    # Old closed candle must never become RC after live touch.
+    # BUT the same touch candle is allowed as RC if it closes reclaiming the zone.
+    touch_close_ms = int((watch or {}).get("touch_close_ms") or 0)
+    same_touch_candle = bool(
+        touch_close_ms > 0
+        and int(closed_ms or 0) == int(touch_close_ms)
+    )
 
-    if resolved_dir == "BUY":
-        rev_ok = (float(cl) > float(zh))
+    if int(closed_ms or 0) <= int(started_ms or 0) and not same_touch_candle:
+        gate["reason"] = "REV_WATCH | WAIT_TOUCH_CANDLE_CLOSE"
+        gate["stage"] = "WATCH"
+        gate["blocked"] = False
+        gate["zone_used"] = zone_used
+        gate["watch_key"] = str(wkey)
+        gate["rev_state"] = {
+            "state": "WATCH",
+            "started_ms": int(started_ms or 0),
+            "touch_close_ms": int(touch_close_ms or 0),
+            "same_touch_candle": bool(same_touch_candle),
+            "current_closed_ms": int(closed_ms or 0),
+            "min_reclaim_close_ms": int(min_reclaim_close_ms or 0),
+            "direction": resolved_dir,
+            "tf": tfu,
+        }
+        return False, gate
+
+    if min_reclaim_close_ms > 0 and int(closed_ms or 0) < int(min_reclaim_close_ms):
+        gate["reason"] = "REV_WATCH | WAIT_TOUCH_CANDLE_CLOSE"
+        gate["stage"] = "WATCH"
+        gate["blocked"] = False
+        gate["zone_used"] = zone_used
+        gate["watch_key"] = str(wkey)
+        gate["rev_state"] = {
+            "state": "WATCH",
+            "started_ms": int(started_ms or 0),
+            "touch_open_ms": int((watch or {}).get("touch_open_ms") or 0),
+            "touch_close_ms": int((watch or {}).get("touch_close_ms") or 0),
+            "min_reclaim_close_ms": int(min_reclaim_close_ms),
+            "current_closed_ms": int(closed_ms or 0),
+            "direction": resolved_dir,
+            "tf": tfu,
+        }
+        return False, gate
+
+    # RC CANDLE HARD RULES:
+    # 1. Same touch candle CAN become RC if it closes reclaiming the frozen zone.
+    # 2. Older candles before touch/freeze must never become RC.
+    # 3. Candle must be closed (complete=True OR open+tf_ms <= sys_now).
+    # 4. Candle close must be >= min_reclaim_close_ms unless it is same_touch_candle.
+    _bar_open_ms = 0
+    try:
+        for _ok in ("t_open_ms", "tOpenMs", "open_time_ms", "ts_ms", "t", "time", "ts"):
+            _v = _to_ms_any((c or {}).get(_ok))
+            if _v and int(_v) > 0:
+                _bar_open_ms = int(_v)
+                break
+    except Exception:
+        _bar_open_ms = 0
+
+    import time as _t3
+    _sys_now_rc = int(_t3.time() * 1000)
+    _is_complete_rc = (c or {}).get("complete") is True
+    _closed_by_clock_rc = (_bar_open_ms > 0 and (_bar_open_ms + int(tf_ms)) <= _sys_now_rc)
+    _bar_is_closed = _is_complete_rc or _closed_by_clock_rc
+    _min_reclaim = int((watch or {}).get("min_reclaim_close_ms") or 0)
+    _watch_created = int((watch or {}).get("watch_created_ms") or started_ms or 0)
+
+    _touch_close_ms_for_rc = int((watch or {}).get("touch_close_ms") or 0)
+    _same_touch_candle_for_rc = bool(
+        _touch_close_ms_for_rc > 0
+        and int(closed_ms or 0) == int(_touch_close_ms_for_rc)
+    )
+
+    _rc_time_valid = (
+        _bar_is_closed
+        and _bar_open_ms > 0
+        and int(closed_ms or 0) >= int(_touch_close_ms_for_rc or 0)
+        and (
+            _same_touch_candle_for_rc
+            or int(closed_ms or 0) > int(_watch_created or 0)
+        )
+        and (_min_reclaim <= 0 or int(closed_ms or 0) >= int(_min_reclaim))
+    )
+    # Scan ALL closed bars after freeze for RC — not just last picked bar
+    # This finds the FIRST bar after freeze that meets RC condition
+    import time as _t6
+    _sys_now_scan = int(_t6.time() * 1000)
+    _rc_bar = None
+    _rc_bar_close = None
+    _rc_bar_open_ms = 0
+    _rc_bar_closed_ms = 0
+    try:
+        _bs_scan = sorted(
+            [b for b in (bars or []) if isinstance(b, dict)],
+            key=lambda b: _to_ms_any(b.get("t_open_ms") or b.get("tOpenMs") or
+                                      b.get("open_time_ms") or b.get("t") or 0) or 0
+        )
+        for _sb in _bs_scan:
+            _sb_om = _to_ms_any(
+                _sb.get("t_open_ms") or _sb.get("tOpenMs") or
+                _sb.get("open_time_ms") or _sb.get("t") or 0
+            )
+            if not _sb_om or int(_sb_om) <= 0:
+                continue
+            # Same-touch candle is valid:
+            # its open can be BEFORE freeze, but its close must be the touch_close_ms.
+            _sb_cm = int(_sb_om) + int(tf_ms)
+            _touch_close_ms_scan = int((watch or {}).get("touch_close_ms") or 0)
+            _same_touch_scan = bool(
+                _touch_close_ms_scan > 0
+                and int(_sb_cm) == int(_touch_close_ms_scan)
+            )
+
+            # For later RC candles, require open after freeze.
+            # For same-touch candle, allow open before freeze.
+            if not _same_touch_scan and int(_sb_om) <= int(started_ms or 0):
+                continue
+
+            # Must be closed
+            _sb_comp = _sb.get("complete") is True
+            _sb_clk = (int(_sb_om) + int(tf_ms)) <= _sys_now_scan
+            if not _sb_comp and not _sb_clk:
+                continue
+
+            # Must close >= min_reclaim
+            if _min_reclaim > 0 and _sb_cm < int(_min_reclaim):
+                continue
+            _sb_cl = _bar_f(_sb, "c", "close")
+            if _sb_cl is None:
+                continue
+            _sb_cl = float(_sb_cl)
+            if resolved_dir == "BUY" and _sb_cl > float(zh):
+                _rc_bar = _sb
+                _rc_bar_close = _sb_cl
+                _rc_bar_open_ms = int(_sb_om)
+                _rc_bar_closed_ms = _sb_cm
+                break
+            elif resolved_dir == "SELL" and _sb_cl < float(zl):
+                _rc_bar = _sb
+                _rc_bar_close = _sb_cl
+                _rc_bar_open_ms = int(_sb_om)
+                _rc_bar_closed_ms = _sb_cm
+                break
+    except Exception:
+        _rc_bar = None
+
+    if _rc_bar is not None:
+        rev_ok = True
+        # Override c, cl, hi, lo, closed_ms with RC bar values
+        c = _rc_bar
+        cl = _rc_bar_close
+        hi = float(_bar_f(_rc_bar, "h", "high") or 0)
+        lo = float(_bar_f(_rc_bar, "l", "low") or 0)
+        closed_ms = _rc_bar_closed_ms
+    elif resolved_dir == "BUY":
+        rev_ok = bool(_rc_time_valid and float(cl) > float(zh))
     else:
-        rev_ok = (float(cl) < float(zl))
+        rev_ok = bool(_rc_time_valid and float(cl) < float(zl))
 
     gate["rev_ok"] = bool(rev_ok)
     # ------------------------------------------------------------
@@ -1716,7 +2591,8 @@ def zone_reversal_gate(
                 watch["state"] = "REV_OK"
                 watch["rev_ok"] = True
                 watch["rev_ok_ms"] = int(closed_ms)
-                watch["rev_ok_bar_close"] = float(cl)
+                watch["last_checked_closed_ms"] = int(closed_ms or 0)
+                watch["last_checked_close"] = float(cl)
 
                 watch["frozen_zone_low"] = float(zl)
                 watch["frozen_zone_high"] = float(zh)
@@ -1730,6 +2606,11 @@ def zone_reversal_gate(
                     watch["rev_ok_bar_lo"] = float(lo)
                 except Exception:
                     pass
+                try:
+                    watch["rev_ok_bar_close"] = float(cl)
+                except Exception:
+                    pass
+
                 R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
         except Exception:
             pass
@@ -1757,23 +2638,41 @@ def zone_reversal_gate(
         }
 
         try:
+            import datetime
+            _freeze_dt = datetime.datetime.utcfromtimestamp(
+                int((watch or {}).get("started_ms") or now_ms_pick or 0) / 1000
+            ).strftime("%m/%d %H:%M")
+            _rc_dt = datetime.datetime.utcfromtimestamp(
+                int(closed_ms or 0) / 1000
+            ).strftime("%m/%d %H:%M")
+        except Exception:
+            _freeze_dt = "?"
+            _rc_dt = "?"
+
+        try:
+            _fzl = float((watch or {}).get("frozen_zone_low", zl))
+            _fzh = float((watch or {}).get("frozen_zone_high", zh))
             if resolved_dir == "BUY":
                 gate["reason"] = (
-                    f"REV_OK | FZ {float((watch or {}).get('frozen_zone_low', zl)):.2f}-"
-                    f"{float((watch or {}).get('frozen_zone_high', zh)):.2f} "
-                    f"| RC {float((watch or {}).get('rev_ok_bar_close', cl)):.2f} "
-                    f"| entry > {float(hi):.2f}"
+                    f"REV_OK | FZ {_fzl:.5f}-{_fzh:.5f} "
+                    f"| FREEZE@{_freeze_dt} | RC@{_rc_dt} "
+                    f"| RC {float(cl):.5f} "
+                    f"| ENTRY > {float(hi):.5f}"
                 )
             else:
                 gate["reason"] = (
-                    f"REV_OK | FZ {float((watch or {}).get('frozen_zone_low', zl)):.5f}-"
-                    f"{float((watch or {}).get('frozen_zone_high', zh)):.5f} "
-                    f"| RC {float((watch or {}).get('rev_ok_bar_close', cl)):.5f} "
-                    f"| entry < {float(lo):.5f}"
+                    f"REV_OK | FZ {_fzl:.5f}-{_fzh:.5f} "
+                    f"| FREEZE@{_freeze_dt} | RC@{_rc_dt} "
+                    f"| RC {float(cl):.5f} "
+                    f"| ENTRY < {float(lo):.5f}"
                 )
         except Exception:
             gate["reason"] = "REV_OK"
-        gate["reason"] = f"{gate.get('reason')} | PCB C={float(cl):.2f} tf={tfu}"
+        gate["reason"] = (
+            f"{gate.get('reason')} "
+            f"| RC_LOCKED | LIVE_BREAKOUT_ONLY "
+            f"| TF={tfu}"
+        )
         gate["stage"] = "REV"
         gate["blocked"] = False
         return True, gate
@@ -1784,260 +2683,94 @@ def zone_reversal_gate(
     
     
     
-    # 6) invalidation: 2 consecutive COMPLETE closed candles beyond the zone boundary (after watch started)
+    # 6) INVALIDATION: 2 consecutive closed candles beyond zone boundary
+    # Uses complete=True as primary signal, clock as fallback
+    # Only counts candles that opened AFTER freeze (started_ms)
     consec = 0
-    checked = 0
     try:
-        started_ms = int((watch or {}).get("started_ms") or 0)
-
-        # Use the same "closed bar" definition as the picker: bar_start + tf_ms <= now_ms_pick
-        def _tms(b):
-            if not isinstance(b, dict):
-                return 0
-            return _to_ms_any(b.get("ts_ms") or b.get("t") or b.get("t_open_ms") or b.get("t_close_ms"))
-
-
-        bs = [b for b in (bars or []) if isinstance(b, dict)]
-        bs.sort(key=_tms)
-
-        # closed bars after watch started
-        closed_after = []
-        for b in bs:
-            t0 = _tms(b)
-            if not t0:
+        import time as _t4
+        _sys_now_inv = int(_t4.time() * 1000)
+        _freeze_ms_inv = int((watch or {}).get("started_ms") or 0)
+        _bs_inv = sorted(
+            [b for b in (bars or []) if isinstance(b, dict)],
+            key=lambda b: _to_ms_any(b.get("t_open_ms") or b.get("tOpenMs") or
+                                      b.get("open_time_ms") or b.get("t") or 0) or 0
+        )
+        for _cb in reversed(_bs_inv):
+            _om_inv = _to_ms_any(
+                _cb.get("t_open_ms") or _cb.get("tOpenMs") or
+                _cb.get("open_time_ms") or _cb.get("t") or 0
+            )
+            if not _om_inv or int(_om_inv) <= 0:
                 continue
-
-            # prefer explicit close time if present
-            t_close = 0
-            try:
-                t_close = _to_ms_any(
-                    b.get("t_close_ms") or b.get("tCloseMs") or b.get("t_close") or b.get("tClose")
-                )
-            except Exception:
-                t_close = 0
-
-            if not t_close:
-                
-                try:
-                    # timestamps are OPEN times in our feed
-                    t_close = int(t0) + int(tf_ms)
-                except Exception:
-                    t_close = int(t0) + int(tf_ms)
-
-            # must close AFTER watch started
-            # Include the candle that started the watch.
-            # If first touch candle itself closes beyond invalidation boundary,
-            # it counts as invalidation close #1.
-            if int(t_close) < int(started_ms):
+            # Only bars opened AFTER freeze
+            if int(_om_inv) <= int(_freeze_ms_inv or 0):
+                break
+            # Bar must be closed
+            _is_comp_inv = _cb.get("complete") is True
+            _clk_inv = (int(_om_inv) + int(tf_ms)) <= _sys_now_inv
+            if not _is_comp_inv and not _clk_inv:
                 continue
-
-            # must be safely closed vs our pick clock
-            if int(t_close) > int(now_ms_pick):
-                continue
-
-            if b.get("complete") is False:
-                continue
-
-            closed_after.append(b)
-
-        # IMPORTANT: if timestamps are missing, invalidation must still work (match picker behavior)
-        if not closed_after:
-            recent = bs[-5:] if len(bs) >= 5 else bs
-            has_ts = any(_tms(x) > 0 for x in recent)
-            if not has_ts:
-                closed_after = bs[-max(6, int(hard_close_bars) + 2):]
-
-        inv_trace = []  # DEBUG: record how consec was computed
-
-        # scan in chronological order so "consecutive" is well-defined
-        for cb in closed_after:
-            cval = _bar_f(cb, "c", "close")
-            if cval is None:
-                continue
-            checked += 1
-
-            try:
-                cv = float(cval)
-            except Exception:
-                continue
-
-            if resolved_dir == "BUY":
-                bad = (cv <= float(zl))  # BUY invalidates only if close <= zone_low
+            _cv_inv = _bar_f(_cb, "c", "close")
+            if _cv_inv is None:
+                break
+            _cv_inv = float(_cv_inv)
+            if resolved_dir == "SELL":
+                _bad_inv = _cv_inv >= float(zh)
             else:
-                bad = (cv >= float(zh))  # SELL invalidates only if close >= zone_high
-
-            if bad:
+                _bad_inv = _cv_inv <= float(zl)
+            if _bad_inv:
                 consec += 1
             else:
-                consec = 0
-
-            if debug_gate:
-                try:
-                    t0_cb = _tms(cb)
-                except Exception:
-                    t0_cb = 0
-
-                # compute close time for trace using same heuristic
-                t_close_cb = 0
-                try:
-                    t_close_cb = _to_ms_any(
-                        cb.get("t_close_ms") or cb.get("tCloseMs") or cb.get("t_close") or cb.get("tClose")
-                    )
-                except Exception:
-                    t_close_cb = 0
-
-                if not t_close_cb:
-                    try:
-                        if int(tf_ms) > 0 and (int(t0_cb) % int(tf_ms)) == 0:
-                            t_close_cb = int(t0_cb)
-                        else:
-                            t_close_cb = int(t0_cb) + int(tf_ms)
-                    except Exception:
-                        t_close_cb = int(t0_cb) + int(tf_ms)
-
-                inv_trace.append({
-                    "t_open": int(t0_cb),
-                    "t_close": int(t_close_cb),
-                    "close": float(cv),
-                    "bad": bool(bad),
-                    "consec": int(consec),
-                })
-                if len(inv_trace) > 12:
-                    inv_trace = inv_trace[-12:]
-
+                break
             if consec >= int(hard_close_bars):
                 break
     except Exception:
         consec = 0
-        checked = 0
-        inv_trace = []
-    # ------------------------------------------------------------
-    # HARD FALLBACK: count latest consecutive invalid closes
-    # Some feeds/timestamps/complete flags can miss closed_after.
-    # This guarantees:
-    # BUY  = latest 2 closed candles below zone_low => INVALIDATED
-    # SELL = latest 2 closed candles above zone_high => INVALIDATED 
-    # ------------------------------------------------------------
-    try:
-        if consec < int(hard_close_bars):
-            bs2 = [b for b in (bars or []) if isinstance(b, dict)]
-
-            def _tclose2(b):
-                t = _to_ms_any(
-                    b.get("t_close_ms")
-                    or b.get("tCloseMs")
-                    or b.get("t_close")
-                    or b.get("tClose")
-                )
-                if not t:
-                    t0 = _to_ms_any(b.get("ts_ms") or b.get("t") or b.get("t_open_ms"))
-                    if t0:
-                        try:
-                            if int(tf_ms) > 0 and int(t0) % int(tf_ms) == 0:
-                                t = int(t0)
-                            else:
-                                t = int(t0) + int(tf_ms)
-                        except Exception:
-                            t = int(t0) + int(tf_ms)
-                return int(t or 0)
-
-            bs2.sort(key=_tclose2)
-
-            pool = []
-            for b in bs2:
-                tc = _tclose2(b)
-
-                if started_ms and tc and tc < int(started_ms):
-                    continue
-
-                if closed_ms and tc and tc > int(closed_ms):
-                    continue
-
-                # do not trust missing complete flag; only skip explicit incomplete future bars
-                if b.get("complete") is False and tc > int(closed_ms or 0):
-                    continue
-
-                pool.append(b)
-
-            # if timestamps are missing, use latest bars fallback
-            if not pool:
-               pool = bs2[-6:]
-
-            consec2 = 0
-            inv_trace2 = []
-
-            for cb in reversed(pool):
-                cv = _bar_f(cb, "c", "close")
-                if cv is None:
-                    continue
-
-                cv = float(cv)
-
-                if resolved_dir == "BUY":
-                   bad2 = cv <= float(zl)
-                else:
-                   bad2 = cv >= float(zh)
-
-                inv_trace2.append({
-                    "close": float(cv),
-                    "bad": bool(bad2),
-                    "consec": int(consec2 + 1 if bad2 else 0),
-                    "fallback": True,
-                })
-
-                if bad2:
-                    consec2 += 1
-                else:
-                    break
-
-                if consec2 >= int(hard_close_bars):
-                    break
-
-            if consec2 > consec:
-                consec = int(consec2)
-                checked = max(int(checked or 0), len(pool))
-                inv_trace = list(reversed(inv_trace2[-12:]))
-
-    except Exception as e:
-        if debug_gate:
-            gate["dbg_inv_fallback_exc"] = f"{type(e).__name__}:{e}"
-
-    if debug_gate:
-        gate["inv_basis"] = {
-            "consec": int(consec),
-            "checked": int(checked),
-            "hard_close_bars": int(hard_close_bars),
-            "started_ms": int((watch or {}).get("started_ms") or 0),
-            "now_ms_pick": int(now_ms_pick),
-            "zone_low": float(zl),
-            "zone_high": float(zh),
-            "inv_trace": inv_trace,
-        }
 
     if consec >= int(hard_close_bars):
-        gate["reason"] = "INVALIDATED"
-        gate["invalidate_state"] = {"state": "INVALIDATED", "consec": int(consec)}
-        gate["blocked"] = True
         try:
-            R.delete(wkey)
+            for _s in ("BUY", "SELL"):
+                for _t in ("H1", "H4"):
+                    R.delete(f"xtl:zone:watch:{sym_u}:{_s}:{_t}")
         except Exception:
             pass
+        gate["reason"] = (
+            f"ZONE_INVALIDATED | FZ {float(zl):.5f}-{float(zh):.5f}"
+            f" | {consec}/{int(hard_close_bars)} closes beyond zone | TF={tfu}"
+        )
+        gate["stage"] = "ZONE_INVALIDATED"
+        gate["blocked"] = True
+        gate["rev_ok"] = False
+        gate["zone_used"] = zone_used
         return False, gate
 
     # If we reach here: watch active but not rev_ok and not invalidated
     try:
+        import datetime
+        _freeze_dt = datetime.datetime.utcfromtimestamp(
+            int((watch or {}).get("started_ms") or started_ms or 0) / 1000
+        ).strftime("%m/%d %H:%M")
+        _candle_dt = datetime.datetime.utcfromtimestamp(
+            int(closed_ms or 0) / 1000
+        ).strftime("%m/%d %H:%M")
+        _watch_created_dt = datetime.datetime.utcfromtimestamp(
+            int((watch or {}).get("watch_created_ms") or 0) / 1000
+        ).strftime("%m/%d %H:%M")
         gate["reason"] = (
-            f"REV_WATCH | FZ {float(zl):.2f}-{float(zh):.2f} "
-            f"| C {float(cl):.2f} "
-            f"| need > {float(zh):.2f}"
+            f"REV_WATCH | FZ {float(zl):.5f}-{float(zh):.5f} "
+            f"| FREEZE@{_freeze_dt} | CREATED@{_watch_created_dt} "
+            f"| C@{_candle_dt} {float(cl):.5f} "
+            f"| NEED > {float(zh):.5f}"
             if resolved_dir == "BUY"
             else
             f"REV_WATCH | FZ {float(zl):.5f}-{float(zh):.5f} "
-            f"| C {float(cl):.5f} "
-            f"| need < {float(zl):.5f}"
+            f"| FREEZE@{_freeze_dt} | CREATED@{_watch_created_dt} "
+            f"| C@{_candle_dt} {float(cl):.5f} "
+            f"| NEED < {float(zl):.5f}"
         )
     except Exception:
         gate["reason"] = "REV_WATCH"
-        gate["stage"] = "WATCH"
-        gate["blocked"] = False
+    gate["stage"] = "WATCH"
+    gate["blocked"] = False
     return False, gate

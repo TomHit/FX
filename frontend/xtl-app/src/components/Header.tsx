@@ -5,11 +5,12 @@ import { useAuth } from "@/context/AuthContext";
 
 const LINKS = [
   { to: "/dashboard",  label: "Dashboard" },
-  { to: "/ai-forecasts",  label: "AI-powered forecasts" },
+  { to: "/prop-firm",  label: "Prop-Firm" },
   { to: "/Confluence-Intelligence",  label: "Confluence Intelligence" },
   { to: "/onboarding", label: "Onboarding" },
   { to: "/devices",    label: "Devices" },
   { to: "/strategy",   label: "Strategy" },
+  { to: "/ai-forecasts",  label: "AI-powered forecasts" },
   { to: "/trend",      label: "Trend" },
   { to: "/my-bots",    label: "My Bots" },
   { to: "/performance",label: "Daily Performance" },

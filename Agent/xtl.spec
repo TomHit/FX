@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_submodules
 from importlib.util import find_spec
 
 binaries = []
-hiddenimports = ['agent_ohlc', 'mt5_client']
+hiddenimports = ['agent_ohlc', 'mt5_client', 'agent_price']
 binaries += collect_dynamic_libs('MetaTrader5')
 binaries += collect_dynamic_libs('numpy')
 hiddenimports += collect_submodules('MetaTrader5')

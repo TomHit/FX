@@ -408,12 +408,6 @@ type OppRow = {
   h4SellStatus?: string | null;
   liqText?: string | null;
   liqSignals?: string[] | null;
-  rangeText?: string | null;
-  bslSsl?: {
-    bsl?: { level: number; kind: string; swept: boolean } | null;
-    ssl?: { level: number; kind: string; swept: boolean } | null;
-  } | null;
-  liqConfidence?: string | null;
   
 
 
@@ -587,53 +581,13 @@ function _pickFirstMajor(sr: any, kind: "support" | "resistance"): { level: numb
   }
 }
 
-
-/**
- * Format the clean SR pipeline fields (active_supports / active_resistances).
- * These are the consolidated, correctly-sided, broken-checked, confluence-flagged
- * levels produced by the new SR engine. When present they are the source of truth
- * for display; we fall back to the legacy near/major fields only if they're absent.
- */
-function fmtActiveLevels(
-  sym: string,
-  sr: any,
-  kind: "support" | "resistance",
-  topN: number,
-): string {
-  const arr = kind === "support" ? sr?.active_supports : sr?.active_resistances;
-  if (!Array.isArray(arr) || arr.length === 0) return "";
-  const levels = arr
-    .map((z: any) => (z && Number.isFinite(z.level) ? Number(z.level) : null))
-    .filter((v: number | null): v is number => v !== null)
-    .slice(0, topN);
-  if (!levels.length) return "";
-  return levels.map((v) => fmtPrice(sym, v)).join(" / ");
-}
-
 function srStringsFromApiRow(r: any): { srNearest: string; srMajor: string } {
   const sym = String(r?.symbol || "");
   const sr = r?.sr;
-
-  // ---- PREFER the clean active levels (new SR pipeline) ----
-  const actS = fmtActiveLevels(sym, sr, "support", 3);
-  const actR = fmtActiveLevels(sym, sr, "resistance", 3);
-  if (actS || actR) {
-    // SR NEAR = nearest active level each side; SR MAJOR = full active set (up to 3)
-    const nearestS = fmtActiveLevels(sym, sr, "support", 1);
-    const nearestR = fmtActiveLevels(sym, sr, "resistance", 1);
-    const nearP: string[] = [];
-    if (nearestS) nearP.push(`S ${nearestS}`);
-    if (nearestR) nearP.push(`R ${nearestR}`);
-    const majP: string[] = [];
-    if (actS) majP.push(`S ${actS}`);
-    if (actR) majP.push(`R ${actR}`);
-    return { srNearest: nearP.join(" | "), srMajor: majP.join(" | ") };
-  }
-
-  // ---- LEGACY fallback (old near/major fields) ----
   const ns = Number.isFinite(sr?.nearest_support) ? Number(sr.nearest_support) : null;
   const nr = Number.isFinite(sr?.nearest_resistance) ? Number(sr.nearest_resistance) : null;
   const nearParts: string[] = [];
+
   const nearSBoth = fmtNearBothTF(sym, sr, "support");
   const nearRBoth = fmtNearBothTF(sym, sr, "resistance");
 
@@ -1017,7 +971,8 @@ if (!srMajor && !srNearest && srLabel) srMajor = srLabel;
 
   const z =
     gateObj?.zone ??
-    gateObj?.display_zone ??
+    h1Zone ??
+    h4Zone ??
     null;
     const zLow = z && Number.isFinite(z.low) ? Number(z.low) : null;
     const zHigh = z && Number.isFinite(z.high) ? Number(z.high) : null;
@@ -1124,9 +1079,6 @@ if (!srMajor && !srNearest && srLabel) srMajor = srLabel;
     h4SellStatus: (r as any)?.h4SellStatus ?? (r as any)?.entry_gate?.h4_sell_status ?? null,
     liqText: (r as any)?.liq_text ?? null,
     liqSignals: Array.isArray((r as any)?.liq_signals) ? (r as any).liq_signals : null,
-    rangeText: (r as any)?.range_text ?? null,
-    bslSsl: (r as any)?.bsl_ssl ?? null,
-    liqConfidence: (r as any)?.liq_confidence ?? null,
 
 
 
@@ -1276,19 +1228,7 @@ function useOpportunities() {
         const prev = frozenRef.current.get(r.symbol);
         if (prev) {
           const alertTimeMs = prev.alertTimeMs ?? r.alertTimeMs ?? now;
-          frozenRef.current.set(
-            r.symbol,
-            {
-              ...prev,
-              ...r,
-
-              h1Zone: r.h1Zone ?? null,
-              h4Zone: r.h4Zone ?? null,
-              zoneStr: r.zoneStr ?? null,
-
-              alertTimeMs,
-            }
-          );
+          frozenRef.current.set(r.symbol, { ...prev, ...r, alertTimeMs });
         } else {
           const alertTimeMs = r.alertTimeMs ?? now;
           frozenRef.current.set(r.symbol, { ...r, alertTimeMs });
@@ -1638,13 +1578,13 @@ function OpportunitiesDashboard() {
                       <td className="px-3 py-2 text-xs text-slate-200 whitespace-nowrap">{r.srMajor || "-"}</td>
                       <td className="px-3 py-2 text-xs text-slate-200 whitespace-nowrap">
                         <div className="flex flex-col gap-1">
-                          {r.gateZoneLevel ? (
+                          {r.zoneStr ? (
                             <div className="text-amber-300">
                               {r.zoneStr}
                             </div>
                           ) : (
                             <>
-                              {false ? (
+                              {r.h1Zone ? (
                                 <div className="text-sky-300">
                                   H1: {fmtPrice(r.symbol, Number(r.h1Zone.low ?? r.h1Zone.level))}
                                   -
@@ -1656,7 +1596,7 @@ function OpportunitiesDashboard() {
                                 </div>
                               )}
 
-                              {false ? (
+                              {r.h4Zone ? (
                                 <div className="text-amber-300">
                                   H4: {fmtPrice(r.symbol, Number(r.h4Zone.low ?? r.h4Zone.level))}
                                   -
@@ -1674,6 +1614,33 @@ function OpportunitiesDashboard() {
                       <td className="px-3 py-2 text-xs text-slate-200 whitespace-nowrap">
                           {r.gateReason || "WATCHING"}
                       </td>
+
+                      
+
+                      <td className="px-3 py-2">
+                        <div className="flex flex-col gap-1">
+                          {reasons.length === 0 ? (
+                            <span className="text-[11px] text-slate-500">
+                              Model + macro blend
+                            </span>
+                          ) : (
+                            <div className="flex max-w-xs flex-wrap gap-1">
+                              {reasons.map((txt, i) => (
+                                <span
+                                  key={i}
+                                  className="rounded-full bg-slate-900/90 px-2 py-0.5 text-[10px] text-slate-200"
+                                >
+                                  {txt}
+                                </span>
+                              ))}
+                            </div>
+                         
+
+                          
+                          )}
+                        </div>
+                      </td>
+                      
 
                       <td className="hidden md:table-cell px-3 py-2">
                         <div className="flex max-w-xs flex-wrap gap-1">
@@ -1694,34 +1661,6 @@ function OpportunitiesDashboard() {
                         </div>
                       </td>
                       <td className="hidden xl:table-cell px-3 py-2 max-w-[260px]">
-                        {/* Direction-independent range: where price can run up (BSL) / down (SSL) */}
-                        {r.rangeText && r.rangeText !== "—" && (
-                          <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] font-medium">
-                            {r.bslSsl?.bsl && (
-                              <span
-                                className={
-                                  r.bslSsl.bsl.swept ? "text-slate-500 line-through" : "text-rose-300"
-                                }
-                                title={`Buy-side liquidity above (${r.bslSsl.bsl.kind})${r.bslSsl.bsl.swept ? " — swept" : ""}`}
-                              >
-                                BSL↑ {r.bslSsl.bsl.level}
-                              </span>
-                            )}
-                            {r.bslSsl?.ssl && (
-                              <span
-                                className={
-                                  r.bslSsl.ssl.swept ? "text-slate-500 line-through" : "text-emerald-300"
-                                }
-                                title={`Sell-side liquidity below (${r.bslSsl.ssl.kind})${r.bslSsl.ssl.swept ? " — swept" : ""}`}
-                              >
-                                SSL↓ {r.bslSsl.ssl.level}
-                              </span>
-                            )}
-                            {!r.bslSsl && (
-                              <span className="text-slate-300">{r.rangeText}</span>
-                            )}
-                          </div>
-                        )}
                         {r.liqText && r.liqText !== "—" ? (
                           <div className="flex flex-wrap gap-1">
                             {(r.liqSignals ?? r.liqText.split(" | ")).map((sig, i) => (
@@ -1734,9 +1673,7 @@ function OpportunitiesDashboard() {
                             ))}
                           </div>
                         ) : (
-                          !r.rangeText || r.rangeText === "—" ? (
-                            <span className="text-[11px] text-slate-600">—</span>
-                          ) : null
+                          <span className="text-[11px] text-slate-600">—</span>
                         )}
                       </td>
 

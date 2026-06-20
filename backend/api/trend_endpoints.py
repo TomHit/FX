@@ -155,6 +155,8 @@ import csv
 import pandas as pd
 from datetime import datetime, timezone
 from api.entry_logic import entry_decision_m1
+from api.prop_firms.prop_config import PROP_FIRM_RULES
+from api.prop_firms.prop_guard import compute_prop_check
 from api.trend.infer_rt import (
     predict_next_hour,
     predict_next_4h,
@@ -163,6 +165,15 @@ from api.trend.infer_rt import (
 )
 from .trend_sr import summarize_sr_multi_tf
 from api.trend.infer_tth import predict_tth
+
+try:
+    from .liq_structure import detect_liq_signals as _detect_liq_signals
+    from .liq_structure import score_sr_with_liquidity as _score_sr_with_liquidity
+except Exception as _liq_imp_err:
+    _detect_liq_signals = None
+    _score_sr_with_liquidity = None
+    import logging as _lg
+    _lg.getLogger(__name__).error("LIQ_IMPORT_FAILED: %s", _liq_imp_err)
 router = APIRouter(prefix="/trend")
 
 log = logging.getLogger("xtl.trend")
@@ -352,6 +363,440 @@ def _log_trade_outcome(payload: dict) -> None:
         R.expire(key, 14 * 24 * 3600)
     except Exception:
         pass
+
+PROP_CFG_KEY = "xtl:prop:config"
+PROP_DAILY_KEY_PREFIX = "xtl:prop:daily"
+PROP_OPEN_RISK_KEY = "xtl:prop:open_risk"
+PROP_STATS_KEY = "xtl:prop:stats"
+
+DEFAULT_PROP_CFG = {
+    "enabled": False,
+    "firm": "ftmo",
+    "phase": "challenge",
+    "account_size": 25000,
+    "risk_pct": 1.0,
+    "target_rr": 2.0,
+    "max_open_risk_pct": 3.0,
+    "max_open_positions": 1,
+    "account_name": "",
+    "account_id": "",
+}
+
+
+def _get_prop_config() -> dict:
+    try:
+        
+        raw = R.get(PROP_CFG_KEY)
+        if raw:
+            cfg = json.loads(raw)
+            out = dict(DEFAULT_PROP_CFG)
+            out.update(cfg)
+            return out
+    except Exception:
+        pass
+    return dict(DEFAULT_PROP_CFG)
+
+
+def _save_prop_config(cfg: dict) -> dict:
+    out = dict(DEFAULT_PROP_CFG)
+    out.update(cfg or {})
+
+    out["firm"] = str(out.get("firm") or "ftmo").lower()
+    out["phase"] = str(out.get("phase") or "challenge").lower()
+    out["enabled"] = bool(out.get("enabled"))
+
+    out["account_size"] = float(out.get("account_size") or 25000)
+    out["risk_pct"] = float(out.get("risk_pct") or 1.0)
+    out["target_rr"] = float(out.get("target_rr") or 2.0)
+    out["max_open_risk_pct"] = float(out.get("max_open_risk_pct") or 3.0)
+    out["max_open_positions"] = int(out.get("max_open_positions") or 1)
+
+    if out["firm"] not in PROP_FIRM_RULES:
+        raise ValueError(f"Unknown firm: {out['firm']}")
+
+    if out["phase"] not in PROP_FIRM_RULES[out["firm"]]["phases"]:
+        raise ValueError(f"Unknown phase {out['phase']} for firm {out['firm']}")
+
+    
+    R.set(PROP_CFG_KEY, json.dumps(out))
+    return out
+
+def _prop_today() -> str:
+    return time.strftime("%Y%m%d", time.gmtime())
+
+
+def _prop_daily_key(day: str | None = None) -> str:
+    return f"{PROP_DAILY_KEY_PREFIX}:{day or _prop_today()}"
+
+
+def _get_prop_risk_state() -> dict:
+    day = _prop_today()
+    daily_key = _prop_daily_key(day)
+
+    daily = {}
+    open_risk = {}
+    stats = {}
+
+    try:
+        daily = R.hgetall(daily_key) or {}
+        open_risk = R.hgetall(PROP_OPEN_RISK_KEY) or {}
+        stats = R.hgetall(PROP_STATS_KEY) or {}
+    except Exception:
+        pass
+
+    def _decode_map(h: dict) -> dict:
+        out = {}
+        for k, v in (h or {}).items():
+            if isinstance(k, (bytes, bytearray)):
+                k = k.decode("utf-8", "ignore")
+            if isinstance(v, (bytes, bytearray)):
+                v = v.decode("utf-8", "ignore")
+            out[str(k)] = v
+        return out
+
+    daily = _decode_map(daily)
+    open_risk = _decode_map(open_risk)
+    stats = _decode_map(stats)
+
+    def _f(d, k, default=0.0):
+        try:
+            return float(d.get(k, default) or default)
+        except Exception:
+            return float(default)
+
+    total_open_risk = 0.0
+    open_items = []
+
+    for k, v in open_risk.items():
+        try:
+            j = json.loads(v) if isinstance(v, str) else v
+            if not isinstance(j, dict):
+                continue
+            risk = float(j.get("risk_usd") or 0)
+            total_open_risk += risk
+            open_items.append(j)
+        except Exception:
+            continue
+
+    return {
+        "day": day,
+        "daily_key": daily_key,
+        "daily_loss_used": _f(daily, "daily_loss_used", 0),
+        "daily_risk_reserved": _f(daily, "daily_risk_reserved", 0),
+        "max_loss_used": _f(stats, "max_loss_used", 0),
+        "open_risk_usd": round(total_open_risk, 2),
+        "open_positions": open_items,
+        "wins_today": int(_f(daily, "wins_today", 0)),
+        "losses_today": int(_f(daily, "losses_today", 0)),
+    }
+
+
+def _reserve_prop_open_risk(trade_id: str, rec: dict) -> None:
+    if not trade_id:
+        return
+
+    daily_key = _prop_daily_key()
+
+    # If same trade_id already exists, subtract old risk first
+    old_raw = R.hget(PROP_OPEN_RISK_KEY, trade_id)
+    old = _json_load_twice(old_raw)
+    if isinstance(old, dict):
+        try:
+            old_risk = float(old.get("risk_usd") or 0)
+            if old_risk:
+                R.hincrbyfloat(daily_key, "daily_risk_reserved", -old_risk)
+        except Exception:
+            pass
+
+    R.hset(PROP_OPEN_RISK_KEY, trade_id, json.dumps(rec, default=str))
+
+    try:
+        risk = float(rec.get("risk_usd") or 0)
+    except Exception:
+        risk = 0.0
+
+    R.hincrbyfloat(daily_key, "daily_risk_reserved", risk)
+    R.expire(daily_key, 3 * 24 * 3600)
+
+def _release_prop_open_risk(trade_id: str, result: str | None = None, pnl_usd: float | None = None) -> None:
+    if not trade_id:
+        return
+
+    raw = R.hget(PROP_OPEN_RISK_KEY, trade_id)
+    log.warning(
+        "[PROP] RELEASE_ATTEMPT trade_id=%s found=%s result=%s pnl_usd=%s",
+        trade_id, bool(raw), result, pnl_usd
+    )
+
+    rec = _json_load_twice(raw)
+    if not isinstance(rec, dict):
+        R.hdel(PROP_OPEN_RISK_KEY, trade_id)
+        return
+
+    try:
+        risk = float(rec.get("risk_usd") or 0)
+    except Exception:
+        risk = 0.0
+
+    R.hdel(PROP_OPEN_RISK_KEY, trade_id)
+    log.warning(
+        "[PROP] RELEASE_DONE trade_id=%s risk_usd=%s result=%s pnl_usd=%s",
+        trade_id, risk, result, pnl_usd
+    )
+
+    daily_key = _prop_daily_key()
+    R.hincrbyfloat(daily_key, "daily_risk_reserved", -risk)
+
+    if pnl_usd is not None:
+        try:
+            pnl = float(pnl_usd)
+            if pnl < 0:
+                R.hincrbyfloat(daily_key, "daily_loss_used", abs(pnl))
+                R.hincrby(daily_key, "losses_today", 1)
+            elif pnl > 0:
+                R.hincrby(daily_key, "wins_today", 1)
+        except Exception:
+            pass
+
+    R.expire(daily_key, 3 * 24 * 3600)
+@router.get("/prop/config")
+def prop_get_config():
+    return {
+        "ok": True,
+        "config": _get_prop_config(),
+        "firms": PROP_FIRM_RULES,
+    }
+
+
+@router.post("/prop/config")
+def prop_set_config(payload: dict):
+    try:
+        cfg = _save_prop_config(payload or {})
+        return {
+            "ok": True,
+            "config": cfg,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+def _get_latest_mt5_account() -> dict:
+    try:
+        for k in R.scan_iter("xtl:mt5:account:*:demo"):
+            raw = R.get(k)
+            j = _json_load_twice(raw)
+            if isinstance(j, dict):
+                return j
+    except Exception:
+        pass
+    return {}
+
+
+@router.get("/prop/status")
+def prop_status():
+    cfg = _get_prop_config()
+
+    firm = cfg["firm"]
+    phase = cfg["phase"]
+    acct = _get_latest_mt5_account()
+
+    broker_balance = float(
+        acct.get("balance")
+        or cfg["account_size"]
+    )
+
+    broker_equity = float(
+        acct.get("equity")
+        or broker_balance
+    )
+
+    account_size = broker_equity
+
+    rules = PROP_FIRM_RULES[firm]["phases"][phase]
+
+    target_pct = rules.get("target_pct")
+    daily_pct = rules.get("daily_loss_pct")
+    max_pct = rules.get("max_loss_pct")
+
+    target_usd = account_size * (target_pct / 100.0) if target_pct else None
+    daily_limit_usd = account_size * (daily_pct / 100.0)
+    max_loss_limit_usd = account_size * (max_pct / 100.0)
+
+    return {
+        "ok": True,
+        "config": cfg,
+        "rules": rules,
+
+        "broker": {
+            "balance": broker_balance,
+            "equity": broker_equity,
+            "margin": acct.get("margin"),
+            "free_margin": acct.get("free_margin"),
+            "floating_pnl": acct.get("floating_pnl"),
+            "leverage": acct.get("leverage"),
+        },
+        "limits": {
+            "target_usd": round(target_usd, 2) if target_usd else None,
+            "daily_limit_usd": round(daily_limit_usd, 2),
+            "max_loss_limit_usd": round(max_loss_limit_usd, 2),
+        },
+    }
+
+@router.get("/prop/risk")
+def prop_risk():
+    return {
+        "ok": True,
+        "config": _get_prop_config(),
+        "risk": _get_prop_risk_state(),
+    }
+
+@router.post("/prop/check")
+def prop_check(payload: dict):
+    try:
+        cfg = _get_prop_config()
+        risk_state = _get_prop_risk_state()
+
+        acct = _get_latest_mt5_account()
+
+        broker_equity = float(
+            acct.get("equity")
+            or cfg["account_size"]
+        )
+
+        account_size = float(
+            payload.get("account_size")
+            or broker_equity
+        )
+
+        result = compute_prop_check(
+            firm=str(payload.get("firm") or cfg["firm"]),
+            phase=str(payload.get("phase") or cfg["phase"]),
+            account_size=account_size,
+            symbol=str(payload["symbol"]),
+            side=str(payload["side"]),
+            entry=float(payload["entry"]),
+            sl=float(payload["sl"]),
+            risk_pct=float(payload.get("risk_pct") or cfg["risk_pct"]),
+            target_rr=float(payload.get("target_rr") or cfg["target_rr"]),
+            daily_loss_used=float(payload.get("daily_loss_used", risk_state["daily_loss_used"])),
+            max_loss_used=float(payload.get("max_loss_used", risk_state["max_loss_used"])),
+            open_risk_usd=float(payload.get("open_risk_usd", risk_state["open_risk_usd"])),
+            open_positions_count=len(risk_state.get("open_positions", [])),
+            max_open_risk_pct=float(payload.get("max_open_risk_pct", cfg["max_open_risk_pct"])),
+            max_open_positions=int(cfg.get("max_open_positions", 1)),
+        )
+
+        return {
+            "ok": True,
+            "config": cfg,
+            "broker": {
+                "balance": acct.get("balance"),
+                "equity": acct.get("equity"),
+                "margin": acct.get("margin"),
+                "free_margin": acct.get("free_margin"),
+                "floating_pnl": acct.get("floating_pnl"),
+                "leverage": acct.get("leverage"),
+                "account_size_used": account_size,
+            },
+            "risk": risk_state,
+            "result": result,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+@router.post("/prop/risk/reset")
+def prop_risk_reset(payload: dict | None = None):
+    payload = payload or {}
+    scope = str(payload.get("scope") or "daily").lower()
+
+    try:
+        if scope in ("daily", "all"):
+            R.delete(_prop_daily_key())
+
+        if scope in ("open", "all"):
+            R.delete(PROP_OPEN_RISK_KEY)
+
+        if scope in ("stats", "all"):
+            R.delete(PROP_STATS_KEY)
+
+        return {
+            "ok": True,
+            "scope": scope,
+            "risk": _get_prop_risk_state(),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+@router.post("/prop/risk/reserve")
+def prop_risk_reserve(payload: dict):
+    try:
+        trade_id = str(payload.get("trade_id") or f"manual-{int(time.time() * 1000)}")
+
+        rec = {
+            "trade_id": trade_id,
+            "symbol": str(payload.get("symbol") or "").upper(),
+            "side": str(payload.get("side") or "").upper(),
+            "risk_usd": float(payload.get("risk_usd") or 0),
+            "lots": float(payload.get("lots") or 0),
+            "entry": float(payload.get("entry") or 0),
+            "sl": float(payload.get("sl") or 0),
+            "tp": float(payload.get("tp") or 0),
+            "reserved_ts_ms": int(time.time() * 1000),
+            "source": "manual_test",
+        }
+
+        if rec["risk_usd"] <= 0:
+            return {"ok": False, "error": "risk_usd must be > 0"}
+
+        _reserve_prop_open_risk(trade_id, rec)
+
+        return {
+            "ok": True,
+            "trade_id": trade_id,
+            "reserved": rec,
+            "risk": _get_prop_risk_state(),
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@router.post("/prop/risk/release")
+def prop_risk_release(payload: dict):
+    try:
+        trade_id = str(payload.get("trade_id") or "").strip()
+        if not trade_id:
+            return {"ok": False, "error": "trade_id required"}
+
+        result = str(payload.get("result") or "").lower() or None
+        pnl_usd_raw = payload.get("pnl_usd", None)
+        pnl_usd = float(pnl_usd_raw) if pnl_usd_raw is not None else None
+
+        _release_prop_open_risk(
+            trade_id=trade_id,
+            result=result,
+            pnl_usd=pnl_usd,
+        )
+
+        return {
+            "ok": True,
+            "trade_id": trade_id,
+            "result": result,
+            "pnl_usd": pnl_usd,
+            "risk": _get_prop_risk_state(),
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 def _json_load_maybe(x):
     if x is None:
         return None
@@ -367,6 +812,27 @@ def _json_load_twice(x):
     if isinstance(y, str):
         return _json_load_maybe(y)
     return y
+
+def _has_open_position_for_symbol(uid: str, sym: str) -> bool:
+    try:
+        key = f"xtl:strategy:oppt:open:{uid}"
+        rows = R.hgetall(key) or {}
+        sym_u = str(sym or "").upper().strip()
+
+        for v in rows.values():
+            j = _json_load_twice(v)
+            if not isinstance(j, dict):
+                continue
+
+            if str(j.get("symbol") or "").upper().strip() != sym_u:
+                continue
+
+            if str(j.get("status") or "").lower() in ("sent", "pending", "filled"):
+                return True
+
+        return False
+    except Exception:
+        return False
 
 def _normalize_sr_roles_by_price(sr: dict, px: float | None, atr: float | None = None) -> dict:
     """
@@ -544,7 +1010,7 @@ def _pick_entry_sr_levels(
         return out
 
     top_n = max(0, int(top_n))
-
+    
     
 
     # ---------- helpers ----------
@@ -635,25 +1101,25 @@ def _pick_entry_sr_levels(
     h4 = sr.get("h4") if isinstance(sr.get("h4"), dict) else (sr.get("H4") if isinstance(sr.get("H4"), dict) else {})
 
     # ---------- strict candidates (prefer near/major if present, else fall back to legacy) ----------
-    h1_supp_near_levels_all  = _get_levels(h1, "supports_near")
+    h1_supp_near_levels_all  = []
     h1_supp_major_levels_all = [
         v for v in _get_levels(h1, "supports_major", "supports")
         if float(v) < px0
     ]
 
-    h4_supp_near_levels_all  = _get_levels(h4, "supports_near")
+    h4_supp_near_levels_all  = []
     h4_supp_major_levels_all = [
         v for v in _get_levels(h4, "supports_major", "supports")
         if float(v) < px0
     ]
 
-    h1_res_near_levels_all   = _get_levels(h1, "resistances_near")
+    h1_res_near_levels_all   = []
     h1_res_major_levels_all = [
         v for v in _get_levels(h1, "resistances_major", "resistances")
         if float(v) > px0
     ]
 
-    h4_res_near_levels_all   = _get_levels(h4, "resistances_near")
+    h4_res_near_levels_all   = []
     h4_res_major_levels_all = [
         v for v in _get_levels(h4, "resistances_major", "resistances")
         if float(v) > px0
@@ -676,78 +1142,58 @@ def _pick_entry_sr_levels(
     h4_flip_res  = _flipped_res_from_supp(h4)
 
 
+    
     # -------------------------
-    # SUPPORT ladder (strict first)
+    # SUPPORT ladder
+    # H1 major -> H4 major -> flipped
     # -------------------------
-    if h1_supp_near:
-        out["entry_support_tf"] = "H1"
-        out["entry_support_kind"] = "near"
-        out["entry_support_near_levels"] = h1_supp_near
-        out["entry_support_major_levels"] = h1_supp_major
-        out["entry_support"] = h1_supp_near[0]
-    elif h1_supp_major:
+    if h1_supp_major:
         out["entry_support_tf"] = "H1"
         out["entry_support_kind"] = "major"
-        out["entry_support_near_levels"] = h1_supp_near
         out["entry_support_major_levels"] = h1_supp_major
         out["entry_support"] = h1_supp_major[0]
-    elif h4_supp_near:
-        out["entry_support_tf"] = "H4"
-        out["entry_support_kind"] = "near"
-        out["entry_support_near_levels"] = h4_supp_near
-        out["entry_support_major_levels"] = h4_supp_major
-        out["entry_support"] = h4_supp_near[0]
+
     elif h4_supp_major:
         out["entry_support_tf"] = "H4"
         out["entry_support_kind"] = "major"
-        out["entry_support_near_levels"] = h4_supp_near
         out["entry_support_major_levels"] = h4_supp_major
         out["entry_support"] = h4_supp_major[0]
+
     else:
         # fallback: flipped supports (H1 then H4)
         if h1_flip_supp:
             out["entry_support_tf"] = "H1"
             out["entry_support_kind"] = "flipped"
             out["entry_support"] = h1_flip_supp[0]
+
         elif h4_flip_supp:
             out["entry_support_tf"] = "H4"
             out["entry_support_kind"] = "flipped"
             out["entry_support"] = h4_flip_supp[0]
-        
 
     # -------------------------
-    # RESISTANCE ladder (strict first)
+    # RESISTANCE ladder
+    # H1 major -> H4 major -> flipped
     # -------------------------
-    if h1_res_near:
-        out["entry_resistance_tf"] = "H1"
-        out["entry_resistance_kind"] = "near"
-        out["entry_resistance_near_levels"] = h1_res_near
-        out["entry_resistance_major_levels"] = h1_res_major
-        out["entry_resistance"] = h1_res_near[0]
-    elif h1_res_major:
+    if h1_res_major:
         out["entry_resistance_tf"] = "H1"
         out["entry_resistance_kind"] = "major"
-        out["entry_resistance_near_levels"] = h1_res_near
         out["entry_resistance_major_levels"] = h1_res_major
         out["entry_resistance"] = h1_res_major[0]
-    elif h4_res_near:
-        out["entry_resistance_tf"] = "H4"
-        out["entry_resistance_kind"] = "near"
-        out["entry_resistance_near_levels"] = h4_res_near
-        out["entry_resistance_major_levels"] = h4_res_major
-        out["entry_resistance"] = h4_res_near[0]
+
     elif h4_res_major:
         out["entry_resistance_tf"] = "H4"
         out["entry_resistance_kind"] = "major"
-        out["entry_resistance_near_levels"] = h4_res_near
         out["entry_resistance_major_levels"] = h4_res_major
         out["entry_resistance"] = h4_res_major[0]
+
     else:
         # fallback: flipped resistances (H1 then H4)
         if h1_flip_res:
             out["entry_resistance_tf"] = "H1"
             out["entry_resistance_kind"] = "flipped"
             out["entry_resistance"] = h1_flip_res[0]
+
         elif h4_flip_res:
             out["entry_resistance_tf"] = "H4"
             out["entry_resistance_kind"] = "flipped"
@@ -838,6 +1284,29 @@ def _surface_h1_h4_zones_from_gate(out: dict, gm: dict) -> dict:
 
     return out
 
+def _resolve_live_device(sym_u: str) -> str | None:
+    """Pick a device that has a fresh OHLC snapshot for this symbol.
+    No uid, no hardcode — finds whoever is actually publishing."""
+    try:
+        best = None
+        best_t = -1
+        now_ms = int(time.time() * 1000)
+        for key in R.scan_iter(match=f"xtl:ohlc:snap:*:{sym_u}:H1", count=200):
+            k = key.decode() if isinstance(key, (bytes, bytearray)) else key
+            dev = k.split(":")[3]  # xtl:ohlc:snap:{dev}:{sym}:H1
+            # confirm the device is online via its hash
+            st = R.hget(f"device:{dev}", "status")
+            st = st.decode() if isinstance(st, (bytes, bytearray)) else st
+            if st != "online":
+                continue
+            hb = R.hget(f"device:{dev}", "last_heartbeat_ms")
+            hb = int(hb) if hb else 0
+            if hb > best_t:
+                best_t, best = hb, dev
+        return best
+    except Exception:
+        return None
+
 def _refresh_dynamic_sr_fields(sym_u: str, row: dict, out: dict) -> dict:
     try:
         live_px = (
@@ -855,9 +1324,22 @@ def _refresh_dynamic_sr_fields(sym_u: str, row: dict, out: dict) -> dict:
         if not live_px or live_px <= 0:
             return out
 
+        prefer_dev = (
+            row.get("device_id")
+            or row.get("pinned_device")
+            or out.get("device_id")
+            or out.get("pinned_device")
+            or row.get("dev_for_gate")
+            or out.get("dev_for_gate")
+            or _resolve_live_device(sym_u)
+            
+        )
+        
+
         sr_bundle = _get_sr_bundle(
             sym_u,
-            prefer_dev=row.get("device_id") or row.get("pinned_device") or out.get("device_id"),
+            prefer_dev=prefer_dev,
+            display_only=True,  # always recompute for display — never block on frozen watch
         )
 
         if not isinstance(sr_bundle, dict) or not sr_bundle:
@@ -953,6 +1435,10 @@ def _disable_tp_sl_fields(r: dict) -> None:
     r["target_price_1h"] = None
     r["stop_loss"] = None
     r["stop_loss_1h"] = None
+    r["tp_source"] = None
+    r["sl_source"] = None
+    r["tp_method"] = None
+    r["sl_method"] = None
 
 
 
@@ -1023,7 +1509,7 @@ def _load_device_h1_bars(sym: str, dev_id: str) -> tuple[list[dict], str]:
     out.sort(key=lambda x: int(x.get("t_close_ms") or 0))
     return out, key
 
-def _get_sr_bundle(sym: str, prefer_dev: str | None = None, return_src: bool = False):
+def _get_sr_bundle(sym: str, prefer_dev=None, return_src: bool = False, display_only: bool = False):
     """
     SR bundle getter:
       - Prefer Redis cache: last_good -> last
@@ -1033,24 +1519,106 @@ def _get_sr_bundle(sym: str, prefer_dev: str | None = None, return_src: bool = F
       - dict (default)
       - OR (dict, src_str) if return_src=True
     """
+    
     src = None
     try:
         sym_u = (sym or "").upper().strip()
         if not sym_u:
             return ({}, "empty_symbol") if return_src else {}
 
-        # 1) prefer last_good, fallback to last
-        for k in (f"xtl:sr:bundle:last_good:{sym_u}", f"xtl:sr:bundle:last:{sym_u}"):
+        # ------------------------------------------------------------
+        # REDISCOVERY GUARD:
+        # If a frozen watch exists for this symbol in REV_WATCH or REV_OK state,
+        # ALWAYS return cached SR — never recompute.
+        # Recomputing SR during a frozen watch can shift zone bands and
+        # corrupt the frozen zone_used that the gate relies on.
+        # ------------------------------------------------------------
+        _frozen_watch_active = False
+        try:
+            for _d in ("BUY", "SELL"):
+                for _tf in ("H1", "H4"):
+                    _wk = f"xtl:zone:watch:{sym_u}:{_d}:{_tf}"
+                    _raw_w = R.get(_wk)
+                    if not _raw_w:
+                        continue
+                    if isinstance(_raw_w, (bytes, bytearray)):
+                        _raw_w = _raw_w.decode("utf-8", "ignore")
+                    _w = json.loads(_raw_w) if isinstance(_raw_w, str) else None
+                    if isinstance(_w, dict) and isinstance(_w.get("zone_used"), dict):
+                        _frozen_watch_active = True
+                        break
+                if _frozen_watch_active:
+                    break
+        except Exception:
+            _frozen_watch_active = False
+
+        
+        # 1) Use SR cache ONLY when a frozen watch is active.
+        # Otherwise recompute from latest OHLC/price so agent restart or big move
+        # cannot reuse stale last_good SR.
+        if _frozen_watch_active and not display_only:
+            for k in (f"xtl:sr:bundle:last_good:{sym_u}", f"xtl:sr:bundle:last:{sym_u}"):
+                try:
+                    raw = R.get(k)
+                except Exception:
+                    raw = None
+                if not raw:
+                    continue
+                js = _json_load_twice(raw)
+                if isinstance(js, dict) and js:
+                    src = f"cache_frozen_watch:{k}"
+                    return (js, src) if return_src else js
+
+        # If frozen watch is active and cache is empty, return empty — do NOT recompute
+        # If frozen watch is active and cache is empty:
+        # Still try a broader cache fallback before giving up.
+        # Never return empty just because cache expired during a frozen watch.
+        if _frozen_watch_active and not display_only:
+            # Try any available SR key regardless of TTL
+            for k in (
+                f"xtl:sr:bundle:last_good:{sym_u}",
+                f"xtl:sr:bundle:last:{sym_u}",
+            ):
+                try:
+                    raw = R.get(k)
+                except Exception:
+                    raw = None
+                if not raw:
+                    continue
+                js = _json_load_twice(raw)
+                if isinstance(js, dict) and js:
+                    src = f"cache_frozen_fallback:{k}"
+                    return (js, src) if return_src else js
+            # Truly nothing in cache — return empty, do not recompute
+            src = "cache_miss_frozen_watch_protected"
+            return ({}, src) if return_src else {}
+        # display_only=True bypasses the frozen watch guard.
+        # MEMORY FIX: serve the cached bundle instead of recomputing on every
+        # display poll. Recompute (the expensive pandas path below) only when the
+        # cache is missing or stale. This stops per-request DataFrame allocation
+        # that was leaking memory under dashboard load.
+        if display_only:
             try:
-                raw = R.get(k)
+                _ck = f"xtl:sr:bundle:last_good:{sym_u}"
+                _raw = R.get(_ck)
+                if _raw:
+                    _cached = _json_load_twice(_raw)
+                    if isinstance(_cached, dict) and _cached:
+                        # freshness: accept cache if its bar/compute ts is within ~1 H1 candle
+                        _ts = _cached.get("computed_ms") or _cached.get("ts_ms") or 0
+                        _now_ms = int(time.time() * 1000)
+                        _age_ok = (not _ts) or ((_now_ms - int(_ts)) <= 90 * 60 * 1000)
+                        if _age_ok:
+                            # cheap: re-point active levels to live price without recompute
+                            try:
+                                _px, _ = _get_live_price(sym_u, prefer_dev)
+                                _px = float(_px) if isinstance(_px, (int, float)) else None
+                            except Exception:
+                                _px = None
+                            src = f"cache_display_only:{_ck}"
+                            return (_cached, src) if return_src else _cached
             except Exception:
-                raw = None
-            if not raw:
-                continue
-            js = _json_load_twice(raw)
-            if isinstance(js, dict) and js:
-                src = f"cache:{k}"
-                return (js, src) if return_src else js
+                pass  # on any cache error, fall through to recompute
 
         # helper: read TF bars from a given device
         def _read_tf_bars_from_dev(dev_id: str, tfu: str):
@@ -1113,7 +1681,12 @@ def _get_sr_bundle(sym: str, prefer_dev: str | None = None, return_src: bool = F
                 except Exception:
                     px = None
 
+                
                 pip_factor = 0.01 if sym_u == "XAUUSD" else (0.01 if sym_u.endswith("JPY") else 0.0001)
+
+               
+
+                
                 b = summarize_sr_multi_tf(
                     symbol=sym_u,
                     price=px,
@@ -1122,7 +1695,7 @@ def _get_sr_bundle(sym: str, prefer_dev: str | None = None, return_src: bool = F
                     pip_factor=float(pip_factor),
                     cache=R,
                     cache_ttl_sec=900,
-                    good_ttl_sec=7 * 24 * 3600,
+                    good_ttl_sec=int(os.getenv("XTL_SR_BUNDLE_TTL_SEC", "3600")),
                 )
                 if isinstance(b, dict) and b:
                     src = f"compute:prefer_dev:{pd}|h1={h1_key}|h4={h4_key}"
@@ -1131,43 +1704,19 @@ def _get_sr_bundle(sym: str, prefer_dev: str | None = None, return_src: bool = F
                 src = f"compute_empty:prefer_dev:{pd}|h1={h1_key}|h4={h4_key}"
 
         # 2B) Fallback: Pick an online device (best heartbeat)
+        # 2B) Fallback: do NOT scan all devices.
+        # If no preferred device is supplied, avoid Redis SCAN and return cache/no device.
         dev = None
         try:
-            best_dev = None
-            best_hb = -1
-            for key in R.scan_iter("device:dev_*"):
-                try:
-                    h = R.hgetall(key) or {}
-                except Exception:
-                    h = {}
-                if not h:
-                    continue
-
-                status = h.get(b"status") or h.get("status")
-                if isinstance(status, (bytes, bytearray)):
-                    status = status.decode("utf-8", "ignore")
-                if (status or "").strip().lower() != "online":
-                    continue
-
-                hb = h.get(b"last_heartbeat_ms") or h.get("last_heartbeat_ms")
-                if isinstance(hb, (bytes, bytearray)):
-                    hb = hb.decode("utf-8", "ignore").strip()
-                try:
-                    hb_i = int(hb) if hb not in (None, "") else -1
-                except Exception:
-                    hb_i = -1
-
-                key_s = key.decode("utf-8", "ignore") if isinstance(key, (bytes, bytearray)) else str(key)
-                dev_id = key_s.replace("device:", "").strip()
-
-                if hb_i > best_hb:
-                    best_hb = hb_i
-                    best_dev = dev_id
-
-            dev = best_dev
+            if prefer_dev:
+                dev = str(prefer_dev).strip()
         except Exception:
             dev = None
 
+        if not dev:
+            src = src or "no_preferred_device_no_scan"
+            return ({}, src) if return_src else {}
+                
         if not dev:
             src = src or "no_online_device"
             return ({}, src) if return_src else {}
@@ -1204,7 +1753,7 @@ def _get_sr_bundle(sym: str, prefer_dev: str | None = None, return_src: bool = F
             pip_factor=float(pip_factor),
             cache=R,
             cache_ttl_sec=900,
-            good_ttl_sec=7 * 24 * 3600,
+            good_ttl_sec=int(os.getenv("XTL_SR_BUNDLE_TTL_SEC", "3600")),
         )
         if isinstance(b, dict) and b:
             src = f"compute:any_dev:{dev}|h1={h1_key}|h4={h4_key}"
@@ -1382,6 +1931,15 @@ def _bars_to_hlc(bars: list[dict]) -> list[dict]:
 ZONE_ATR_WIDTH = float(os.getenv("XTL_ZONE_ATR_WIDTH", "0.15"))
 ZONE_MIN_PIPS  = float(os.getenv("XTL_ZONE_MIN_PIPS", "8")) / 10000
 MOVE_AWAY_ATR  = float(os.getenv("XTL_MOVE_AWAY_ATR", "0.25"))
+# ------------------------------------------------
+# Forecast TP/SL switch
+# 0 = structural TP/SL only
+# 1 = use prediction-based TP/SL
+# ------------------------------------------------
+USE_FORECAST_TP_SL = (
+    os.getenv("XTL_USE_FORECAST_TP_SL", "0").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 
 MAX_TAP_BARS    = int(os.getenv("XTL_MAX_TAP_BARS", "20"))
 MAX_TAP2_AGE_MS = int(os.getenv("XTL_MAX_TAP2_AGE_MS", str(12 * 60 * 60 * 1000)))  # 
@@ -1809,8 +2367,8 @@ def _h1_feed_stale_for_gate(row_h1: dict, now_ms: int, tf_ms: int = 60 * 60 * 10
 
     if not isinstance(bars, list) or len(bars) < 2:
         return True, {
-            "reason": "MT5_FEED_STALE_OR_MARKET_CLOSED",
-            "detail": "no_h1_bars_for_gate",
+            "reason": "PHASE1_ALLOW_NO_H1_BARS",
+            "detail": "skip_h1_feed_guard",
             "bars_n": len(bars) if isinstance(bars, list) else 0,
         }
 
@@ -1862,8 +2420,8 @@ def _h1_feed_stale_for_gate(row_h1: dict, now_ms: int, tf_ms: int = 60 * 60 * 10
 
     if age_ms > max_age_ms:
         return True, {
-            "reason": "MT5_FEED_STALE_OR_MARKET_CLOSED",
-            "detail": "h1_snapshot_too_old",
+            "reason": "PHASE1_ALLOW_STALE_H1_FEED",
+            "detail": "skip_h1_feed_age_guard",
             "last_close_ms": last_close_ms,
             "age_ms": age_ms,
             "max_age_ms": max_age_ms,
@@ -1880,25 +2438,25 @@ def _h1_feed_stale_for_gate(row_h1: dict, now_ms: int, tf_ms: int = 60 * 60 * 10
 def _live_price_stale_for_gate(
     row_h1: dict,
     now_ms: int,
+    live_px: float | None = None,
 ) -> tuple[bool, dict]:
-    """
-    Main execution freshness guard.
 
-    If live price timestamp is stale,
-    do NOT allow gate evaluation.
+    max_age_ms = int(os.getenv("XTL_GATE_LIVE_PRICE_MAX_AGE_MS", str(15 * 60 * 1000)))
 
-    Heartbeat intentionally ignored.
-    """
-
-    max_age_ms = int(
-        os.getenv(
-            "XTL_GATE_LIVE_PRICE_MAX_AGE_MS",
-            str(15 * 60 * 1000),   # 15 min
+    px = None
+    try:
+        px = (
+            live_px
+            if live_px is not None
+            else row_h1.get("last_price")
+            or row_h1.get("live_price")
+            or row_h1.get("price")
         )
-    )
+        px = float(px) if px is not None else None
+    except Exception:
+        px = None
 
     ts_ms = 0
-
     try:
         ts_ms = int(
             row_h1.get("last_price_ts_ms")
@@ -1911,38 +2469,28 @@ def _live_price_stale_for_gate(
     except Exception:
         ts_ms = 0
 
-    if ts_ms <= 0:
-        return True, {
-            "reason": "LIVE_PRICE_STALE",
-            "detail": "missing_live_price_timestamp",
-            "max_age_ms": max_age_ms,
-        }
-
-    age_ms = int(now_ms or 0) - int(ts_ms)
-
-    if age_ms < 0:
-        return True, {
-            "reason": "LIVE_PRICE_STALE",
-            "detail": "future_live_price_timestamp",
-            "ts_ms": ts_ms,
-            "age_ms": age_ms,
-        }
-
-    if age_ms > max_age_ms:
-        return True, {
-            "reason": "LIVE_PRICE_STALE",
-            "detail": "live_price_too_old",
+    # -------------------------------------------------
+    # PHASE-1 VALIDATION BYPASS:
+    # If live price exists, allow gate even if timestamp is old/missing.
+    # Gate still uses closed candles for REV_OK.
+    # -------------------------------------------------
+    if px is not None and px > 0:
+        age_ms = int(now_ms or 0) - int(ts_ms or 0) if ts_ms > 0 else None
+        return False, {
+            "reason": "LIVE_PRICE_OK_PHASE1",
+            "detail": "allow_gate_when_price_exists",
+            "price": float(px),
             "ts_ms": ts_ms,
             "age_ms": age_ms,
             "max_age_ms": max_age_ms,
         }
 
-    return False, {
+    return True, {
+        "reason": "LIVE_PRICE_STALE",
+        "detail": "no_live_price_available",
         "ts_ms": ts_ms,
-        "age_ms": age_ms,
         "max_age_ms": max_age_ms,
     }
-
 def _zone_reversal_gate(
     *,
     sym: str,
@@ -1967,6 +2515,7 @@ def _zone_reversal_gate(
     lp_stale, lp_meta = _live_price_stale_for_gate(
         row_h1=row_h1,
         now_ms=now_ms,
+        live_px=kwargs.get("live_px"),
     )
 
     if lp_stale:
@@ -1994,20 +2543,10 @@ def _zone_reversal_gate(
     )
 
     if stale:
-        return False, {
-            "blocked": True,
-            "stage": "FEED_STALE",
-            "reason": "MT5_FEED_STALE_OR_MARKET_CLOSED",
-            "rev_ok": False,
-            "zone": None,
-            "planned_zone": None,
-            "zone_used": None,
-            "rev_state": None,
-            "rev_basis": None,
-            "touch_basis": None,
-            "dev_used": x_device_id or pinned_device,
-            "feed_meta": stale_meta,
-        }
+        # PHASE-1: do not block gate validation because of stale H1 feed guard.
+        stale_meta = stale_meta or {}
+        stale_meta["phase1_bypass"] = True
+        stale = False
 
     
     if callable(zone_reversal_gate):
@@ -2021,7 +2560,7 @@ def _zone_reversal_gate(
             tf_tag=tf_tag,
             pinned_device=pinned_device,
             x_device_id=x_device_id,
-            live_px=kwargs.get("live_px"),
+           
             debug_gate=bool(debug_gate),
             **{k: v for k, v in kwargs.items() if k not in ("R",)},
         )
@@ -3307,13 +3846,144 @@ def _delete_live_snapshot(sym: str, opp_dir: str | None = None):
 
 ALERT_HASH_PREFIX = "xtl:trend:opp:h1:"
 ALERT_INDEX_KEY = "xtl:trend:opp:h1:index"
+def _clear_oppt_cache() -> None:
+    try:
+        for k in R.scan_iter("xtl:oppt:cache:*"):
+            R.delete(k)
+    except Exception:
+        pass
 
+def _invalidate_active_opportunity(sym: str, opp_dir: str, reason: str = "ZONE_INVALIDATED") -> None:
+    sym_u = str(sym or "").upper().strip()
+    d = str(opp_dir or "").upper().strip()
+    if d in ("BUY", "UP"):
+        d = "UP"
+        side = "BUY"
+    elif d in ("SELL", "DOWN"):
+        d = "DOWN"
+        side = "SELL"
+    else:
+        return
 
+    # ── FIX 1: resolve the REAL alert_id from the active pointer ──────────────
+    active_key = f"xtl:trend:opp:active:{sym_u}:{d}"
+    real_id = ""
+    try:
+        raw = R.get(active_key)
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+        real_id = str(raw or "").strip()
+    except Exception:
+        pass
 
+    
+    # ── FIX 1b: fallback — scan index if active_key already gone ──────────────
+    if not real_id:
+        try:
+            ids = R.lrange(ALERT_INDEX_KEY, 0, 50) or []
+            for candidate in ids:
+                cid = candidate.decode("utf-8", "ignore") if isinstance(candidate, (bytes, bytearray)) else str(candidate or "")
+                cid = cid.strip()
+                if not cid:
+                    continue
+
+                # Support both formats:
+                #   USDCHF-H1-UP-...
+                #   ...:USDCHF:UP...
+                if sym_u not in cid or d not in cid:
+                    continue
+
+                raw_st = R.hget(f"{ALERT_HASH_PREFIX}{cid}", "status")
+                st = raw_st.decode("utf-8", "ignore") if isinstance(raw_st, (bytes, bytearray)) else str(raw_st or "")
+                try:
+                    st = json.loads(st)
+                except Exception:
+                    pass
+                st = str(st or "").strip().strip('"').lower()
+
+                if st == "active":
+                    real_id = cid
+                    break
+        except Exception:
+            pass
+
+    # ── FIX 2: mark the REAL hash invalidated ─────────────────────────────────
+    if real_id:
+        hkey = f"{ALERT_HASH_PREFIX}{real_id}"
+        try:
+            R.hset(hkey, mapping={
+                "status":             json.dumps("invalidated"),
+                "trade_state":        json.dumps("ZONE_INVALIDATED"),
+                "active":             json.dumps(False),
+                "entry_triggered":    json.dumps(False),
+                "entry_signal":       json.dumps(""),
+                "entry_price":        json.dumps(0.0),
+                "entry_ts_ms":        json.dumps(0),
+                "invalidated_reason": json.dumps(reason),
+                "updated_ms":         json.dumps(int(time.time() * 1000)),
+            })
+            R.expire(hkey, 24 * 3600)
+            R.lrem(ALERT_INDEX_KEY, 0, real_id)
+        except Exception:
+            pass
+
+    # ── FIX 2b: delete ENTRY_CAND claim for this opportunity ────────────────
+    try:
+        if real_id:
+            R.delete(f"xtl:oppt:entry_claim:{real_id}")
+    except Exception:
+        pass
+
+    # ── FIX 3: delete active pointer ──────────────────────────────────────────
+    try:
+        R.delete(active_key)
+    except Exception:
+        pass
+
+    # ── FIX 4: delete ALL zone watch keys (H1+H4, both sides) ─────────────────
+    # The original only deleted H1 for one side — leaving stale watch keys that
+    # lock the REDISCOVERY GUARD and cause permanent ZONE_TOO_FAR stuck state
+    try:
+        for _side in ("BUY", "SELL"):
+            for _tf in ("H1", "H4"):
+                R.delete(f"xtl:zone:watch:{sym_u}:{_side}:{_tf}")
+    except Exception:
+        pass
+
+    # ── FIX 5: clear SR bundle cache so zone bands recompute fresh ─────────────
+    # Without this, stale cached SR keeps the zone "too far" even after watch cleared
+    try:
+        for _sr_key in (
+            f"xtl:sr:bundle:last_good:{sym_u}",
+            f"xtl:sr:bundle:last:{sym_u}",
+        ):
+            R.delete(_sr_key)
+    except Exception:
+        pass
+
+    # ── unchanged: delete snapshot and break state ─────────────────────────────
+    snap_key = _opp_snapshot_key(sym_u, d)
+    try:
+        R.delete(snap_key)
+    except Exception:
+        pass
+
+    try:
+        for k in R.scan_iter(f"xtl:oppt:break_state:*{sym_u}*"):
+            R.delete(k)
+    except Exception:
+        pass
+
+    _clear_oppt_cache()
 
 def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
     sym = (symbol or payload.get("symbol") or "").upper()
     direction = str(payload.get("opp_direction") or payload.get("direction") or "").upper()
+    # Normalize BUY/SELL to UP/DOWN
+    if direction == "BUY":
+        direction = "UP"
+    elif direction == "SELL":
+        direction = "DOWN"
     if direction not in ("UP", "DOWN"):
         direction = "NA"
 
@@ -3322,11 +3992,78 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
     payload.setdefault("opp_direction", direction)
     payload.setdefault("direction", direction)
 
+    # Ensure direction fields exist for downstream logic
+    payload.setdefault("symbol", sym)
+    payload.setdefault("opp_direction", direction)
+    payload.setdefault("direction", direction)
+
     alert_id = str(payload.get("alert_id") or "").strip()
 
+    active_key = f"xtl:trend:opp:active:{sym}:{direction}"
+    log.warning("[OPP] SAVE_ALERT_SNAPSHOT active_key=%s alert_id_in=%s", active_key, alert_id)
+
     if not alert_id:
-        ts = int(payload.get("alert_created_ms") or int(time.time() * 1000))
-        alert_id = f"{ts}:{sym}:{direction}"
+        existing_id = ""
+
+        try:
+            existing_id = R.get(active_key)
+            if isinstance(existing_id, (bytes, bytearray)):
+                existing_id = existing_id.decode("utf-8", "ignore")
+            existing_id = str(existing_id or "").strip()
+        except Exception:
+            existing_id = ""
+        # ── GUARD: don't reuse a stale/invalidated pointer ──────────────
+        if existing_id:
+            existing_status = ""
+            try:
+                raw_status = R.hget(f"{ALERT_HASH_PREFIX}{existing_id}", "status")
+                if raw_status:
+                    existing_status = json.loads(
+                        raw_status if isinstance(raw_status, str) else raw_status.decode()
+                    )
+            except Exception:
+                pass
+
+            existing_status = str(existing_status or "").strip().strip('"').lower()
+
+            if existing_status in ("invalidated", "expired", "exit", "exited", "closed"):
+                try:
+                    R.delete(active_key)
+                except Exception:
+                    pass
+                existing_id = ""  # fall through to mint a fresh ID
+        # ── END GUARD ────────────────────────────────────────────────────
+
+        if existing_id:
+            alert_id = existing_id
+        else:
+            ts = int(payload.get("alert_created_ms") or int(time.time() * 1000))
+            candidate_id = f"{ts}:{sym}:{direction}"
+
+            # ── ATOMIC DEDUP FIX: SET NX prevents race condition across workers ──
+            try:
+                set_ok = R.set(active_key, candidate_id, nx=True, ex=5 * 24 * 3600)
+            except Exception:
+                set_ok = False
+
+            if set_ok:
+                alert_id = candidate_id
+            else:
+                try:
+                    winner_id = R.get(active_key)
+                    if isinstance(winner_id, (bytes, bytearray)):
+                        winner_id = winner_id.decode("utf-8", "ignore")
+                    winner_id = str(winner_id or "").strip()
+                except Exception:
+                    winner_id = ""
+                alert_id = winner_id or candidate_id
+                import logging as _lg
+                _lg.getLogger("xtl.trend").warning(
+                    "[OPP] DEDUP_RACE_RESOLVED sym=%s dir=%s lost_race_to=%s",
+                    sym, direction, alert_id
+                )
+            # ── END ATOMIC DEDUP FIX ─────────────────────────────────────────────
+
         payload["alert_id"] = alert_id
 
     if "alert_created_ms" not in payload:
@@ -3334,6 +4071,21 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
 
     if "status" not in payload:
         payload["status"] = "active"
+
+
+    if "alert_created_ms" not in payload:
+        payload["alert_created_ms"] = int(time.time() * 1000)
+
+    if "status" not in payload:
+        payload["status"] = "active"
+    # -------------------------------------------------
+    # Keep active pointer aligned with current alert_id
+    # -------------------------------------------------
+    try:
+        if alert_id and direction in ("UP", "DOWN"):
+            R.setex(active_key, 5 * 24 * 3600, alert_id)
+    except Exception:
+        pass
 
     key = f"{ALERT_HASH_PREFIX}{alert_id}"
 
@@ -5266,13 +6018,12 @@ def _read_freshest_snap_for_user_or_any(uid, sym_u: str, tfu: str):
 
 def _get_live_price_with_ts(sym: str, dev: str | None = None):
     """
-    Return (price, ts_ms, src).
-
-    Important:
-    - Gate needs a real live/tick timestamp.
-    - If preferred device has stale/missing timestamp, scan all device price keys.
-    - Plain float price is allowed for display, but NOT trusted for freshness unless
-      Redis key TTL/update timestamp can be read from payload.
+    Fast live price lookup.
+    IMPORTANT:
+    - No Redis SCAN.
+    - Prefer device-scoped tick/price/live keys.
+    - Fallback to global symbol price key.
+    - Fallback to device-scoped M1 OHLC close only.
     """
     sym_u = str(sym or "").upper().strip()
     dev = (dev or "").strip()
@@ -5287,7 +6038,6 @@ def _get_live_price_with_ts(sym: str, dev: str | None = None):
         if raw is None:
             return None, None, None
 
-        # JSON payload preferred
         try:
             obj = json.loads(raw) if isinstance(raw, str) else raw
         except Exception:
@@ -5298,6 +6048,7 @@ def _get_live_price_with_ts(sym: str, dev: str | None = None):
                 obj.get("price")
                 or obj.get("last_price")
                 or obj.get("live_price")
+                or obj.get("ltp")
                 or obj.get("bid")
                 or obj.get("ask")
                 or obj.get("mid")
@@ -5330,39 +6081,31 @@ def _get_live_price_with_ts(sym: str, dev: str | None = None):
 
             return px, ts_ms if ts_ms > 0 else None, str(src or key_src)
 
-        # Plain float fallback: price only, timestamp unknown
         try:
             return float(raw), None, key_src
         except Exception:
             return None, None, None
 
-    candidates = []
+    keys = []
 
-    # 1) preferred device first
     if dev:
-        candidates.append(f"xtl:price:{dev}:{sym_u}")
-        candidates.append(f"xtl:live:{dev}:{sym_u}")
-        candidates.append(f"xtl:tick:{dev}:{sym_u}")
+        keys.extend([
+            f"xtl:tick:{dev}:{sym_u}",
+            f"xtl:price:{dev}:{sym_u}",
+            f"xtl:live:{dev}:{sym_u}",
+        ])
 
-    # 2) scan all devices for freshest timestamp
-    try:
-        for pat in (
-            f"xtl:price:*:{sym_u}",
-            f"xtl:live:*:{sym_u}",
-            f"xtl:tick:*:{sym_u}",
-        ):
-            for k in R.scan_iter(pat):
-                ks = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
-                if ks not in candidates:
-                    candidates.append(ks)
-    except Exception:
-        pass
+    keys.extend([
+        f"xtl:price:{sym_u}",
+        f"xtl:live:{sym_u}",
+        f"xtl:tick:{sym_u}",
+    ])
 
     best_px = None
     best_ts = None
     best_src = None
 
-    for key in candidates:
+    for key in keys:
         try:
             raw = R.get(key)
         except Exception:
@@ -5373,97 +6116,73 @@ def _get_live_price_with_ts(sym: str, dev: str | None = None):
         if px is None:
             continue
 
-        # Prefer freshest timestamp
         if ts_ms:
             if best_ts is None or int(ts_ms) > int(best_ts):
                 best_px = px
                 best_ts = int(ts_ms)
                 best_src = src
         elif best_px is None:
-            # keep display fallback only if no timestamped price found
             best_px = px
             best_src = src
 
-    # -------------------------------------------------
-    # Fallback: derive live price timestamp from freshest M1 OHLC snapshot
-    # This is needed when agent does NOT write xtl:price:* JSON payload.
-    # -------------------------------------------------
-    if best_ts is None:
+    # Fallback only to direct device-scoped OHLC M1 key.
+    # No xtl:ohlc:snap:* scan.
+    if best_ts is None and dev:
+        key = f"xtl:ohlc:snap:{dev}:{sym_u}:M1"
         try:
-            patterns = []
-
-            if dev:
-                patterns.append(f"xtl:ohlc:snap:{dev}:{sym_u}:M1")
-
-            patterns.append(f"xtl:ohlc:snap:*:{sym_u}:M1")
-
-            for pat in patterns:
-                for k in R.scan_iter(pat):
-                    try:
-                        raw = R.get(k)
-                        obj = _json_load_twice(raw)
-                        if not isinstance(obj, dict):
+            raw = R.get(key)
+            obj = _json_load_twice(raw)
+            if isinstance(obj, dict):
+                bars = obj.get("bars") or obj.get("ohlc") or []
+                if isinstance(bars, list) and bars:
+                    for b in reversed(bars):
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("complete") is False:
                             continue
 
-                        bars = obj.get("bars") or obj.get("ohlc") or []
-                        if not isinstance(bars, list) or not bars:
-                            continue
+                        px = (
+                            b.get("c")
+                            or b.get("close")
+                            or b.get("bid")
+                            or b.get("ask")
+                            or b.get("mid")
+                        )
 
-                        for b in reversed(bars):
-                            if not isinstance(b, dict):
-                                continue
+                        try:
+                            px = float(px)
+                        except Exception:
+                            px = None
 
-                            if b.get("complete") is False:
-                                continue
+                        t_close = _to_ms_any(
+                            b.get("t_close_ms")
+                            or b.get("tCloseMs")
+                            or b.get("t_close")
+                            or b.get("tClose")
+                            or b.get("close_time_ms")
+                        )
 
-                            px = (
-                                b.get("c")
-                                or b.get("close")
-                                or b.get("bid")
-                                or b.get("ask")
-                                or b.get("mid")
+                        if t_close <= 0:
+                            t_open = _to_ms_any(
+                                b.get("t_open_ms")
+                                or b.get("tOpenMs")
+                                or b.get("open_time_ms")
+                                or b.get("t")
+                                or b.get("time")
+                                or b.get("ts")
                             )
+                            if t_open > 0:
+                                t_close = int(t_open + 60 * 1000)
 
-                            try:
-                                px = float(px)
-                            except Exception:
-                                px = None
-
-                            t_close = _to_ms_any(
-                                b.get("t_close_ms")
-                                or b.get("tCloseMs")
-                                or b.get("t_close")
-                                or b.get("tClose")
-                                or b.get("close_time_ms")
-                            )
-
-                            if t_close <= 0:
-                                t_open = _to_ms_any(
-                                    b.get("t_open_ms")
-                                    or b.get("tOpenMs")
-                                    or b.get("open_time_ms")
-                                    or b.get("t")
-                                    or b.get("time")
-                                    or b.get("ts")
-                                )
-                                if t_open > 0:
-                                    t_close = int(t_open + 60 * 1000)
-
-                            if px is not None and t_close > 0:
-                                if best_ts is None or int(t_close) > int(best_ts):
-                                    best_px = px
-                                    best_ts = int(t_close)
-                                    best_src = f"ohlc_m1:{k}"
-                                break
-
-                    except Exception:
-                        continue
-
+                        if px is not None and t_close > 0:
+                            best_px = px
+                            best_ts = int(t_close)
+                            best_src = f"ohlc_m1:{key}"
+                            break
         except Exception:
             pass
 
     return best_px, best_ts, best_src
-
 # Optional backward-compatible wrapper (ONLY if other code still calls _get_live_price)
 def _get_live_price(sym: str, device: str | None) -> tuple[float | None, int | None]:
     px, ts, _src = _get_live_price_with_ts(sym, device)
@@ -5545,55 +6264,45 @@ def price_all(
     pinned_device = device or x_device_id or getattr(user, "device_id", None) or getattr(user, "deviceId", None)
 
     # AUTO-SELECT active device when none is pinned
+    # AUTO-SELECT active device without Redis SCAN
     if not pinned_device and R is not None:
         try:
+            user_id = _uid_from_user(user)
+            devs = R.smembers(f"xtl:user:{user_id}:devices") if user_id else set()
+
             best_dev = None
             best_hb = -1
 
-            for key in R.scan_iter("device:dev_*"):
-                try:
-                    h = R.hgetall(key) or {}
-                except Exception:
-                    h = {}
-                if not h:
+            for d in devs or []:
+                d = d.decode("utf-8", "ignore") if isinstance(d, (bytes, bytearray)) else str(d)
+                d = d.strip()
+                if not d:
                     continue
 
-                # status (bytes -> str)
+                try:
+                    h = R.hgetall(f"device:{d}") or {}
+                except Exception:
+                    h = {}
+
                 status = h.get(b"status") or h.get("status")
                 if isinstance(status, (bytes, bytearray)):
                     status = status.decode("utf-8", "ignore")
-                status_s = (status or "").strip().lower()
-                if status_s != "online":
+
+                if str(status or "").strip().lower() != "online":
                     continue
 
-                # Prefer devices that actually have broker tz fields
-                tz_v = h.get(b"broker_tz_offset_min") or h.get("broker_tz_offset_min") or h.get(b"Broker.TzOffsetMin") or h.get("Broker.TzOffsetMin")
-                has_tz = tz_v is not None and tz_v != b"" and tz_v != ""
-
-                # last_heartbeat_ms (bytes -> str -> int)
                 hb = h.get(b"last_heartbeat_ms") or h.get("last_heartbeat_ms")
                 if isinstance(hb, (bytes, bytearray)):
                     hb = hb.decode("utf-8", "ignore").strip()
+
                 try:
-                    hb_i = int(hb) if hb is not None and hb != "" else -1
+                    hb_i = int(hb) if hb not in (None, "") else -1
                 except Exception:
                     hb_i = -1
 
-                # decode key -> device id
-                if isinstance(key, (bytes, bytearray)):
-                    key_s = key.decode("utf-8", "ignore")
-                else:
-                    key_s = str(key)
-                dev_id = key_s.replace("device:", "").strip()
-
-                # ranking: prefer higher heartbeat; if tie, prefer has_tz
                 if hb_i > best_hb:
                     best_hb = hb_i
-                    best_dev = dev_id
-                elif hb_i == best_hb and best_dev and has_tz:
-                    # if current best doesn't have tz but this one does, prefer it
-                    # (safe “tie-breaker”)
-                    best_dev = dev_id
+                    best_dev = d
 
             if best_dev:
                 pinned_device = best_dev
@@ -6581,7 +7290,7 @@ def predict_all(
             frozen=False,
             p_up=p_up,
             expected_move_pct=expected_move_pct if ok else 0.0,
-            target_price=target_price if ok else None,
+            target_price=target_price if (ok and USE_FORECAST_TP_SL) else None,
             decision=decision if ok else "ABSTAIN",
             confidence=conf if ok else "low",
             label=label_w if ok else "Unavailable",
@@ -6593,10 +7302,14 @@ def predict_all(
             reasons=_build_reasons(sym_u, label_w, p_up, extra) if ok else base_reasons,
             macro_reasons=_macro_chips_for_symbol(sym_u, macro, p_up, extra) if ok else [],
         )
+                
+
+        if not USE_FORECAST_TP_SL:
+            _disable_tp_sl_fields(row)
 
         rows.append(row)
         _write_lastrow(sym_u, row)
-
+    
     return {"ok": True, "tf": tfu, "server_now_ms": now_ms, "rows": rows}
 
 
@@ -6829,6 +7542,7 @@ def trend_opportunities(
     debug_top: int = Query(0, ge=0, le=10),
     debug_persist: bool = Query(False),
     debug_gate: int = Query(0),
+    include_sr: str | None = Query(None),
     user=Depends(require_auth_optional),
 ):
     """
@@ -7499,11 +8213,12 @@ def trend_opportunities(
         rev_ok = bool(eg.get("rev_ok"))
 
         # HARD BLOCK: do not freeze/enter unless reversal is confirmed
-        # Allow entry evaluation once TAP is armed (tap_count 1..3)
         armed = False
         if eg_reason in ("REVERSAL_OK", "LOOSE_BYPASS"):
             armed = True
         elif eg_reason == "ARMED_TAP" and 1 <= tap_n <= 3:
+            armed = True
+        elif rev_ok or eg_reason.startswith("REV_OK") or "REV_OK" in eg_reason:
             armed = True
 
         if not armed:
@@ -7512,10 +8227,291 @@ def trend_opportunities(
             row["signal_reason"] = f"waiting_gate:{eg_reason.lower() or 'missing'}"
             return
 
+        # ------------------------------------------------------------
+        if rev_ok or eg_reason.startswith("REV_OK") or "REV_OK" in eg_reason:
+            _dir = str(
+                eg.get("resolved_dir")
+                or row.get("decision")
+                or row.get("opp_direction")
+                or row.get("direction")
+                or eg.get("direction") or ""
+            ).upper()
+
+            if _dir in ("UP", "LONG", "BULLISH", "BULL"):
+                _dir = "BUY"
+            elif _dir in ("DOWN", "SHORT", "BEARISH", "BEAR"):
+                _dir = "SELL"
+
+            # Trigger level from gate/watch
+            try:
+                _rev_trigger = eg.get("rev_trigger") or {}
+                if _dir == "BUY":
+                    _entry_trigger = float(
+                        _rev_trigger.get("entry_above")
+                        or eg.get("rev_ok_bar_hi")
+                        or eg.get("rev_state", {}).get("rev_ok_bar_hi")
+                        or 0
+                    )
+                else:
+                    _entry_trigger = float(
+                        _rev_trigger.get("entry_below")
+                        or eg.get("rev_ok_bar_lo")
+                        or eg.get("rev_state", {}).get("rev_ok_bar_lo")
+                        or 0
+                    )
+            except Exception:
+                _entry_trigger = 0.0
+
+            # Live price
+            try:
+                _lp = float(
+                    row.get("last_price")
+                    or row.get("live_price")
+                    or row.get("price")
+                    or row.get("mid")
+                    or 0
+                )
+            except Exception:
+                _lp = 0.0
+
+            # Always keep these for UI/debug
+            row["opp_direction"] = "UP" if _dir == "BUY" else "DOWN"
+            row["decision"] = _dir
+            row["entry_trigger_level"] = _entry_trigger
+            row["rev_ok_bar_hi"] = float(
+                eg.get("rev_state", {}).get("rev_ok_bar_hi")
+                or eg.get("rev_ok_bar_hi")
+                or 0
+            )
+            row["rev_ok_bar_lo"] = float(
+                eg.get("rev_state", {}).get("rev_ok_bar_lo")
+                or eg.get("rev_ok_bar_lo")
+                or 0
+            )
+
+            # Block duplicate symbol position before entry
+            if _has_open_position_for_symbol(str(user_id), str(row.get("symbol") or sym_u)):
+                row["status"] = "blocked"
+                row["trade_state"] = "POSITION_OPEN"
+                row["signal"] = "WAIT"
+                row["signal_text"] = "POSITION_OPEN"
+                row["signal_reason"] = "same_symbol_position_open"
+                row["entry_blocked_reason"] = "same_symbol_position_open"
+
+                if isinstance(row.get("entry_gate"), dict):
+                    row["entry_gate"]["blocked"] = True
+                    row["entry_gate"]["reason"] = (
+                        str(row["entry_gate"].get("reason") or "")
+                        + " | BLOCKED_BY_OPEN_POSITION"
+                    )
+
+                try:
+                    _save_alert_snapshot(str(row.get("symbol") or ""), row)
+                except Exception:
+                    pass
+                return
+
+            # Breakout trigger check
+            # ------------------------------------------------------------
+            # Breakout trigger check
+            # IMPORTANT:
+            # - Entry must be a fresh live cross only.
+            # - If API/agent was down and price is already beyond trigger,
+            #   do NOT chase.
+            # - Reset only same symbol+side watch/opportunity so it can rediscover.
+            # ------------------------------------------------------------
+            _breakout_hit = False
+
+            try:
+                _sym0 = str(row.get("symbol") or sym_u).upper().strip()
+            except Exception:
+                _sym0 = str(sym_u or "").upper().strip()
+
+            _side0 = "BUY" if _dir == "BUY" else "SELL"
+            _break_key = f"xtl:watch:break_state:{_sym0}:{_side0}:H1"
+
+            _prev_px = 0.0
+            _prev_ts = 0
+
+            try:
+                _bs = _json_load_twice(R.get(_break_key)) or {}
+                if isinstance(_bs, dict):
+                    _prev_px = float(_bs.get("last_price") or 0)
+                    _prev_ts = int(float(_bs.get("updated_ms") or 0))
+            except Exception:
+                _prev_px = 0.0
+                _prev_ts = 0
+
+            try:
+                _now0 = int(time.time() * 1000)
+            except Exception:
+                _now0 = 0
+
+            _prev_fresh = bool(_prev_px > 0 and _prev_ts > 0 and (_now0 - _prev_ts) <= 120000)
+
+            # Fresh cross only
+            if _entry_trigger > 0 and _lp > 0:
+                if _dir == "BUY":
+                    _breakout_hit = bool(_prev_fresh and _prev_px < _entry_trigger and _lp >= _entry_trigger)
+                    _already_beyond = bool((not _prev_fresh) and _lp >= _entry_trigger)
+                else:
+                    _breakout_hit = bool(_prev_fresh and _prev_px > _entry_trigger and _lp <= _entry_trigger)
+                    _already_beyond = bool((not _prev_fresh) and _lp <= _entry_trigger)
+            else:
+                _already_beyond = False
+
+            try:
+                R.setex(
+                   _break_key,
+                   24 * 3600,
+                   json.dumps(
+                       {
+                           "symbol": _sym0,
+                           "side": _side0,
+                           "trigger_level": float(_entry_trigger or 0),
+                           "last_price": float(_lp or 0),
+                           "prev_price": float(_prev_px or 0),
+                           "prev_fresh": bool(_prev_fresh),
+                           "breakout_hit": bool(_breakout_hit),
+                           "already_beyond": bool(_already_beyond),
+                           "updated_ms": _now0,
+                       },
+                       default=str,
+                   ),
+                )
+            except Exception:
+                pass
+
+            # Missed breakout after downtime / stale previous price:
+            # Reset only same symbol + same side, not all symbols.
+            if _already_beyond:
+                try:
+                    _watch_key = f"xtl:zone:watch:{_sym0}:{_side0}:H1"
+                    R.delete(_watch_key)
+
+                    _opp_dir = "UP" if _side0 == "BUY" else "DOWN"
+                    R.delete(f"xtl:trend:opp:active:{_sym0}:{_opp_dir}")
+
+                    try:
+                        _rev_ms = int(
+                            eg.get("rev_state", {}).get("rev_ok_ms")
+                            or eg.get("rev_ok_ms")
+                            or row.get("rev_ok_ms")
+                            or 0
+                        )
+                    except Exception:
+                        _rev_ms = 0
+
+                    if _rev_ms > 0:
+                        R.delete(f"xtl:watch:entry_claim:{_sym0}:{_side0}:H1:{_rev_ms}")
+
+                    # remove this break state too, so next discovery starts fresh
+                    R.delete(_break_key)
+
+                    row["signal"] = "WAIT"
+                    row["signal_text"] = "REDISCOVER"
+                    row["signal_reason"] = "missed_breakout_rediscover"
+                    row["trade_state"] = "MISSED_BREAKOUT_REDISCOVER"
+                    row["entry_blocked_reason"] = "missed_breakout_no_late_entry"
+
+                    if isinstance(row.get("entry_gate"), dict):
+                        row["entry_gate"]["blocked"] = True
+                        row["entry_gate"]["reason"] = (
+                            str(row["entry_gate"].get("reason") or "")
+                            + " | MISSED_BREAKOUT_REDISCOVER"
+                        )
+
+                    log.warning(
+                        "[GATE] MISSED_BREAKOUT_REDISCOVER sym=%s side=%s live=%s trigger=%s prev=%s prev_fresh=%s watch=%s",
+                        _sym0,
+                        _side0,
+                        _lp,
+                        _entry_trigger,
+                        _prev_px,
+                        _prev_fresh,
+                        _watch_key,
+                    )  
+
+                    try:
+                        _save_alert_snapshot(str(row.get("symbol") or _sym0), row)
+                    except Exception:
+                        pass
+
+                    return
+
+                except Exception as e:
+                    log.warning(
+                        "[GATE] MISSED_BREAKOUT_REDISCOVER_FAILED sym=%s side=%s err=%r",
+                        _sym0,
+                        _side0,
+                        e,
+                    )
+
+            # Not triggered yet: display ENTRY_READY and save active snapshot
+            if not _breakout_hit:
+                row["signal"] = "WAIT"
+                row["signal_text"] = "ENTRY_READY"
+                row["signal_reason"] = (
+                    f"ENTRY_READY:{_dir}:"
+                    f"{'>' if _dir == 'BUY' else '<'}"
+                    f"{_entry_trigger:.5f}"
+                )
+                row["trade_state"] = "ENTRY_READY"
+                row["status"] = "active"
+                row["entry_triggered"] = False
+                _disable_tp_sl_fields(row)
+
+                try:
+                    row["alert_id"] = _save_alert_snapshot(str(row.get("symbol") or ""), row)
+                except Exception as e:
+                    row["dbg_save_alert_exc"] = f"{type(e).__name__}:{e}"
+
+                return
+
+            # Triggered: convert REV_OK watch into executable ENTRY event
+            row["signal"] = _dir
+            row["signal_text"] = _dir
+            row["signal_reason"] = (
+                f"LIVE_BREAKOUT:{_dir}:"
+                f"{_lp:.5f}:"
+                f"{'>' if _dir == 'BUY' else '<'}"
+                f"{_entry_trigger:.5f}"
+            )
+            row["trade_state"] = "ENTRY_TRIGGERED"
+            row["status"] = "active"
+            row["entry_triggered"] = True
+            row["entry_signal"] = _dir
+            row["entry_price"] = float(_lp)
+            row["entry_ts_ms"] = int(now_ms)
+            row["entry_reason"] = row["signal_reason"]
+            row["confidence"] = row.get("confidence") or ""
+            row["score"] = float(row.get("score") or 10.0)
+
+            try:
+                row["alert_id"] = _save_alert_snapshot(str(row.get("symbol") or ""), row)
+                log.warning(
+                    "[OPP] WATCH_BREAKOUT_ENTRY sym=%s side=%s alert_id=%s lp=%s trigger=%s",
+                    row.get("symbol") or sym_u,
+                    _dir,
+                    row.get("alert_id"),
+                    _lp,
+                    _entry_trigger,
+                )
+            except Exception as e:
+                row["signal"] = "WAIT"
+                row["signal_text"] = "ENTRY_READY"
+                row["signal_reason"] = f"entry_snapshot_save_failed:{type(e).__name__}"
+                row["trade_state"] = "ENTRY_READY"
+                row["entry_triggered"] = False
+                row["dbg_save_alert_exc"] = f"{type(e).__name__}:{e}"
+
+            _disable_tp_sl_fields(row)
+            return
 
         if isinstance(ed, dict) and ed.get("ok") is True:
             dec = str(
-                row.get("decision")
+                eg.get("resolved_dir")
+                or row.get("decision")
                 or row.get("opp_direction")
                 or row.get("direction")
                 or ""
@@ -7685,7 +8681,9 @@ def trend_opportunities(
 
                 # Discord notify (best-effort)
                 try:
-                    _maybe_discord_entry(row=row, sig=sig, tp=None, sl=None, now_ms=now_ms)
+                    # DISABLED: old trade signal; prop executor sends final manual signal
+                    # _maybe_discord_entry(row=row, sig=sig, tp=None, sl=None, now_ms=now_ms)
+                    pass
                 except Exception:
                     pass
                 
@@ -7803,7 +8801,11 @@ def trend_opportunities(
             gm = r.get("entry_gate") or r.get("gate") or r.get("gate_meta") or {}
             reason = str((gm or {}).get("reason") or "").upper()
 
-            if reason in ("REVERSAL_OK","ARMED_TAP", "LOOSE_BYPASS"):
+            if (
+                reason in ("REVERSAL_OK", "ARMED_TAP", "LOOSE_BYPASS")
+                or reason.startswith("REV_OK")
+                or "REV_OK" in reason
+            ):
                 _attach_entry_1m(r)
                 _set_signal_from_entry(r)
                 return
@@ -7996,6 +8998,28 @@ def trend_opportunities(
             _r["zone"] = None
             _r["zone_text"] = None
             _r["market_closed"] = True
+        # ------------------------------------------------------------
+        # Slim default opportunities response.
+        # Do NOT send full SR tree unless explicitly requested.
+        # This does NOT change SR generation logic.
+        # ------------------------------------------------------------
+        try:
+            include_sr_on = str(include_sr or "").strip().lower() in (
+                "1", "true", "yes", "y", "on"
+            )
+        except Exception:
+            include_sr_on = False
+
+        if not include_sr_on:
+            for r in rows:
+                if isinstance(r, dict):
+                    r.pop("sr", None)
+                    r.pop("h1", None)
+                    r.pop("h4", None)
+                    r.pop("debug_support_below_price", None)
+                    r.pop("debug_support_above_price", None)
+                    r.pop("debug_resistance_below_price", None)
+                    r.pop("debug_resistance_above_price", None)
         payload = {"ok": True, "tf": tfu, "rows": rows, "history": history}
         
 
@@ -8075,6 +9099,8 @@ def trend_opportunities(
         if not sym_u:
             continue
 
+        _sym_side_rows = []   # collect surviving side-rows; collapse to one after loop
+
         for side in ("BUY", "SELL"):
             row = {
                 "symbol": sym_u,
@@ -8128,6 +9154,9 @@ def trend_opportunities(
                 bars_h1, h1_key = _load_device_h1_bars(sym_u, dev_for_gate)
                 row_h1 = {
                     "bars": bars_h1,
+                    "last_price": row.get("last_price"),
+                    "live_price": row.get("live_price"),
+                    "price": row.get("price"),
                     "last_price_ts_ms": (
                         row.get("last_price_ts_ms")
                         or row.get("live_price_ts_ms")
@@ -8161,7 +9190,7 @@ def trend_opportunities(
                     row["zone"] = None
                     row["zone_text"] = None
                     row["opp_reason"] = "MARKET_CLOSED_NO_LIVE_H1"
-                    watch_rows.append(row)
+                    _sym_side_rows.append(row)
                     continue
                 # --- end guard ---
 
@@ -8170,7 +9199,46 @@ def trend_opportunities(
                     row_h1["atr"] = float(atr_h1)
                     row["atr_1h"] = float(atr_h1)
                     row["atr14"] = float(atr_h1)
-
+                # ── BRIDGE (moved above gate): enrich sr with best_support/best_resistance ──
+                # Must run BEFORE the gate so the resolver reads scored levels.
+                # Inputs are independent of the liq-detection block below:
+                #   _liq_px/_liq_atr from row, _liq_h4 from Redis H4 snap.
+                try:
+                    if callable(_score_sr_with_liquidity):
+                        _b_px  = float(row.get("last_price") or row.get("price") or 0)
+                        _b_atr = float(row.get("atr_1h") or row.get("atr14") or 0)
+                        _b_h4  = []
+                        try:
+                            _h4_raw = R.get(f"xtl:ohlc:snap:{dev_for_gate}:{sym_u}:H4") if R is not None else None
+                            if isinstance(_h4_raw, (bytes, bytearray)):
+                                _h4_raw = _h4_raw.decode("utf-8", "ignore")
+                            if _h4_raw:
+                                _h4_obj = json.loads(_h4_raw)
+                                _b_h4 = (
+                                    (_h4_obj.get("bars") or _h4_obj.get("ohlc") or [])
+                                    if isinstance(_h4_obj, dict)
+                                    else (_h4_obj if isinstance(_h4_obj, list) else [])
+                                )
+                        except Exception:
+                            _b_h4 = []
+                        _sr_pre = row.get("sr") if isinstance(row.get("sr"), dict) else {}
+                        if _sr_pre and (_sr_pre.get("active_supports") or _sr_pre.get("active_resistances")):
+                            _sc = _score_sr_with_liquidity(sym_u, _sr_pre, bars_h1, _b_h4, _b_px, _b_atr)
+                            if isinstance(_sc, dict) and _sc:
+                                _sr_pre["scored_supports"]    = _sc.get("scored_supports") or []
+                                _sr_pre["scored_resistances"] = _sc.get("scored_resistances") or []
+                                _sr_pre["best_support"]       = _sc.get("best_support")
+                                _sr_pre["best_resistance"]    = _sc.get("best_resistance")
+                                row["sr"] = _sr_pre
+                                if debug_gate_on:
+                                    row["dbg_bridge_preglate_ran"] = True
+                                    row["dbg_bridge_preglate_best"] = isinstance(_sr_pre.get("best_support"), dict)
+                except Exception as _pre_exc:
+                    if debug_gate_on:
+                        row["dbg_bridge_preglate_exc"] = f"{type(_pre_exc).__name__}:{_pre_exc}"
+                # ── END BRIDGE (pre-gate) ──
+                
+                if debug_gate_on: row["dbg_gate_path"] = "P9203_main_loop"
                 allowed, gm = _zone_reversal_gate_zone_only(
                     R=R,
                     sym=sym_u,
@@ -8265,9 +9333,189 @@ def trend_opportunities(
                 row["signal"] = "WAIT"
                 row["signal_reason"] = "entry_check_exception"
 
-            watch_rows.append(row)
+            # ── LIQ STRUCTURE OBSERVATION (Phase 1 — display only) ────────
+            try:
+                if callable(_detect_liq_signals):
+                    _liq_px  = float(row.get("last_price") or row.get("price") or 0)
+                    _liq_atr_tmp = float(row.get("atr_1h") or row.get("atr14") or 0) or 1.0
+                    _liq_zone = (
+                        row.get("zone_used")
+                        or row.get("planned_zone")
+                        or row.get("zone")
+                        or row.get("active_zone")
+                    )
+                    # STALE-ZONE GUARD: if the carried zone is far from current price
+                    # (e.g. an old setup's zone left at 4345 while price is 4165),
+                    # don't anchor liquidity there. Re-anchor to a price-relative band
+                    # so OB/BSL/SWING/FVG reflect where price actually is.
+                    try:
+                        if isinstance(_liq_zone, dict):
+                            _zmid = float(_liq_zone.get("level")
+                                          or ((float(_liq_zone.get("low", _liq_px)) + float(_liq_zone.get("high", _liq_px))) / 2.0))
+                            if abs(_zmid - _liq_px) > 4.0 * _liq_atr_tmp:   # >4 ATR away = stale
+                                _liq_zone = None
+                    except Exception:
+                        pass
+                    if not _liq_zone and _liq_px > 0:
+                        _liq_zone = {"low": _liq_px - 1.5 * _liq_atr_tmp,
+                                     "high": _liq_px + 1.5 * _liq_atr_tmp,
+                                     "level": _liq_px}
+                    _liq_dir = str(
+                        row.get("direction") or row.get("opp_direction") or ""
+                    ).upper()
+                    _liq_px  = float(row.get("last_price") or row.get("price") or 0)
+                    _liq_atr = float(row.get("atr_1h") or row.get("atr14") or 0)
+
+                    # H4 bars — device-scoped key
+                    _liq_h4: list[dict] = []
+                    try:
+                        _h4_raw = R.get(f"xtl:ohlc:snap:{dev_for_gate}:{sym_u}:H4")
+                        if isinstance(_h4_raw, (bytes, bytearray)):
+                            _h4_raw = _h4_raw.decode("utf-8", "ignore")
+                        if _h4_raw:
+                            _h4_obj = json.loads(_h4_raw)
+                            _liq_h4 = (
+                                _h4_obj.get("bars") or _h4_obj.get("ohlc") or []
+                                if isinstance(_h4_obj, dict)
+                                else (_h4_obj if isinstance(_h4_obj, list) else [])
+                            )
+                    except Exception:
+                        _liq_h4 = []
+
+                    _liq = _detect_liq_signals(
+                        sym       = sym_u,
+                        direction = _liq_dir,
+                        zone      = _liq_zone,
+                        bars_h1   = bars_h1,
+                        bars_h4   = _liq_h4,
+                        price     = _liq_px,
+                        atr       = _liq_atr,
+                    )
+                    row["liq_signals"]    = _liq.get("signals", [])
+                    row["liq_text"]       = _liq.get("liq_text", "—")
+                    row["liq_confidence"] = _liq.get("liq_confidence", "—")
+                    row["range_text"]     = _liq.get("range_text", "—")
+                    row["bsl_ssl"]        = _liq.get("bsl_ssl", {})
+                    row["liq_detail"]     = _liq.get("liq_detail", {})
+            except Exception as _liq_exc:
+                import traceback as _tb; log.error("LIQ_ERR sym=%s err=%s trace=%s", sym_u, _liq_exc, _tb.format_exc())
+                row.setdefault("liq_signals", [])
+                row.setdefault("liq_text", "—")
+                row.setdefault("liq_confidence", "—")
+                row.setdefault("range_text", "—")
+                row.setdefault("bsl_ssl", {})
+                row.setdefault("liq_detail", {})
+            # ── END LIQ STRUCTURE ─────────────────────────────────────────
+
+            # ── BRIDGE: score SR active levels by liquidity evidence ──────
+            try:
+                if callable(_score_sr_with_liquidity):
+                    _sr_b = row.get("sr") if isinstance(row.get("sr"), dict) else {}
+                    if _sr_b and (_sr_b.get("active_supports") or _sr_b.get("active_resistances")):
+                        _scored = _score_sr_with_liquidity(
+                            sym_u,
+                            _sr_b,
+                            bars_h1,
+                            _liq_h4,
+                            _liq_px,
+                            _liq_atr,
+                        )
+                        if isinstance(_scored, dict) and _scored:
+                            _sr_b["scored_supports"]    = _scored.get("scored_supports") or []
+                            _sr_b["scored_resistances"] = _scored.get("scored_resistances") or []
+                            _sr_b["best_support"]       = _scored.get("best_support")
+                            _sr_b["best_resistance"]    = _scored.get("best_resistance")
+                            if debug_gate_on:
+                                row["dbg_bridge_ran"] = True
+                                row["dbg_bridge_sr_id"] = id(_sr_b)
+                                row["dbg_bridge_wrote_best"] = isinstance(_sr_b.get("best_support"), dict)
+                           
+                            
+                            row["sr"] = _sr_b
+            except Exception as _br_exc:
+                import traceback as _tb
+                log.error("BRIDGE_ERR sym=%s err=%s trace=%s", sym_u, _br_exc, _tb.format_exc())
+            # ── END BRIDGE ────────────────────────────────────────────────
+
+            _sym_side_rows.append(row)
+
+        # ── Source-side mirror row guard: exactly one row per symbol ───────────────
+        # The zone-side guard above skips the mirrored side in clear cases.
+        # This is the safety net: if the side couldn't be inferred (no zone,
+        # stale zone, market-closed) and BOTH sides survived, pick the winner
+        # by the gate's own verdict so a duplicate can never reach the UI.
+        if _sym_side_rows:
+            if len(_sym_side_rows) == 1:
+                watch_rows.append(_sym_side_rows[0])
+            else:
+                def _side_rank(r):
+                    gm = (r or {}).get("entry_gate") or (r or {}).get("gate_meta") or {}
+                    gm = gm if isinstance(gm, dict) else {}
+
+                    row_side = str((r or {}).get("direction") or (r or {}).get("decision") or "").upper()
+                    resolved = str(gm.get("resolved_dir") or "").upper()
+
+                    resolved_match = 1 if resolved in ("BUY", "SELL") and row_side == resolved else 0
+                    mkt_open = 0 if gm.get("market_closed") else 1
+                    not_blocked = 0 if gm.get("blocked") else 1
+
+                    sig = str((r or {}).get("signal") or "").upper()
+                    has_sig = 0 if sig in ("", "WAIT", "NONE") else 1
+
+                    try:
+                        score = abs(float((r or {}).get("score") or 0))
+                    except Exception:
+                        score = 0.0
+
+                    return (resolved_match, mkt_open, not_blocked, has_sig, score)
+                watch_rows.append(max(_sym_side_rows, key=_side_rank))
 
     history = _load_opp_history(limit=50)
+    # ------------------------------------------------------------
+    # Slim default opportunities/watchlist response.
+    # Do NOT send full SR tree unless explicitly requested.
+    # This does NOT change SR generation logic.
+    # ------------------------------------------------------------
+    try:
+        include_sr_on = str(include_sr or "").strip().lower() in (
+            "1", "true", "yes", "y", "on"
+        )
+    except Exception:
+        include_sr_on = False
+
+    if not include_sr_on:
+        for r in watch_rows:
+            if isinstance(r, dict):
+                # Slim the SR: drop the heavy h1/h4 tree + inventory, but KEEP the
+                # small active_*/nearest_* fields the UI needs for SR NEAR/MAJOR.
+                _full_sr = r.get("sr") if isinstance(r.get("sr"), dict) else {}
+                r["sr"] = {
+                    "active_supports":    _full_sr.get("active_supports") or [],
+                    "active_resistances": _full_sr.get("active_resistances") or [],
+                    "nearest_support":    _full_sr.get("nearest_support"),
+                    "nearest_resistance": _full_sr.get("nearest_resistance"),
+                    "scored_supports":    _full_sr.get("scored_supports") or [],
+                    "scored_resistances": _full_sr.get("scored_resistances") or [],
+                    "best_support":       _full_sr.get("best_support"),
+                    "best_resistance":    _full_sr.get("best_resistance"),
+                }
+                r.pop("h1", None)
+                r.pop("h4", None)
+                r.pop("liq_detail", None)
+                r.pop("gate_meta", None)
+                r.pop("sr_inventory", None)
+
+                # Duplicate zone payloads; UI uses entry_gate.zone / h1Zone / h4Zone
+                r.pop("zone", None)
+                r.pop("planned_zone", None)
+                r.pop("active_zone", None)
+
+                # Debug-only SR lists
+                r.pop("debug_support_below_price", None)
+                r.pop("debug_support_above_price", None)
+                r.pop("debug_resistance_below_price", None)
+                r.pop("debug_resistance_above_price", None)
+
     payload = {
         "ok": True,
         "tf": tfu,
@@ -8501,7 +9749,7 @@ def trend_opportunities(
             # DEBUG_PERSIST: write the fabricated opp into live snapshot
             # so UI (no-debug) can see it on the next poll.
             # ---------------------------------------------------------
-            if debug_persist:
+            if False and debug_persist:
                 try:
                     
                     out["debug_force"] = True
@@ -8832,6 +10080,7 @@ def trend_opportunities(
             if not sym_u:
                 sym_u = str(sym or "").upper().strip()
             try:
+                if debug_gate_on: active_snap_row["dbg_gate_path"] = "P10040_active_snap"
                 allowed, gate_meta = _zone_reversal_gate_zone_only(R=R, 
                     sym=sym_u,
                     direction=("BUY" if str(active_snap_row.get("opp_direction") or active_snap_row.get("decision") or "").upper() in ("UP", "BUY") else "SELL"),
@@ -9154,7 +10403,7 @@ def trend_opportunities(
             if snap_any is None and sym_u:
                 try:
                     # Pull a reasonable tail so ATR14 + tap logic works
-                    agent_rows = _broker_bars_sync(sym_u, "H1", limit=240) or []
+                    agent_rows = _broker_bars_sync(sym_u, "H1", limit=1500) or []
                     bars_b: list[dict] = []
 
                     # _broker_bars_sync rows are typically {t_open_ms,t_close_ms,o,h,l,c,complete}
@@ -9749,6 +10998,14 @@ def trend_opportunities(
                     sr_for_gate = s0
             except Exception:
                 sr_for_gate = None
+            # ── DEBUG: what does row["sr"] actually carry at gate-time? ──
+            if debug_gate_on:
+                _s = row.get("sr") if isinstance(row.get("sr"), dict) else {}
+                row["dbg_gate_sr_keys"] = sorted(_s.keys())[:24]
+                row["dbg_gate_has_best_support"] = isinstance(_s.get("best_support"), dict)
+                row["dbg_gate_has_scored"] = isinstance(_s.get("scored_supports"), list)
+                row["dbg_gate_sr_id"] = id(_s)
+            # ── END DEBUG ──
 
             # 2) If not present, load last_good SR bundle directly from Redis
             if (not isinstance(sr_for_gate, dict)) and R is not None:
@@ -9791,9 +11048,30 @@ def trend_opportunities(
             
 
            
-            
+            # -------------------------------------------------
+            # Feed enriched scored SR into zone gate
+            # row["sr"] has best_support / best_resistance after liquidity scoring.
+            # sr_for_gate may still be the older SR bundle shape.
+            # -------------------------------------------------
+            try:
+                row_sr = row.get("sr") if isinstance(row.get("sr"), dict) else {}
+
+                if isinstance(row_sr.get("best_support"), dict):
+                    sr_for_gate["best_support"] = row_sr["best_support"]
+
+                if isinstance(row_sr.get("best_resistance"), dict):
+                    sr_for_gate["best_resistance"] = row_sr["best_resistance"]
+
+                if isinstance(row_sr.get("scored_supports"), list):
+                    sr_for_gate["scored_supports"] = row_sr["scored_supports"]
+
+                if isinstance(row_sr.get("scored_resistances"), list):
+                    sr_for_gate["scored_resistances"] = row_sr["scored_resistances"]
+            except Exception:
+                pass
 
             try:
+                if debug_gate_on: row["dbg_gate_path"] = "P11022_watchlist_reload"
                 allowed, gate_meta = _zone_reversal_gate_zone_only(R=R, 
                     sym=sym_u,
                     direction=("BUY" if opp_dir == "UP" else "SELL"),
@@ -9855,7 +11133,15 @@ def trend_opportunities(
                 try:
                     if isinstance(gate_meta, dict):
                         zu = gate_meta.get("zone_used")
-                        if not (isinstance(zu, dict) and zu):
+                        # Only synthesize zone_used if truly missing.
+                        # NEVER overwrite a real zone_used from a frozen watch.
+                        _zu_has_valid_band = (
+                            isinstance(zu, dict)
+                            and zu.get("low") is not None
+                            and zu.get("high") is not None
+                            and float(zu.get("low", 0)) < float(zu.get("high", 0))
+                        )
+                        if not _zu_has_valid_band:
                             z0 = gate_meta.get("zone") or gate_meta.get("zone_meta")
                             if isinstance(z0, dict):
                                 try:
@@ -10154,6 +11440,30 @@ def trend_opportunities(
                     out["gate_heal_result_reason"] = (
                         gate_meta2.get("reason") if isinstance(gate_meta2, dict) else "unknown"
                     )
+                    try:
+                        _gm_reason = str((gate_meta2 or {}).get("reason") or "").upper()
+                        _gm_stage = str((gate_meta2 or {}).get("stage") or "").upper()
+
+                        if "ZONE_INVALIDATED" in _gm_reason or _gm_stage == "ZONE_INVALIDATED":
+                            _invalidate_active_opportunity(
+                                sym=sym_u,
+                                opp_dir=opp_dir,
+                                reason=_gm_reason or _gm_stage,
+                            )
+
+                            out["status"] = "invalidated"
+                            out["trade_state"] = "ZONE_INVALIDATED"
+                            out["entry_gate"] = gate_meta2
+                            out["zone"] = None
+                            out["planned_zone"] = None
+                            out["zone_used"] = None
+                            out["signal"] = "WAIT"
+                            out["signal_text"] = "WAIT"
+                            out["signal_reason"] = "zone_invalidated"
+
+                            continue
+                    except Exception:
+                        pass
                     out["gate_heal_result_allowed"] = bool(allowed)
                     # re-sync derived fields from healed gate
                     try:
@@ -10419,7 +11729,12 @@ def trend_opportunities(
     # heavy work happens here (predict_all + build opp_rows/history/payload) ...
     # DROP null/empty symbol rows (safety)
     opp_rows = [r for r in opp_rows if str((r or {}).get("symbol") or "").strip()]
-    payload = {"ok": True, "tf": tfu, "rows": opp_rows, "history": history}
+
+    
+
+    
+    payload = {"ok": True, "tf": tfu, "rows": rows, "history": history}
+    
     if debug_gate and gate_stats:
         payload["gate_stats"] = dict(sorted(gate_stats.items(), key=lambda x: -x[1]))
     # -------------------------------------------------
@@ -11548,8 +12863,8 @@ def trend_state2(
                 if bars:
                     bars[-1]["complete"] = bool(bars[-1].get("complete", True))
                 # trim if needed
-                if len(bars) > 1000:
-                    bars = bars[-1000:]
+                if len(bars) > 1500:
+                    bars = bars[-1500:]
                 snap_dev["bars"] = bars  # t remains seconds
 
                 # enrich broker if missing
@@ -12715,7 +14030,7 @@ def trend_state2(
 
         # Always compute SR from true H1 and H4 broker bars
         try:
-            h1_rows = _broker_bars_sync(sym, "H1", limit=300)
+            h1_rows = _broker_bars_sync(sym, "H1", limit=1500)
         except Exception:
             h1_rows = None
         try:
@@ -12765,7 +14080,7 @@ def trend_state2(
             pip_factor=float(pip_factor),
             cache=R,
             cache_ttl_sec=900,
-            good_ttl_sec=7 * 24 * 3600,
+            good_ttl_sec=int(os.getenv("XTL_SR_BUNDLE_TTL_SEC", "3600")),
         )
     except Exception as e:
         sr_summary = {"error": f"sr_failed: {e}"}
@@ -13823,6 +15138,10 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
                         "updated_ms": now_ms,
                         "last_price": float(last_price),
                         "tp_structure_meta": tp_struct.get("meta") or {},
+                        "tp_source" : "STRUCTURE",
+                        "tp_method" : str(tp_struct.get("reason") or "tp_structure_exit"),
+                        "sl_source" : "NONE",
+                        "sl_method" : None,
                     }
                     payload.update(meta)
                     payload["tp_price"] = tp_price
@@ -13950,3 +15269,59 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
 
         _delete_live_snapshot(sym_u, direction)
         return
+
+
+@router.get("/confluence/news")
+async def get_confluence_news(request: Request):
+    import time
+    from datetime import datetime, timezone
+    from api.news_adapter import check_news_block, get_upcoming_events, get_calendar_status
+
+    now_ms  = int(time.time() * 1000)
+    SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF"]
+
+    cal_status     = get_calendar_status(R)
+    symbol_results = {}
+    any_blocked    = False
+
+    for sym in SYMBOLS:
+        result = check_news_block(sym, now_ms, R, shadow_mode=False)
+        symbol_results[sym] = {
+            "verdict":          result.get("verdict", "ALLOW"),
+            "reason":           result.get("reason"),
+            "event_name":       result.get("event_name"),
+            "window":           result.get("window"),
+            "minutes_to_event": result.get("minutes_to_event"),
+        }
+        if result.get("block"):
+            any_blocked = True
+
+    upcoming_raw = get_upcoming_events(R, hours_ahead=336)   # 14 days, matches scraper lookahead
+    upcoming     = []
+    for ev in upcoming_raw:
+        t_ms          = int(ev.get("time_ms") or 0)
+        minutes_until = round((t_ms - now_ms) / 60000, 1)
+        pre_ms        = int(ev.get("pre_block_min") or 15) * 60_000
+        post_ms       = int(ev.get("post_block_min") or 15) * 60_000
+        stab_ms       = int(ev.get("stabilization_min") or 0) * 60_000
+        is_blocking   = (t_ms - pre_ms) <= now_ms <= (t_ms + post_ms + stab_ms)
+        dt_str        = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%b %d  %H:%M")
+        upcoming.append({
+            "event":             ev.get("event", ""),
+            "currency":          ev.get("currency", ""),
+            "datetime_utc":      dt_str,
+            "time_ms":           t_ms,
+            "pre_block_min":     ev.get("pre_block_min", 15),
+            "post_block_min":    ev.get("post_block_min", 15),
+            "stabilization_min": ev.get("stabilization_min", 0),
+            "minutes_until":     minutes_until,
+            "is_blocking":       is_blocking,
+        })
+
+    return JSONResponse({
+        "calendar_status": cal_status,
+        "symbols":         symbol_results,
+        "upcoming_events": upcoming,
+        "any_blocked":     any_blocked,
+        "generated_at_ms": now_ms,
+    })

@@ -18,6 +18,8 @@ import AIForecasts from "@/pages/Dashboard";
 import PerformancePages from "@/pages/PerformancePages";
 import ConfluenceIntelligence from "@/pages/Confluence";
 
+import Propfirm from "@/pages/Propfirm";
+
 
 // ✅ Knowledge Base
 import KBLayout from "@/pages/kb/KBLayout";
@@ -105,6 +107,15 @@ export default function App() {
                 </RouteBoundary>
               }
             />
+            <Route
+              path="/prop-firm"
+              element={
+                <RouteBoundary>
+                  <Propfirm/>
+                </RouteBoundary>
+              }
+            />
+
 
             <Route
               path="/ai-forecasts"

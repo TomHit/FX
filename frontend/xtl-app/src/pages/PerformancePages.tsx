@@ -1,143 +1,200 @@
 import React from "react";
 
-type Counts = { hit: number; sl_hit: number; expired: number; other: number };
-
-type StatsResp = {
-  ok: boolean;
-  day: string; // YYYYMMDD UTC
-  uid: string;
-  total_closed: number;
-  counts: Counts;
-  win_rate_vs_sl: number | null;
-  by_symbol: Record<string, Counts>;
+type BrokerAccount = {
+  balance?: number;
+  equity?: number;
+  margin?: number;
+  free_margin?: number;
+  floating_pnl?: number;
+  leverage?: number;
 };
 
-function pad2(n: number) {
-  return String(n).padStart(2, "0");
-}
+type PropConfig = {
+  enabled: boolean;
+  firm: string;
+  phase: string;
+  account_size: number;
+  risk_pct: number;
+  target_rr: number;
+  max_open_risk_pct: number;
+  max_open_positions: number;
+  account_name?: string;
+  account_id?: string;
+};
 
-// UTC today in YYYYMMDD
-function utcTodayYYYYMMDD() {
-  const d = new Date();
-  const y = d.getUTCFullYear();
-  const m = pad2(d.getUTCMonth() + 1);
-  const dd = pad2(d.getUTCDate());
-  return `${y}${m}${dd}`;
-}
+type PropRules = {
+  target_pct?: number;
+  daily_loss_pct?: number;
+  max_loss_pct?: number;
+  min_days?: number;
+  risk_per_idea_pct?: number | null;
+};
 
-// YYYYMMDD -> YYYY-MM-DD (for <input type="date">)
-function yyyymmddToDateInput(day: string) {
-  if (!day || day.length !== 8) return "";
-  return `${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6, 8)}`;
-}
+type PropLimits = {
+  target_usd?: number;
+  daily_limit_usd?: number;
+  max_loss_limit_usd?: number;
+};
 
-// YYYY-MM-DD -> YYYYMMDD
-function dateInputToYYYYMMDD(x: string) {
-  // x = "YYYY-MM-DD"
-  if (!x || x.length !== 10) return "";
-  return x.replace(/-/g, "");
-}
+type OpenRiskPosition = {
+  trade_id?: string;
+  symbol?: string;
+  side?: string;
+  risk_usd?: number;
+  risk_pct?: number;
+  lots?: number;
+  entry?: number;
+  sl?: number;
+  tp?: number;
+  firm?: string;
+  phase?: string;
+  source?: string;
+  mt5_job_id?: string;
+  mt5_ticket?: number;
+  device_id?: string;
+  reserved_ts_ms?: number;
+};
 
-function addUtcDays(yyyymmdd: string, delta: number) {
-  if (!yyyymmdd || yyyymmdd.length !== 8) return yyyymmdd;
-  const y = Number(yyyymmdd.slice(0, 4));
-  const m = Number(yyyymmdd.slice(4, 6)) - 1;
-  const d = Number(yyyymmdd.slice(6, 8));
-  const dt = new Date(Date.UTC(y, m, d));
-  dt.setUTCDate(dt.getUTCDate() + delta);
-  const yy = dt.getUTCFullYear();
-  const mm = pad2(dt.getUTCMonth() + 1);
-  const dd = pad2(dt.getUTCDate());
-  return `${yy}${mm}${dd}`;
-}
+type PropRisk = {
+  day: string;
+  daily_key: string;
+  daily_loss_used: number;
+  daily_risk_reserved: number;
+  max_loss_used: number;
+  open_risk_usd: number;
+  open_positions: OpenRiskPosition[];
+  wins_today: number;
+  losses_today: number;
+};
 
-function pct(n: number | null | undefined) {
-  if (typeof n !== "number" || !isFinite(n)) return "—";
-  return `${(n * 100).toFixed(1)}%`;
-}
+type PropStatusResp = {
+  ok: boolean;
+  config: PropConfig;
+  rules: PropRules;
+  broker: BrokerAccount;
+  limits: PropLimits;
+};
 
-function safeNum(x: any) {
+type PropRiskResp = {
+  ok: boolean;
+  config: PropConfig;
+  risk: PropRisk;
+};
+
+function safeNum(x: any, fallback = 0) {
   const n = typeof x === "number" ? x : Number(x);
-  return isFinite(n) ? n : 0;
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function money(x: any, digits = 2) {
+  const n = safeNum(x, NaN);
+  if (!Number.isFinite(n)) return "—";
+  return `$${n.toLocaleString(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })}`;
+}
+
+function num(x: any, digits = 2) {
+  const n = safeNum(x, NaN);
+  if (!Number.isFinite(n)) return "—";
+  return n.toLocaleString(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
+
+function pct(x: any, digits = 1) {
+  const n = safeNum(x, NaN);
+  if (!Number.isFinite(n)) return "—";
+  return `${n.toFixed(digits)}%`;
+}
+
+function fmtPrice(x: any) {
+  const n = safeNum(x, NaN);
+  if (!Number.isFinite(n)) return "—";
+  if (Math.abs(n) >= 100) return n.toFixed(2);
+  return n.toFixed(5);
+}
+
+function statusTone(ok: boolean) {
+  return ok
+    ? "border-emerald-900/50 bg-emerald-950/20 text-emerald-300"
+    : "border-red-900/50 bg-red-950/20 text-red-300";
 }
 
 function Card({
   title,
   value,
   sub,
-  right,
   loading,
+  tone = "default",
 }: {
   title: string;
   value: React.ReactNode;
   sub?: React.ReactNode;
-  right?: React.ReactNode;
   loading?: boolean;
+  tone?: "default" | "good" | "warn" | "bad";
 }) {
+  const toneClass =
+    tone === "good"
+      ? "from-emerald-500/10"
+      : tone === "warn"
+        ? "from-amber-500/10"
+        : tone === "bad"
+          ? "from-red-500/10"
+          : "from-slate-700/20";
+
   return (
-    <div className="relative overflow-hidden rounded-2xl border border-slate-800/60 bg-slate-950/60 shadow-[0_0_0_1px_rgba(255,255,255,0.03)]">
-      <div className="absolute inset-x-0 top-0 h-12 bg-gradient-to-b from-slate-800/30 to-transparent" />
+    <div className="relative overflow-hidden rounded-2xl border border-slate-800/70 bg-slate-950/70 shadow-[0_0_0_1px_rgba(255,255,255,0.03)]">
+      <div className={`absolute inset-x-0 top-0 h-16 bg-gradient-to-b ${toneClass} to-transparent`} />
       <div className="relative p-4">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <div className="text-xs font-medium tracking-wide text-slate-400">{title}</div>
-            <div className="mt-2">
-              {loading ? (
-                <div className="h-8 w-28 animate-pulse rounded-lg bg-slate-800/60" />
-              ) : (
-                <div className="text-2xl font-semibold text-slate-100">{value}</div>
-              )}
-            </div>
-            <div className="mt-1 text-xs text-slate-500">
-              {loading ? <div className="h-3 w-36 animate-pulse rounded bg-slate-800/50" /> : sub}
-            </div>
-          </div>
-          {right ? (
-            <div className="pt-1 text-xs text-slate-400">{right}</div>
-          ) : null}
+        <div className="text-xs font-medium tracking-wide text-slate-400">{title}</div>
+        <div className="mt-2">
+          {loading ? (
+            <div className="h-8 w-32 animate-pulse rounded-lg bg-slate-800/60" />
+          ) : (
+            <div className="text-2xl font-semibold text-slate-100">{value}</div>
+          )}
+        </div>
+        <div className="mt-1 min-h-[18px] text-xs text-slate-500">
+          {loading ? <div className="h-3 w-36 animate-pulse rounded bg-slate-800/50" /> : sub}
         </div>
       </div>
     </div>
   );
 }
 
-function ProgressRow({
-  label,
-  count,
-  total,
-  loading,
-}: {
-  label: string;
-  count: number;
-  total: number;
-  loading?: boolean;
-}) {
-  const p = total > 0 ? (count / total) * 100 : 0;
+function HealthPill({ ok, label }: { ok: boolean; label: string }) {
   return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between text-xs">
-        <div className="text-slate-300">{label}</div>
-        {loading ? (
-          <div className="h-3 w-20 animate-pulse rounded bg-slate-800/60" />
-        ) : (
-          <div className="text-slate-400">
-            {count} <span className="text-slate-600">({p.toFixed(1)}%)</span>
-          </div>
-        )}
+    <div className={`rounded-full border px-3 py-1 text-xs ${statusTone(ok)}`}>
+      {ok ? "OK" : "WARN"} {label}
+    </div>
+  );
+}
+
+function ProgressBar({ value, max, label }: { value: number; max: number; label: string }) {
+  const p = max > 0 ? Math.max(0, Math.min(100, (value / max) * 100)) : 0;
+  const tone = p >= 90 ? "bg-red-500" : p >= 70 ? "bg-amber-500" : "bg-emerald-500";
+
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between text-xs">
+        <span className="text-slate-300">{label}</span>
+        <span className="text-slate-500">
+          {money(value)} / {money(max)} · {p.toFixed(1)}%
+        </span>
       </div>
-      <div className="h-2 w-full overflow-hidden rounded-full bg-slate-900">
-        <div
-          className="h-full rounded-full bg-slate-700"
-          style={{ width: `${Math.max(0, Math.min(100, p))}%` }}
-        />
+      <div className="h-3 overflow-hidden rounded-full bg-slate-900">
+        <div className={`h-full rounded-full ${tone}`} style={{ width: `${p}%` }} />
       </div>
     </div>
   );
 }
 
-function SkeletonTable({ rows = 6 }: { rows?: number }) {
+function SkeletonTable({ rows = 5 }: { rows?: number }) {
   return (
-    <div className="space-y-2">
+    <div className="space-y-2 p-4">
       {Array.from({ length: rows }).map((_, i) => (
         <div key={i} className="h-10 w-full animate-pulse rounded-xl bg-slate-900/70" />
       ))}
@@ -146,166 +203,99 @@ function SkeletonTable({ rows = 6 }: { rows?: number }) {
 }
 
 export default function PerformancePage() {
-  const todayUtc = React.useMemo(() => utcTodayYYYYMMDD(), []);
-  const [day, setDay] = React.useState<string>(todayUtc);
-
-  const [loading, setLoading] = React.useState<boolean>(true);
+  const [status, setStatus] = React.useState<PropStatusResp | null>(null);
+  const [risk, setRisk] = React.useState<PropRiskResp | null>(null);
+  const [loading, setLoading] = React.useState(true);
   const [err, setErr] = React.useState<string | null>(null);
-  const [data, setData] = React.useState<StatsResp | null>(null);
+  const [lastUpdated, setLastUpdated] = React.useState<Date | null>(null);
 
-  const [q, setQ] = React.useState<string>("");
-  const [sortKey, setSortKey] = React.useState<
-    "symbol" | "total" | "hit" | "sl_hit" | "expired" | "win"
-  >("total");
-  const [sortDir, setSortDir] = React.useState<"asc" | "desc">("desc");
-
-  const canNext = day < todayUtc;
-
-  async function load(d: string) {
-    setLoading(true);
-    setErr(null);
+  async function load() {
     try {
+      setErr(null);
       const API_ORIGIN = (import.meta.env.VITE_API_ORIGIN || "").replace(/\/+$/, "");
-      const res = await fetch(`${API_ORIGIN}/trend/opportunities/stats?day=${encodeURIComponent(d)}`, {
 
-        method: "GET",
-        credentials: "include",
-        headers: { "Accept": "application/json" },
-      });
-      if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status} ${t || ""}`.trim());
+      const [statusRes, riskRes] = await Promise.all([
+        fetch(`${API_ORIGIN}/trend/prop/status`, {
+          method: "GET",
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        }),
+        fetch(`${API_ORIGIN}/trend/prop/risk`, {
+          method: "GET",
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        }),
+      ]);
+
+      if (!statusRes.ok) {
+        const t = await statusRes.text().catch(() => "");
+        throw new Error(`prop/status HTTP ${statusRes.status} ${t}`.trim());
       }
-      const json = (await res.json()) as StatsResp;
-      if (!json?.ok) throw new Error("API returned ok=false");
-      setData(json);
+      if (!riskRes.ok) {
+        const t = await riskRes.text().catch(() => "");
+        throw new Error(`prop/risk HTTP ${riskRes.status} ${t}`.trim());
+      }
+
+      const statusJson = (await statusRes.json()) as PropStatusResp;
+      const riskJson = (await riskRes.json()) as PropRiskResp;
+
+      if (!statusJson?.ok) throw new Error("prop/status returned ok=false");
+      if (!riskJson?.ok) throw new Error("prop/risk returned ok=false");
+
+      setStatus(statusJson);
+      setRisk(riskJson);
+      setLastUpdated(new Date());
     } catch (e: any) {
-      setData(null);
-      setErr(e?.message || "Failed to load");
+      setErr(e?.message || "Failed to load prop dashboard");
     } finally {
       setLoading(false);
     }
   }
 
-  // initial + on day change
   React.useEffect(() => {
-    load(day);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [day]);
+    load();
+    const t = window.setInterval(load, 2000);
+    return () => window.clearInterval(t);
+  }, []);
 
-  const totals = React.useMemo(() => {
-    const c = data?.counts;
-    return {
-      total: safeNum(data?.total_closed),
-      hit: safeNum(c?.hit),
-      sl: safeNum(c?.sl_hit),
-      exp: safeNum(c?.expired),
-      other: safeNum(c?.other),
-      win: data?.win_rate_vs_sl ?? null,
-    };
-  }, [data]);
+  const cfg = status?.config || risk?.config;
+  const broker = status?.broker || {};
+  const limits = status?.limits || {};
+  const rules = status?.rules || {};
+  const riskState = risk?.risk;
 
-  const rows = React.useMemo(() => {
-    const by = data?.by_symbol || {};
-    const out = Object.entries(by).map(([symbol, c]) => {
-      const hit = safeNum(c.hit);
-      const sl = safeNum(c.sl_hit);
-      const expired = safeNum(c.expired);
-      const other = safeNum(c.other);
-      const total = hit + sl + expired + other;
-      const denom = hit + sl;
-      const win = denom > 0 ? hit / denom : null;
-      return { symbol, hit, sl_hit: sl, expired, other, total, win };
-    });
+  const equity = safeNum(broker.equity);
+  const balance = safeNum(broker.balance);
+  const floating = safeNum(broker.floating_pnl);
+  const margin = safeNum(broker.margin);
+  const freeMargin = safeNum(broker.free_margin);
+  const openRisk = safeNum(riskState?.open_risk_usd);
+  const maxOpenRiskUsd = equity * (safeNum(cfg?.max_open_risk_pct) / 100);
+  const riskRoom = Math.max(0, maxOpenRiskUsd - openRisk);
+  const openPositions = riskState?.open_positions || [];
 
-    const qq = q.trim().toUpperCase();
-    const filtered = qq ? out.filter(r => r.symbol.toUpperCase().includes(qq)) : out;
-
-    const dir = sortDir === "asc" ? 1 : -1;
-    filtered.sort((a, b) => {
-      let av: any;
-      let bv: any;
-      switch (sortKey) {
-        case "symbol":
-          av = a.symbol;
-          bv = b.symbol;
-          return av.localeCompare(bv) * dir;
-        case "hit":
-          return (a.hit - b.hit) * dir;
-        case "sl_hit":
-          return (a.sl_hit - b.sl_hit) * dir;
-        case "expired":
-          return (a.expired - b.expired) * dir;
-        case "win":
-          av = a.win ?? -1;
-          bv = b.win ?? -1;
-          return (av - bv) * dir;
-        case "total":
-        default:
-          return (a.total - b.total) * dir;
-      }
-    });
-
-    return filtered;
-  }, [data, q, sortKey, sortDir]);
-
-  function toggleSort(k: typeof sortKey) {
-    if (sortKey === k) {
-      setSortDir(sortDir === "asc" ? "desc" : "asc");
-    } else {
-      setSortKey(k);
-      setSortDir("desc");
-    }
-  }
+  const brokerOk = equity > 0 && balance > 0;
+  const riskOk = maxOpenRiskUsd <= 0 || openRisk <= maxOpenRiskUsd;
+  const posOk = openPositions.length <= safeNum(cfg?.max_open_positions, 0);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-        {/* Header */}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <div className="text-2xl font-semibold tracking-tight">Performance</div>
+            <div className="text-2xl font-semibold tracking-tight">Prop Dashboard</div>
             <div className="mt-1 text-sm text-slate-400">
-              Daily outcomes from Redis <span className="text-slate-600">(UTC day)</span>
+              Broker account is source of truth for FundingPips risk sizing.
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              className="rounded-xl border border-slate-800 bg-slate-950/40 px-3 py-2 text-sm text-slate-200 hover:bg-slate-900 disabled:opacity-50"
-              onClick={() => setDay(addUtcDays(day, -1))}
-              disabled={loading}
-              title="Previous day (UTC)"
-            >
-              ? Prev
-            </button>
-
-            <div className="rounded-xl border border-slate-800 bg-slate-950/40 px-3 py-2">
-              <div className="text-[11px] text-slate-500">Day</div>
-              <input
-                type="date"
-                className="mt-1 w-[150px] bg-transparent text-sm text-slate-100 outline-none"
-                value={yyyymmddToDateInput(day)}
-                onChange={(e) => {
-                  const v = dateInputToYYYYMMDD(e.target.value);
-                  if (v) setDay(v);
-                }}
-                disabled={loading}
-              />
-            </div>
-
-            <button
-              className="rounded-xl border border-slate-800 bg-slate-950/40 px-3 py-2 text-sm text-slate-200 hover:bg-slate-900 disabled:opacity-50"
-              onClick={() => setDay(addUtcDays(day, +1))}
-              disabled={loading || !canNext}
-              title="Next day (UTC)"
-            >
-              Next ?
-            </button>
-
+            <HealthPill ok={!!cfg?.enabled} label={cfg?.enabled ? "Prop mode ON" : "Prop mode OFF"} />
+            <HealthPill ok={brokerOk} label="Broker sync" />
+            <HealthPill ok={riskOk} label="Risk room" />
             <button
               className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-white disabled:opacity-60"
-              onClick={() => load(day)}
+              onClick={load}
               disabled={loading}
             >
               Refresh
@@ -313,202 +303,136 @@ export default function PerformancePage() {
           </div>
         </div>
 
-        {/* KPI grid */}
+        {err ? (
+          <div className="mt-4 rounded-2xl border border-red-900/60 bg-red-950/30 p-4 text-sm text-red-200">
+            Failed to load dashboard: <span className="font-mono">{err}</span>
+          </div>
+        ) : null}
+
         <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Card title="Balance" value={money(balance)} sub="Broker balance" loading={loading} />
+          <Card title="Equity" value={money(equity)} sub="Used for dynamic lot sizing" tone="good" loading={loading} />
           <Card
-            title="Total Closed"
-            value={totals.total}
-            sub={<span>Outcomes logged for {day}</span>}
+            title="Floating PnL"
+            value={money(floating)}
+            sub="Live unrealized PnL"
+            tone={floating < 0 ? "bad" : floating > 0 ? "good" : "default"}
             loading={loading}
           />
+          <Card title="Free Margin" value={money(freeMargin)} sub={`Margin used: ${money(margin)}`} loading={loading} />
+        </div>
+
+        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Card title="Target" value={money(limits.target_usd)} sub={`${safeNum(rules.target_pct)}% target`} loading={loading} />
+          <Card title="Daily Loss Limit" value={money(limits.daily_limit_usd)} sub={`${safeNum(rules.daily_loss_pct)}% rule`} tone="warn" loading={loading} />
+          <Card title="Max Loss Limit" value={money(limits.max_loss_limit_usd)} sub={`${safeNum(rules.max_loss_pct)}% rule`} tone="bad" loading={loading} />
           <Card
-            title="HIT"
-            value={totals.hit}
-            sub={<span>Target reached</span>}
-            loading={loading}
-          />
-          <Card
-            title="SL Hit"
-            value={totals.sl}
-            sub={<span>Stopped out</span>}
-            loading={loading}
-          />
-          <Card
-            title="Win Rate vs SL"
-            value={pct(totals.win)}
-            sub={<span>HIT / (HIT + SL)</span>}
-            right={!loading ? <span className="text-slate-500">Expired ignored</span> : null}
+            title="Open Positions"
+            value={`${openPositions.length} / ${safeNum(cfg?.max_open_positions, 0)}`}
+            sub={posOk ? "Within configured cap" : "Above configured cap"}
+            tone={posOk ? "good" : "bad"}
             loading={loading}
           />
         </div>
 
-        {/* Breakdown */}
-        <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
-          <div className="rounded-2xl border border-slate-800/60 bg-slate-950/60 p-4 shadow-[0_0_0_1px_rgba(255,255,255,0.03)]">
+        <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-3">
+          <div className="rounded-2xl border border-slate-800/60 bg-slate-950/60 p-4 lg:col-span-2">
             <div className="flex items-center justify-between">
-              <div className="text-sm font-semibold">Outcome mix</div>
-              {!loading ? (
-                <div className="text-xs text-slate-500">Total: {totals.total}</div>
-              ) : (
-                <div className="h-3 w-20 animate-pulse rounded bg-slate-800/60" />
-              )}
+              <div>
+                <div className="text-sm font-semibold">Risk Utilization</div>
+                <div className="mt-1 text-xs text-slate-500">
+                  Max open risk = equity × {pct(cfg?.max_open_risk_pct)}
+                </div>
+              </div>
+              <div className="text-right text-xs text-slate-500">
+                Risk room
+                <div className="text-sm font-semibold text-slate-200">{money(riskRoom)}</div>
+              </div>
             </div>
 
-            <div className="mt-4 space-y-4">
-              <ProgressRow label="HIT" count={totals.hit} total={totals.total} loading={loading} />
-              <ProgressRow label="SL Hit" count={totals.sl} total={totals.total} loading={loading} />
-              <ProgressRow label="Expired" count={totals.exp} total={totals.total} loading={loading} />
-              {!loading && totals.other > 0 ? (
-                <div className="text-xs text-slate-500">
-                  Other: <span className="text-slate-300">{totals.other}</span>
-                </div>
-              ) : null}
+            <div className="mt-5">
+              <ProgressBar value={openRisk} max={maxOpenRiskUsd} label="Open risk" />
+            </div>
+
+            <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+                <div className="text-xs text-slate-500">Reserved today</div>
+                <div className="mt-1 text-lg font-semibold">{money(riskState?.daily_risk_reserved)}</div>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+                <div className="text-xs text-slate-500">Wins today</div>
+                <div className="mt-1 text-lg font-semibold">{safeNum(riskState?.wins_today, 0)}</div>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+                <div className="text-xs text-slate-500">Losses today</div>
+                <div className="mt-1 text-lg font-semibold">{safeNum(riskState?.losses_today, 0)}</div>
+              </div>
             </div>
           </div>
 
-          <div className="rounded-2xl border border-slate-800/60 bg-slate-950/60 p-4 shadow-[0_0_0_1px_rgba(255,255,255,0.03)]">
-            <div className="text-sm font-semibold">Notes</div>
-            <div className="mt-3 space-y-2 text-sm text-slate-400">
-              {loading ? (
-                <>
-                  <div className="h-4 w-5/6 animate-pulse rounded bg-slate-800/60" />
-                  <div className="h-4 w-4/6 animate-pulse rounded bg-slate-800/60" />
-                  <div className="h-4 w-3/6 animate-pulse rounded bg-slate-800/60" />
-                </>
-              ) : (
-                <>
-                  <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
-                    <div className="text-xs font-semibold text-slate-200">Win rate definition</div>
-                    <div className="mt-1 text-xs text-slate-500">
-                      <span className="text-slate-300">win_rate_vs_sl</span> =
-                      hits / (hits + sl_hit). Expired outcomes are excluded.
-                    </div>
-                  </div>
-                  <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
-                    <div className="text-xs font-semibold text-slate-200">UTC day</div>
-                    <div className="mt-1 text-xs text-slate-500">
-                      Stats are keyed by <span className="text-slate-300">YYYYMMDD (UTC)</span>.
-                      The selected day is <span className="text-slate-300">{day}</span>.
-                    </div>
-                  </div>
-                </>
-              )}
-              {err ? (
-                <div className="mt-2 rounded-xl border border-red-900/60 bg-red-950/30 p-3 text-xs text-red-200">
-                  Failed to load stats: <span className="font-mono">{err}</span>
-                </div>
-              ) : null}
+          <div className="rounded-2xl border border-slate-800/60 bg-slate-950/60 p-4">
+            <div className="text-sm font-semibold">Account</div>
+            <div className="mt-4 space-y-3 text-sm">
+              <div className="flex justify-between gap-3"><span className="text-slate-500">Firm</span><span className="text-slate-200">{cfg?.firm || "—"}</span></div>
+              <div className="flex justify-between gap-3"><span className="text-slate-500">Phase</span><span className="text-slate-200">{cfg?.phase || "—"}</span></div>
+              <div className="flex justify-between gap-3"><span className="text-slate-500">Risk per idea</span><span className="text-slate-200">{pct(cfg?.risk_pct)}</span></div>
+              <div className="flex justify-between gap-3"><span className="text-slate-500">Target RR</span><span className="text-slate-200">{num(cfg?.target_rr, 1)}R</span></div>
+              <div className="flex justify-between gap-3"><span className="text-slate-500">Leverage</span><span className="text-slate-200">{safeNum(broker.leverage, 0)}x</span></div>
+              <div className="flex justify-between gap-3"><span className="text-slate-500">Last update</span><span className="text-slate-200">{lastUpdated ? lastUpdated.toLocaleTimeString() : "—"}</span></div>
             </div>
           </div>
         </div>
 
-        {/* Table */}
-        <div className="mt-3 rounded-2xl border border-slate-800/60 bg-slate-950/60 p-4 shadow-[0_0_0_1px_rgba(255,255,255,0.03)]">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="mt-3 rounded-2xl border border-slate-800/60 bg-slate-950/60 p-4">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
             <div>
-              <div className="text-sm font-semibold">By symbol</div>
+              <div className="text-sm font-semibold">Open Prop Risk</div>
               <div className="mt-1 text-xs text-slate-500">
-                Closed outcomes grouped by symbol for the selected day.
+                Comes from <span className="font-mono text-slate-400">/trend/prop/risk</span>.
               </div>
             </div>
-
-            <div className="flex items-center gap-2">
-              <div className="rounded-xl border border-slate-800 bg-slate-950/40 px-3 py-2">
-                <div className="text-[11px] text-slate-500">Search</div>
-                <input
-                  className="mt-1 w-[220px] bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-600"
-                  placeholder="XAUUSD, EURUSD…"
-                  value={q}
-                  onChange={(e) => setQ(e.target.value)}
-                  disabled={loading}
-                />
-              </div>
+            <div className="text-xs text-slate-500">
+              Day: <span className="font-mono text-slate-300">{riskState?.day || "—"}</span>
             </div>
           </div>
 
           <div className="mt-4 overflow-hidden rounded-2xl border border-slate-800">
             {loading ? (
-              <div className="p-4">
-                <SkeletonTable rows={6} />
-              </div>
+              <SkeletonTable />
             ) : (
               <table className="w-full border-collapse text-sm">
                 <thead className="bg-slate-950/80">
                   <tr className="text-left text-xs text-slate-400">
-                    <th className="px-4 py-3">
-                      <button
-                        className="hover:text-slate-200"
-                        onClick={() => toggleSort("symbol")}
-                      >
-                        Symbol
-                      </button>
-                    </th>
-                    <th className="px-4 py-3 text-right">
-                      <button
-                        className="hover:text-slate-200"
-                        onClick={() => toggleSort("total")}
-                      >
-                        Total
-                      </button>
-                    </th>
-                    <th className="px-4 py-3 text-right">
-                      <button
-                        className="hover:text-slate-200"
-                        onClick={() => toggleSort("hit")}
-                      >
-                        HIT
-                      </button>
-                    </th>
-                    <th className="px-4 py-3 text-right">
-                      <button
-                        className="hover:text-slate-200"
-                        onClick={() => toggleSort("sl_hit")}
-                      >
-                        SL Hit
-                      </button>
-                    </th>
-                    <th className="px-4 py-3 text-right">
-                      <button
-                        className="hover:text-slate-200"
-                        onClick={() => toggleSort("expired")}
-                      >
-                        Expired
-                      </button>
-                    </th>
-                    <th className="px-4 py-3 text-right">
-                      <button
-                        className="hover:text-slate-200"
-                        onClick={() => toggleSort("win")}
-                      >
-                        Win%
-                      </button>
-                    </th>
+                    <th className="px-4 py-3">Symbol</th>
+                    <th className="px-4 py-3">Side</th>
+                    <th className="px-4 py-3 text-right">Lots</th>
+                    <th className="px-4 py-3 text-right">Risk</th>
+                    <th className="px-4 py-3 text-right">Entry</th>
+                    <th className="px-4 py-3 text-right">SL</th>
+                    <th className="px-4 py-3 text-right">TP</th>
+                    <th className="px-4 py-3">Source</th>
                   </tr>
                 </thead>
-
                 <tbody>
-                  {rows.length === 0 ? (
+                  {openPositions.length === 0 ? (
                     <tr>
-                      <td className="px-4 py-10 text-center text-slate-500" colSpan={6}>
-                        No symbols found for this day.
+                      <td className="px-4 py-10 text-center text-slate-500" colSpan={8}>
+                        No open prop risk. Account is clean.
                       </td>
                     </tr>
                   ) : (
-                    rows.map((r) => (
-                      <tr
-                        key={r.symbol}
-                        className="border-t border-slate-900/70 hover:bg-slate-900/30"
-                      >
-                        <td className="px-4 py-3 font-medium text-slate-200">
-                          {r.symbol}
+                    openPositions.map((p, idx) => (
+                      <tr key={`${p.trade_id || p.symbol || idx}`} className="border-t border-slate-900/70 hover:bg-slate-900/30">
+                        <td className="px-4 py-3 font-medium text-slate-200">{p.symbol || "—"}</td>
+                        <td className="px-4 py-3">
+                          <span className={String(p.side).toUpperCase() === "BUY" ? "text-emerald-300" : "text-red-300"}>{p.side || "—"}</span>
                         </td>
-                        <td className="px-4 py-3 text-right text-slate-200">{r.total}</td>
-                        <td className="px-4 py-3 text-right text-slate-200">{r.hit}</td>
-                        <td className="px-4 py-3 text-right text-slate-200">{r.sl_hit}</td>
-                        <td className="px-4 py-3 text-right text-slate-200">{r.expired}</td>
-                        <td className="px-4 py-3 text-right text-slate-200">
-                          {pct(r.win)}
-                        </td>
+                        <td className="px-4 py-3 text-right text-slate-200">{num(p.lots, 2)}</td>
+                        <td className="px-4 py-3 text-right text-slate-200">{money(p.risk_usd)}</td>
+                        <td className="px-4 py-3 text-right text-slate-200">{fmtPrice(p.entry)}</td>
+                        <td className="px-4 py-3 text-right text-slate-200">{fmtPrice(p.sl)}</td>
+                        <td className="px-4 py-3 text-right text-slate-200">{fmtPrice(p.tp)}</td>
+                        <td className="px-4 py-3 text-xs text-slate-500">{p.source || "—"}</td>
                       </tr>
                     ))
                   )}
@@ -516,12 +440,6 @@ export default function PerformancePage() {
               </table>
             )}
           </div>
-
-          {!loading && data ? (
-            <div className="mt-3 text-xs text-slate-500">
-              Source key: <span className="font-mono text-slate-400">xtl:outcomes:{data.uid}:{data.day}</span>
-            </div>
-          ) : null}
         </div>
       </div>
     </div>

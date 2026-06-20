@@ -1253,11 +1253,20 @@ class DevicesResp(BaseModel):
 @app.get("/worker/devices", dependencies=[Depends(require_api_key)])
 def list_devices(user_id: str):
     items: list[dict] = []
-    for key in r.scan_iter("device:*"):
-        info = r.hgetall(key)
+
+    # No Redis SCAN here. Use maintained devices set.
+    dev_ids = r.smembers(devices_set()) or []
+
+    for raw in dev_ids:
+        dev_id = _b2s(raw)
+        dev_id = str(dev_id or "").strip()
+        if not dev_id:
+            continue
+
+        info = r.hgetall(dkey(dev_id)) or {}
         if not info or info.get("user_id") != user_id:
             continue
-        dev_id = key.split(":", 1)[1]
+
         last = int(info.get("last_heartbeat") or 0)
         online = (now_ts() - last) <= 90
         pre = info.get("preflight")
@@ -1268,6 +1277,7 @@ def list_devices(user_id: str):
             "last_heartbeat": last,
             "preflight": json.loads(pre) if pre else None,
         })
+
     # online first
     items.sort(key=lambda d: (not d["online"], d["name"].lower()))
     return {"devices": items}
