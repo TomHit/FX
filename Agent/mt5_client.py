@@ -787,6 +787,24 @@ def _mt5_reconnect():
 
     _log(f"[mt5] reconnect timeout; err={_mt5_last_error()}")
     return False
+    
+def _is_trusted_broker_tz(off: int | None, source: str | None = None) -> bool:
+    try:
+        off = int(off)
+    except Exception:
+        return False
+
+    if off < -720 or off > 900:
+        return False
+
+    src = (source or "").lower()
+
+    # 330 was the historical IST/PC-time bug.
+    # Only allow 330 if it was actually auto-detected by MT5.
+    if off == 330 and src != "auto_detected":
+        return False
+
+    return src == "auto_detected"
 
 def _probe_broker_offset_min() -> int | None:
     """
@@ -831,7 +849,8 @@ def _broker_offset_min() -> int:
     # 2) probe (cheap: 1 M1 bar)
     try:
         p = _probe_broker_offset_min()
-        if p is not None and -720 <= int(p) <= 900:
+        src = _reg_read("Broker.TzSource") or ""
+        if _is_trusted_broker_tz(p, src):
             _BROKER_OFF_MIN_CACHE = int(p)
             return _BROKER_OFF_MIN_CACHE
     except Exception:
@@ -840,7 +859,9 @@ def _broker_offset_min() -> int:
     # 3) registry
     try:
         tz_name, off_min = _broker_meta_from_registry()
-        if isinstance(off_min, int):
+        src = _reg_read("Broker.TzSource") or ""
+        if _is_trusted_broker_tz(off_min, src):
+            _BROKER_OFF_MIN_CACHE = int(off_min)
             return int(off_min)
     except Exception:
         pass
@@ -854,14 +875,12 @@ def _broker_offset_min() -> int:
         pass
 
     # 5) default
-    return 0
+    raise RuntimeError("broker timezone offset is not trusted/auto_detected")
 
 def _ensure_broker_offset_fresh():
     """
-    Legacy helper: runtime auto-detection of broker TZ is DISABLED.
-
-    We now trust whatever the installer / user has written into
-    Broker.TzOffsetMin / Broker.TzName and just load it into the cache.
+    Load trusted Broker.TzOffsetMin into cache.
+    Only auto_detected broker timezone is trusted.
     """
     try:
         raw = _reg_read("Broker.TzOffsetMin")
@@ -869,18 +888,22 @@ def _ensure_broker_offset_fresh():
         raw = None
 
     if raw is None or raw == "":
-        _log("[mt5_tz] Broker.TzOffsetMin missing; please set it via installer/registry.")
+        _log("[mt5_tz] Broker.TzOffsetMin missing; waiting for auto-detection.")
         return
 
     try:
         off = int(raw)
-        if -720 <= off <= 900:
+        src = _reg_read("Broker.TzSource") or ""
+
+        if _is_trusted_broker_tz(off, src):
             global _BROKER_OFF_MIN_CACHE
             _BROKER_OFF_MIN_CACHE = off
-            _log(f"[mt5_tz] using stored broker offset {off} minutes")
+            _log(f"[mt5_tz] using trusted broker offset {off} minutes source={src}")
+        else:
+            _log(f"[mt5_tz] untrusted broker offset ignored off={off} source={src}")
+
     except Exception as e:
         _log(f"[mt5_tz] invalid Broker.TzOffsetMin '{raw}': {e}")
-
 # --- Broker timezone: detect from MT5 bars and persist to registry ---
 
 import time as _time
@@ -1085,29 +1108,39 @@ def detect_and_write_broker_tz_any(symbols: list[str]) -> None:
             if not (-720 <= best_off <= 900):
                 continue
 
-            # Persist
-            #global _BROKER_OFF_MIN_CACHE
-            #_BROKER_OFF_MIN_CACHE = int(best_off)
+            # FRESHNESS GUARD: only persist if the M1 bar is recent (market open).
+            # Stale bar (market closed) -> this symbol's offset is unreliable; try next symbol.
+            bar_age_min = (now_ms - t_close_ms) / 60_000
+            if bar_age_min > 5:
+                _log(f"[mt5_detect_tz] {base}: M1 bar stale ({bar_age_min:.0f}min) - skip, try next symbol")
+                continue
 
-            #_xtl_reg_write_all("Broker.TzOffsetMin", str(best_off))
-            #_xtl_reg_write_all("Broker.TzName", _tz_label(best_off))
+            # Persist (RE-ENABLED with freshness guard + source tag)
+            global _BROKER_OFF_MIN_CACHE
 
-            # Log broker_time to confirm
-            #try:
-            #   t_broker = datetime.fromtimestamp(t_open_sec, tz=timezone.utc).astimezone(
-            #      timezone(timedelta(minutes=best_off))
-            # ).strftime("%Y-%m-%d %H:%M:%S")
-            #_log(f"[mt5_detect_tz] {resolved}: off_min={best_off} bar_broker_time={t_broker} err_ms={int(best_err)}")
-            #except Exception:
-            #   pass
+            if not (-720 <= int(best_off) <= 900):
+                _log(f"[P0_TZ_BLOCK] ignored out-of-range detected offset={best_off}")
+                continue
 
-            #return
+            _xtl_reg_write_all("Broker.TzOffsetMin", str(int(best_off)))
+            _xtl_reg_write_all("Broker.TzName", _tz_label(int(best_off)))
+            _xtl_reg_write_all("Broker.TzSource", "auto_detected")
+            _BROKER_OFF_MIN_CACHE = int(best_off)
+            try:
+                _log("[mt5_detect_tz] verifying registry writes after auto_detected")
+                for _name in ("Broker.TzOffsetMin", "Broker.TzName", "Broker.TzSource"):
+                    _val = _reg_read(_name)
+                    _log(f"[mt5_detect_tz] verify {_name}={_val}")
+            except Exception as e:
+                _log(f"[mt5_detect_tz] verify registry failed: {e}")
+            _log(f"[mt5_detect_tz] {resolved}: DETECTED off_min={best_off} ({_tz_label(best_off)}) age={bar_age_min:.0f}min err_ms={int(best_err)}")
+            return
+
         except Exception as e:
-           _log(f"[mt5_detect_tz] {base} detection error: {e}")
-            #continue
+            _log(f"[mt5_detect_tz] {base} detection error: {e}")
+            continue
 
-    #_log("[mt5_detect_tz] unable to detect broker offset using candidates")
-
+    _log("[mt5_detect_tz] unable to detect broker offset from any candidate (market closed?)")
 # ---------- rates -> dicts ----------
 def _np_to_dicts(rates) -> List[Dict]:
     out: List[Dict] = []
@@ -1220,10 +1253,13 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
     try:
        if probe is not None and -720 <= int(probe) <= 900 and (stored_int is None or int(probe) != stored_int):
            global _BROKER_OFF_MIN_CACHE
-           _BROKER_OFF_MIN_CACHE = int(probe)
-           _xtl_reg_write_all("Broker.TzOffsetMin", str(int(probe)))
-           _xtl_reg_write_all("Broker.TzName", _tz_label(int(probe)))
-           _log(f"[mt5_tz] refreshed: stored_off={stored_int} -> probe_off={int(probe)}")
+           src = _reg_read("Broker.TzSource") or ""
+           if _is_trusted_broker_tz(probe, src):
+               _BROKER_OFF_MIN_CACHE = int(probe)
+           else:
+               _log(f"[P0_TZ_BLOCK] ignored untrusted probe offset={probe} source={src}")
+               
+               _log(f"[mt5_tz] refreshed: stored_off={stored_int} -> probe_off={int(probe)}")
     except Exception as _e:
        _log(f"[mt5_tz] refresh error: {getattr(_e,'args',_e)}")
 
@@ -1233,27 +1269,32 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
     except NameError:
         off_min_fresh = None
     if off_min_fresh is None:
-        off_min_fresh = probe if probe is not None else stored_int
-    if off_min_fresh is None:
-        off_min_fresh = 0
+        src = _reg_read("Broker.TzSource") or ""
+        if _is_trusted_broker_tz(probe, src):
+            off_min_fresh = int(probe)
+        elif _is_trusted_broker_tz(stored_int, src):
+            off_min_fresh = int(stored_int)
+        else:
+            raise RuntimeError(f"broker timezone not trusted: probe={probe} stored={stored_int} source={src}")
     try:
         _log(f"[mt5_tz] probe={probe} stored={stored_int} chosen_off={off_min_fresh}")
     except Exception:
         pass
     # If probe failed (MT5 not connected in this session), bootstrap from any good hive
+    # If probe failed, bootstrap only from trusted auto_detected hive.
     if probe is None:
         try:
             best_off, best_src = _pick_best_known_offset()
-            if isinstance(best_off, int) and -720 <= best_off <= 900:
-                _tz_bootstrap_to_identity_hive(best_off)
-                # seed cache + chosen for this call so logs/time use it now
+            src = _reg_read("Broker.TzSource") or ""
 
+            if _is_trusted_broker_tz(best_off, src):
+                _tz_bootstrap_to_identity_hive(best_off)
                 _BROKER_OFF_MIN_CACHE = int(best_off)
                 off_min_fresh = int(best_off)
-                try:
-                    _log(f"[tz_bootstrap] adopted off_min={best_off} from {best_src} (probe=None)")
-                except Exception:
-                    pass
+                _log(f"[tz_bootstrap] adopted trusted off_min={best_off} from {best_src}")
+            else:
+                _log(f"[P0_TZ_BLOCK] ignored bootstrap offset={best_off} source={src} from={best_src}")
+
         except Exception:
             pass
 

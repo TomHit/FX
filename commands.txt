@@ -1,0 +1,1831 @@
+#BEST SR
+
+
+DEV=dev_4ad056c8ad1649ecb929c771c70ac888
+curl -s -H "X-Device-Id: $DEV" "http://127.0.0.1:8000/trend/opportunities?symbols=EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,XAUUSD" \
+ | python3 -c "import sys,json
+rows=json.load(sys.stdin)['rows']
+for r in rows:
+    sr=r.get('sr') or {}
+    bs=sr.get('best_support'); br=sr.get('best_resistance')
+    print(r.get('symbol'),
+          'best_support=', (bs.get('level') if isinstance(bs,dict) else None),
+          'best_resistance=', (br.get('level') if isinstance(br,dict) else None),
+          'scored=', len(sr.get('scored_supports') or [])+len(sr.get('scored_resistances') or []),
+          'reason=', r.get('reason'))"
+************************************************************
+redis-cli --no-auth-warning -a 'xau12345' GET "xtl:zone:watch:XAUUSD:BUY:H1" \
+  | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+z=d.get('zone_used') or {}
+print('zone_source:', z.get('zone_source'))
+print('selection_model:', z.get('selection_model'))
+print('zone low/high/level:', z.get('low'), z.get('high'), z.get('level'))
+print('band_type:', z.get('band_type'), '| band_width:', z.get('band_width'))
+print('flip_source:', z.get('flip_source'), '| was_kind:', z.get('was_kind'))
+print('quality_score:', z.get('quality_score'))
+print('sr_score:', z.get('sr_score'), '| touches:', z.get('touches'), '| strength:', z.get('strength'))
+"
+******************************************************************************
+#watch stale key check
+DEV=dev_4ad056c8ad1649ecb929c771c70ac888
+
+echo "=== XAUUSD watch keys (frozen zones) ==="
+redis-cli -a xau12345 --no-auth-warning KEYS "xtl:zone:watch:XAUUSD:*"
+
+echo "=== contents (zone_used + timestamps) ==="
+for k in $(redis-cli -a xau12345 --no-auth-warning KEYS "xtl:zone:watch:XAUUSD:*"); do
+  echo "--- $k (TTL: $(redis-cli -a xau12345 --no-auth-warning TTL "$k")s) ---"
+  redis-cli -a xau12345 --no-auth-warning GET "$k" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); z=d.get('zone_used') or {}; print('zone_used low/high:',z.get('low'),z.get('high'),' state:',d.get('state'),' created/updated:',d.get('created_ms') or d.get('updated_ms') or d.get('ts_ms'))" 2>/dev/null || echo "(raw)"
+done
+
+
+*************************
+
+clean 
+#Delete all watch keys
+redis-cli -a xau12345 --scan --pattern "xtl:zone:watch:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+#Verify:
+
+redis-cli -a xau12345 --scan --pattern "xtl:zone:watch:*"
+
+Should return nothing.
+
+#2. Delete active opportunity pointers
+
+redis-cli -a xau12345 --scan --pattern "xtl:trend:opp:active:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+#Delete entry claims
+
+redis-cli -a xau12345 --scan --pattern "xtl:watch:entry_claim:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+#Delete breakout tracking state
+
+redis-cli -a xau12345 --scan --pattern "xtl:watch:break_state:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+#Delete opportunity cache
+
+redis-cli -a xau12345 --scan --pattern "xtl:oppt:cache:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+****************************************************
+
+USDCHF clean
+
+# Remove watch state
+redis-cli -a xau12345 DEL xtl:zone:watch:USDCHF:SELL:H1
+
+# Remove breakout tracking
+redis-cli -a xau12345 DEL xtl:watch:break_state:USDCHF:SELL:H1
+
+# Remove entry claim if it exists
+redis-cli -a xau12345 --scan --pattern "xtl:watch:entry_claim:USDCHF:SELL:H1:*" \
+| xargs -r redis-cli -a xau12345 DEL
+
+***********************************************************
+
+clean all symbol, claim and watch
+
+
+
+*************************************************
+
+curl -s --max-time 60 "http://127.0.0.1:8000/trend/opportunities?tf=H1&debug_gate=1" \
+  | python3 -c "
+import sys,json
+d=json.load(sys.stdin); rows=d.get('rows') or d.get('opportunities') or d
+for r in rows:
+    if (r.get('symbol') or r.get('sym'))=='XAUUSD':
+        sr=r.get('sr',{}); eg=r.get('entry_gate',{})
+        print('price:', r.get('live_price') or r.get('price'))
+        print('resolved_dir:', eg.get('resolved_dir'), '| reason:', eg.get('reason'))
+        print('actionable_cap:', eg.get('actionable_cap'))
+        print('active_supports:', len(sr.get('active_supports') or []), '| scored_supports:', len(sr.get('scored_supports') or []))
+        print('active_resistances:', len(sr.get('active_resistances') or []), '| scored_resistances:', len(sr.get('scored_resistances') or []))
+        print('nearest_support:', sr.get('nearest_support'), '| nearest_resistance:', sr.get('nearest_resistance'))
+        print('best_support:', (sr.get('best_support') or {}).get('level'), '| best_resistance:', (sr.get('best_resistance') or {}).get('level'))
+        print('--- actionable_candidates:')
+        for c in (eg.get('actionable_candidates') or []):
+            print('   ', c.get('side'), c.get('level'), 'dist', round(float(c.get('dist') or 0),2), c.get('zone_source'))
+"
+
+***********************************************************
+curl -s "http://127.0.0.1:8000/trend/opportunities?tf=H1&symbols=USDJPY&debug_gate=1" \
+| jq '.rows[0].entry_gate | {
+  reason,
+  stage,
+  dbg_pick_model,
+  dbg_pick_bar_start_ms,
+  dbg_pick_bar_close_ms,
+  picked_closed_bar,
+  touch_basis,
+  zone,
+  planned_zone,
+  zone_used
+}'
+
+*************************************************
+journalctl -u xauapi -f --no-pager \
+| grep -E "SKIP_ENTRY_FUTURE_RC|BREAK_CHECK|AFTER_CROSS|ENTRY_CAND|MT5_ENQUEUE|ERROR|Traceback"
+************************************************
+sudo systemctl status xauapi --no-pager
+
+#blank lines removal command from python files.
+
+# start (one-time)
+sudo systemctl start xauapi
+
+# auto-start on boot (once)
+sudo systemctl enable xauapi
+
+# restart after any code/env change
+sudo systemctl restart xauapi
+
+sudo systemctl cat xauapi | sed -n '1,200p'
+
+
+# if you edited the unit/override, reload then restart
+sudo systemctl daemon-reload && sudo systemctl restart xauapi
+
+# live logs
+sudo journalctl -u xauapi -f
+systemctl show xauapi --property=Environment
+sudo journalctl -u pgbouncer -n 100 --no-pager
+
+
+# last 100 log lines
+sudo journalctl -u xauapi -n 100 --no-pager
+
+sudo journalctl -u nginx -n 100 --no-pager
+sudo journalctl -u nginx -n 100 --no-pager
+# See the running process
+pgrep -a uvicorn
+
+#nginx
+sudo nginx -t && sudo systemctl reload nginx
+
+sudo nano /opt/xauapi/api/main.py
+python3 -m py_compile /opt/xauapi/api/main.py
+sudo nano /opt/xauapi/bin/xtl_worker.py
+
+ls -l /opt/xauapi/bin
+
+# quick health check (on the server)
+curl -s http://127.0.0.1:8000/health
+
+
+sudo systemctl status redis-server --no-pager
+# if needed:
+sudo systemctl start redis-server
+
+sudo systemctl status nginx --no-pager
+
+
+connect ubuntu vis powershell
+ssh ubuntu@129.159.224.89
+
+# grab ssh key 
+sudo cat /root/.ssh/id_ed25519.pub
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPryF09jO9XIdALSaIpUCuJRvRIdkUlpCarPMcTkbKEX xautrendlab
+
+sudo systemctl stop xauapi
+
+# See how the service starts (look for ExecStart/venv path)
+systemctl cat xauapi | sed -n '1,200p'
+
+VM public IP: 129.159.224.89
+
+sudo systemctl cat xauapi.service
+
+postgresql URL: DATABASE_URL=postgresql://xtl:S3cure_xTL_2025@127.0.0.1:6432/xautrendlab
+
+ubuntu@xautrendlab-api:~$ echo "$DATABASE_URL=postgresql://xtl:S3cure_xTL_2025@127.0.0.1:6432/xautrendlab"
+
+PGPASSWORD='S3cure_xTL_2025' psql \
+  -h 127.0.0.1 -p 6432 -U xtl -d xautrendlab \
+  -c '\conninfo'
+
+
+psql "$DATABASE_URL" -c '\dt public.*'
+
+ubuntu@xautrendlab-api:~$
+
+
+sudo grep -vE '^(#|$)' /etc/xauapi.env
+
+EDIT REDDIS : on ubuntu reddis run on port 6379
+sudo nano /etc/redis/redis.conf
+
+sudo systemctl restart redis-server
+sudo systemctl status redis-server --no-pager
+
+sudo ss -ltnp | grep :6379
+# should show 0.0.0.0:6379 (LISTEN)
+
+WORKER
+
+Start-ScheduledTask   -TaskName 'XauTrendLab-MT5-Worker'
+
+Get-ScheduledTask -TaskName 'XauTrendLab-MT5-Worker' | Format-List *
+Get-ScheduledTask -TaskName 'XauTrendLab-MT5-Worker' | Format-List *
+Get-Content 'D:\Algo\Gold\jobRunner\worker.log' -Tail 50 -Wait
+
+Check status
+Get-ScheduledTask -TaskName "XauTrendLab-MT5-Worker" | Get-ScheduledTaskInfo
+
+Get-ChildItem "D:\Algo\Gold\jobRunner\logs\worker_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content -Wait
+
+Kill a stuck worker (if ever needed)
+Get-Process python -ErrorAction SilentlyContinue | Where-Object {$_.Path -like "*\.venv\Scripts\python.exe"} | 
+-Process -Force
+
+
+
+Stop-ScheduledTask -TaskName "XauTrendLab-MT5-Worker"
+
+
+
+
+powrshell: 
+
+$taskName  = "XauTrendLab-MT5-Worker"
+$script    = "D:\Algo\Gold\jobRunner\start_worker.ps1"
+$startIn   = "D:\Algo\Gold\jobRunner"
+
+# Remove old copy (ignore errors)
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+$action    = New-ScheduledTaskAction -Execute "powershell.exe" `
+              -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$script`"" `
+              -WorkingDirectory $startIn
+$trigger   = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType S4U -RunLevel Highest
+
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal `
+  -Description "Start the XauTrendLab MT5 worker at boot"
+
+Test-NetConnection 129.159.224.89 -Port 6379
+# should be True
+
+
+system IP chk:
+
+(Invoke-RestMethod -Uri "https://ifconfig.me/ip").Trim()
+
+
+Ubuntu can block via nftables even if UFW says inactive. Flush both stacks (temporary—survives only until reboot):
+sudo nft list ruleset
+sudo nft flush ruleset
+
+
+sudo systemctl enable nftables --now
+sudo nft list ruleset
+
+
+health checks you can run anytime : ON VM
+# See packets arrive (you already did)
+sudo tcpdump -nn 'tcp port 6379'
+
+# See syn-recv backlog (should jump when Windows tests)
+sudo ss -nt state syn-recv sport = :6379
+
+# Test Redis locally
+redis-cli -a xau12345 -h 127.0.0.1 -p 6379 PING
+redis-cli -a xau12345 -h 10.0.0.132 -p 6379 PING
+
+redis-cli -a xau12345 -n 0 MONITOR
+
+
+
+
+sudo tee /etc/nftables.conf >/dev/null <<'EOF'
+flush ruleset
+table inet filter {
+  chain input {
+    type filter hook input priority 0;
+
+    ct state established,related accept;
+    iif lo accept;
+
+    # SSH so you don't lock yourself out
+    tcp dport 22 accept;
+
+    # Allow Redis only from your Windows public IP
+    ip saddr 122.161.49.208 tcp dport 6379 accept;
+
+    # Useful ICMP
+    icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded } accept;
+    icmpv6 type { echo-request, echo-reply, destination-unreachable, time-exceeded, packet-too-big } accept;
+
+    counter drop;
+  }
+
+  chain output  { type filter hook output  priority 0; accept; }
+  chain forward { type filter hook forward priority 0; drop;   }
+}
+EOF
+
+
+
+TUNNEL: 
+
+start tunnel:
+
+ssh -N xau-redis OR ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 `
+    -N -L 6380:127.0.0.1:6379 ubuntu@129.159.224.89
+
+ssh -N xau-redis
+
+
+Verify the tunnel (on Windows)
+
+# 1) Port is listening and owned by ssh.exe
+netstat -ano | findstr ":6380"
+
+# 2) Port test should be True
+Test-NetConnection 127.0.0.1 -Port 6380
+ Test-NetConnection 129.159.224.89 -Port 80
+ 
+ sudo tcpdump -nni any 'tcp dst port 80 and not host 169.254.169.254'
+ sudo tcpdump -nni any 'host YOUR_HOME_IP and tcp port 80'
+
+
+# 3) Redis PING via tunnel should return PONG
+redis-cli -a xau12345 -u redis://127.0.0.1:6380 ping
+
+sudo systemctl status cloudflared
+
+
+CURL:
+
+# Health
+curl -s -H "Authorization: Bearer Trendlabind@25" https://api.xautrendlab.com/healthz
+
+# Start a backtest
+curl -s -X POST https://api.xautrendlab.com/backtest \
+  -H "Authorization: Bearer Trendlabind@25" -H "Content-Type: application/json" \
+  -d '{"symbol":"XAUUSD","tz":"Asia/Kolkata","start":"2025-09-16","end":"2025-09-16","assumed_spread":0.2}'
+
+
+
+
+wizard:
+
+xtl_wizard.exe     (this file)
+MT5_worker.py      (service loop)
+nssm.exe
+provision.json     (generated by your API /worker/bundle)
+
+
+
+tight pre-build checklist you can run in PowerShell to catch issues before you make the EXE.
+
+# 0) Go to the project folder
+cd D:\Algo\Gold\wizard
+
+# 1) Make sure we’re using the intended Python + PyInstaller
+py -3 --version
+py -3 -m pip show pyinstaller
+
+# 2) Syntax check (fails fast on any parse errors)
+py -3 -X dev -W error -m py_compile .\xtl_installer.py
+
+# 3) Import smoke test + key helpers exist
+python -c "import xtl_installer as x; print('import OK'); print('agent_path =', x.agent_path())"
+python -c "import inspect, xtl_installer as x; print('autostart sig =', inspect.signature(x.install_autostart_task)); print('keepalive sig =', inspect.signature(x.install_keepalive_task))"
+
+# 4) Dry-run scheduler *with Notepad* (proves the task creation works)
+python -c "import xtl_installer as x; print('autostart->', x.install_autostart_task(r'C:\Windows\System32\notepad.exe')); print('keepalive->', x.install_keepalive_task(1, r'C:\Windows\System32\notepad.exe'))"
+
+# 5) Verify the tasks got created (query both our canonical names and the older ones)
+schtasks /Query /TN "\XTL\Worker"    /FO LIST
+schtasks /Query /TN "\XTL\KeepAlive" /FO LIST
+schtasks /Query /TN "XauTrendLab Agent (On logon)" /FO LIST
+schtasks /Query /TN "XauTrendLab KeepAlive"        /FO LIST
+
+# 6) Clean up those test tasks (so the real installer can recreate them)
+schtasks /Delete /TN "\XTL\Worker"    /F  2>$null
+schtasks /Delete /TN "\XTL\KeepAlive" /F  2>$null
+schtasks /Delete /TN "XauTrendLab Agent (On logon)" /F 2>$null
+schtasks /Delete /TN "XauTrendLab KeepAlive"        /F 2>$null
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v XTLWorker /f 2>$null
+
+# 7) Quick API reachability (should be HTTP 200 + {"ok":true})
+Invoke-WebRequest https://api.xautrendlab.com/healthz -UseBasicParsing
+
+# 8) Confirm the target install path constant looks right
+python -c "import xtl_installer as x, os; print('LOCALAPPDATA =', os.environ.get('LOCALAPPDATA')); print('APP_EXE_PATH =', x.agent_path())"
+
+INSTALLER BUILD COMMAND:  py -3.11 -m PyInstaller --onefile --noconsole --name xtl xtl.py
+
+Hard-stop the old agent and keep-alive
+ 
+ # Kill any running agent first
+Get-Process xtl -ErrorAction SilentlyContinue | Stop-Process -Force
+taskkill /IM xtl.exe /F 2>$null
+
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v XTLWorker /f
+reg delete "HKCU\Software\XauTrendLab" /f
+
+reg delete "HKCU\Software\XauTrendLab" /v ApiBase /f
+reg delete "HKCU\Software\XauTrendLab" /v DeviceId /f
+reg delete "HKCU\Software\XauTrendLab" /v DeviceToken /f
+reg delete "HKCU\Software\XauTrendLab" /v "MT5.TerminalPath" /f
+reg query HKCU\Software\XauTrendLab /v BindToken
+
+schtasks /Delete /TN "XTLWorker" /F
+
+
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "XTLWorker" -Force
+# (Elevated) if you added it under HKLM:
+Remove-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "XTLWorker" -Force
+
+
+Remove-Item -Path "HKCU:\Software\XauTrendLab" -Recurse -Force
+# Or specific values:
+Remove-ItemProperty -Path "HKCU:\Software\XauTrendLab" -Name ApiBase,DeviceId,DeviceToken,"MT5.TerminalPath" -Force
+
+
+# End + delete every legacy/new task name we used
+$tasks = @("\XTL\Worker","\XTL\KeepAlive","XauTrendLab Agent (On logon)","XauTrendLab KeepAlive")
+foreach ($t in $tasks) { schtasks /End /TN $t 2>$null; schtasks /Delete /TN $t /F 2>$null }
+
+# Remove fallback autostart (Run key)
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v XTLWorker /f 2>$null
+
+# Now you can delete the folder
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\XTL" 2>$null
+
+# stop any running agent/installer
+Get-Process xtl -ErrorAction SilentlyContinue | Stop-Process -Force
+taskkill /IM xtl.exe /F 2>$null
+
+# remove any temp PyInstaller extraction dirs (_MEI…)
+Remove-Item "$env:TEMP\_MEI*" -Recurse -Force -ErrorAction SilentlyContinue
+
+
+AGENT CHECK: 
+
+# Run KeepAlive once and show status
+schtasks /run /TN XTL-KeepAlive
+Start-Sleep -Seconds 5
+schtasks /query /TN XTL-KeepAlive /V /FO LIST
+
+# Is the agent running?
+Get-CimInstance Win32_Process | ? { $_.Name -eq 'xtl.exe' } |
+  Select ProcessId, CommandLine
+
+# Confirm Worker autostart entries
+reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v XTLWorker
+dir "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\XTL-Worker.bat"
+
+
+
+
+2. Build the EXE (onefile, windowed, includes tkinter file picker)
+
+ 
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Version 1.0.3 -AgentOneFile -InstallerOneFile -InstallLocal
+
+single file installer:
+
+# allow this one script for the current session
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+# ONEDIR (recommended for now)
+.\build.ps1 -Version 1.0.0
+
+
+# Start the agent in background (hidden)
+Start-Process -FilePath "$env:LOCALAPPDATA\XTL\xtl.exe" -ArgumentList 'run' -WindowStyle Hidden
+
+
+Output: dist\xtl.exe
+
+3. Code-sign the EXE (recommended)
+ 
+ we have to buy cert tools
+ 
+zip file:
+
+
+# 1) sanity: make sure files exist
+Get-ChildItem 'D:\Algo\Gold\wizard\dist\xtl_installer' | Format-Table Name,Length
+
+# 2) create the zip in the project root
+cd D:\Algo\Gold\wizard
+$dst = '.\xtl_installer-1.0.0.zip'
+if (Test-Path $dst) { Remove-Item $dst -Force }
+Compress-Archive -Path '.\dist\xtl_installer\*' -DestinationPath $dst -CompressionLevel Optimal -Force
+
+# 3) verify size and contents
+Get-Item $dst | Format-Table Name,Length
+tar -tf $dst | Select-Object -First 10
+
+
+ COPY FILE FROM /HOME TO DOWNLOAD FOLDER
+ 
+ sudo mv ~/xtl /opt/xauapi/dist/
+ 
+sudo mv ~/xtl.zip* /var/www/downloads/
+
+sudo mv ~/xtl_agent_1.0.2.zip* /var/www/downloads/
+
+sudo mv ~/xtl* /opt/xauapi/api/dist/
+
+sudo chown root:root /var/www/downloads/xtl_agent-1.0.0.zip*
+sudo chmod 0644 /var/www/downloads/xtl_agent-1.0.2.zip*
+
+
+sudo mv ~/xtl_installer-1.0.0.zip.sha256* /var/www/downloads/
+
+sudo chown root:root /var/www/downloads/xtl_installer-1.0.0.zip.sha256*
+sudo chmod 0644 /var/www/downloads/xtl_installer-1.0.0.zip.sha256*
+
+check sha 256 on server :
+sha256sum xtl_agent_1.0.1.zip
+
+check sha 256 on local:
+Get-FileHash .\dist\xtl_agent_1.0.1.zip -Algorithm SHA256
+
+
+DELETE FILE :
+sudo rm /var/www/downloads/xtl_installer.exe
+
+# or
+sudo rm /var/www/downloads/xtl.zip
+
+sudo rm /var/www/downloads/xtl_installer-1.0.0.zip.sha256
+sudo rm /var/www/downloads/xtl_agent_1.0.2.zip
+
+
+ls -ld /opt/xauapi/api/dist
+ls -ld /opt/xauapi/api/dist/xtl
+
+sudo rm /var/www/downloads/xtl.zip
+sudo rm /opt/xauapi/dist/xtl.exe
+
+sudo rm -rf /opt/xauapi/api/dist/xtl
+mkdir -p /opt/xauapi/api/dist
+
+
+
+Publish SHA-256 checksums
+
+(Get-FileHash dist\xtl_installer.exe -Algorithm SHA256).Hash | Out-File dist\xtl_installer.exe.sha256 -Encoding ascii
+(Get-FileHash dist\xtl_installer-1.0.0.zip -Algorithm SHA256).Hash | Out-File dist\xtl_installer-1.0.0.zip.sha256 -Encoding ascii
+
+check sha 256 match with exe installer:
+
+# 1) Read the expected hash (first token) from the .sha256 file
+EXPECTED=$(awk '{print $1}' xtl_installer-1.0.0.zip.sha256)
+
+# 2) Compute the actual hash of the ZIP you’re serving
+ACTUAL=$(sha256sum xtl_installer-1.0.0.zip | awk '{print $1}')
+
+# 3) Compare
+if [ "$ACTUAL" = "$EXPECTED" ]; then
+  echo "OK ✅ Hash matches"
+else
+  echo "❌ MISMATCH: do NOT publish/run"
+fi
+
+
+COMMANDS TO CHECK AGENT IS RUNNING OR NOT:
+# A) Confirm the agent file exists
+Test-Path "$env:LOCALAPPDATA\XTL\xtl.exe"
+Get-ChildItem "$env:LOCALAPPDATA\XTL" -Force
+
+Get-Process xtl -ErrorAction SilentlyContinue | Select Name, Id, StartTime
+
+
+# If it's missing, run your installer again with 'repair' to re-copy it:
+# & "$HOME\Downloads\xtl_installer.exe" repair
+
+# B) Start agent now (hidden)
+Start-Process -FilePath "$env:LOCALAPPDATA\XTL\xtl.exe" -ArgumentList 'run' -WindowStyle Hidden
+
+# C) Process present?
+Get-Process -Name xtl -ErrorAction SilentlyContinue
+
+# D) Registry has device + API?
+Get-ItemProperty 'HKCU:\Software\XauTrendLab' -ErrorAction SilentlyContinue | Format-List DeviceId,ApiBase,MT5*
+  
+
+
+curl -s -H "Authorization: Bearer Trendlabind@25" http://127.0.0.1:8000/healthz
+
+
+curl -s ifconfig.me
+
+
+check where domain pointed:
+
+dig +short api.xautrendlab.com
+
+
+NGINX
+
+sudo systemctl status nginx
+
+pair and download
+
+py -u .\xtl_worker.py --verbose
+
+
+
+
+When the installer opens /device-login, the server:
+
+creates a short-lived pairing code,
+
+immediately claims with that code,
+
+creates a device:{device_id} record in Redis,
+
+generates a secure device_token,
+
+returns both to the browser, which passes them to the installer via the local callback.
+
+From that moment, the worker uses device_token to talk to your API (heartbeats, jobs, uploads).
+
+
+
+ENV:
+sudo nano /etc/xauapi.env
+
+
+
+command to check installer installed:
+
+PS C:\XauTrendLab> .\xtl.exe selftest
+
+PS C:\XauTrendLab> reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v XTL_Worker
+
+PS C:\XauTrendLab> reg query HKCU\Software\XauTrendLab
+
+reg query HKCU\Software\XauTrendLab
+(If MT5 = MISSING, run C:\XauTrendLab\xtl.exe open-mt5
+
+
+live logs:
+See live logs now
+
+C:\XauTrendLab\xtl.exe run
+
+
+Verify token & device exist for THIS Windows user
+reg query HKCU\Software\XauTrendLab /v DeviceToken
+reg query HKCU\Software\XauTrendLab /v DeviceId
+
+
+ubuntu@xautrendlab-api:~$ curl -sS -X POST https://api.xautrendlab.com/mt5/test \
+  -H 'X-API-Key: Trendlabind@25' \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"dev_a56f2fd6f1ff4d4ba0da29fda34de488"}'
+{"detail":"Authentication required."}ubuntu@xautrendlab-api:~$
+
+
+USER PC check:
+
+# 1) See ALL running xtl.exe instances and where they’re launching from
+Get-CimInstance Win32_Process -Filter "name='xtl.exe'" |
+  Select-Object ProcessId, CommandLine, ExecutablePath
+
+# 2) Stop every stray instance
+Get-CimInstance Win32_Process -Filter "name='xtl.exe'" | ForEach-Object {
+  Stop-Process -Id $_.ProcessId -Force
+}
+
+# 3) Ensure autostart is ONLY the new binary via Run key
+reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v XTL_Worker
+# Should be: "C:\XauTrendLab\xtl.exe" run
+
+# If a Scheduled Task was created earlier, delete it (it may be starting the old build)
+schtasks /Delete /TN XTL_Worker /F  2>nul
+
+# 4) Start the current worker once (so it begins polling now)
+Start-Process "C:\XauTrendLab\xtl.exe" -ArgumentList "run"
+
+
+reg query HKCU\Software\XauTrendLab /v DeviceId
+
+
+https://api.xautrendlab.com/devices/dev_a56f2fd6f1ff4d4ba0da29fda34de488
+
+
+curl -sS -X POST https://api.xautrendlab.com/mt5/test \
+  -H 'X-API-Key: Trendlabind@25' \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"dev_22390875345a4bbfae672bcfdd9d2a2c"}'
+
+
+
+# Stop the API service
+sudo systemctl stop xauapi
+
+# Verify it stopped
+systemctl is-active xauapi
+systemctl status xauapi --no-pager
+
+
+
+VCN:
+vcn-20250915-1712
+
+postressql create on OCI:
+# become root-ish for the session
+sudo -s
+
+# 0) Verify swap (should show /swapfile)
+swapon --show || true
+
+# 1) Resolve your Postgres version and base dir
+PGVER=$(ls /etc/postgresql | head -n1)
+PGDIR="/etc/postgresql/$PGVER/main"
+mkdir -p "$PGDIR/conf.d"
+
+# 2) Write tuning config (safe for 1 GB RAM)
+cat > "$PGDIR/conf.d/xtl.conf" <<'EOF'
+shared_buffers = 128MB
+effective_cache_size = 256MB
+work_mem = 8MB
+maintenance_work_mem = 64MB
+max_connections = 30
+wal_compression = on
+max_wal_size = 512MB
+checkpoint_timeout = 15min
+log_min_duration_statement = 500ms
+listen_addresses = '127.0.0.1'
+EOF
+
+# 3) Ensure local auth uses md5 (password) not peer
+sed -i 's/^\(local[[:space:]]\+all[[:space:]]\+all[[:space:]]\+\)peer/\1md5/' "$PGDIR/pg_hba.conf"
+
+# 4) Restart Postgres
+systemctl restart postgresql
+systemctl status postgresql --no-pager
+
+# 5) Install/finish pgbouncer (if not already)
+apt -y install pgbouncer >/dev/null 2>&1 || true
+
+cat > /etc/pgbouncer/pgbouncer.ini <<'EOF'
+[databases]
+xautrendlab = host=127.0.0.1 port=5432 dbname=xautrendlab
+
+[pgbouncer]
+listen_addr = 127.0.0.1
+listen_port = 6432
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = session
+max_client_conn = 200
+default_pool_size = 50
+ignore_startup_parameters = extra_float_digits
+EOF
+
+# pgbouncer credentials
+echo '"xtl" "Trendlabind@25"' > /etc/pgbouncer/userlist.txt
+chown pgbouncer:pgbouncer /etc/pgbouncer/userlist.txt
+chmod 600 /etc/pgbouncer/userlist.txt
+
+systemctl enable pgbouncer
+systemctl restart pgbouncer
+systemctl status pgbouncer --no-pager
+
+# PgBouncer pools (useful to see active clients)
+psql -h 127.0.0.1 -p 6432 pgboun
+# Pools / stats
+PGPASSWORD='S3cure_xTL_2025' psql -h 127.0.0.1 -p 6432 -U xtl pgbouncer -c "SHOW POOLS;"
+PGPASSWORD='S3cure_xTL_2025' psql -h 127.0.0.1 -p 6432 -U xtl pgbouncer -c "SHOW STATS;"
+PGPASSWORD='S3cure_xTL_2025' psql -h 127.0.0.1 -p 6432 -U xtl pgbouncer -c "SHOW CLIENTS;"
+
+# Live watch (every 2s)
+watch -n2 "PGPASSWORD='S3cure_xTL_2025' psql -h 127.0.0.1 -p 6432 -U xtl pgbouncer -c 'SHOW POOLS;'"
+
+
+# avoid typing the password
+echo "127.0.0.1:6432:pgbouncer:xtl:S3cure_xTL_2025" >> ~/.pgpass && chmod 600 ~/.pgpass
+psql -h 127.0.0.1 -p 6432 -U xtl pgbouncer -c "SHOW POOLS;"
+
+# OS
+vmstat 2
+mpstat 2
+
+# 6) Smoke tests
+psql "postgresql://xtl:Trendlabind@25@127.0.0.1:5432/xautrendlab" -c "select version();"   # direct PG
+psql "postgresql://xtl:Trendlabind@25@127.0.0.1:6432/xautrendlab" -c "select now();"       # via pgbouncer
+
+# 7) (Optional) cap Redis if it's on this box
+if [ -f /etc/redis/redis.conf ]; then
+  sed -i 's/^#\?maxmemory .*/maxmemory 128mb/' /etc/redis/redis.conf
+  sed -i 's/^#\?maxmemory-policy .*/maxmemory-policy allkeys-lru/' /etc/redis/redis.conf
+  systemctl restart redis-server
+fi
+
+exit
+
+
+
+point API to DB:
+DATABASE_URL=postgresql://xtl:Trendlabind@25@127.0.0.1:6432/xautrendlab
+
+
+postgresql:
+
+# VERIFY DB USERS LIST
+sudo -u postgres psql -d xautrendlab -c \
+"select username,email,role,status,created_at from users order by created_at desc limit 5;"
+
+sudo -u postgres psql -d xautrendlab -c \
+"SELECT username,email,role,status,created_at
+ FROM users
+ WHERE status='active'
+ ORDER BY created_at DESC;"
+ 
+sudo -u postgres psql -d xautrendlab -c "SELECT COUNT(*) AS total FROM users;"
+sudo -u postgres psql -d xautrendlab -c \
+"SELECT role, COUNT(*) AS n FROM users GROUP BY role ORDER BY n DESC;"
+
+
+VERIFY MFA COMMAND: 
+PGPASSWORD="S3cure_xTL_2025" psql -h 127.0.0.1 -p 6432 -U xtl -d xautrendlab \
+  -c "select username, mfa_enabled, (mfa_secret is not null) as has_secret from users where username='admin';"
+  
+DISABLE MFA to particular users:
+
+sudo -H bash -lc '
+  export DATABASE_URL="postgresql://xtl:S3cure_xTL_2025@127.0.0.1:6432/xautrendlab"
+  /opt/xauapi/.venv/bin/python /opt/xauapi/tools/reset_mfa.py -u "dherya" --yes
+'
+
+
+DEVICE ID WITH OFFLINE/ONLINE
+sudo -u postgres psql -d xautrendlab -c "
+SELECT id,
+       now() - last_heartbeat_at AS age,
+       (now() - last_heartbeat_at > interval '120 seconds') AS is_offline
+FROM devices
+ORDER BY age DESC;"
+
+
+# list routes the app exposes
+curl -s http://127.0.0.1:8000/openapi.json | jq '.paths | keys'
+
+python3 - <<'PY'
+import secrets; print(secrets.token_urlsafe(48))
+PY
+# copy the output, then:
+sudo mkdir -p /etc/systemd/system/xauapi.service.d
+sudo bash -lc 'cat > /etc/systemd/system/xauapi.service.d/secure.conf <<EOF
+[Service]
+Environment=SESSION_SECRET=<PASTE_GENERATED_SECRET_HERE>
+EOF'
+
+
+curl -i -X OPTIONS "https://api.xautrendlab.com/user/login" \
+  -H "Origin: https://app.xautrendlab.com" \
+  -H "Access-Control-Request-Method: POST"
+  
+  CREATE USER:
+  
+sudo -H bash -lc '
+  export PYTHONPATH=/opt/xauapi
+  export DATABASE_URL="postgresql://xtl:S3cure_xTL_2025@127.0.0.1:6432/xautrendlab"
+  /opt/xauapi/.venv/bin/python /opt/xauapi/tools/create_user.py \
+    -u "BJ" -e "test@gmail.com" --role user --password "BJ"
+'
+
+	
+	
+UPDATE USER
+
+sudo -H bash -lc '
+  export PYTHONPATH=/opt/xauapi
+  export DATABASE_URL="postgresql://xtl:S3cure_xTL_2025@127.0.0.1:6432/xautrendlab"
+  /opt/xauapi/.venv/bin/python /opt/xauapi/tools/create_user.py \
+    -u payal -e payal@example.com --role admin --update
+	'
+
+'
+
+DELETE USER:
+
+sudo -H bash -lc '
+  export DATABASE_URL="postgresql://xtl:S3cure_xTL_2025@127.0.0.1:6432/xautrendlab"
+  export REDIS_URL="redis://:xau12345@127.0.0.1:6379/0"
+  /opt/xauapi/.venv/bin/python /opt/xauapi/tools/nuke_user.py -u "payal" --yes
+'
+
+
+DISABLE MFA to particular users:
+
+
+
+sudo -H bash -lc '
+  export DATABASE_URL="postgresql://xtl:S3cure_xTL_2025@127.0.0.1:6432/xautrendlab"
+  /opt/xauapi/.venv/bin/python /opt/xauapi/tools/reset_mfa.py -u "test" --disable --print-otpauth --yes
+'
+
+ENABLE MFA:
+
+sudo -H bash -lc '
+  export DATABASE_URL="postgresql://xtl:S3cure_xTL_2025@127.0.0.1:6432/xautrendlab"
+  /opt/xauapi/.venv/bin/python /opt/xauapi/tools/reset_mfa.py -u "admin" --enable --print-otpauth --yes
+'
+
+
+RESET USER MFA:
+
+sudo -H bash -lc '
+  export DATABASE_URL="postgresql://xtl:S3cure_xTL_2025@127.0.0.1:6432/xautrendlab"
+  /opt/xauapi/.venv/bin/python /opt/xauapi/tools/reset_mfa.py -u "admin" --reset --yes
+'
+
+
+PGPASSWORD="S3cure_xTL_2025" psql -h 127.0.0.1 -p 6432 -U xtl -d xautrendlab -v USERNAME='admin' -c "
+BEGIN;
+  SELECT id, username, mfa_enabled, (mfa_secret IS NOT NULL) AS has_secret FROM users WHERE username = :'USERNAME' FOR UPDATE;
+  UPDATE users
+     SET mfa_enabled = FALSE,
+         mfa_secret = NULL,
+         mfa_temp_secret = NULL,
+         mfa_temp_set_at = NULL
+   WHERE username = :'USERNAME';
+  SELECT id, username, mfa_enabled, (mfa_secret IS NOT NULL) AS has_secret FROM users WHERE username = :'USERNAME';
+COMMIT;
+"
+
+
+VERIFY COMMAND: 
+PGPASSWORD="S3cure_xTL_2025" psql -h 127.0.0.1 -p 6432 -U xtl -d xautrendlab \
+  -c "select username, mfa_enabled, (mfa_secret is not null) as has_secret from users where username='admin';"
+  
+PGPASSWORD="S3cure_xTL_2025" psql -h 127.0.0.1 -p 6432 -U xtl -d xautrendlab \
+  -c "SELECT id, username, email FROM users WHERE id=123;"
+
+
+# List any rows that match either the username or the email used to log in
+PGPASSWORD="S3cure_xTL_2025" psql -h 127.0.0.1 -p 6432 -U xtl -d xautrendlab -c "
+SELECT id, username, email, status, mfa_enabled
+FROM users
+WHERE lower(username) = lower('payal')
+   OR lower(email)    = lower('payal')
+   OR lower(email)    = lower('payal@example.com');
+"
+
+
+FIND REDIS PAAWORD 
+
+# Check your app env file if you use it
+sudo grep -i REDIS_URL /etc/xauapi.env
+
+# Or search the repo for a REDIS setting
+grep -R "REDIS_URL" /opt/xauapi || true
+
+# Or read redis.conf for 'requirepass'
+sudo grep -i 'requirepass' /etc/redis/redis.conf
+
+
+Verify config (device linked) & tasks
+
+# a) Device registry keys (one of these keys will exist)
+Get-ItemProperty 'HKCU:\Software\XauTrendLab' -ErrorAction SilentlyContinue | Format-List DeviceId,ApiBase,BrokerTZName,
+Get-ItemProperty 'HKCU:\Software\XTL'          -ErrorAction SilentlyContinue | Format-List DeviceId,ApiBase
+
+# b) Tasks exist?
+schtasks /Query /TN "XauTrendLab Agent (On logon)" /V /FO LIST
+schtasks /Query /TN "XauTrendLab KeepAlive"        /V /FO LIST
+
+
+DB:
+
+sudo -u postgres psql -d xautrendlab -c "SELECT id,name FROM roles ORDER BY name;"
+sudo -u postgres psql -d xautrendlab -c "SELECT id,label FROM pages ORDER BY id;"
+sudo -u postgres psql -d xautrendlab -c "
+ SELECT r.name AS role, p.id AS page, can_view, can_write
+  FROM role_page_perms rp
+  JOIN roles r ON r.id=rp.role_id
+  JOIN pages p ON p.id=rp.page_id
+  ORDER BY r.name, p.id;"
+  
+ 
+command to verify existing db tables.
+sudo -u postgres psql -d xautrendlab -c "\dt+"
+
+sudo -u postgres psql -d xautrendlab -c "\d+ user_download_tokens"
+sudo -u postgres psql -d xautrendlab -c "\d+ devices"
+sudo -u postgres psql -d xautrendlab -c "\d+ device_claims"
+sudo -u postgres psql -d xautrendlab -c "\d+ auth_identities"
+
+
+
+admin ID- c81c88d8-fc45-4ea1-b03c-0a1525c65cbe
+USER ID- 746d574e-67f6-42c7-a007-c1bbd7c6cbdc
+
+
+# 2) Who owns the device?  (replace DEV_ID with one from the first query)
+ 
+Single device by ID
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT name FROM devices where id='dev_15a5ce3ddd6c430b9a6937556376cd1c';"
+
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT username,id FROM users where username='dherya';"
+
+SELECT * FROM users where username='dherya';"
+
+
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT token FROM user_download_tokens where user_id='f3a3cf2e-6095-495c-a5fd-94227948cd3a' ORDER BY created_at DESC
+LIMIT 1;"
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT * FROM users where username='dherya';"
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT * FROM users ;"
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT
+  id, username, email, mfa_enabled,
+  convert_from(mfa_secret, 'SQL_ASCII') AS mfa_secret_text
+FROM users
+WHERE username='dherya';
+"
+
+
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT id,
+       now() - last_heartbeat_at AS age,
+       (now() - last_heartbeat_at > interval '120 seconds') AS is_offline
+FROM devices
+ORDER BY age DESC;"
+
+
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT column_name, data_type, is_nullable, column_default
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'user'
+ORDER BY ordinal_position;"
+
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT
+  d.id                         AS device_id,
+  d.name                       AS device_name,
+  d.status                     AS device_status,
+  d.user_id                    AS device_user_id_text,
+  u.id                         AS user_id_uuid,
+  u.username,
+  u.email,
+  d.last_heartbeat_at,
+  now() - COALESCE(d.last_heartbeat_at, d.updated_at) AS hb_age,
+  (now() - COALESCE(d.last_heartbeat_at, d.updated_at) <= interval '10 minutes') AS is_running
+FROM devices d
+LEFT JOIN users u
+  ON u.id::text = d.user_id            -- devices.user_id is text; users.id is uuid
+ORDER BY d.last_heartbeat_at DESC NULLS LAST, d.updated_at DESC NULLS LAST
+LIMIT 50;
+"
+
+Single device detail (by id)
+
+
+DEV_ID='dev_15a5ce3ddd6c430b9a6937556376cd1c'  # <- set this
+sudo -u postgres psql -d xautrendlab -v dev="$DEV_ID" -c "
+SELECT
+  d.id AS device_id,
+  d.user_id,
+  u.id AS user_id_uuid,
+  u.username,
+  u.email,
+  d.status,
+  d.last_heartbeat_at,
+  now() - COALESCE(d.last_heartbeat_at, d.updated_at) AS hb_age,
+  (now() - COALESCE(d.last_heartbeat_at, d.updated_at) <= interval '10 minutes') AS is_running
+FROM devices d
+LEFT JOIN users u ON u.id::text = d.user_id
+WHERE d.id = 'dev';
+"
+
+device with no matching users:
+sudo -u postgres psql -d xautrendlab -c "
+SELECT d.id AS device_id, d.user_id, d.status, d.last_heartbeat_at,
+       now() - COALESCE(d.last_heartbeat_at, d.updated_at) AS hb_age
+FROM devices d
+LEFT JOIN users u ON u.id::text = d.user_id
+WHERE u.id IS NULL
+ORDER BY d.updated_at DESC NULLS LAST
+LIMIT 50;
+"
+
+verify device status:
+sudo -u postgres psql -d xautrendlab -c "
+SELECT id, user_id, status, last_heartbeat_at
+FROM devices
+WHERE id = 'dev_9245cd0ac05446569f11a466be978ab0';
+"
+
+ATTACH DEVICE TO USER:
+
+# 
+DEV_ID='dev_9245cd0ac05446569f11a466be978ab0'
+USER_UUID='f3a3cf2e-6095-495c-a5fd-94227948cd3a'
+
+# preview
+sudo -u postgres psql -d xautrendlab -c "
+SELECT id AS device_id, user_id, status, last_heartbeat_at, updated_at
+FROM devices
+WHERE id = '$DEV_ID';
+"
+
+# attach (and bump updated_at)
+sudo -u postgres psql -d xautrendlab -c "
+UPDATE devices
+SET user_id = '$USER_UUID', updated_at = now()
+WHERE id = '$DEV_ID'
+RETURNING id AS device_id, user_id, status, updated_at;
+"
+
+# verify join to users
+sudo -u postgres psql -d xautrendlab -c "
+SELECT d.id AS device_id, d.user_id, u.username, u.email, d.status, d.last_heartbeat_at
+FROM devices d
+LEFT JOIN users u ON u.id::text = d.user_id
+WHERE d.id = '$DEV_ID';
+"
+
+which device attach to user:
+
+sudo -u postgres psql -d xautrendlab -c '
+SELECT
+  d.id               AS device_id,
+  d.user_id,
+  u.username,
+  u.email,
+  d.status,
+  d.last_heartbeat_at,
+  d.device_token
+FROM devices d
+JOIN users u
+  ON u.id::text = d.user_id
+WHERE u.username = '\''dherya'\''
+ORDER BY d.last_heartbeat_at DESC NULLS LAST;
+'
+
+sudo -u postgres psql -d xautrendlab -c '
+SELECT
+  d.id               AS device_id,
+  d.device_token
+FROM devices d
+JOIN users u
+  ON u.id::text = d.user_id
+WHERE u.username = '\''dherya'\''
+ORDER BY d.last_heartbeat_at DESC NULLS LAST;
+'
+
+
+
+FIX INSTALLER UTF-8 :
+
+# === Recode xtl_installer.py to UTF-8 (no BOM) and normalize CP1252 punctuation ===
+$target = 'D:\Algo\Gold\wizard\xtl_installer.py'
+if (!(Test-Path $target)) { throw "File not found: $target" }
+
+# Backup
+Copy-Item $target "$target.bak" -Force
+
+# Encodings
+$Utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)  # no BOM, throw on invalid
+$Utf8NoBom  = New-Object System.Text.UTF8Encoding($false)         # no BOM, no throw
+$Cp1252     = [Text.Encoding]::GetEncoding(1252)
+
+# Decode: strict UTF-8, else cp1252
+$bytes = [IO.File]::ReadAllBytes($target)
+try { $text = $Utf8Strict.GetString($bytes) } catch { $text = $Cp1252.GetString($bytes) }
+
+# Normalize notorious cp1252 punctuation (— – ‘ ’ “ ” …) to ASCII
+$text = $text `
+  -replace "\u2014","-" `
+  -replace "\u2013","-" `
+  -replace "[\u2018\u2019]","'" `
+  -replace "[\u201C\u201D]",'"' `
+  -replace "\u2026","..."
+
+# Ensure coding cookie on line 1 or 2 (after shebang if present)
+$lines  = $text -split "(`r`n|`n|`r)"
+$cookie = "# -*- coding: utf-8 -*-"
+$hasTop = ($lines.Count -ge 1 -and $lines[0] -match "coding:\s*utf-8") -or
+          ($lines.Count -ge 2 -and $lines[1] -match "coding:\s*utf-8")
+if (-not $hasTop) {
+  if ($lines[0].StartsWith("#!")) { $lines = @($lines[0], $cookie) + $lines[1..($lines.Count-1)] }
+  else { $lines = @($cookie) + $lines }
+}
+
+# Normalize EOLs to CRLF and save as UTF-8 (no BOM)
+$t = ($lines -join "`n") -replace "`r`n","`n" -replace "`r","`n"
+$t = $t -replace "`n","`r`n"
+[IO.File]::WriteAllText($target, $t, $Utf8NoBom)
+
+# Verify strict UTF-8 now passes
+[void]$Utf8Strict.GetString([IO.File]::ReadAllBytes($target))
+Write-Host "OK: Rewrote as UTF-8 -> $target"
+
+
+
+
+VERIFY:
+# Look for any remaining em-dashes or curly quotes
+Select-String -Path .\*.py -Pattern '—|–|“|”|‘|’' -List
+
+# Spot-check the installer file bytes (should NOT show 0x97)
+Format-Hex .\xtl_installer.py | Select-Object -First 3
+
+You should see the file start with:
+
+23 20 2D 2A 2D 20 63 6F 64 69 6E 67 3A 20 75 74   # -*- coding: ut
+66 2D 38 20 2D 2A 2D 0D 0A ...
+
+CLEAN AND REBUILD:
+Remove-Item .\build,.\dist,.\__pycache__ -Recurse -Force -ErrorAction SilentlyCon
+
+# If your build.ps1 expects ONEDIR, do:
+py -3.11 -m pip install --upgrade pyinstaller
+py -3.11 -m PyInstaller -D --noconsole -n xtl .\xtl_installer.py
+
+# or let your wrapper run PyInstaller if xtl.spec is present:
+.\build.ps1 -Version 1.0.0
+
+
+
+# --- Build XTL OneDir with MetaTrader5 bundled and produce a ZIP ---
+
+# --- XTL: compile -> build -> package -> install/start (self-installing agent) ---
+
+param(
+  [string]$Spec    = ".\xtl_installer.spec",
+  [string]$Version = "1.0.2"
+)
+
+$ErrorActionPreference = "Stop"
+Write-Host "== XTL pipeline start =="
+
+# 0) Clean old outputs + bytecode
+Write-Host "[clean] build/, dist/, __pycache__"
+Remove-Item .\build,.\dist,.\__pycache__ -Recurse -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Recurse -Include *.pyc,__pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+# 1) Compile only the key files (fail fast)
+Write-Host "[compile] mt5_client, agent_ohlc, xtl_installer,agent_price"
+python -m py_compile .\xtl\mt5_client.py .\xtl\agent_ohlc.py .\xtl_installer.py .\xtl\agent_price.py
+if ($LASTEXITCODE -ne 0) { throw "❌ Python compile failed. Fix errors above." }
+
+# 1b) Quick import check for package modules only (safe)
+Write-Host "[import-check] xtl.mt5_client, xtl.agent_ohlc,xtl.agent_price"
+$env:PYTHONPATH = (Get-Location).Path
+$importFile = Join-Path $env:TEMP ("xtl_import_check_{0}.py" -f (Get-Random))
+@'
+import importlib, sys
+sys.path.insert(0, r".")
+importlib.import_module("xtl.mt5_client")
+importlib.import_module("xtl.agent_ohlc")
+importlib.import_module("xtl.agent_price")
+print("✅ imports OK")
+'@ | Set-Content -Encoding ASCII $importFile
+python $importFile
+Remove-Item $importFile -Force -ErrorAction SilentlyContinue
+if ($LASTEXITCODE -ne 0) { throw "❌ Import check failed. Fix errors above." }
+
+# 2) Build
+Write-Host "[build] pyinstaller $Spec"
+pyinstaller $Spec --noconfirm --clean --log-level=INFO
+if ($LASTEXITCODE -ne 0) { throw "❌ PyInstaller failed. See console log." }
+
+# 2b) Stage extras into the output folder so they end up in the ZIP
+$OutDir = Join-Path (Get-Location) "dist\xtl"
+if (-not (Test-Path $OutDir)) { throw "❌ Expected output folder not found: $OutDir" }
+
+# Normalize: if PyInstaller produced xtl.bin, rename to xtl.exe
+$binPath = Join-Path $OutDir "xtl.bin"
+$exePath = Join-Path $OutDir "xtl.exe"
+if (Test-Path $binPath) {
+  try { Rename-Item $binPath -NewName "xtl.exe" -Force } catch { throw "❌ Failed to rename xtl.bin -> xtl.exe: $($_.Exception.Message)" }
+}
+
+# Generate Run-XTL.bat (elevates, unblocks, installs & starts)
+$runBat = @'
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+cd /d "%~dp0"
+
+set "LOG=%TEMP%\xtl_install_bootstrap.log"
+echo ==== %date% %time% Run-XTL.bat start ====>>"%LOG%"
+echo cwd=%cd%>>"%LOG%"
+
+REM --- Elevate to Admin (UAC) ---
+>nul 2>&1 net session
+if not "%errorlevel%"=="0" (
+  echo Elevating via PowerShell...>>"%LOG%"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Start-Process -FilePath '%~f0' -Verb RunAs"
+  set "rc=%errorlevel%"
+  echo Elevation spawn rc=%rc%>>"%LOG%"
+  if not "%rc%"=="0" (
+    echo ERROR: Elevation failed (rc=%rc%).>>"%LOG%"
+    echo Elevation failed. See %LOG%
+    pause
+  )
+  exit /b
+)
+
+echo Running as admin.>>"%LOG%"
+
+REM --- Normalize binary ---
+if not exist "xtl.exe" if exist "xtl.bin" (
+  echo Renaming xtl.bin -> xtl.exe>>"%LOG%"
+  ren "xtl.bin" "xtl.exe"
+)
+
+if not exist "xtl.exe" (
+  echo ERROR: xtl.exe/xtl.bin not found beside this script.>>"%LOG%"
+  echo ERROR: xtl.exe/xtl.bin not found beside this script.
+  pause & exit /b 1
+)
+
+REM --- Unblock 'downloaded from internet' mark ---
+echo Unblocking xtl.exe>>"%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "if (Get-Command Unblock-File -EA SilentlyContinue) { Unblock-File -Path '%~dp0xtl.exe' }"
+
+REM --- Install + start service ---
+echo Running install...>>"%LOG%"
+"%~dp0xtl.exe" install >>"%LOG%" 2>&1
+if errorlevel 1 (
+  echo INSTALL FAILED (see %LOG%).>>"%LOG%"
+  echo INSTALL FAILED. See %LOG%
+  pause & exit /b 1
+)
+
+echo Starting service...>>"%LOG%"
+"%~dp0xtl.exe" start >>"%LOG%" 2>&1
+if errorlevel 1 (
+  echo START FAILED (see %LOG%).>>"%LOG%"
+  echo START FAILED. See %LOG%
+  pause & exit /b 1
+)
+
+echo SUCCESS: XTL installed and started.>>"%LOG%"
+echo Log: C:\Program Files\XTL\dist\xtl\xtl_agent.log>>"%LOG%"
+echo Success. Bootstrap log: %LOG%
+pause
+'@
+
+# Write the batch with Windows line endings and ASCII (safe)
+$runBatPath = Join-Path $OutDir "Run-XTL.bat"
+Get-ChildItem -Path $OutDir -Filter "Run-XTL*" -File | Remove-Item -Force -ErrorAction SilentlyContinue
+Set-Content -LiteralPath $runBatPath -Encoding ASCII -Value $runBat
+
+# Optionally copy auxiliary files if you ship them
+# (Pick ONE WinSW binary if multiple exist alongside the script)
+$winswCandidates = @("WinSW-x64.exe","winsw.exe","XTLAgent.exe")
+$winswPick = $null
+foreach ($w in $winswCandidates) {
+  if (Test-Path $w) { $winswPick = $w; break }
+}
+if ($winswPick) {
+  Copy-Item -LiteralPath $winswPick -Destination $OutDir -Force
+} else {
+  Write-Warning "[warn] No WinSW binary found beside the build script; service creation may fail on target."
+}
+
+# Copy remaining extras if present
+$extras = @("VC_redist.x64.exe","README.txt")
+foreach ($f in $extras) {
+  if (Test-Path $f) {
+    try {
+      Copy-Item -LiteralPath $f -Destination $OutDir -Force
+    } catch {
+      Write-Warning ("[warn] Failed to copy {0}: {1}" -f $f, $_.Exception.Message)
+      # or: Write-Warning "[warn] Failed to copy ${f}: $($_.Exception.Message)"
+    }
+  }
+}
+
+
+# Optional: unblock everything in OutDir (helps with SmartScreen / MOTW)
+Get-ChildItem -LiteralPath $OutDir -Recurse -Force | ForEach-Object {
+  try { Unblock-File $_.FullName -ErrorAction SilentlyContinue } catch {}
+}
+
+
+# 3) Sanity
+$OutDir = Join-Path (Get-Location) "dist\xtl"
+$Exe    = Join-Path $OutDir "xtl.exe"
+if (-not (Test-Path $Exe)) { throw "❌ Build failed: dist\xtl\xtl.exe not found" }
+
+# Ensure WinSW exists
+$winswOk = (Test-Path (Join-Path $OutDir 'WinSW-x64.exe')) -or (Test-Path (Join-Path $OutDir 'winsw.exe')) -or (Test-Path (Join-Path $OutDir 'XTLAgent.exe'))
+if (-not $winswOk) { Write-Warning "[warn] WinSW binary not found in $OutDir (service creation may fail)" }
+
+
+# Make _internal mandatory (if your runtime needs it)
+if (-not (Test-Path (Join-Path $OutDir "_internal"))) { throw "❌ _internal missing (check spec or build log)" }
+
+Write-Host "[ok] built: $Exe"
+
+# 3a) Paths
+$OutDir = Join-Path (Get-Location) "dist\xtl"
+$InternalCertDir = Join-Path $OutDir "_internal\certifi"
+New-Item -ItemType Directory -Force -Path $InternalCertDir | Out-Null
+
+# 3b) Ask Python for certifi’s bundle path
+$certPath = & python -c "import certifi, sys; sys.stdout.write(certifi.where())"
+if (-not $certPath) { throw "certifi.where() returned empty. Is certifi installed in the build env?" }
+if (-not (Test-Path $certPath)) { throw "certifi bundle not found at: $certPath" }
+
+# 3c) Copy into your package
+$dstPem = Join-Path $InternalCertDir "cacert.pem"
+Copy-Item -LiteralPath $certPath -Destination $dstPem -Force
+
+# 3d) Sanity check (should be > 100000 bytes)
+$len = (Get-Item $dstPem).Length
+if ($len -lt 100000) { throw "cacert.pem too small ($len bytes) at $dstPem" }
+Write-Host ("[ok] cert bundle staged -> {0} (size={1} bytes)" -f $dstPem, $len)
+
+# 3e) (Optional) ensure the service account can read it
+try { icacls $InternalCertDir /grant "NT AUTHORITY\SYSTEM:(R)" /T | Out-Null } catch {}
+
+
+
+
+# 4) Package for frontend download  (safe, no tzdata locks)
+$Zip    = ".\dist\xtl_agent_$Version.zip"
+$Stage  = ".\dist\_stage_xtl"
+$OutDir = ".\dist\xtl"
+
+Write-Host "[stage] preparing staging folder to avoid lock issues..."
+Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+
+# Kill any leftover xtl/python processes that may still hold tzdata
+Get-Process xtl -ErrorAction SilentlyContinue      | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process python,py,pyw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -ErrorAction SilentlyContinue | Where-Object {
+  $_.Path -and $_.Path.StartsWith((Resolve-Path $OutDir))
+} | Stop-Process -Force -ErrorAction SilentlyContinue
+
+Write-Host "[mirror] copying dist\xtl -> $Stage"
+robocopy $OutDir $Stage /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+if ($LASTEXITCODE -gt 1) { throw "robocopy failed with code $LASTEXITCODE" }
+
+# Zip from the *stage* folder (static snapshot)
+if (Test-Path $Zip) { Remove-Item $Zip -Force -ErrorAction SilentlyContinue }
+Write-Host "[zip] -> $Zip"rm
+tar -a -c -f $Zip -C (Split-Path $Stage -Parent) (Split-Path $Stage -Leaf)
+
+if (-not (Test-Path $Zip)) { throw "❌ ZIP not created (tar failed)" }
+
+# Compute hash
+(Get-FileHash $Zip -Algorithm SHA256).Hash | Out-File "$Zip.sha256" -Encoding ascii
+Write-Host "[ok] checksum: $((Get-Content "$Zip.sha256"))"
+
+# Clean up temporary stage
+Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+
+
+# 5) (Disabled) Install/Repair service from freshly built folder
+Write-Host "[install] skipped during build (package does not self-install)"
+# (no Start-Process xtl.exe here)
+
+# 6) (Disabled) Verify service
+Write-Host "[verify] skipped (no service install during build)"
+
+**************************************************************************
+latest build steps:
+
+1. cd D:\Algo\Gold\wizard
+
+2. .\build_xtl.ps1 -Version "1.0.2"
+
+once step 2 done then run step 3
+
+3. Deploy latest build to Program Files
+$SRC = "D:\Algo\Gold\wizard\dist\xtl"
+$DST = "C:\Program Files\XTL\dist\xtl"
+
+& "$DST\XTLAgent.exe" stop
+Start-Sleep -Seconds 3
+
+robocopy $SRC $DST /MIR /NFL /NDL /NJH /NJS /NP
+if ($LASTEXITCODE -gt 1) { throw "robocopy deploy failed: $LASTEXITCODE" }
+
+$srcExe = Get-Item "$SRC\xtl.exe"
+$dstExe = Get-Item "$DST\xtl.exe"
+
+if ($srcExe.Length -ne $dstExe.Length) {
+    throw "Install failed: xtl.exe size mismatch. SRC=$($srcExe.Length), DST=$($dstExe.Length)"
+}
+
+& "$DST\XTLAgent.exe" start
+
+Write-Host "✅ XTL deployed and started"
+
+4. Verify installed exe
+
+Get-Item "D:\Algo\Gold\wizard\dist\xtl\xtl.exe" | Select FullName,Length,LastWriteTime
+Get-Item "C:\Program Files\XTL\dist\xtl\xtl.exe" | Select FullName,Length,LastWriteTime
+
+5. Verify Redis
+
+redis-cli -a xau12345 --scan --pattern "xtl:ohlc:snap:dev_fe64a5e1442b4d409e009d1f5a9b07b6:XAUUSD:*" | sort
+
+
+
+
+*************************************************************************
+clean resistry
+
+# HKCU
+reg delete "HKCU\Software\XTL" /v "Broker.TzOffsetMin" /f
+reg delete "HKCU\Software\XTL" /v "Broker.TzName" /f
+reg delete "HKCU\Software\XTL" /v "Broker.TzSource" /f
+
+# HKLM
+reg delete "HKLM\Software\XTL" /v "Broker.TzOffsetMin" /f
+reg delete "HKLM\Software\XTL" /v "Broker.TzName" /f
+reg delete "HKLM\Software\XTL" /v "Broker.TzSource" /f
+
+# LocalSystem hive
+reg delete "HKU\S-1-5-18\Software\XTL" /v "Broker.TzOffsetMin" /f
+reg delete "HKU\S-1-5-18\Software\XTL" /v "Broker.TzName" /f
+reg delete "HKU\S-1-5-18\Software\XTL" /v "Broker.TzSource" /f
+
+
+
+reg query "HKLM\Software\XTL" /v "Broker.TzOffsetMin"
+reg query "HKLM\Software\XTL" /v "Broker.TzSource"
+reg query "HKU\S-1-5-18\Software\XTL" /v "Broker.TzOffsetMin"
+reg query "HKU\S-1-5-18\Software\XTL" /v "Broker.TzSource"
+
+************************************************************
+
+#1. 
+cd D:\Algo\Gold\wizard
+python -m py_compile .\xtl\mt5_client.py .\xtl\agent_ohlc.py .\xtl_installer.py .\xtl\agent_price.py
+
+#2. 
+Remove-Item .\build,.\dist,.\__pycache__ -Recurse -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Recurse -Include *.pyc,__pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+#3. 
+pyinstaller .\xtl_installer.spec --noconfirm --clean --log-level=INFO
+
+# 4) Package for frontend download  (safe, no tzdata locks)
+$Zip    = ".\dist\xtl_agent_$Version.zip"
+$Stage  = ".\dist\_stage_xtl"
+$OutDir = ".\dist\xtl"
+
+Write-Host "[stage] preparing staging folder to avoid lock issues..."
+Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+
+Get-Process xtl -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process python,py,pyw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -ErrorAction SilentlyContinue | Where-Object {
+  $_.Path -and $_.Path.StartsWith((Resolve-Path $OutDir))
+} | Stop-Process -Force -ErrorAction SilentlyContinue
+
+Write-Host "[mirror] copying dist\xtl -> $Stage"
+robocopy $OutDir $Stage /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+if ($LASTEXITCODE -gt 1) { throw "robocopy failed with code $LASTEXITCODE" }
+
+if (Test-Path $Zip) { Remove-Item $Zip -Force -ErrorAction SilentlyContinue }
+
+Write-Host "[zip] -> $Zip"
+tar -a -c -f $Zip -C (Split-Path $Stage -Parent) (Split-Path $Stage -Leaf)
+
+if (-not (Test-Path $Zip)) { throw "❌ ZIP not created (tar failed)" }
+
+(Get-FileHash $Zip -Algorithm SHA256).Hash | Out-File "$Zip.sha256" -Encoding ascii
+Write-Host "[ok] checksum: $((Get-Content "$Zip.sha256"))"
+
+Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+
+#5
+Get-FileHash "D:\Algo\Gold\wizard\dist\xtl\xtl.exe"
+Get-FileHash "C:\Program Files\XTL\dist\xtl\xtl.exe"
+
+Get-FileHash "D:\Algo\Gold\wizard\dist\xtl\_internal\base_library.zip"
+Get-FileHash "C:\Program Files\XTL\dist\xtl\_internal\base_library.zip"
+
+
+****************************************************************************
+
+sc.exe query XTLAgent
+
+STOP AGENT
+taskkill /im xtl.exe /f
+& "$env:PROGRAMFILES\XTL\xtl.exe" stop
+
+
+.\XTLAgent.exe stop
+sc stop  XTLAgent
+
+is agent running:
+# See if a service or process looks like the agent
+Get-Service | Where-Object { $_.DisplayName -match 'xtl|trend|agent' -or $_.Name -match 'xtl|trend|agent' } | ft Name,Status,DisplayName
+Get-Process | Where-Object { $_.ProcessName -match 'xtl|agent|trend|wizard|uvicorn|python|node' } | ft Id,ProcessName,Path
+
+Restart the agent:
+
+Get-Process xtl -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# Is the Windows service installed/running?
+Get-Service xtl.exe | Format-Table Name,Status,StartType
+
+
+
+
+# Foreground run (see live logging in console):
+& "$env:PROGRAMFILES\XTL\xtl.exe" run
+
+
+
+Get-Process xtl -ErrorAction SilentlyContinue | Format-Table Id,CPU,StartTime,Path
+
+Remove the autostart entry so it doesn’t come back on next logon:
+
+DELETE REG:
+
+reg delete "HKLM\Software\XauTrendLab" /v DeviceId    /f 2>$null
+reg delete "HKLM\Software\XauTrendLab" /v DeviceToken /f 2>$null
+reg delete "HKLM\Software\XTL"         /v DeviceId    /f 2>$null
+reg delete "HKLM\Software\XTL"         /v DeviceToken /f 2>$null
+reg delete HKLM\Software\XauTrendLab /v ConfigJson
+reg delete HKLM\Software\XTL /v ConfigJson
+
+reg delete "HKU\S-1-5-18\Software\XTL" /v DeviceId /f
+reg delete "HKU\S-1-5-18\Software\XTL" /v DeviceToken /f
+reg delete "HKU\S-1-5-18\Software\XTL" /v ApiBase /f
+reg delete "HKU\S-1-5-18\Software\XTL" /v DeviceId /f 2>$null
+reg delete "HKU\S-1-5-18\Software\XTL" /v DeviceToken /f 2>$null
+reg delete "HKU\S-1-5-18\Software\XTL" /v MT5Path/f 2>$null
+
+reg delete "HKU\S-1-5-18\Software\XTL" /v Symbols/f 2>$null
+reg delete "HKU\S-1-5-18\Software\XTL" /v Timeframes/f 2>$null
+reg delete "HKU\S-1-5-18\Software\XTL" /v IncludeLatest/f 2>$null
+
+reg delete "HKU\S-1-5-18\Software\XTL" /v Symbols/f
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v XTL /f
+
+
+
+
+
+broker_tz_name broker_tz_offset_min
+
+
+Remove-ItemProperty -Path "Registry::HKEY_USERS\S-1-5-18\Software\XTL" -Name BindBackoffSec   -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "Registry::HKEY_USERS\S-1-5-18\Software\XTL" -Name BindRetryAfter   -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "Registry::HKEY_USERS\S-1-5-18\Software\XTL" -Name MT5Path          -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "Registry::HKEY_USERS\S-1-5-18\Software\XTL" -Name BindTokenStatus  -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "Registry::HKEY_USERS\S-1-5-18\Software\XTL" -Name "MT5.TerminalPath" -ErrorAction SilentlyContinue
+
+
+reset agent service disable to auto:
+
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\XTLAgent" /v Start /t REG_DWORD /d 2 /f
+sc.exe qc XTLAgent
+
+sc.exe stop XTLAgent
+sc.exe start XTLAgent
+
+bind token check:
+
+
+reg query HKCU\Software\XauTrendLab /v ApiBase
+reg query HKCU\Software\XauTrendLab /v DeviceId
+reg query HKCU\Software\XauTrendLab /v DeviceToken
+
+reg query HKCU\Software\XauTrendLab /v MT5Path
+reg query HKCU\Software\XauTrendLab /v MT5Status
+reg add HKCU\Software\XauTrendLab /v BrokerTZOffsetMin /t REG_SZ /d 180 /f
+
+reg query HKCU\Software\XauTrendLab /v BindToken
+reg query HKLM\Software\XauTrendLab /v BindToken
+reg query HKLM\Software\XauTrendLab /v ApiBase
+reg query HKLM\Software\XauTrendLab /v DeviceId
+reg query HKLM\Software\XauTrendLab /v DeviceToken
+reg query HKLM\Software\XauTrendLab /v MT5Path
+reg query HKLM\Software\XauTrendLab /v MT5Status
+
+reg query HKLM\Software\XauTrendLab /v ConfigJson
+reg query HKLM\Software\XTL /v ConfigJson
+
+# 1) Machine-wide settings (used by both accounts)
+reg query "HKLM\Software\XTL"
+
+# 2) Service runtime creds (LocalSystem’s HKCU)
+reg query "HKU\S-1-5-18\Software\XTL"
+
+
+reg query HKLM\Software\XTL /v MT5Status
+reg query HKLM\Software\XTL /v MT5Path
+
+reg query "HKU\S-1-5-18\Software\XTL" /v "MT5Path"
+reg query "HKLM\S-1-5-18\XTL" /v "MT5Path"
+
+reg query "HKCU\Software\MetaQuotes\MetaTrader 5" /s
+
+# LocalSystem hive (service account) – this is what the agent actually uses
+
+
+reg query "HKU\S-1-5-18\Software\XTL"
+
+reg delete "HKU\S-1-5-18\Software\XTL" /f
+
+
+
+
+reg query "HKU\S-1-5-18\Software\XTL" /v BindToken
+
+reg query HKLM\Software\XTL /v BindToken
+
+
+# You should see:
+#   ApiBase    REG_SZ   https://api.xautrendlab.com
+#   DeviceId   REG_SZ   <some-id>
+#   DeviceToken REG_SZ  <some-token>
+#   (optionally) BindTokenStatus / BindTokenLastError
+
+
+
+
+1) Prove MT5 returns bars for XAUUSD (on this terminal)
+
+# Creates a quick test script and runs it
+$py = @"
+import sys, time, json
+import MetaTrader5 as MT5
+from datetime import datetime, timezone, timedelta
+
+sym = "XAUUSD"
+tf  = MT5.TIMEFRAME_H1
+
+# Initialize using the MT5Path the agent has in registry (optional, but good)
+# If initialize(None) fails, try giving your terminal64.exe full path here:
+ok = MT5.initialize()
+print("MT5.initialize:", ok)
+if not ok:
+    print("last_error:", MT5.last_error())
+    sys.exit(2)
+
+# Make sure symbol is enabled in Market Watch
+MT5.symbol_select(sym, True)
+info = MT5.symbol_info(sym)
+print("symbol_info.present:", bool(info), "trade_mode:", getattr(info, "trade_mode", None))
+
+# Try fetching the last 120 closed H1 bars
+rates = MT5.copy_rates_from_pos(sym, tf, 1, 120)  # start at pos=1 to skip the forming bar
+print("bars_len:", 0 if rates is None else len(rates))
+if not rates:
+    # Try wildcard fallback: e.g., XAUUSD.m, XAUUSD.r
+    cands = MT5.symbols_get(sym+"*")
+    print("wildcards:", [c.name for c in (cands or [])])
+    if cands:
+        alt = cands[0].name
+        MT5.symbol_select(alt, True)
+        rates = MT5.copy_rates_from_pos(alt, tf, 1, 120)
+        print("fallback_alt:", alt, "bars_len:", 0 if rates is None else len(rates))
+
+MT5.shutdown()
+"@
+$fn = "$env:TEMP\xtl_mt5_probe.py"
+$py | Out-File -Encoding utf8 $fn
+python "$fn"
+
+
+************************************
+
+local machine:
+
+run backend :
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8001 --reload
+
+
+curl -s 'http://localhost:8000/trend/predict/eval/ready' | jq
+
+
+

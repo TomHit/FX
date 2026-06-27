@@ -408,6 +408,12 @@ type OppRow = {
   h4SellStatus?: string | null;
   liqText?: string | null;
   liqSignals?: string[] | null;
+  regime?: {
+    h1?: { label?: string; er?: number | null; adx?: number | null };
+    h4?: { label?: string; er?: number | null; adx?: number | null };
+    d1?: { label?: string; er?: number | null; adx?: number | null };
+    text?: string;
+  } | null;
   rangeText?: string | null;
   bslSsl?: {
     bsl?: { level: number; kind: string; swept: boolean } | null;
@@ -1125,6 +1131,7 @@ if (!srMajor && !srNearest && srLabel) srMajor = srLabel;
     liqText: (r as any)?.liq_text ?? null,
     liqSignals: Array.isArray((r as any)?.liq_signals) ? (r as any).liq_signals : null,
     rangeText: (r as any)?.range_text ?? null,
+    regime: (r as any)?.regime ?? null,
     bslSsl: (r as any)?.bsl_ssl ?? null,
     liqConfidence: (r as any)?.liq_confidence ?? null,
 
@@ -1724,7 +1731,9 @@ function OpportunitiesDashboard() {
                         )}
                         {r.liqText && r.liqText !== "—" ? (
                           <div className="flex flex-wrap gap-1">
-                            {(r.liqSignals ?? r.liqText.split(" | ")).map((sig, i) => (
+                            {(r.liqSignals ?? r.liqText.split(/\s{2,}REG\s/)[0].split(" | "))
+                              .filter((s) => s && s.trim() !== "" && !s.startsWith("REG"))
+                              .map((sig, i) => (
                               <span
                                 key={i}
                                 className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-amber-300 whitespace-nowrap"
@@ -1738,6 +1747,41 @@ function OpportunitiesDashboard() {
                             <span className="text-[11px] text-slate-600">—</span>
                           ) : null
                         )}
+                        {/* ↓↓↓ ADD THE REGIME BLOCK HERE ↓↓↓ */}
+                        {r.regime && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {([
+                              ["1H", r.regime.h1],
+                              ["4H", r.regime.h4],
+                              ["1D", r.regime.d1],
+                            ] as const).map(([tf, rg], i) => {
+                              const label = rg?.label ?? "—";
+                              const cls =
+                                label === "RANGE"
+                                  ? "bg-emerald-900/40 text-emerald-300 ring-1 ring-emerald-700/40"
+                                  : label === "TREND"
+                                  ? "bg-rose-900/40 text-rose-300 ring-1 ring-rose-700/40"
+                                  : label === "MIXED"
+                                  ? "bg-slate-800 text-slate-300"
+                                  : "bg-slate-900 text-slate-600";
+                              const emphasis = tf === "1D" ? " font-semibold" : "";
+                              return (
+                                <span
+                                  key={i}
+                                  title={
+                                    rg && rg.er != null
+                                      ? `${tf} ${label} — ER ${rg.er} / ADX ${rg.adx}`
+                                      : `${tf} ${label}`
+                                  }
+                                  className={`rounded-full px-2 py-0.5 text-[10px] whitespace-nowrap ${cls}${emphasis}`}
+                                >
+                                  {tf} {label}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        )}
+                        {/* ↑↑↑ END REGIME BLOCK ↑↑↑ */}
                       </td>
 
                       <td className="px-3 py-2 text-right text-[11px] text-slate-400">

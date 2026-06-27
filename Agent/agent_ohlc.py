@@ -22,8 +22,8 @@ import uuid
 import logging
 log = logging.getLogger("xtl.agent")
 # at module top (once):
+
 _last_sent_bar: dict[tuple[str, str], int] = {}  # (symbol, TF) -> last 't' sent
-from xtl.mt5_client import mt5_init, mt5_fetch_rates, get_mt5_tick_price_and_ts, mt5_get_open_positions
 
 # Force-pack critical modules under PyInstaller
 try:
@@ -39,60 +39,79 @@ except Exception:
     pass
 
 try:
-    # Running as package (PyInstaller / pip-style)
-    from xtl.mt5_client import mt5_init, mt5_fetch_rates, get_mt5_tick_price_and_ts, mt5_get_open_positions
+    # Running as package / PyInstaller
+    from xtl.mt5_client import (
+        mt5_init,
+        mt5_fetch_rates,
+        get_mt5_tick_price_and_ts,
+        mt5_get_open_positions,
+        _broker_offset_min,
+        
+    )
 except ImportError:
-    # Running directly from source folder
     try:
-        from .mt5_client import mt5_init, mt5_fetch_rates, get_mt5_tick_price_and_ts, mt5_get_open_positions
+        # Running as package-relative source
+        from .mt5_client import (
+            mt5_init,
+            mt5_fetch_rates,
+            get_mt5_tick_price_and_ts,
+            mt5_get_open_positions,
+            _broker_offset_min,
+            
+        )
     except Exception:
-
+        # Running directly from source folder
         sys.path.append(os.path.dirname(__file__))
-        from mt5_client import mt5_init, mt5_fetch_rates, mt5_get_open_positions
+        from mt5_client import (
+            mt5_init,
+            mt5_fetch_rates,
+            get_mt5_tick_price_and_ts,
+            mt5_get_open_positions,
+            _broker_offset_min,
+            
+        )
 
 DEFAULT_TFS = ["M1","M15","H1","H4"]
 # Self-contained registry getter (prefers registry, falls back to env)
+
+
+
 def reg_get(name: str) -> Optional[str]:
-    try:
-        import winreg
-        # 1) LocalSystem hive (service)
-        with winreg.OpenKey(winreg.HKEY_USERS, r"S-1-5-18\Software\XTL") as k:
-            try:
-                v, _ = winreg.QueryValueEx(k, name)
-                if v is not None and str(v).strip() != "":
-                    return str(v)
-            except FileNotFoundError:
-                pass
-    except Exception:
-        pass
-    try:
-        import winreg
-        # 2) HKLM (machine-wide defaults)
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\XTL") as k:
-            try:
-                v, _ = winreg.QueryValueEx(k, name)
-                if v is not None and str(v).strip() != "":
-                    return str(v)
-            except FileNotFoundError:
-                pass
-    except Exception:
-        pass
-    try:
-        import winreg
-        # 3) HKCU (interactive user; helpful when running manually)
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\XTL") as k:
-            try:
-                v, _ = winreg.QueryValueEx(k, name)
-                if v is not None and str(v).strip() != "":
-                    return str(v)
-            except FileNotFoundError:
-                pass
-    except Exception:
-        pass
-    # 4) ENV as last fallback (keeps existing override behavior)
-    return os.environ.get(name) or ""
+    import os
+    import winreg
 
+    name_s = str(name or "")
 
+    # Broker timezone is runtime MT5-detected state.
+    # Never read HKLM/HKU for Broker.Tz* because installer_pending_detection
+    # is only an install placeholder and must not block OHLC/RC logic.
+    if name_s.startswith("Broker.Tz"):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\XTL") as k:
+                v, _ = winreg.QueryValueEx(k, name_s)
+                if v is not None and str(v).strip() != "":
+                    return str(v)
+        except Exception:
+            pass
+
+        return os.environ.get(name_s) or ""
+
+    # Normal config still supports service/machine/user fallback.
+    for root, path in (
+        (winreg.HKEY_USERS, r"S-1-5-18\Software\XTL"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\XTL"),
+        (winreg.HKEY_CURRENT_USER, r"Software\XTL"),
+    ):
+        try:
+            with winreg.OpenKey(root, path) as k:
+                v, _ = winreg.QueryValueEx(k, name_s)
+                if v is not None and str(v).strip() != "":
+                    return str(v)
+        except Exception:
+            pass
+
+    return os.environ.get(name_s) or ""
+    
 def _good_ca(p: str, min_bytes: int = 100_000) -> bool:
     try:
         if not (p and os.path.isfile(p) and os.path.getsize(p) >= min_bytes):
@@ -517,52 +536,67 @@ def _convert_utc_to_broker_ms(utc_ms, offset_min):
     dt_broker = dt_utc.astimezone(timezone(timedelta(minutes=offset_min)))
     return int(dt_broker.timestamp() * 1000)
 
+def _tz_label(off_min: int) -> str:
+    sign = "+" if int(off_min) >= 0 else "-"
+    hh = abs(int(off_min)) // 60
+    mm = abs(int(off_min)) % 60
+    return f"UTC{sign}{hh:02d}:{mm:02d}"
+
+
+def _is_trusted_broker_tz(off_min, source: str | None) -> bool:
+    try:
+        off = int(off_min)
+    except Exception:
+        return False
+
+    src = (source or "").strip().lower()
+
+    if off < -720 or off > 900:
+        return False
+
+    # historical bug: 330 came from IST/PC timezone
+    if off == 330 and src != "auto_detected":
+        return False
+
+    return src == "auto_detected"
+
 
 def _broker_tz_meta() -> dict:
     """
-    Broker TZ metadata for the server snapshot.
-    Priority:
-      1) Registry overrides: Broker.TzName / Broker.TzOffsetMin
-      2) Fallback to local OS timezone (name + offset minutes)
+    P0: Broker timezone must come from MT5 runtime auto-detection only.
+    Broker.Tz* is runtime state, not installer config.
     """
+    src = ""
+    off_min = None
+
     try:
-        # 1) Registry overrides (if installer or UI has set them)
-        tn = (reg_get("Broker.TzName") or "").strip()
-        toff = reg_get("Broker.TzOffsetMin")
-        if toff is not None and str(toff).strip() != "":
-            try:
-                off_min = int(str(toff).strip())
-            except Exception:
-                off_min = None
-        else:
+        src = (reg_get("Broker.TzSource") or "").strip()
+    except Exception:
+        src = ""
+
+    try:
+        raw = reg_get("Broker.TzOffsetMin")
+        off_min = int(str(raw).strip()) if str(raw or "").strip() else None
+    except Exception:
+        off_min = None
+
+    # fallback only if HKCU runtime value is missing
+    if off_min is None:
+        try:
+            off_min = int(_broker_offset_min())
+        except Exception:
             off_min = None
 
-        # 2) Fallback to OS local TZ if overrides are missing/incomplete
-        if (not tn) or (off_min is None):
-            import time
-            # name
-            if not tn:
-                try:
-                    tn = (time.tzname[time.localtime().tm_isdst] or time.tzname[0] or "").strip()
-                except Exception:
-                    tn = ""
-            # offset (minutes east of UTC)
-            try:
-                # Windows: time.timezone is seconds WEST of UTC (non-DST);
-                # use altzone when DST is active, then flip sign to get minutes EAST of UTC.
-                if time.daylight and time.localtime().tm_isdst:
-                    offset_s = -time.altzone
-                else:
-                    offset_s = -time.timezone
-                off_min = int(offset_s // 60)
-            except Exception:
-                if off_min is None:
-                    off_min = 0
+    valid = _is_trusted_broker_tz(off_min, src)
 
-        return {"tz_name": tn or None, "tz_offset_min": off_min}
-    except Exception:
-        # Never block OHLC pushes because of TZ meta
-        return {}
+    return {
+        "tz_name": _tz_label(int(off_min)) if off_min is not None else None,
+        "tz_offset_min": int(off_min) if off_min is not None else None,
+        "tz_source": src or "unknown",
+        "tz_valid": bool(valid),
+    }
+
+
 import winreg
 
 def ensure_registry_defaults():
@@ -822,6 +856,12 @@ def push_rates_batch(api_base, device_id, token, symbol, tf, bars, include_lates
     # --- anchor to broker TF grid rather than local clock ---
     # (prevents off-by-one-bar when OS TZ != broker TZ)
     bmeta = _broker_tz_meta() or {}
+    if not bmeta.get("tz_valid"):
+        log.error(
+            "P0_TZ_BLOCK: skip OHLC publish %s/%s; broker timezone not trusted meta=%s",
+            symbol, tf, bmeta,
+        )
+        return False
     try:
         off_min = int(bmeta.get("tz_offset_min") or 0)
     except Exception:
@@ -1504,7 +1544,7 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
                     base, device_id, token,
                     sym, tf, rates,
                     include_latest=include_latest,
-                    count=tf_count  # soft cap; push_rates_batch trims if needed
+                    count=tf_bars # soft cap; push_rates_batch trims if needed
                 )
                 if sent:
                     _last_sent_bar[key] = last_t_s
@@ -1630,11 +1670,12 @@ def push_ohlc_once(
                 log.info("OHLC: skip — already sent last_closed=%s for %s/%s", prev, s, tfu)
                 continue
 
-            _last_sent_bar[key] = last_t
+            
+            
 
             # POST the batch
             try:
-                push_rates_batch(
+                sent = push_rates_batch(
                     base,
                     device_id,
                     token,
@@ -1643,7 +1684,12 @@ def push_ohlc_once(
                     arr_raw,
                     include_latest=include_latest,
                 )
-                total_pushed += 1
+
+                if sent:
+                    _last_sent_bar[key] = last_t
+                    total_pushed += 1
+                else:
+                    log.warning("OHLC: POST skipped/failed for %s/%s", s, tfu)
             except Exception as e:
                 import traceback
                 log.error("OHLC: POST crash %s/%s: %s\n%s", s, tfu, e, traceback.format_exc())

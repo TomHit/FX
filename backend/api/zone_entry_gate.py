@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
+log = logging.getLogger(__name__)
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
 
 
 
@@ -33,6 +36,7 @@ def _bar_f(b: dict, *keys: str) -> Optional[float]:
             except Exception:
                 return None
     return None
+
 
 
 def _level_to_zone(lvl: float, tf: str, sym_u: str, atr: float | None) -> dict:
@@ -97,10 +101,12 @@ def _pick_last_closed_bar_from_bars(
             om = _om(b)
             if om <= 0:
                 continue 
-            is_complete = b.get("complete") is True
+            # MT5 marks FUTURE bars complete=True, so `complete` alone must not
+            # qualify a bar as closed. The clock is authoritative: a bar is closed
+            # only once its close time has actually passed.
             closed_by_clock = (om + tf_ms) <= sys_now
-            if not is_complete and not closed_by_clock:
-                continue  # still forming
+            if not closed_by_clock:
+                continue  # future or still-forming — not closed
             prev = bs_sorted[i-1] if i-1 >= 0 else None
             return (b, prev)
         return (None, None)
@@ -838,11 +844,13 @@ def zone_reversal_gate(
                     except Exception:
                         _last_bar_close_ms = 0
 
-                    # Use the largest of: serverNow, last bar close, system now
-                    # Ensures bar picker never skips a genuinely closed candle
+                    # Use the freshest REAL clock (snap serverNow or system now).
+                    # Do NOT max in _last_bar_close_ms: MT5 emits future bars whose
+                    # close time would inflate now_ms_pick into the future, poisoning
+                    # started_ms / last_checked_closed_ms / rev_ok_ms and causing the
+                    # executor (true UTC) to reject every RC as "future".
                     now_ms_pick = max(
                         _snap_server_now,
-                        _last_bar_close_ms,
                         int(now_ms or 0)
                     )
                     if now_ms_pick <= 0:
@@ -885,11 +893,44 @@ def zone_reversal_gate(
     }.get(str(tfu).upper(), 60 * 60 * 1000)
     c, p = (None, None)  # Default to tuple
     try:
-        result = _pick_last_closed_bar_from_bars(bars, int(now_ms_pick), int(tf_ms))
-        if result is not None and isinstance(result, tuple) and len(result) == 2:
-            c, p = result
+        # Prefer MT5-agent completed bars. The agent already marks H1 candles
+        # complete=True. Do not reject the newest completed bar just because
+        # broker candle timestamps are ahead of repaired server clock; that
+        # makes gate lag 1-2 candles and miss zone touches.
+        # A bar is only truly closed once its close-time has actually passed.
+        # MT5 marks FUTURE bars complete=True, so trusting `complete` alone makes the
+        # picker select a future bar as the RC candle (future rev_ok_ms -> entry limbo).
+        # Apply the same clock check the fallback picker uses. Rejecting future bars
+        # does NOT reintroduce lag: a just-closed bar (close-time already passed) is
+        # still accepted immediately; only genuinely-future bars are excluded.
+        import time as _t_clk
+        _real_now_clk = int(_t_clk.time() * 1000)  # REAL clock only; never now_ms_pick (could be future-poisoned)
+        def _ob_ms(b):
+            for _k in ("t_open_ms", "tOpenMs", "open_time_ms", "ts_ms", "t", "time", "ts"):
+                _v = _to_ms_any(b.get(_k))
+                if _v > 0:
+                    return int(_v)
+            return 0
+        complete_bars = [
+            b for b in (bars or [])
+            if isinstance(b, dict)
+            and bool(b.get("complete")) is True
+            and _ob_ms(b) > 0
+            and (_ob_ms(b) + int(tf_ms)) <= _real_now_clk
+        ]
+        if complete_bars:
+            c = complete_bars[-1]
+            p = complete_bars[-2] if len(complete_bars) >= 2 else None
+            if debug_gate:
+                gate["dbg_pick_model"] = "LATEST_COMPLETE_TRUE_BAR"
         else:
-            c, p = (None, None)
+            result = _pick_last_closed_bar_from_bars(bars, int(now_ms_pick), int(tf_ms))
+            if result is not None and isinstance(result, tuple) and len(result) == 2:
+                c, p = result
+            else:
+                c, p = (None, None)
+            if debug_gate:
+                gate["dbg_pick_model"] = "TIME_BASED_PICKER_FALLBACK"
     except Exception as e:
         if debug_gate:
             gate["dbg_pick_bar_exc"] = f"{type(e).__name__}:{e}"
@@ -1114,26 +1155,43 @@ def zone_reversal_gate(
 
         candidate_sources = []
 
+        # BUY candidates:
+        # Include BOTH best scored support and nearest H1 display support.
+        # Do not let a far/H4 best_support hide a nearer valid H1 support.
         if isinstance(best_buy_zone, dict):
             bz = dict(best_buy_zone)
             bz["tf"] = str(bz.get("tf") or "H1").upper()
             bz["kind"] = "support"
-            bz["zone_source"] = "BEST_SCORED_SR"
+            bz["zone_source"] = bz.get("zone_source") or "BEST_SCORED_SR"
             bz["selection_model"] = "BEST_SR_DIRECTION_RESOLVER"
             candidate_sources.append(("BUY", bz))
-        else:
-            candidate_sources.append(("BUY", display_zones.get("h1_buy_zone")))
 
+        if isinstance(display_zones.get("h1_buy_zone"), dict):
+            bz = dict(display_zones.get("h1_buy_zone"))
+            bz["tf"] = "H1"
+            bz["kind"] = "support"
+            bz["zone_source"] = bz.get("zone_source") or "H1_DISPLAY_ZONE"
+            bz["selection_model"] = "H1_DISPLAY_DIRECTION_RESOLVER"
+            candidate_sources.append(("BUY", bz))
+
+        # SELL candidates:
+        # Include BOTH best scored resistance and nearest H1 display resistance.
+        # Do not let a far/H4 best_resistance hide a nearer valid H1 resistance.
         if isinstance(best_sell_zone, dict):
             bz = dict(best_sell_zone)
             bz["tf"] = str(bz.get("tf") or "H1").upper()
             bz["kind"] = "resistance"
-            bz["zone_source"] = "BEST_SCORED_SR"
+            bz["zone_source"] = bz.get("zone_source") or "BEST_SCORED_SR"
             bz["selection_model"] = "BEST_SR_DIRECTION_RESOLVER"
             candidate_sources.append(("SELL", bz))
-        else:
-            candidate_sources.append(("SELL", display_zones.get("h1_sell_zone")))
 
+        if isinstance(display_zones.get("h1_sell_zone"), dict):
+            bz = dict(display_zones.get("h1_sell_zone"))
+            bz["tf"] = "H1"
+            bz["kind"] = "resistance"
+            bz["zone_source"] = bz.get("zone_source") or "H1_DISPLAY_ZONE"
+            bz["selection_model"] = "H1_DISPLAY_DIRECTION_RESOLVER"
+            candidate_sources.append(("SELL", bz))
         for side, z in candidate_sources:
             if not isinstance(z, dict):
                 continue
@@ -1144,13 +1202,20 @@ def zone_reversal_gate(
 
             zz = dict(z)
             zz["kind"] = "support" if side == "BUY" else "resistance"
+
+            # PHASE-1: H1 execution only.
+            # H4 may be displayed separately, but must not win direction resolver
+            # or become the executable gate zone.
+            if str(zz.get("tf") or "").upper() != "H1":
+                continue
+
             zz["actionable_dist"] = float(d0)
 
             candidates.append({
                 "side": side,
                 "zone": zz,
                 "dist": float(d0),
-                "tf_rank": 0 if str(zz.get("tf") or "").upper() == "H1" else 1,
+                "tf_rank": 0,
             })
 
         candidates.sort(key=lambda x: (float(x["dist"]), int(x["tf_rank"])))
@@ -1167,6 +1232,7 @@ def zone_reversal_gate(
             if isinstance(best_zone, dict):
                 try:
                     bz = dict(best_zone)
+                    _bz_dist = _zone_band_dist(bz, float(decision_px))
                     if (
                         bz.get("level") is not None
                         and bz.get("low") is not None
@@ -1174,12 +1240,15 @@ def zone_reversal_gate(
                         and float(bz.get("low")) < float(bz.get("high"))
                         and bz.get("side_ok") is not False
                         and bz.get("stale") is not True
+                        and str(bz.get("tf") or "").upper() == "H1"
+                        and _bz_dist is not None
+                        and float(_bz_dist) <= float(cap)
                     ):
                         bz["zone_source"] = "BEST_SCORED_SR"
                         bz["selection_model"] = "BEST_SR_DIRECTION_RESOLVED"
                         bz["execution_tf"] = "H1"
                         bz["zone_role"] = "BEST_SUPPORT" if resolved_dir == "BUY" else "BEST_RESISTANCE"
-                        bz["actionable_dist"] = _zone_band_dist(bz, float(decision_px)) or 0.0
+                        bz["actionable_dist"] = float(_bz_dist)
                         preferred_zone = bz
                 except Exception:
                     pass
@@ -1222,6 +1291,13 @@ def zone_reversal_gate(
     watch = None
     zone_used = None
     wkey = None
+
+    def _is_protected_watch_state(st: str) -> bool:
+        st_u = str(st or "").upper().strip()
+        return (
+            st_u in ("REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE")
+            or st_u.startswith("ENTRY_BLOCKED")
+        )
 
     def _load_watch_for_dir(d: str):
         try:
@@ -1273,6 +1349,45 @@ def zone_reversal_gate(
     if isinstance(watch, dict):
         w_state = str(watch.get("state") or "").upper()
         w_rev_ok = bool(watch.get("rev_ok"))
+        w_trade_state = str(watch.get("trade_state") or "").upper()
+        w_missed = bool(watch.get("missed_breakout"))
+
+        if (
+            w_state in ("MISSED_BREAKOUT", "ORDER_FAILED", "ZONE_INVALIDATED")
+            or w_trade_state in ("MISSED_BREAKOUT", "ORDER_FAILED", "ZONE_INVALIDATED")
+            or w_missed
+        ):
+            terminal_state = (
+                w_trade_state
+                if w_trade_state in ("MISSED_BREAKOUT", "ORDER_FAILED", "ZONE_INVALIDATED")
+                else w_state
+                if w_state in ("MISSED_BREAKOUT", "ORDER_FAILED", "ZONE_INVALIDATED")
+                else "MISSED_BREAKOUT"
+            )
+
+            watch["state"] = terminal_state
+            watch["trade_state"] = terminal_state
+
+            try:
+                R.set(
+                    wkey,
+                    json.dumps(watch, separators=(",", ":")),
+                    ex=7 * 24 * 3600,
+                )
+            except Exception:
+                pass
+
+            gate["blocked"] = True
+            gate["stage"] = terminal_state
+            gate["reason"] = str(watch.get("missed_breakout_reason") or terminal_state)
+            gate["watch_key"] = str(wkey)
+            gate["watch_reused"] = True
+            gate["resolved_dir"] = str(watch.get("direction") or resolved_dir or "").upper()
+            gate["zone"] = None
+            gate["planned_zone"] = None
+            gate["zone_used"] = dict(watch.get("zone_used")) if isinstance(watch.get("zone_used"), dict) else None
+            gate["rev_state"] = dict(watch)
+            return False, gate	
         if w_rev_ok and w_state != "REV_OK":
             watch["state"] = "REV_OK"
         if w_state == "REV_OK" and not w_rev_ok:
@@ -1292,7 +1407,24 @@ def zone_reversal_gate(
         # ------------------------------------------------------------
         if w_rev_ok or w_state == "REV_OK":
             rev_ok_ms = int(watch.get("rev_ok_ms") or 0)
-            if rev_ok_ms > 0 and rev_ok_ms > int(now_ms_pick or 0):
+            # Validate RC against latest completed broker candle, not server now_ms_pick.
+            # Broker candle timestamps can be ahead of server clock. If rev_ok_ms is <=
+            # latest completed candle close_ms, RC is valid.
+            latest_complete_close_ms = 0
+            try:
+                for _b in (bars or []):
+                    if isinstance(_b, dict) and bool(_b.get("complete")) is True:
+                        _open_ms = _to_ms_any(_b.get("t_open_ms") or _b.get("tOpenMs") or _b.get("t"))
+                        if _open_ms and _open_ms < 10_000_000_000:
+                            _open_ms *= 1000
+                        _close_ms = _to_ms_any(_b.get("t_close_ms") or _b.get("tCloseMs") or _b.get("t_close"))
+                        if not _close_ms and _open_ms:
+                            _close_ms = int(_open_ms + tf_ms)
+                        latest_complete_close_ms = max(int(latest_complete_close_ms or 0), int(_close_ms or 0))
+            except Exception:
+                latest_complete_close_ms = int(closed_ms or 0)
+
+            if rev_ok_ms > 0 and latest_complete_close_ms > 0 and rev_ok_ms > latest_complete_close_ms:
                 # RC candle close time is in the future — forming candle was used
                 # Roll back to REV_WATCH cleanly
                 watch["state"] = "REV_WATCH"
@@ -1314,9 +1446,33 @@ def zone_reversal_gate(
                         "reason": "forming_candle_used_as_rc",
                         "rev_ok_ms": rev_ok_ms,
                         "now_ms_pick": int(now_ms_pick or 0),
+                        "latest_complete_close_ms": int(latest_complete_close_ms or 0),
                         "rolled_back_to": "REV_WATCH",
-                    }     
+                    }   
+                w_rev_ok = False
+                w_state = "REV_WATCH"  
 
+        # ------------------------------------------------------------
+        # TERMINAL WATCH STATE: MISSED_BREAKOUT
+        # Keep the watch visible for UI/audit. Do not rediscover,
+        # do not re-evaluate REV_OK, and do not allow executor entry.
+        # Manual cleanup can delete the watch key after review.
+        # ------------------------------------------------------------
+        if str(watch.get("state") or "").upper() == "MISSED_BREAKOUT":
+            gate["blocked"] = True
+            gate["stage"] = "MISSED_BREAKOUT"
+            gate["reason"] = (
+                f"MISSED_BREAKOUT | trigger={float(watch.get('missed_breakout_trigger_level') or 0):.5f} "
+                f"| live={float(watch.get('missed_breakout_live_price') or 0):.5f} "
+                f"| no fresh cross"
+            )
+            gate["watch_key"] = str(wkey)
+            gate["watch_reused"] = True
+            gate["resolved_dir"] = str(watch.get("direction") or resolved_dir or "").upper()
+            gate["zone"] = dict(watch.get("zone_used")) if isinstance(watch.get("zone_used"), dict) else None
+            gate["zone_used"] = dict(watch.get("zone_used")) if isinstance(watch.get("zone_used"), dict) else None
+            gate["rev_state"] = dict(watch)
+            return False, gate
 
     # Normalize frozen zone_used: old watches may be level-only.
     # Priority: rehydrate from SR -> else synthesize via _level_to_zone (never collapse).
@@ -1582,12 +1738,17 @@ def zone_reversal_gate(
             # Do not execute H4 zone with H1 reversal candle.
             # H4 zones are display/watch only until H4 candle execution is implemented.
             if str(zone.get("tf") or "").upper() == "H4":
-                gate["reason"] = "H4_ZONE_EXECUTION_DISABLED_PHASE1"
+                gate["reason"] = "WATCHING_NO_H1_EXECUTION_ZONE"
                 gate["stage"] = "ZONE_PICK"
                 gate["blocked"] = False
-                gate["zone"] = dict(zone)
-                gate["planned_zone"] = dict(zone)
+
+                # H4 is display-only in Phase 1.
+                # Never expose H4 as executable zone/planned_zone.
+                gate["zone"] = None
+                gate["planned_zone"] = None
                 gate["zone_used"] = None
+                gate["display_zone"] = dict(zone)
+
                 gate["resolved_dir"] = "WATCHING"
                 return False, gate
         else:
@@ -1721,30 +1882,43 @@ def zone_reversal_gate(
     gate["zone_tf"] = zone_tf
     gate["dist_gate_model"] = "ZONE_BAND_ACTIONABLE_DISTANCE_CAP"
 
-    if dist > (max_dist + eps):
+    # Protect CONFIRMED/ACTIVE states from the too-far reset — these zones
+    # are held until invalidation/confirmation, never reset on distance.
+    # Unconfirmed WATCH/REV_WATCH are NOT protected: a zone price has fled
+    # far from, before any confirmation, should reset for rediscovery.
+    _frozen_state = False
+    if isinstance(watch, dict):
+        _wst = str(watch.get("state") or "").upper()
+        _frozen_state = _wst in (
+            "REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE",
+        )
+
+    if dist > (max_dist + eps) and not _frozen_state:
         # ------------------------------------------------------------
         # FAR-ZONE DISCOVERY RESET:
-        # If selected zone is too far from live/current price, do not keep
-        # old far zone as actionable. Clear non-REV watch and allow fresh
+        # Runs only when no CONFIRMED/ACTIVE watch exists. Clears the far
+        # watch (incl. unconfirmed WATCH/REV_WATCH) and allows fresh
         # nearest H1 zone discovery on next cycle.
         # ------------------------------------------------------------
         try:
             if isinstance(watch, dict):
-                st = str(watch.get("state") or "").upper()
-                # Protect REV_WATCH and WATCH states — zone is frozen, do not delete
-                if st not in ("WATCH", "REV_WATCH", "REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE"):
+                _st_del = str(watch.get("state") or "").upper().strip()
+                if not _is_protected_watch_state(_st_del):
                     R.delete(wkey)
+                else:
+                    if debug_gate:
+                        gate["dbg_delete_skipped_protected_watch"] = {
+                            "key": str(wkey),
+                            "state": _st_del,
+                        }
         except Exception:
             pass
-
         gate["reason"] = "ZONE_TOO_FAR_RESET_FOR_REDISCOVERY"
         gate["stage"] = "DIST_GUARD"
         gate["blocked"] = False
-
         gate["zone"] = dict(zone)
         gate["planned_zone"] = dict(zone)
         gate["zone_used"] = None
-
         gate["dist"] = float(dist)
         gate["max_dist"] = float(max_dist)
         gate["over"] = float(dist - max_dist)
@@ -1783,7 +1957,17 @@ def zone_reversal_gate(
                     try:
                         for _s in ("BUY", "SELL"):
                             for _t in ("H1", "H4"):
-                                R.delete(f"xtl:zone:watch:{sym_u}:{_s}:{_t}")
+                                _dk = f"xtl:zone:watch:{sym_u}:{_s}:{_t}"
+                                _dj = _json_load(R.get(_dk)) or {}
+                                _dst = str(_dj.get("state") or "").upper().strip() if isinstance(_dj, dict) else ""
+                                if not _is_protected_watch_state(_dst):
+                                    R.delete(_dk)
+                                else:
+                                    if debug_gate:
+                                        gate.setdefault("dbg_delete_skipped_protected_watches", []).append({
+                                            "key": _dk,
+                                            "state": _dst,
+                                        })
                     except Exception:
                         pass
             else:
@@ -2060,7 +2244,16 @@ def zone_reversal_gate(
     # REV_OK remains armed, but latest valid RC can refresh trigger.
     # This prevents stale/yesterday RC from staying locked forever.
     # ------------------------------------------------------------
-    if isinstance(watch, dict) and bool(watch.get("rev_ok")) and str(watch.get("state") or "").upper() == "REV_OK":
+    _watch_state_u = str((watch or {}).get("state") or "").upper()
+    _is_rc_locked_state = (
+        isinstance(watch, dict)
+        and bool(watch.get("rev_ok"))
+        and (
+            _watch_state_u == "REV_OK"
+            or _watch_state_u.startswith("ENTRY_BLOCKED")
+        )
+    )
+    if _is_rc_locked_state:
         # ------------------------------------------------------------
         # LATEST RC ALWAYS WINS
         # If watch is already REV_OK, still allow a newer closed candle
@@ -2072,46 +2265,75 @@ def zone_reversal_gate(
 
             _newer_rc = False
             _rc_reject_reason = None
- 
-            if _cur_closed_ms > _old_rev_ms:
-                _dir = str(watch.get("direction") or resolved_dir).upper()
-         
-                if _dir == "SELL":
-                    # Latest SELL RC wins only if candle touched/entered resistance zone
-                    # and closed back below zone low.
-                    _newer_rc = bool(float(hi) >= float(zl) and float(cl) < float(zl))
-                    if not _newer_rc:
-                        _rc_reject_reason = {
-                            "need": "SELL: hi>=zone_low and close<zone_low",
-                            "hi": float(hi),
-                            "close": float(cl),
-                            "zone_low": float(zl),
-                            "zone_high": float(zh),
+            _best_rc = None
+
+            _dir = str(watch.get("direction") or resolved_dir).upper()
+
+            # P1 FIX:
+            # Do not check only the latest/current closed candle.
+            # Scan all completed bars after old rev_ok_ms and pick the latest valid RC.
+            try:
+                for _b in (bars or []):
+                    if not isinstance(_b, dict):
+                        continue
+                    if not bool(_b.get("complete", True)):
+                        continue
+
+                    _b_ms = _to_ms_any(
+                        _b.get("t_open_ms")
+                        or _b.get("tOpenMs")
+                        or _b.get("open_time_ms")
+                        or _b.get("t")
+                        or _b.get("time")
+                        or _b.get("ts")
+                        or 0
+                    )
+                    _b_ms = int(_b_ms or 0)
+                    if _b_ms <= int(_old_rev_ms or 0):
+                        continue
+
+                    _bh = float(_b.get("h") or _b.get("high") or 0.0)
+                    _bl = float(_b.get("l") or _b.get("low") or 0.0)
+                    _bc = float(_b.get("c") or _b.get("close") or 0.0)
+
+                    if _dir == "SELL":
+                        _valid = bool(_bh >= float(zl) and _bc < float(zl))
+                    else:
+                        _valid = bool(_bl <= float(zh) and _bc > float(zh))
+
+                    if _valid:
+                        _best_rc = {
+                            "ms": int(_b_ms),
+                            "hi": float(_bh),
+                            "lo": float(_bl),
+                            "cl": float(_bc),
                         }
-                else:
-                     # Latest BUY RC wins only if candle touched/entered support zone
-                     # and closed back above zone high.
-                     _newer_rc = bool(float(lo) <= float(zh) and float(cl) > float(zh))
-                     if not _newer_rc:
-                         _rc_reject_reason = {
-                             "need": "BUY: lo<=zone_high and close>zone_high",
-                             "lo": float(lo),
-                             "close": float(cl),
-                             "zone_low": float(zl),
-                             "zone_high": float(zh),
-                         }
+
+            except Exception as _scan_exc:
+                if debug_gate:
+                    gate["dbg_latest_rc_scan_exc"] = f"{type(_scan_exc).__name__}:{_scan_exc}"
+
+            if _best_rc:
+                _newer_rc = True
+                _cur_closed_ms = int(_best_rc["ms"])
+                hi = float(_best_rc["hi"])
+                lo = float(_best_rc["lo"])
+                cl = float(_best_rc["cl"])
             else:
                 _rc_reject_reason = {
-                    "need": "closed candle newer than stored RC",
-                    "cur_closed_ms": int(_cur_closed_ms),
+                    "need": "latest valid RC after old_rev_ok_ms",
                     "old_rev_ok_ms": int(_old_rev_ms),
+                    "latest_closed_ms": int(_cur_closed_ms),
+                    "direction": str(_dir),
+                    "zone_low": float(zl),
+                    "zone_high": float(zh),
                 }
 
             if debug_gate and _rc_reject_reason:
                 gate["dbg_latest_rc_not_refreshed"] = _rc_reject_reason
-
             if _newer_rc:
-                watch["state"] = "REV_OK"
+                _prev_state_for_rc_refresh = str(watch.get("state") or "").upper()
+                watch["state"] = _prev_state_for_rc_refresh if _prev_state_for_rc_refresh.startswith("ENTRY_BLOCKED") else "REV_OK"
                 watch["rev_ok"] = True
                 watch["rev_ok_ms"] = int(_cur_closed_ms)
                 watch["last_checked_closed_ms"] = int(_cur_closed_ms)
@@ -2123,10 +2345,38 @@ def zone_reversal_gate(
                 watch["rev_ok_bar_lo"] = float(lo)
                 watch["rev_ok_bar_close"] = float(cl)
 
-                R.set(
-                    wkey,
-                    json.dumps(watch, separators=(",", ":")),
-                    ex=7 * 24 * 3600,
+                # Full REV_OK snapshot for audit/UI/executor consistency
+                _dir_for_trigger = str(watch.get("direction") or resolved_dir).upper()
+                watch["rc_open_ms"] = int(_cur_closed_ms)
+                watch["rc_close_ms"] = int(_cur_closed_ms)
+                watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
+                watch["frozen_at_ms"] = int(now_ms_pick)
+                watch["last_price"] = float((live_px if "live_px" in locals() else 0) or cl)
+                watch["updated_at_ms"] = int(now_ms_pick)
+
+                _refresh_set_ok = False  # set by final persist after RC cleanup below
+
+                # RC changed => old breakout state / old entry claim is no longer valid.
+                # New RC must require a fresh break of the new trigger.
+                try:
+                    _rc_side = str(watch.get("direction") or resolved_dir).upper()
+                    R.delete(f"xtl:watch:break_state:{sym_u}:{_rc_side}:H1")
+                    for _ck in R.scan_iter(f"xtl:watch:entry_claim:{sym_u}:{_rc_side}:H1:*", count=50):
+                        R.delete(_ck)
+                    watch["entry_triggered"] = False
+                    watch["entry_ready"] = False
+                    watch.pop("entry_ready_price", None)
+                    watch.pop("entry_ready_ts_ms", None)
+                    watch.pop("entry_price", None)
+                    watch.pop("entry_ts_ms", None)
+                    _refresh_set_ok = R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
+                except Exception:
+                    pass
+                log.warning(
+                    "[WATCHLIST] LATEST_RC_REFRESH_PERSIST sym=%s side=%s key=%s set_ok=%s old_rev=%s new_rev=%s new_lo=%s new_hi=%s",
+                    sym_u, str(watch.get("direction") or resolved_dir).upper(), wkey,
+                    bool(_refresh_set_ok), int(_old_rev_ms), int(_cur_closed_ms),
+                    float(lo), float(hi)
                 )
 
                 gate["dbg_latest_rc_refreshed"] = {
@@ -2233,6 +2483,7 @@ def zone_reversal_gate(
 
         gate["zone_used"] = zone_used
         gate["rev_ok"] = True
+        gate["rev_ok_ms"] = int((watch or {}).get("rev_ok_ms") or closed_ms)
         gate["watch_key"] = str(wkey)
         gate["rev_state"] = {
             "state": "REV_OK",
@@ -2320,7 +2571,20 @@ def zone_reversal_gate(
                 try:
                     for _s in ("BUY", "SELL"):
                         for _t in ("H1", "H4"):
-                            R.delete(f"xtl:zone:watch:{sym_u}:{_s}:{_t}")
+                            _wk_inv = f"xtl:zone:watch:{sym_u}:{_s}:{_t}"
+                            # GUARD: if a live/confirmed trade is riding this watch,
+                            # do NOT delete it — that orphans the open broker position
+                            # and forces a source-stripping BROKER_REPAIR. The trade
+                            # rides to its SL/TP under broker management; the watch
+                            # must persist until the trade actually closes.
+                            try:
+                                _wj = _json_load(R.get(_wk_inv)) or {}
+                                _wst_inv = str(_wj.get("state") or "").upper()
+                            except Exception:
+                                _wst_inv = ""
+                            if _wst_inv in ("ORDER_PENDING", "TRADE_ACTIVE"):
+                                continue
+                            R.delete(_wk_inv)
                 except Exception:
                     pass
                 gate["reason"] = f"INVALIDATED | REV_OK_CANCELLED | {_inv_consec} closes beyond zone | FZ {float(zl):.5f}-{float(zh):.5f}"
@@ -2350,19 +2614,27 @@ def zone_reversal_gate(
 
     # Only write candle refresh if this is genuinely a new closed candle
     # and the watch is NOT already in REV_OK state (REV_OK lock handles its own write)
-    _watch_is_rev_ok = (
+    _watch_state_u2 = str((watch or {}).get("state") or "").upper()
+    _watch_is_rc_locked = (
         isinstance(watch, dict)
         and bool(watch.get("rev_ok"))
-        and str(watch.get("state") or "").upper() == "REV_OK"
+        and (
+            _watch_state_u2 == "REV_OK"
+            or _watch_state_u2.startswith("ENTRY_BLOCKED")
+        )
     )
-    if not _watch_is_rev_ok:
+    if not _watch_is_rc_locked:
         try:
             if isinstance(watch, dict) and int(closed_ms or 0) >= int(last_checked_ms or 0):
                 watch["last_checked_closed_ms"] = int(closed_ms or 0)
                 watch["last_checked_close"] = float(cl)
                 watch["last_checked_high"] = float(hi)
                 watch["last_checked_low"] = float(lo)
-                R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
+                # Do NOT persist here.
+                # This is only an in-memory closed-candle refresh.
+                # Redis writes are allowed only on lifecycle transitions:
+                # WATCH_CREATE, REV_OK_REFRESH, REV_OK_CONFIRM, RC_ROLLBACK.
+                pass
         except Exception:
             pass
     if debug_gate:
@@ -2519,6 +2791,19 @@ def zone_reversal_gate(
             if _sb_cl is None:
                 continue
             _sb_cl = float(_sb_cl)
+            # ── RC TOUCH GATE (strict, additive) ───────────────────
+            # RC candle must have REACHED the zone before closing beyond it.
+            # SELL: high must reach zone low (rejection off resistance).
+            # BUY:  low must reach zone high (rejection off support).
+            _sb_hi = _bar_f(_sb, "h", "high")
+            _sb_lo = _bar_f(_sb, "l", "low")
+            if resolved_dir == "SELL":
+                if _sb_hi is None or float(_sb_hi) < float(zl):
+                    continue
+            else:
+                if _sb_lo is None or float(_sb_lo) > float(zh):
+                    continue
+            # ── END RC TOUCH GATE ──────────────────────────────────
             if resolved_dir == "BUY" and _sb_cl > float(zh):
                 _rc_bar = _sb
                 _rc_bar_close = _sb_cl
@@ -2543,9 +2828,11 @@ def zone_reversal_gate(
         lo = float(_bar_f(_rc_bar, "l", "low") or 0)
         closed_ms = _rc_bar_closed_ms
     elif resolved_dir == "BUY":
-        rev_ok = bool(_rc_time_valid and float(cl) > float(zh))
+        rev_ok = bool(_rc_time_valid and float(cl) > float(zh)
+                      and lo is not None and float(lo) <= float(zh))
     else:
-        rev_ok = bool(_rc_time_valid and float(cl) < float(zl))
+        rev_ok = bool(_rc_time_valid and float(cl) < float(zl)
+                      and hi is not None and float(hi) >= float(zl))
 
     gate["rev_ok"] = bool(rev_ok)
     # ------------------------------------------------------------
@@ -2585,35 +2872,54 @@ def zone_reversal_gate(
         pass
 
     if rev_ok:
-        # persist REV_OK so we don't show WATCH after confirm
+        # SINGLE SOURCE OF TRUTH:
+        # Any RC shown to API/UI must first be persisted into Redis watch.
+        # BREAK_CHECK/executor then use exactly the same RC trigger.
         try:
-            if isinstance(watch, dict):
-                watch["state"] = "REV_OK"
-                watch["rev_ok"] = True
-                watch["rev_ok_ms"] = int(closed_ms)
-                watch["last_checked_closed_ms"] = int(closed_ms or 0)
-                watch["last_checked_close"] = float(cl)
+            if not isinstance(watch, dict):
+                watch = {}
 
-                watch["frozen_zone_low"] = float(zl)
-                watch["frozen_zone_high"] = float(zh)
-                watch["frozen_zone_tf"] = str(tfu)
-                #store the REV_OK candle trigger levels (for live-break entry)
-                try:
-                    watch["rev_ok_bar_hi"] = float(hi)
-                except Exception:
-                    pass
-                try:
-                    watch["rev_ok_bar_lo"] = float(lo)
-                except Exception:
-                    pass
-                try:
-                    watch["rev_ok_bar_close"] = float(cl)
-                except Exception:
-                    pass
+            watch.setdefault("started_ms", int(started_ms or now_ms_pick or 0))
+            watch.setdefault("watch_created_ms", int((watch or {}).get("started_ms") or started_ms or now_ms_pick or 0))
+            watch.setdefault("direction", str(resolved_dir).upper())
+            watch.setdefault("tf", str(tfu))
+            if isinstance(zone_used, dict):
+                watch["zone_used"] = zone_used
 
-                R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
-        except Exception:
-            pass
+            watch["state"] = "REV_OK"
+            watch["rev_ok"] = True
+            watch["rev_ok_ms"] = int(closed_ms)
+            watch["last_checked_closed_ms"] = int(closed_ms or 0)
+            watch["last_checked_close"] = float(cl)
+            watch["last_checked_high"] = float(hi)
+            watch["last_checked_low"] = float(lo)
+
+            watch["frozen_zone_low"] = float(zl)
+            watch["frozen_zone_high"] = float(zh)
+            watch["frozen_zone_tf"] = str(tfu)
+
+            watch["rev_ok_bar_hi"] = float(hi)
+            watch["rev_ok_bar_lo"] = float(lo)
+            watch["rev_ok_bar_close"] = float(cl)
+
+            _dir_for_trigger = str(watch.get("direction") or resolved_dir).upper()
+            watch["rc_open_ms"] = int(closed_ms)
+            watch["rc_close_ms"] = int(closed_ms)
+            watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
+            watch["frozen_at_ms"] = int(now_ms_pick)
+            watch["last_price"] = float((live_px if "live_px" in locals() else 0) or cl)
+            watch["updated_at_ms"] = int(now_ms_pick)
+
+            _set_ok = R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
+            log.warning(
+                "[WATCHLIST] REV_OK_SINGLE_TRUTH_PERSIST sym=%s side=%s key=%s set_ok=%s rev_ok_ms=%s trigger=%s",
+                sym_u, _dir_for_trigger, wkey, bool(_set_ok), int(watch.get("rev_ok_ms") or 0), watch.get("trigger_level")
+            )
+        except Exception as e:
+            log.warning(
+                "[WATCHLIST] REV_OK_SINGLE_TRUTH_PERSIST_EXC sym=%s side=%s key=%s err=%r",
+                sym_u, str(resolved_dir).upper(), wkey, e
+            )
 
         gate["rev_ok"] = True
         gate["watch_key"] = str(wkey)
@@ -2732,7 +3038,16 @@ def zone_reversal_gate(
         try:
             for _s in ("BUY", "SELL"):
                 for _t in ("H1", "H4"):
-                    R.delete(f"xtl:zone:watch:{sym_u}:{_s}:{_t}")
+                    _wk_inv2 = f"xtl:zone:watch:{sym_u}:{_s}:{_t}"
+                    # GUARD: never delete a watch with a live/confirmed trade.
+                    try:
+                        _wj2 = _json_load(R.get(_wk_inv2)) or {}
+                        _wst_inv2 = str(_wj2.get("state") or "").upper()
+                    except Exception:
+                        _wst_inv2 = ""
+                    if _wst_inv2 in ("REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE"):
+                        continue
+                    R.delete(_wk_inv2)
         except Exception:
             pass
         gate["reason"] = (

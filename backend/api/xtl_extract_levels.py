@@ -21,7 +21,7 @@ Usage:
 import argparse, csv, json, sys, urllib.request
 
 def get(url):
-    with urllib.request.urlopen(url, timeout=20) as r:
+    with urllib.request.urlopen(url, timeout=60) as r:
         return json.load(r)
 
 def f(v):

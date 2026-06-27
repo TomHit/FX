@@ -61,6 +61,33 @@ PROP_FIRM_RULES = {
             },
         },
     },
+
+    "fundednext": {
+        "label": "FundedNext",
+        "phases": {
+            "phase_1": {
+                "target_pct": 8,
+                "daily_loss_pct": 5,
+                "max_loss_pct": 10,
+                "min_days": 5,
+                "risk_per_idea_pct": None,
+            },
+            "phase_2": {
+                "target_pct": 5,
+                "daily_loss_pct": 5,
+                "max_loss_pct": 10,
+                "min_days": 5,
+                "risk_per_idea_pct": None,
+            },
+            "funded": {
+                "target_pct": None,
+                "daily_loss_pct": 5,
+                "max_loss_pct": 10,
+                "min_days": None,
+                "risk_per_idea_pct": None,
+            },
+        },
+    },
 }
 
 SYMBOL_SPECS = {

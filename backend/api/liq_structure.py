@@ -75,6 +75,154 @@ def _bar_open_ms(b: dict) -> int:
         return 0
 
 
+# ─── REGIME (trend vs range) — always-on, OHLC only ──────────────────────────
+# Two cheap, well-worn measures combined:
+#   - Kaufman Efficiency Ratio (ER): net move / total path. ~0=chop, ~1=clean trend.
+#   - ADX (Wilder): trend-strength. >25 trending, <20 ranging.
+# Label = TREND only if BOTH agree; RANGE if both weak; else MIXED.
+# For a zone-REVERSAL strategy: RANGE = zones hold (favourable to take),
+# TREND = zones get run over (reversals fail). This is the read to gate on.
+
+REG_ER_TREND  = 0.45
+REG_ER_RANGE  = 0.30
+REG_ADX_TREND = 25.0
+REG_ADX_RANGE = 20.0
+# If the daily candle on your broker/chart does NOT start at 00:00 UTC, set this
+# so resampled daily buckets line up with the chart you verify against.
+REG_DAY_OFFSET_H = 0.0
+
+
+def _efficiency_ratio(closes: list[float], n: int) -> float:
+    """Kaufman ER over the last n steps. 0..1; higher = more directional."""
+    try:
+        if len(closes) < 3:
+            return 0.0
+        w = closes[-(n + 1):] if len(closes) > n else closes
+        net = abs(w[-1] - w[0])
+        noise = sum(abs(w[i] - w[i - 1]) for i in range(1, len(w)))
+        return float(net / noise) if noise > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _adx(bars: list[dict], n: int = 14) -> float:
+    """Wilder ADX from o/h/l/c bars. Returns 0.0 if insufficient history."""
+    try:
+        if not bars or len(bars) < 2 * n + 1:
+            return 0.0
+        highs, lows, closes = [], [], []
+        for b in bars:
+            highs.append(float(b["h"])); lows.append(float(b["l"])); closes.append(float(b["c"]))
+
+        tr, plus_dm, minus_dm = [], [], []
+        for i in range(1, len(highs)):
+            up = highs[i] - highs[i - 1]
+            dn = lows[i - 1] - lows[i]
+            plus_dm.append(up if (up > dn and up > 0) else 0.0)
+            minus_dm.append(dn if (dn > up and dn > 0) else 0.0)
+            tr.append(max(highs[i] - lows[i],
+                          abs(highs[i] - closes[i - 1]),
+                          abs(lows[i] - closes[i - 1])))
+
+        def _wilder(seq, period):
+            sm = [sum(seq[:period])]
+            for v in seq[period:]:
+                sm.append(sm[-1] - sm[-1] / period + v)
+            return sm
+
+        if len(tr) < 2 * n:
+            return 0.0
+        atr_s = _wilder(tr, n)
+        pdm_s = _wilder(plus_dm, n)
+        mdm_s = _wilder(minus_dm, n)
+
+        dx = []
+        for i in range(len(atr_s)):
+            a = atr_s[i]
+            if a <= 0:
+                dx.append(0.0); continue
+            pdi = 100.0 * pdm_s[i] / a
+            mdi = 100.0 * mdm_s[i] / a
+            s = pdi + mdi
+            dx.append(100.0 * abs(pdi - mdi) / s if s > 0 else 0.0)
+
+        if len(dx) < n:
+            return 0.0
+        adx = sum(dx[:n]) / n
+        for v in dx[n:]:
+            adx = (adx * (n - 1) + v) / n
+        return float(adx)
+    except Exception:
+        return 0.0
+
+
+def _regime_label(er: float, adx: float) -> str:
+    if er >= REG_ER_TREND and adx >= REG_ADX_TREND:
+        return "TREND"
+    if er < REG_ER_RANGE and adx < REG_ADX_RANGE:
+        return "RANGE"
+    return "MIXED"
+
+
+def _resample_to_d1(bars_h4: list[dict], offset_h: float = 0.0) -> list[dict]:
+    """Build daily o/h/l/c from H4 bars by calendar-day bucket (UTC +/- offset)."""
+    try:
+        if not bars_h4:
+            return []
+        off_ms = int(offset_h * 3_600_000)
+        days: dict[int, dict] = {}
+        order: list[int] = []
+        for b in bars_h4:
+            t = _bar_open_ms(b)
+            if t <= 0:
+                continue
+            day = (t - off_ms) // 86_400_000
+            o = float(b["o"]); h = float(b["h"]); l = float(b["l"]); c = float(b["c"])
+            if day not in days:
+                days[day] = {"o": o, "h": h, "l": l, "c": c, "t_open_ms": t}
+                order.append(day)
+            else:
+                d = days[day]
+                d["h"] = max(d["h"], h)
+                d["l"] = min(d["l"], l)
+                d["c"] = c
+        return [days[d] for d in order]
+    except Exception:
+        return []
+
+
+def compute_regime(bars: list[dict], er_n: int) -> dict:
+    """One timeframe -> {label, er, adx}. Safe; returns dashes on failure."""
+    try:
+        closes = [float(b["c"]) for b in bars] if bars else []
+        if len(closes) < 5:
+            return {"label": "—", "er": None, "adx": None}
+        er  = _efficiency_ratio(closes, er_n)
+        adx = _adx(bars, 14)
+        return {"label": _regime_label(er, adx), "er": round(er, 2), "adx": round(adx, 1)}
+    except Exception:
+        return {"label": "—", "er": None, "adx": None}
+
+
+def detect_regime(bars_h1: list[dict], bars_h4: list[dict],
+                  bars_d1: list[dict] | None = None) -> dict:
+    """
+    Always-on regime read for H1 / H4 / D1. D1 uses bars_d1 if provided, else
+    resamples from H4. Returns structured per-TF dict plus a compact UI string.
+    Also serves as the live regime label for shadow-mode trade capture.
+    """
+    h1 = compute_regime(bars_h1, er_n=24)
+    h4 = compute_regime(bars_h4, er_n=20)
+    d1_bars = bars_d1 if bars_d1 else _resample_to_d1(bars_h4, REG_DAY_OFFSET_H)
+    d1 = compute_regime(d1_bars, er_n=14)
+
+    def _tag(tf, r):
+        return f"{tf}:—" if r["label"] == "—" else f"{tf}:{r['label']}(ER{r['er']}/ADX{r['adx']})"
+
+    text = "REG " + " ".join([_tag("1H", h1), _tag("4H", h4), _tag("1D", d1)])
+    return {"h1": h1, "h4": h4, "d1": d1, "text": text}
+
+
 # ─── sweep + overlap helpers (Phase 1 confirmation layer) ─────────────────────
 
 def _is_swept(bars: list[dict], level: float, liq_type: str, lookback: int = 100) -> bool:
@@ -1337,6 +1485,7 @@ def detect_liq_signals(
     bars_h4: list[dict],
     price: float,
     atr: float,
+    bars_d1: list[dict] | None = None,
 ) -> dict[str, Any]:
     """
     Run all 6 liquidity detections and return:
@@ -1348,7 +1497,9 @@ def detect_liq_signals(
     """
     _empty = {"signals": [], "liq_text": "—", "liq_confidence": "—",
               "bsl_ssl": {"bsl": None, "ssl": None, "range_text": "—"},
-              "range_text": "—", "liq_detail": {}}
+              "range_text": "—", "liq_detail": {},
+              "regime": {"h1": {"label": "—"}, "h4": {"label": "—"},
+                         "d1": {"label": "—"}, "text": "REG —"}}
 
     try:
         if not bars_h1 or price <= 0:
@@ -1446,6 +1597,10 @@ def detect_liq_signals(
 
         liq_text = " | ".join(labels) if labels else "—"
 
+        # ── REGIME (always-on) — appended to LIQ column for chart verification ──
+        regime = detect_regime(bars_h1, bars_h4, bars_d1)
+        liq_text = f"{liq_text}    {regime['text']}" if liq_text != "—" else regime["text"]
+
         # ── direction-independent BSL/SSL range (always both sides) ──────
         bsl_ssl = find_nearest_bsl_ssl(bars_h1, price, _atr)
         detail["bsl_ssl"] = bsl_ssl
@@ -1475,6 +1630,7 @@ def detect_liq_signals(
             "range_text"    : bsl_ssl.get("range_text", "—"),
             "liq_inventory" : liq_inventory,
             "liq_detail"    : detail,
+            "regime"        : regime,
         }
 
     except Exception as e:

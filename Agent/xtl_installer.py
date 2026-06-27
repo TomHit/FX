@@ -240,64 +240,68 @@ def _compute_local_tz_offset_min() -> int:
 
 def _write_broker_meta_from_env_or_local() -> None:
     """
-    Seed Broker.TzOffsetMin / Broker.TzName into all hives so the
-    LocalSystem service (HKU\S-1-5-18) has a correct baseline
-    even before the agent runs MT5 detection.
-    Priority: env -> HKLM -> keep existing.
-    """
-    import os, winreg as _wr
-    # 1) ENV override (optional)
-    import os, time, winreg as _wr
+    P0 broker timezone seed.
 
-    # 1) ENV override (optional)
+    Installer must NEVER use:
+      - Windows/PC local timezone
+      - existing HKLM/HKCU/HKU Broker.TzOffsetMin
+
+    Why:
+      Existing registry may contain the historical bad IST value 330.
+      The agent will auto-detect real broker time from MT5 and overwrite
+      with Broker.TzSource=auto_detected.
+
+    Installer seed must be neutral:
+      Broker.TzOffsetMin = 0
+      Broker.TzName      = UTC+00:00
+      Broker.TzSource    = installer_pending_detection
+
+    Optional override:
+      FORCE_TZ_OFFSET_MIN can still be used for emergency/manual installer builds.
+    """
+    import os
+
     env_off = os.environ.get("FORCE_TZ_OFFSET_MIN")
+    env_name = os.environ.get("FORCE_TZ_NAME")
+
+    off = None
+    seeded_source = "installer_pending_detection"
+
+    # Optional explicit env override only.
+    # Do not read HKLM/HKCU/HKU and do not use OS timezone.
     try:
-        off = int(env_off) if env_off not in (None, "") else None
+        if env_off not in (None, ""):
+            probe = int(str(env_off).strip())
+            if -720 <= probe <= 900:
+                off = probe
+                seeded_source = "env_force"
     except Exception:
         off = None
 
-    # 2) HKLM fallback (machine config; either 64 or WOW6432Node)
     if off is None:
-        try:
-           with _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",
-                         0, _wr.KEY_READ | getattr(_wr, "KEY_WOW64_64KEY", 0x0100)) as k:
-               v, _ = _wr.QueryValueEx(k, "Broker.TzOffsetMin")
-               off = int(v)
-        except Exception:
-            try:
-                with _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\XTL",
-                             0, _wr.KEY_READ | getattr(_wr, "KEY_WOW64_32KEY", 0x0200)) as k:
-                    v, _ = _wr.QueryValueEx(k, "Broker.TzOffsetMin")
-                    off = int(v)
-            except Exception:
-                off = None
+        off = 0
 
-    # 3) If still unknown, seed from local OS timezone (minutes EAST of UTC)
-    if off is None or off < -720 or off > 900:
-        try:
-            import time as _t
-            isdst = _t.localtime().tm_isdst
-            seconds_west = _t.altzone if (isdst and _t.daylight) else _t.timezone
-            off = -int(seconds_west // 60)
-        except Exception:
-            off = 0
+    name = env_name or _tz_label(off)
 
-    # Normalize a friendly label; allow FORCE_TZ_NAME to override
-    name = os.environ.get("FORCE_TZ_NAME") or _tz_label(off)
-
-    # --- CRITICAL: clean legacy values in *all* views before writing fresh ones
+    # Clean legacy/bad values in all views before writing neutral seed.
     try:
-       _xtl_del_all_roots("Broker.TzOffsetMin")
-       _xtl_del_all_roots("Broker.TzName")
+        _xtl_del_all_roots("Broker.TzOffsetMin")
+        _xtl_del_all_roots("Broker.TzName")
+        _xtl_del_all_roots("Broker.TzSource")
     except Exception:
-       pass
+        pass
 
-    # Write consistent values to LS (HKU\S-1-5-18), HKLM (64+32), and HKCU (64+32)
     _xtl_set_all_roots("Broker.TzOffsetMin", str(off))
     _xtl_set_all_roots("Broker.TzName", name)
+    _xtl_set_all_roots("Broker.TzSource", seeded_source)
 
     try:
-        LOGGER.info("installer: seeded broker tz off_min=%s name=%s across all hives", off, name)
+        LOGGER.info(
+            "installer: seeded broker tz off_min=%s name=%s source=%s across all hives",
+            off,
+            name,
+            seeded_source,
+        )
     except Exception:
         pass
 
@@ -1054,71 +1058,64 @@ def _is_pid_running(pid: int) -> bool:
     except Exception:
         return False
 
+
 def service_supervise_user_agent(agent_exe, args="run", restart_backoff_s=10, ping_interval_s=5):
     """
-    Service-side supervisor loop: ensure a user-session agent is running.
-    If it exits or we can't launch yet (no user session), retry with backoff.
+    Service-side supervisor loop: keep the real user-session agent alive.
+    This function must NEVER return during normal service operation.
     """
     import time, os
 
-    # Prepare runtime/env once
-    ensure_internal_runtime_complete()   # make sure _internal (python310.dll, base_library.zip) exists
-    _ensure_cert_bundle()                # set REQUESTS_CA_BUNDLE/SSL_CERT_FILE if we bundled certs
-
-    # --- Force the intended MT5 terminal (Program Files) on every launch ---
     try:
-        mt5_exe = (
-                _hku_ls_get("MT5.TerminalPath") or _hku_ls_get("MT5Path")
-                or reg_get("MT5.TerminalPath")  or reg_get("MT5Path") or ""
-        )
-        mt5_exe = (mt5_exe or "").strip()
-    except Exception:
-        mt5_exe = ""
+        _write_broker_meta_from_env_or_local()
+        alog("supervisor: broker tz seed/normalize applied before user-agent launch")
+    except Exception as e:
+        try:
+            alog(f"supervisor: broker tz seed/normalize failed: {e}")
+        except Exception:
+            pass
 
-    mt5_dir = os.path.dirname(mt5_exe) if mt5_exe else str(APP_DIR)
-
-    # Pass both CLI flag and env hint (harmless if agent ignores them)
-    child_args = "run" + (f' --mt5-path="{mt5_exe}"' if mt5_exe else "")
+    # Do NOT repair/copy _internal from inside a running service.
+    # It causes locked-file PermissionError and can corrupt deployment.
     try:
-        if mt5_exe:
-            os.environ["XTL_MT5_PATH"] = mt5_exe
-        else:
-            os.environ.pop("XTL_MT5_PATH", None)
+        alog(f"supervisor: starting loop agent_exe={agent_exe} args={args}")
     except Exception:
         pass
 
-    last_log = 0.0
+    child_pid = None
+
     while True:
-        pid = launch_in_active_user_session(
-            str(APP_DIR / "xtl.exe"),
-            args=child_args,
-            workdir=mt5_dir,   # start inside the MT5 install folder to avoid roaming fallback
-            hidden=True,
-        )
+        try:
+            if child_pid and _is_pid_running(int(child_pid)):
+                time.sleep(ping_interval_s)
+                continue
 
-        if not pid:
-            # avoid log spam every second
-            now = time.time()
-            if now - last_log > 5:
-                alog("supervisor: launch returned None (no session or token failure); retrying")
-                last_log = now
-            time.sleep(restart_backoff_s)
-            continue
-
-        alog(f"supervisor: supervising user-session agent pid={pid}")
-
-        # Poll the child; if it dies, relaunch
-        while True:
-            time.sleep(ping_interval_s)
-            if not _is_pid_running(pid):
-                alog("supervisor: user-session agent exited; relaunching after backoff")
+            if child_pid:
+                alog(f"supervisor: child exited pid={child_pid}; restarting in {restart_backoff_s}s")
                 time.sleep(restart_backoff_s)
-                try:
-                    ensure_internal_runtime_complete()
-                except Exception as e:
-                    alog(f"supervisor: runtime verify failed before relaunch: {e}")
-                break
 
+            child_pid = launch_in_active_user_session(
+                agent_exe,
+                args=args,
+                workdir=os.path.dirname(agent_exe),
+                hidden=True,
+            )
+
+            if child_pid:
+                alog(f"supervisor: launched user-session agent pid={child_pid}")
+            else:
+                alog(f"supervisor: launch failed; retry in {restart_backoff_s}s")
+                time.sleep(restart_backoff_s)
+
+        except KeyboardInterrupt:
+            alog("supervisor: KeyboardInterrupt; exiting")
+            break
+        except Exception as e:
+            alog(f"supervisor: loop error: {e}; retry in {restart_backoff_s}s")
+            time.sleep(restart_backoff_s)
+
+    return 0
+    
 def _bind_from_registry(api_base: str) -> bool:
     """
     Robust binding flow:
@@ -1969,6 +1966,16 @@ def ensure_internal_runtime_complete() -> None:
             _log(f"runtime: WARN copy {src} -> {dst}: {e}")
         return False
 
+
+    # --- EARLY-OUT: if _internal is already complete, do NOT run merge/download repair.
+    # The deployment package ships a correct _internal; the repair below (especially the
+    # python.org base_library.zip fetch) can REPLACE the correct PyInstaller base_library.zip
+    # with a mismatched one. Only repair when genuinely broken.
+    _blz0    = app_internal / "base_library.zip"
+    _py310_0 = app_internal / "python310.dll"
+    if _ok_file(_blz0, min_bytes=1_000_000) and _ok_file(_py310_0, min_bytes=1):
+        _log("runtime: _internal already complete (base_library.zip + python310.dll present) - skipping repair/fetch")
+        return
     # --- 1) Stage from common _internal folders ------------------------------
     candidates_internal = [
         here / "_internal",
@@ -2415,14 +2422,33 @@ def deploy_files(src_exe: Path) -> None:
             return False
 
     here = src_exe.parent
+    try:
+        blog(f"DEPLOY_DEBUG src_exe={src_exe}")
+        blog(f"DEPLOY_DEBUG src_exe_exists={src_exe.exists()}")
+        blog(f"DEPLOY_DEBUG src_exe_size={src_exe.stat().st_size if src_exe.exists() else -1}")
+        blog(f"DEPLOY_DEBUG here={here}")
+        blog(f"DEPLOY_DEBUG APP_DIR={APP_DIR}")
+    except Exception as e:
+        blog(f"DEPLOY_DEBUG source_check_failed={e}")
+        
     APP_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1) xtl.exe
     dst_exe = APP_DIR / "xtl.exe"
     try:
         if (not dst_exe.exists()) or (not _same_file(src_exe, dst_exe)):
-            blog(f"deploy_files: copying xtl.exe -> {dst_exe}")
+            blog(f"deploy_files: copying xtl.exe from {src_exe} -> {dst_exe}")
             shutil.copy2(src_exe, dst_exe)
+            # VERIFY the copy actually took (not blocked by a lock)
+            if dst_exe.stat().st_size != src_exe.stat().st_size:
+                raise RuntimeError(
+                    f"xtl.exe deploy size mismatch: src={src_exe.stat().st_size} "
+                    f"dst={dst_exe.stat().st_size} — file likely locked by running service")
+
+            try:
+                blog(f"DEPLOY_DEBUG dst_exe_size_after_copy={dst_exe.stat().st_size if dst_exe.exists() else -1}")
+            except Exception as e:
+                blog(f"DEPLOY_DEBUG dst_size_check_failed={e}")
     except Exception as e:
         blog(f"deploy_files: copy xtl.exe ERROR {e}")
         raise
@@ -4220,8 +4246,39 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
         ensure_winsw_binary()
 
         log("install: deploy_files()...")
-        deploy_files(Path(sys.argv[0]).resolve())
 
+        # --- CRITICAL: stop service + kill stray xtl processes so files aren't locked ---
+        log("install: stopping XTLAgent service before deploy (release file locks)...")
+        try:
+            subprocess.run(["sc", "stop", "XTLAgent"], capture_output=True, timeout=30)
+        except Exception as e:
+            log(f"install: sc stop warn: {e}")
+        # wait for the service to actually stop + release handles
+        for _ in range(20):  # up to ~20s
+            try:
+                out = subprocess.run(["sc", "query", "XTLAgent"], capture_output=True, text=True, timeout=10)
+                if "STOPPED" in (out.stdout or ""):
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        # kill any stray xtl.exe children still holding the binary/_internal
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "xtl.exe", "/T"], capture_output=True, timeout=20)
+        except Exception as e:
+            log(f"install: taskkill xtl.exe warn: {e}")
+        time.sleep(2)  # let Windows release file handles
+
+        # Resolve the REAL built xtl.exe (sibling of the running installer if present)
+        src_exe = Path(sys.argv[0]).resolve()
+        sibling_xtl = src_exe.parent / "xtl.exe"
+        if sibling_xtl.exists() and sibling_xtl.resolve() != src_exe:
+            src_exe = sibling_xtl
+        log(f"install: deploy source exe={src_exe} size={src_exe.stat().st_size}")
+
+        deploy_files(src_exe)
+        import hashlib
+        
         # Resolve APP_DIR (destination where the service runs)
         def _resolve_app_dir() -> Path:
             candidates = [
@@ -4236,8 +4293,26 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
         global APP_DIR
         APP_DIR = _resolve_app_dir()
 
-        log("install: ensure_internal_runtime_complete()...")
-        ensure_internal_runtime_complete()
+        def _sha256(p: Path) -> str:
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        try:
+            installed_exe = APP_DIR / "xtl.exe"
+            if installed_exe.exists():
+                log(f"install: deployed xtl.exe sha={_sha256(installed_exe)}")
+            else:
+                log("install: deployed xtl.exe NOT FOUND")
+        except Exception as e:
+            log(f"install: sha check failed: {e}")
+
+        
+
+        #log("install: ensure_internal_runtime_complete()...")
+        #ensure_internal_runtime_complete()
 
         # Optional visibility to the embedded runtime landing
         try:

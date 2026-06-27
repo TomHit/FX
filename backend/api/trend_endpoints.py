@@ -3,6 +3,77 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# === OPPT profiling: per-symbol/per-phase perf_counter timing (Step 1 instrument) ===
+import logging as _oppt_logging
+import json as _oppt_json
+from time import perf_counter as _oppt_perf_counter
+_oppt_log = _oppt_logging.getLogger("xtl.oppt")
+
+class _OpptTimer:
+    """One OPPT_TIMING line per /trend/opportunities call.
+    add() before cur is set lands in global (pre/post-loop) phases."""
+    def __init__(self, debug_gate=False):
+        self.debug_gate = bool(debug_gate)
+        self._t0 = _oppt_perf_counter()
+        self.cur = None
+        self.rows = {}
+        self.order = []
+        self.glob = {}
+        self._iter_start = None
+    def now(self):
+        return _oppt_perf_counter()
+    def _close_iter(self):
+        # attribute in-loop time not captured by named phases to "loop_overhead"
+        if self.cur is not None and self._iter_start is not None:
+            b = self.rows.get(self.cur, {})
+            phase_sum = sum(v for k, v in b.items() if k != "loop_overhead")
+            ov = (_oppt_perf_counter() - self._iter_start) - phase_sum
+            if ov > 0:
+                b["loop_overhead"] = b.get("loop_overhead", 0.0) + ov
+        self._iter_start = None
+    def start(self, sym, side):
+        self._close_iter()
+        self.cur = f"{sym}/{side}"
+        if self.cur not in self.rows:
+            self.rows[self.cur] = {}
+            self.order.append(self.cur)
+        self._iter_start = _oppt_perf_counter()
+    def end_loop(self):
+        self._close_iter()
+        self.cur = None
+    def add(self, phase, dt):
+        b = self.rows.get(self.cur) if self.cur else None
+        if b is None:
+            self.glob[phase] = self.glob.get(phase, 0.0) + dt
+        else:
+            b[phase] = b.get(phase, 0.0) + dt
+    def emit(self, where=""):
+        total = _oppt_perf_counter() - self._t0
+        phase_tot = {}
+        for b in self.rows.values():
+            for k, v in b.items():
+                phase_tot[k] = phase_tot.get(k, 0.0) + v
+        for k, v in self.glob.items():
+            phase_tot[k] = phase_tot.get(k, 0.0) + v
+        payload = {
+            "where": where,
+            "total_ms": round(total * 1000, 1),
+            "debug_gate": self.debug_gate,
+            "n_iter": len(self.order),
+            "phase_ms": {k: round(v * 1000, 1)
+                         for k, v in sorted(phase_tot.items(), key=lambda kv: -kv[1])},
+            "global_ms": {k: round(v * 1000, 1) for k, v in self.glob.items()},
+            "per_iter_ms": {k: {p: round(s * 1000, 1) for p, s in self.rows[k].items()}
+                            for k in self.order},
+        }
+        try:
+            _oppt_log.warning("OPPT_TIMING %s",
+                              _oppt_json.dumps(payload, separators=(",", ":"), default=str))
+        except Exception:
+            pass
+        return payload
+# === end OPPT profiling ===
+
 
 # --- Zone-only entry gate (new module; single source of truth) ---
 _ZONE_GATE_IMPORT_ERR = None
@@ -422,13 +493,59 @@ def _save_prop_config(cfg: dict) -> dict:
     return out
 
 def _prop_today() -> str:
-    return time.strftime("%Y%m%d", time.gmtime())
+    """
+    Prop firm day key.
 
+    FTMO resets Maximum Daily Loss at midnight CE(S)T.
+    Use Europe/Prague as CE(S)T timezone.
+    Fallback to UTC if zoneinfo unavailable.
+    """
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/Prague")).strftime("%Y%m%d")
+    except Exception:
+        return time.strftime("%Y%m%d", time.gmtime())
 
 def _prop_daily_key(day: str | None = None) -> str:
     return f"{PROP_DAILY_KEY_PREFIX}:{day or _prop_today()}"
 
 
+def _reservation_ticket(j: dict) -> str:
+    ticket = (
+        j.get("ticket")
+        or j.get("mt5_ticket")
+        or j.get("broker_ticket")
+        or j.get("position_ticket")
+    )
+    return str(ticket) if ticket not in (None, "", 0) else ""
+
+
+def _live_broker_tickets_for_prop() -> set[str]:
+    tickets = set()
+    try:
+        for k in R.scan_iter("xtl:mt5:pos:*"):
+            raw = R.get(k)
+            js = json.loads(raw) if raw else None
+
+            if isinstance(js, dict):
+                positions = js.get("positions") or js.get("items") or js.get("data") or []
+                if not positions and any(x in js for x in ("ticket", "mt5_ticket", "position_id")):
+                    positions = [js]
+            elif isinstance(js, list):
+                positions = js
+            else:
+                positions = []
+
+            for p in positions:
+                if not isinstance(p, dict):
+                    continue
+                ticket = p.get("ticket") or p.get("mt5_ticket") or p.get("position_id")
+                if ticket not in (None, "", 0):
+                    tickets.add(str(ticket))
+    except Exception:
+        pass
+    return tickets
 def _get_prop_risk_state() -> dict:
     day = _prop_today()
     daily_key = _prop_daily_key(day)
@@ -466,30 +583,122 @@ def _get_prop_risk_state() -> dict:
 
     total_open_risk = 0.0
     open_items = []
+    live_tickets = _live_broker_tickets_for_prop()
 
     for k, v in open_risk.items():
         try:
             j = json.loads(v) if isinstance(v, str) else v
             if not isinstance(j, dict):
                 continue
+
             risk = float(j.get("risk_usd") or 0)
+            ticket = _reservation_ticket(j)
+
+            # Drop phantom/stale reservation before counting it.
+            if ticket and live_tickets and ticket not in live_tickets:
+                try:
+                    R.hdel(PROP_OPEN_RISK_KEY, k)
+                    log.warning(
+                        "[PROP_RISK] DROP_ORPHAN_RESERVATION key=%s ticket=%s symbol=%s side=%s risk=%s",
+                        k, ticket, j.get("symbol"), j.get("side"), risk
+                    )
+                except Exception:
+                    pass
+                continue
+
             total_open_risk += risk
             open_items.append(j)
+
         except Exception:
             continue
+
+    daily_reserved = _f(daily, "daily_risk_reserved", 0)
+
+    if total_open_risk > 0 and abs(daily_reserved - total_open_risk) > 0.01:
+        daily_reserved = total_open_risk
+        try:
+            R.hset(daily_key, "daily_risk_reserved", round(float(total_open_risk), 2))
+            R.expire(daily_key, 3 * 24 * 3600)
+        except Exception:
+            pass
+    # -------------------------------------------------
+    # FTMO live daily-loss model:
+    # Daily loss resets at midnight CE(S)T and is based on equity.
+    # We store start-of-day balance once, then compare live equity.
+    # -------------------------------------------------
+    broker = _get_latest_mt5_account()
+    broker_balance = 0.0
+    broker_equity = 0.0
+    floating_pnl = 0.0
+
+    try:
+        broker_balance = float(broker.get("balance") or 0.0)
+        broker_equity = float(broker.get("equity") or broker_balance or 0.0)
+        floating_pnl = float(broker.get("floating_pnl") or 0.0)
+    except Exception:
+        broker_balance = broker_equity = floating_pnl = 0.0
+
+    sod_balance = _f(daily, "start_balance", 0)
+    if sod_balance <= 0 and broker_balance > 0:
+        sod_balance = broker_balance
+        try:
+            R.hset(daily_key, "start_balance", round(float(sod_balance), 2))
+            R.expire(daily_key, 3 * 24 * 3600)
+        except Exception:
+            pass
+
+    # -------------------------------------------------
+    # Daily reset notification - once per prop day
+    # FTMO day resets at midnight CE(S)T via _prop_today().
+    # -------------------------------------------------
+    try:
+        cfg = _get_prop_config()
+        firm_u = str(cfg.get("firm") or "").lower()
+
+        if firm_u == "ftmo" and broker_balance > 0:
+            notice_key = f"xtl:prop:reset_notice:{firm_u}:{day}"
+
+            if not R.get(notice_key):
+                msg = (
+                    f"**FTMO Daily Reset**\n"
+                    f"New prop day: `{day}` CE(S)T\n"
+                    f"Start balance: `${float(sod_balance):.2f}`\n"
+                    f"Current equity: `${float(broker_equity):.2f}`\n"
+                    f"Floating P/L: `${float(floating_pnl):.2f}`\n"
+                    f"Daily loss limit: `${float(cfg.get('account_size') or sod_balance) * 0.05:.2f}`"
+                )
+
+                _discord_post(msg)
+
+                R.setex(notice_key, 36 * 3600, "1")
+    except Exception:
+        pass
+
+    ftmo_live_daily_loss = 0.0
+    if sod_balance > 0 and broker_equity > 0:
+        ftmo_live_daily_loss = max(0.0, float(sod_balance) - float(broker_equity))
 
     return {
         "day": day,
         "daily_key": daily_key,
         "daily_loss_used": _f(daily, "daily_loss_used", 0),
-        "daily_risk_reserved": _f(daily, "daily_risk_reserved", 0),
+        "daily_risk_reserved": round(float(daily_reserved), 2),
         "max_loss_used": _f(stats, "max_loss_used", 0),
         "open_risk_usd": round(total_open_risk, 2),
         "open_positions": open_items,
+        "open_positions_count": (
+            len(live_tickets)
+            if live_tickets
+            else len(open_items)
+        ),
         "wins_today": int(_f(daily, "wins_today", 0)),
         "losses_today": int(_f(daily, "losses_today", 0)),
+        "start_balance": round(float(sod_balance), 2),
+        "broker_balance": round(float(broker_balance), 2),
+        "broker_equity": round(float(broker_equity), 2),
+        "floating_pnl": round(float(floating_pnl), 2),
+        "ftmo_live_daily_loss": round(float(ftmo_live_daily_loss), 2),
     }
-
 
 def _reserve_prop_open_risk(trade_id: str, rec: dict) -> None:
     if not trade_id:
@@ -612,7 +821,7 @@ def prop_status():
         or broker_balance
     )
 
-    account_size = broker_equity
+    account_size = float(cfg.get("account_size") or broker_balance)
 
     rules = PROP_FIRM_RULES[firm]["phases"][phase]
 
@@ -665,9 +874,11 @@ def prop_check(payload: dict):
             or cfg["account_size"]
         )
 
+        firm_u = str(payload.get("firm") or cfg["firm"]).lower()
+
         account_size = float(
             payload.get("account_size")
-            or broker_equity
+            or (cfg["account_size"] if firm_u == "ftmo" else broker_equity)
         )
 
         result = compute_prop_check(
@@ -680,10 +891,17 @@ def prop_check(payload: dict):
             sl=float(payload["sl"]),
             risk_pct=float(payload.get("risk_pct") or cfg["risk_pct"]),
             target_rr=float(payload.get("target_rr") or cfg["target_rr"]),
-            daily_loss_used=float(payload.get("daily_loss_used", risk_state["daily_loss_used"])),
+            daily_loss_used=float(
+                payload.get(
+                    "daily_loss_used",
+                    risk_state.get("ftmo_live_daily_loss")
+                    if str(payload.get("firm") or cfg["firm"]).lower() == "ftmo"
+                    else risk_state["daily_loss_used"]
+                )
+            ),
             max_loss_used=float(payload.get("max_loss_used", risk_state["max_loss_used"])),
             open_risk_usd=float(payload.get("open_risk_usd", risk_state["open_risk_usd"])),
-            open_positions_count=len(risk_state.get("open_positions", [])),
+            open_positions_count=int(risk_state.get("open_positions_count", len(risk_state.get("open_positions", [])))),
             max_open_risk_pct=float(payload.get("max_open_risk_pct", cfg["max_open_risk_pct"])),
             max_open_positions=int(cfg.get("max_open_positions", 1)),
         )
@@ -7572,6 +7790,8 @@ def trend_opportunities(
         except Exception:
             debug_gate_on = False
 
+    _oppt_t = _OpptTimer(debug_gate=debug_gate_on)
+
 
     # -------------------------------------------------
     # defaults so debug_gate/debug_force never 500s
@@ -7720,6 +7940,7 @@ def trend_opportunities(
     # Step 2: HARD fallback only if still none
     if not resolved_device and R is not None:
         try:
+            _pt = _oppt_t.now()
             best_dev = None
             best_hb = -1
             for key in R.scan_iter("device:dev_*"):
@@ -7751,6 +7972,7 @@ def trend_opportunities(
                     best_hb = hb_i
                     best_dev = dev_id
 
+            _oppt_t.add("dev_scan", _oppt_t.now() - _pt)
             if best_dev:
                 resolved_device = best_dev
         except Exception:
@@ -7792,6 +8014,66 @@ def trend_opportunities(
             "auth_ok": auth_ok,
         },
     )
+
+    # -------------------------------------------------
+    # RESPONSE CACHE (revived) — slim default path only, device-scoped.
+    # Key on the RESOLVED device so header + auto-resolved requests share one
+    # entry and never cross device feeds. 2s TTL. Debug / include_sr bypass.
+    # Per-key concurrency ≈ 1 (each agent install = own device_id), so the
+    # existing anti-stampede lock only needs to cover multi-tab / rapid refresh.
+    # -------------------------------------------------
+    _is_slim_cacheable = (
+        (not debug_gate_on)
+        and (not debug_force)
+        and (not (debug_top and debug_top > 0))
+        and (not debug_persist)
+        and (not loose)
+        and (str(include_sr or "").strip().lower() not in ("1", "true", "yes", "y", "on"))
+    )
+    if _is_slim_cacheable:
+        _dev_for_key = ((effective_device or dev_for_gate or "").strip() or "nodev")
+        _sym_for_key = ",".join(_sym_list(symbols))
+        cache_key = f"xtl:oppt:cache:slim:{_dev_for_key}:{tfu}:{_sym_for_key}"
+        cache_ttl_s = 10   # H1 gate/zone display tolerates ~10s staleness; price pushed separately
+    else:
+        cache_key = None
+        cache_ttl_s = 0
+
+    # 1) fast-path: serve cache immediately (skips sweep + full loop)
+    if cache_key:
+        try:
+            _cached_raw = R.get(cache_key)
+            if _cached_raw:
+                _js = _json_load_twice(_cached_raw)
+                if isinstance(_js, dict) and _js.get("ok"):
+                    _js["cached"] = True
+                    _js["cache_ttl_s"] = cache_ttl_s
+                    try:
+                        _oppt_log.warning("OPPT_CACHE_HIT %s", cache_key)
+                    except Exception:
+                        pass
+                    return _js
+        except Exception:
+            pass
+
+        # 2) anti-stampede: one request recomputes per window; others serve stale
+        inflight_lock_key = cache_key + ":lock"
+        try:
+            inflight_got_lock = bool(R.set(inflight_lock_key, "1", nx=True, ex=6))
+        except Exception:
+            inflight_got_lock = False
+        if not inflight_got_lock:
+            try:
+                _cached2 = R.get(cache_key)
+                if _cached2:
+                    _js2 = _json_load_twice(_cached2)
+                    if isinstance(_js2, dict) and _js2.get("ok"):
+                        _js2["cached"] = True
+                        _js2["cache_ttl_s"] = cache_ttl_s
+                        _js2["cache_note"] = "served_stale_while_inflight"
+                        return _js2
+            except Exception:
+                pass
 
     # Build debug dict here; attach to rows later (row doesn't exist yet)
     oppt_dev_dbg = None
@@ -8979,10 +9261,12 @@ def trend_opportunities(
     is_weekend = utc_weekday >= 5
 
     # Always sweep (so HIT/EXPIRED snapshots are cleaned)
+    _pt = _oppt_t.now()
     try:
         _sweep_opp_snapshots(symbols, now_ms)
     except Exception:
         pass
+    _oppt_t.add("sweep", _oppt_t.now() - _pt)
 
     if is_weekend and not (debug_force or debug_gate):
         
@@ -9037,6 +9321,7 @@ def trend_opportunities(
        
        
 
+        _oppt_t.emit("weekend")
         return payload
    
     def _fmt_zone(z):
@@ -9102,6 +9387,7 @@ def trend_opportunities(
         _sym_side_rows = []   # collect surviving side-rows; collapse to one after loop
 
         for side in ("BUY", "SELL"):
+            _oppt_t.start(sym_u, side)
             row = {
                 "symbol": sym_u,
                 "status": "active",
@@ -9122,8 +9408,10 @@ def trend_opportunities(
                 "server_now_ms": now_ms,
             }
 
+            _pt = _oppt_t.now()
             try:
                 lp, lp_ts_ms, lp_src = _get_live_price_with_ts(sym_u, dev_for_gate)
+                _oppt_t.add("live_price", _oppt_t.now() - _pt)
 
                 if lp is not None:
                     row["last_price"] = float(lp)
@@ -9140,18 +9428,23 @@ def trend_opportunities(
                 if debug_gate_on:
                     row["dbg_live_price_exc"] = f"{type(e).__name__}:{e}"
 
+            _pt = _oppt_t.now()
             try:
                 sr_bundle = _get_sr_bundle(
                     sym_u,
                     prefer_dev=dev_for_gate,
+                    display_only=True,   # PERF: serve cached last_good SR; recompute only on true miss
                 )
+                _oppt_t.add("sr_read", _oppt_t.now() - _pt)
                 if isinstance(sr_bundle, dict) and sr_bundle:
                     row["sr"] = sr_bundle
             except Exception:
                 row["sr"] = {}
 
+            _pt = _oppt_t.now()
             try:
                 bars_h1, h1_key = _load_device_h1_bars(sym_u, dev_for_gate)
+                _oppt_t.add("h1_bars", _oppt_t.now() - _pt)
                 row_h1 = {
                     "bars": bars_h1,
                     "last_price": row.get("last_price"),
@@ -9209,7 +9502,9 @@ def trend_opportunities(
                         _b_atr = float(row.get("atr_1h") or row.get("atr14") or 0)
                         _b_h4  = []
                         try:
+                            _pt = _oppt_t.now()
                             _h4_raw = R.get(f"xtl:ohlc:snap:{dev_for_gate}:{sym_u}:H4") if R is not None else None
+                            _oppt_t.add("h4_read", _oppt_t.now() - _pt)
                             if isinstance(_h4_raw, (bytes, bytearray)):
                                 _h4_raw = _h4_raw.decode("utf-8", "ignore")
                             if _h4_raw:
@@ -9223,7 +9518,9 @@ def trend_opportunities(
                             _b_h4 = []
                         _sr_pre = row.get("sr") if isinstance(row.get("sr"), dict) else {}
                         if _sr_pre and (_sr_pre.get("active_supports") or _sr_pre.get("active_resistances")):
+                            _pt = _oppt_t.now()
                             _sc = _score_sr_with_liquidity(sym_u, _sr_pre, bars_h1, _b_h4, _b_px, _b_atr)
+                            _oppt_t.add("liq_score", _oppt_t.now() - _pt)
                             if isinstance(_sc, dict) and _sc:
                                 _sr_pre["scored_supports"]    = _sc.get("scored_supports") or []
                                 _sr_pre["scored_resistances"] = _sc.get("scored_resistances") or []
@@ -9239,6 +9536,7 @@ def trend_opportunities(
                 # ── END BRIDGE (pre-gate) ──
                 
                 if debug_gate_on: row["dbg_gate_path"] = "P9203_main_loop"
+                _pt = _oppt_t.now()
                 allowed, gm = _zone_reversal_gate_zone_only(
                     R=R,
                     sym=sym_u,
@@ -9252,6 +9550,7 @@ def trend_opportunities(
                     debug_gate=bool(debug_gate_on),
                     live_px=row.get("last_price"),
                 )
+                _oppt_t.add("gate", _oppt_t.now() - _pt)
 
                 gm = gm if isinstance(gm, dict) else {"reason": "gate_meta_not_dict"}
                 gm.setdefault("blocked", not bool(allowed))
@@ -9393,6 +9692,7 @@ def trend_opportunities(
                     )
                     row["liq_signals"]    = _liq.get("signals", [])
                     row["liq_text"]       = _liq.get("liq_text", "—")
+                    row["regime"]   = _liq.get("regime", None)
                     row["liq_confidence"] = _liq.get("liq_confidence", "—")
                     row["range_text"]     = _liq.get("range_text", "—")
                     row["bsl_ssl"]        = _liq.get("bsl_ssl", {})
@@ -9402,39 +9702,40 @@ def trend_opportunities(
                 row.setdefault("liq_signals", [])
                 row.setdefault("liq_text", "—")
                 row.setdefault("liq_confidence", "—")
+                row.setdefault("regime", None)
                 row.setdefault("range_text", "—")
                 row.setdefault("bsl_ssl", {})
                 row.setdefault("liq_detail", {})
             # ── END LIQ STRUCTURE ─────────────────────────────────────────
 
             # ── BRIDGE: score SR active levels by liquidity evidence ──────
-            try:
-                if callable(_score_sr_with_liquidity):
-                    _sr_b = row.get("sr") if isinstance(row.get("sr"), dict) else {}
-                    if _sr_b and (_sr_b.get("active_supports") or _sr_b.get("active_resistances")):
-                        _scored = _score_sr_with_liquidity(
-                            sym_u,
-                            _sr_b,
-                            bars_h1,
-                            _liq_h4,
-                            _liq_px,
-                            _liq_atr,
-                        )
-                        if isinstance(_scored, dict) and _scored:
-                            _sr_b["scored_supports"]    = _scored.get("scored_supports") or []
-                            _sr_b["scored_resistances"] = _scored.get("scored_resistances") or []
-                            _sr_b["best_support"]       = _scored.get("best_support")
-                            _sr_b["best_resistance"]    = _scored.get("best_resistance")
-                            if debug_gate_on:
-                                row["dbg_bridge_ran"] = True
-                                row["dbg_bridge_sr_id"] = id(_sr_b)
-                                row["dbg_bridge_wrote_best"] = isinstance(_sr_b.get("best_support"), dict)
-                           
+            #try:
+            #    if callable(_score_sr_with_liquidity):
+            #        _sr_b = row.get("sr") if isinstance(row.get("sr"), dict) else {}
+            #        if _sr_b and (_sr_b.get("active_supports") or _sr_b.get("active_resistances")):
+            #            _scored = _score_sr_with_liquidity(
+            #                sym_u,
+            #                _sr_b,
+            #                bars_h1,
+            #                _liq_h4,
+            #                _liq_px,
+            #                _liq_atr,
+            #            )
+            #            if isinstance(_scored, dict) and _scored:
+            #                _sr_b["scored_supports"]    = _scored.get("scored_supports") or []
+            #                _sr_b["scored_resistances"] = _scored.get("scored_resistances") or []
+            #                _sr_b["best_support"]       = _scored.get("best_support")
+            #                _sr_b["best_resistance"]    = _scored.get("best_resistance")
+            #                if debug_gate_on:
+            #                    row["dbg_bridge_ran"] = True
+            #                    row["dbg_bridge_sr_id"] = id(_sr_b)
+            #                    row["dbg_bridge_wrote_best"] = isinstance(_sr_b.get("best_support"), dict)
+            #               
                             
-                            row["sr"] = _sr_b
-            except Exception as _br_exc:
-                import traceback as _tb
-                log.error("BRIDGE_ERR sym=%s err=%s trace=%s", sym_u, _br_exc, _tb.format_exc())
+            #                row["sr"] = _sr_b
+            #except Exception as _br_exc:
+            #    import traceback as _tb
+            #    log.error("BRIDGE_ERR sym=%s err=%s trace=%s", sym_u, _br_exc, _tb.format_exc())
             # ── END BRIDGE ────────────────────────────────────────────────
 
             _sym_side_rows.append(row)
@@ -9470,7 +9771,10 @@ def trend_opportunities(
                     return (resolved_match, mkt_open, not_blocked, has_sig, score)
                 watch_rows.append(max(_sym_side_rows, key=_side_rank))
 
+    _oppt_t.end_loop()
+    _pt = _oppt_t.now()
     history = _load_opp_history(limit=50)
+    _oppt_t.add("history", _oppt_t.now() - _pt)
     # ------------------------------------------------------------
     # Slim default opportunities/watchlist response.
     # Do NOT send full SR tree unless explicitly requested.
@@ -9536,6 +9840,7 @@ def trend_opportunities(
     except Exception:
         pass
 
+    _oppt_t.emit("watchlist_weekday")
     return payload
     
     # ---------- Reuse main prediction logic (need H1 + H4 because predict_all is TF-STRICT) ----------
