@@ -12,21 +12,33 @@ TRIED_LOG: list[str] = []
 # cache: once MT5 is initialized and connected, don't re-init every cycle
 _MT5_READY = False
 
+
 # Attach-only guard: detect if MT5 is already running.
 def _mt5_running() -> bool:
     try:
         import os
-        out = os.popen('tasklist /FI "IMAGENAME eq terminal64.exe" /FO CSV /NH').read().lower()
+
+        out = (
+            os.popen('tasklist /FI "IMAGENAME eq terminal64.exe" /FO CSV /NH')
+            .read()
+            .lower()
+        )
         if "terminal64.exe" in out and "no tasks" not in out:
             return True
-        out2 = os.popen('tasklist /FI "IMAGENAME eq terminal.exe" /FO CSV /NH').read().lower()
+        out2 = (
+            os.popen('tasklist /FI "IMAGENAME eq terminal.exe" /FO CSV /NH')
+            .read()
+            .lower()
+        )
         return ("terminal.exe" in out2) and ("no tasks" not in out2)
     except Exception:
         return False
 
+
 # Returns full path of the running MT5 terminal (terminal64.exe/terminal.exe), or None.
 def _find_running_mt5_exe() -> str | None:
     import os
+
     try:
         ps = r'powershell -NoProfile -Command "(Get-Process terminal64 -ErrorAction SilentlyContinue | Select-Object -First 1).Path"'
         out = os.popen(ps).read().strip().strip('"')
@@ -39,13 +51,17 @@ def _find_running_mt5_exe() -> str | None:
     except Exception:
         pass
     try:
-        out = os.popen('wmic process where "name=\'terminal64.exe\'" get ExecutablePath /value').read()
+        out = os.popen(
+            "wmic process where \"name='terminal64.exe'\" get ExecutablePath /value"
+        ).read()
         for line in out.splitlines():
             if line.lower().startswith("executablepath="):
                 p = line.split("=", 1)[1].strip()
                 if p:
                     return p
-        out2 = os.popen('wmic process where "name=\'terminal.exe\'" get ExecutablePath /value').read()
+        out2 = os.popen(
+            "wmic process where \"name='terminal.exe'\" get ExecutablePath /value"
+        ).read()
         for line in out2.splitlines():
             if line.lower().startswith("executablepath="):
                 p = line.split("=", 1)[1].strip()
@@ -54,7 +70,8 @@ def _find_running_mt5_exe() -> str | None:
     except Exception:
         pass
     return None
-    
+
+
 def mt5_get_open_positions() -> list[dict]:
     if not mt5_init():
         return []
@@ -67,22 +84,26 @@ def mt5_get_open_positions() -> list[dict]:
         out = []
         for p in positions:
             try:
-                out.append({
-                    "ticket": int(getattr(p, "ticket", 0) or 0),
-                    "symbol": str(getattr(p, "symbol", "") or "").upper(),
-                    "type": int(getattr(p, "type", 0) or 0),
-                    "side": "BUY" if int(getattr(p, "type", 0) or 0) == 0 else "SELL",
-                    "volume": float(getattr(p, "volume", 0.0) or 0.0),
-                    "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
-                    "price_current": float(getattr(p, "price_current", 0.0) or 0.0),
-                    "profit": float(getattr(p, "profit", 0.0) or 0.0),
-                    "sl": float(getattr(p, "sl", 0.0) or 0.0),
-                    "tp": float(getattr(p, "tp", 0.0) or 0.0),
-                    "magic": int(getattr(p, "magic", 0) or 0),
-                    "comment": str(getattr(p, "comment", "") or ""),
-                    "time": int(getattr(p, "time", 0) or 0),
-                    "time_msc": int(getattr(p, "time_msc", 0) or 0),
-                })
+                out.append(
+                    {
+                        "ticket": int(getattr(p, "ticket", 0) or 0),
+                        "symbol": str(getattr(p, "symbol", "") or "").upper(),
+                        "type": int(getattr(p, "type", 0) or 0),
+                        "side": (
+                            "BUY" if int(getattr(p, "type", 0) or 0) == 0 else "SELL"
+                        ),
+                        "volume": float(getattr(p, "volume", 0.0) or 0.0),
+                        "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
+                        "price_current": float(getattr(p, "price_current", 0.0) or 0.0),
+                        "profit": float(getattr(p, "profit", 0.0) or 0.0),
+                        "sl": float(getattr(p, "sl", 0.0) or 0.0),
+                        "tp": float(getattr(p, "tp", 0.0) or 0.0),
+                        "magic": int(getattr(p, "magic", 0) or 0),
+                        "comment": str(getattr(p, "comment", "") or ""),
+                        "time": int(getattr(p, "time", 0) or 0),
+                        "time_msc": int(getattr(p, "time_msc", 0) or 0),
+                    }
+                )
             except Exception:
                 continue
 
@@ -90,13 +111,309 @@ def mt5_get_open_positions() -> list[dict]:
     except Exception:
         return []
 
+
+def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
+    """
+    Passive MT5 deal-history reader.
+
+    Safe Phase-1:
+      - only reads MT5 history
+      - does not place/close orders
+      - does not change lifecycle
+      - caller can write result to Redis later as xtl:mt5:deal:{position_id}
+    """
+    if not mt5_init():
+        return {
+            "ok": False,
+            "error": "mt5_init_failed",
+            "position_id": int(position_id or 0),
+        }
+
+    try:
+        from datetime import datetime, timedelta
+        import MetaTrader5 as MT5
+
+        pid = int(position_id or 0)
+        if pid <= 0:
+            return {"ok": False, "error": "bad_position_id", "position_id": pid}
+
+        # MT5 broker/deal time can be ahead of local PC time.
+        # Use a forward buffer so freshly closed deals are included.
+        dt_to = datetime.now() + timedelta(days=1)
+        dt_from = datetime.now() - timedelta(days=int(days_back or 7))
+
+        deals = MT5.history_deals_get(dt_from, dt_to)
+        if deals is None:
+            return {
+                "ok": False,
+                "error": "history_deals_get_failed",
+                "position_id": pid,
+                "last_error": MT5.last_error(),
+            }
+
+        matched = []
+        for d in deals:
+            try:
+                if (
+                    int(getattr(d, "position_id", 0) or 0) == pid
+                    or int(getattr(d, "order", 0) or 0) == pid
+                    or int(getattr(d, "ticket", 0) or 0) == pid
+                ):
+                    matched.append(d)
+            except Exception:
+                continue
+
+        if not matched:
+            # MT5 history can lag a few seconds immediately after close.
+            # Retry briefly before returning no_deals_found.
+            for _retry in range(5):
+                time.sleep(1.0)
+
+                deals = MT5.history_deals_get(
+                    dt_from, datetime.now() + timedelta(days=1)
+                )
+                if deals is None:
+                    continue
+
+                matched = []
+                for d in deals:
+                    try:
+                        if (
+                            int(getattr(d, "position_id", 0) or 0) == pid
+                            or int(getattr(d, "order", 0) or 0) == pid
+                            or int(getattr(d, "ticket", 0) or 0) == pid
+                        ):
+                            matched.append(d)
+                    except Exception:
+                        continue
+
+                if matched:
+                    break
+
+            if not matched:
+                return {
+                    "ok": False,
+                    "error": "no_deals_found",
+                    "position_id": pid,
+                    "days_back": int(days_back or 7),
+                }
+        in_deals = []
+        out_deals = []
+        all_rows = []
+
+        for d in matched:
+            try:
+                entry = int(getattr(d, "entry", -1))
+                row = {
+                    "ticket": int(getattr(d, "ticket", 0) or 0),
+                    "order": int(getattr(d, "order", 0) or 0),
+                    "time": int(getattr(d, "time", 0) or 0),
+                    "time_msc": int(getattr(d, "time_msc", 0) or 0),
+                    "type": int(getattr(d, "type", -1)),
+                    "entry": entry,
+                    "position_id": int(getattr(d, "position_id", 0) or 0),
+                    "volume": float(getattr(d, "volume", 0.0) or 0.0),
+                    "price": float(getattr(d, "price", 0.0) or 0.0),
+                    "commission": float(getattr(d, "commission", 0.0) or 0.0),
+                    "swap": float(getattr(d, "swap", 0.0) or 0.0),
+                    "profit": float(getattr(d, "profit", 0.0) or 0.0),
+                    "fee": float(getattr(d, "fee", 0.0) or 0.0),
+                    "symbol": str(getattr(d, "symbol", "") or "").upper(),
+                    "comment": str(getattr(d, "comment", "") or ""),
+                }
+                all_rows.append(row)
+
+                # MT5 constants are usually:
+                # DEAL_ENTRY_IN=0, DEAL_ENTRY_OUT=1, DEAL_ENTRY_INOUT=2
+                if entry == getattr(MT5, "DEAL_ENTRY_IN", 0):
+                    in_deals.append(row)
+                elif entry == getattr(MT5, "DEAL_ENTRY_OUT", 1):
+                    out_deals.append(row)
+                elif entry == getattr(MT5, "DEAL_ENTRY_INOUT", 2):
+                    out_deals.append(row)
+            except Exception:
+                continue
+
+        open_deal = in_deals[0] if in_deals else (all_rows[0] if all_rows else {})
+        close_deals = out_deals or []
+
+        closed_volume = sum(float(x.get("volume") or 0.0) for x in close_deals)
+        if closed_volume > 0:
+            close_price = (
+                sum(
+                    float(x.get("price") or 0.0) * float(x.get("volume") or 0.0)
+                    for x in close_deals
+                )
+                / closed_volume
+            )
+        else:
+            close_price = float((all_rows[-1] or {}).get("price") or 0.0)
+
+        gross_profit = sum(float(x.get("profit") or 0.0) for x in close_deals)
+        commission = sum(float(x.get("commission") or 0.0) for x in all_rows)
+        swap = sum(float(x.get("swap") or 0.0) for x in all_rows)
+        fee = sum(float(x.get("fee") or 0.0) for x in all_rows)
+        net_profit = gross_profit + commission + swap + fee
+
+        close_time_ms = 0
+        if close_deals:
+            close_time_ms = max(int(x.get("time_msc") or 0) for x in close_deals)
+        if close_time_ms <= 0 and all_rows:
+            close_time_ms = int(all_rows[-1].get("time_msc") or 0)
+
+        summary = {
+            "ok": True,
+            "position_id": pid,
+            "symbol": str(
+                open_deal.get("symbol")
+                or (all_rows[0].get("symbol") if all_rows else "")
+            ).upper(),
+            "open_price": float(open_deal.get("price") or 0.0),
+            "open_time_ms": int(open_deal.get("time_msc") or 0),
+            "close_price": round(float(close_price or 0.0), 6),
+            "close_time_ms": int(close_time_ms or 0),
+            "volume": round(float(closed_volume or open_deal.get("volume") or 0.0), 4),
+            "gross_profit": round(float(gross_profit or 0.0), 2),
+            "commission": round(float(commission or 0.0), 2),
+            "swap": round(float(swap or 0.0), 2),
+            "fee": round(float(fee or 0.0), 2),
+            "net_profit": round(float(net_profit or 0.0), 2),
+            "deal_count": len(all_rows),
+            "entry_deal_ticket": int(open_deal.get("ticket") or 0),
+            "exit_deal_ticket": (
+                int(close_deals[-1].get("ticket") or 0) if close_deals else 0
+            ),
+            "close_order_ticket": (
+                int(close_deals[-1].get("order") or 0) if close_deals else 0
+            ),
+            "comment": str(
+                close_deals[-1].get("comment") or open_deal.get("comment") or ""
+            ),
+            "raw_deals": all_rows,
+            "created_at_ms": int(time.time() * 1000),
+        }
+
+        return summary
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"deal_summary_exc:{type(e).__name__}:{e}",
+            "position_id": int(position_id or 0),
+        }
+
+
+def mt5_calc_order_margin(
+    symbol: str,
+    side: str,
+    volume: float,
+    price: float | None = None,
+) -> dict:
+    """
+    Broker-native margin calculation using MT5 OrderCalcMargin().
+    Returns the exact margin the broker would require.
+    """
+
+    try:
+        import MetaTrader5 as mt5
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"mt5_import_failed:{e}",
+        }
+
+    try:
+        if not mt5_init():
+            return {
+                "ok": False,
+                "error": "mt5_init_failed",
+            }
+
+        symbol = str(symbol or "").upper().strip()
+        side = str(side or "").upper().strip()
+        volume = float(volume or 0)
+
+        broker_symbol = _resolve_broker_symbol(symbol)
+
+        if not mt5.symbol_select(broker_symbol, True):
+            return {
+                "ok": False,
+                "error": "symbol_select_failed",
+                "symbol": symbol,
+                "broker_symbol": broker_symbol,
+            }
+
+        tick = mt5.symbol_info_tick(broker_symbol)
+        if tick is None:
+            return {
+                "ok": False,
+                "error": "tick_not_found",
+            }
+
+        if price is None or float(price) <= 0:
+            if side == "BUY":
+                price = tick.ask
+            else:
+                price = tick.bid
+
+        order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+
+        required_margin = mt5.order_calc_margin(
+            order_type,
+            broker_symbol,
+            float(volume),
+            float(price),
+        )
+
+        if required_margin is None:
+            return {
+                "ok": False,
+                "error": "order_calc_margin_failed",
+                "last_error": mt5.last_error(),
+            }
+
+        acct = mt5.account_info()
+
+        free_margin = float(acct.margin_free)
+        equity = float(acct.equity)
+        balance = float(acct.balance)
+        leverage = int(acct.leverage)
+
+        return {
+            "ok": True,
+            "required_margin": round(required_margin, 2),
+            "free_margin": round(free_margin, 2),
+            "remaining_margin": round(
+                free_margin - required_margin,
+                2,
+            ),
+            "shortfall": round(
+                max(0.0, required_margin - free_margin),
+                2,
+            ),
+            "balance": round(balance, 2),
+            "equity": round(equity, 2),
+            "leverage": leverage,
+            "broker_symbol": broker_symbol,
+            "enough_margin": required_margin <= free_margin,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
 # ---------- logging ----------
 def _ts():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
+
 def _log(msg: str):
     try:
         import logging
+
         logging.getLogger("xtl.agent").info(msg)
     except Exception:
         print(f"{_ts()} [mt5] {msg}", flush=True)
@@ -106,6 +423,7 @@ def _log(msg: str):
 
 # --- Registry helpers (prefer LocalSystem HKU\S-1-5-18, then HKLM, then HKCU) ---
 import sys
+
 try:
     import winreg as _winreg
 except Exception:
@@ -113,14 +431,16 @@ except Exception:
 
 import os
 
+
 # --- robust identity detection (LocalSystem = S-1-5-18) ---
 def _current_user_sid() -> str | None:
     import ctypes, ctypes.wintypes as wt
+
     adv = ctypes.WinDLL("advapi32", use_last_error=True)
     ker = ctypes.WinDLL("kernel32", use_last_error=True)
 
     GetCurrentProcess = ker.GetCurrentProcess
-    OpenProcessToken  = adv.OpenProcessToken
+    OpenProcessToken = adv.OpenProcessToken
     GetTokenInformation = adv.GetTokenInformation
     ConvertSidToStringSidW = adv.ConvertSidToStringSidW
     LocalFree = ker.LocalFree
@@ -130,6 +450,7 @@ def _current_user_sid() -> str | None:
 
     class SID_AND_ATTRIBUTES(ctypes.Structure):
         _fields_ = [("Sid", wt.LPVOID), ("Attributes", wt.DWORD)]
+
     class TOKEN_USER(ctypes.Structure):
         _fields_ = [("User", SID_AND_ATTRIBUTES)]
 
@@ -155,6 +476,7 @@ def _current_user_sid() -> str | None:
         if out:
             LocalFree(out)
 
+
 # --- robust LocalSystem detection ---
 def _is_localsystem() -> bool:
     """
@@ -163,9 +485,10 @@ def _is_localsystem() -> bool:
     try:
         import ctypes
         from ctypes import wintypes as wt
+
         GetUserNameW = ctypes.windll.advapi32.GetUserNameW
         GetUserNameW.argtypes = [wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
-        GetUserNameW.restype  = wt.BOOL
+        GetUserNameW.restype = wt.BOOL
 
         buf_len = wt.DWORD(256)
         buf = ctypes.create_unicode_buffer(buf_len.value)
@@ -188,7 +511,9 @@ def _is_localsystem() -> bool:
         return True
     return False
 
+
 _XTL_SUBKEY = r"Software\XTL"
+
 
 def _reg_read_value(name: str):
     try:
@@ -202,21 +527,21 @@ def _reg_read_value(name: str):
     # Prefer HKU\S-1-5-18 when running as LocalSystem; otherwise HKCU first.
     if _is_localsystem():
         order = [
-            (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_64, "HKU\\S-1-5-18 64"),
-            (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_32, "HKU\\S-1-5-18 32"),
-            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_64, "HKLM 64"),
-            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_32, "HKLM 32"),
-            (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_64, "HKCU 64"),
-            (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_32, "HKCU 32"),
+            (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_64, "HKU\\S-1-5-18 64"),
+            (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_32, "HKU\\S-1-5-18 32"),
+            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_64, "HKLM 64"),
+            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_32, "HKLM 32"),
+            (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_64, "HKCU 64"),
+            (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_32, "HKCU 32"),
         ]
     else:
         order = [
-            (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_64, "HKCU 64"),
-            (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_32, "HKCU 32"),
-            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_64, "HKLM 64"),
-            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_32, "HKLM 32"),
-            (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_64, "HKU\\S-1-5-18 64"),
-            (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_32, "HKU\\S-1-5-18 32"),
+            (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_64, "HKCU 64"),
+            (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_32, "HKCU 32"),
+            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_64, "HKLM 64"),
+            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_32, "HKLM 32"),
+            (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_64, "HKU\\S-1-5-18 64"),
+            (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_32, "HKU\\S-1-5-18 32"),
         ]
 
     for hive, subkey, view, tag in order:
@@ -233,7 +558,7 @@ def _reg_read_value(name: str):
 def _broker_meta_from_registry():
     # read offset + name + report source for debugging
     off, off_src = _reg_read_value("Broker.TzOffsetMin")
-    nm,  nm_src  = _reg_read_value("Broker.TzName")
+    nm, nm_src = _reg_read_value("Broker.TzName")
     try:
         off = int(off) if off not in (None, "") else None
     except Exception:
@@ -248,7 +573,6 @@ def _broker_meta_from_registry():
     except Exception:
         pass
     return (nm, off)
-
 
 
 def _reg_get_xtl(name):
@@ -296,6 +620,7 @@ def _reg_get_xtl(name):
 def _read_reg(root: str, key: str, value: str) -> Optional[str]:
     try:
         import winreg
+
         hive = winreg.HKEY_LOCAL_MACHINE if root == "HKLM" else winreg.HKEY_CURRENT_USER
         with winreg.OpenKey(hive, key) as k:
             val, _ = winreg.QueryValueEx(k, value)
@@ -303,32 +628,38 @@ def _read_reg(root: str, key: str, value: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def _reg_get(name: str) -> str:
     """Prefer HKCU\Software\XTL; fallback to LocalSystem hive HKU\S-1-5-18\Software\XTL."""
     try:
         import winreg
+
         # HKCU
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\XTL") as k:
                 v, _ = winreg.QueryValueEx(k, name)
-                if v: return str(v).strip()
+                if v:
+                    return str(v).strip()
         except Exception:
             pass
         # LocalSystem hive
         try:
             with winreg.OpenKey(winreg.HKEY_USERS, r"S-1-5-18\Software\XTL") as k:
                 v, _ = winreg.QueryValueEx(k, name)
-                if v: return str(v).strip()
+                if v:
+                    return str(v).strip()
         except Exception:
             pass
     except Exception:
         pass
     return ""
 
+
 # --- Registry helper (safe, works under LocalSystem + user) ---
 def reg_get(name: str, root=None, default=None):
     """Fetch REG_SZ from HKCU/HKLM/HKU\S-1-5-18\Software\XTL in order."""
     import winreg
+
     keys = [
         (winreg.HKEY_CURRENT_USER, r"Software\XTL"),
         (winreg.HKEY_LOCAL_MACHINE, r"Software\XTL"),
@@ -348,9 +679,9 @@ def reg_get(name: str, root=None, default=None):
 def _guess_mt5_path() -> Optional[str]:
     # 1) App registry hints (future-proof if installer writes them)
     for r, k, v in [
-        ("HKLM", r"Software\XTL",           "MT5Path"),
-        ("HKLM", r"Software\XauTrendLab",   "MT5Path"),
-        ("HKLM", r"Software\XTL",           "MT5.TerminalPath"),
+        ("HKLM", r"Software\XTL", "MT5Path"),
+        ("HKLM", r"Software\XauTrendLab", "MT5Path"),
+        ("HKLM", r"Software\XTL", "MT5.TerminalPath"),
     ]:
         p = _read_reg(r, k, v)
         if p and Path(p).is_file():
@@ -374,17 +705,28 @@ def _guess_mt5_path() -> Optional[str]:
     # 3) Try to detect a running terminal (best-effort)
     try:
         out = subprocess.check_output(
-            ["wmic","process","where","name='terminal64.exe'","get","ExecutablePath","/value"],
-            stderr=subprocess.DEVNULL, text=True, timeout=3
+            [
+                "wmic",
+                "process",
+                "where",
+                "name='terminal64.exe'",
+                "get",
+                "ExecutablePath",
+                "/value",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
         )
         for line in out.splitlines():
             if line.startswith("ExecutablePath="):
-                exe = line.split("=",1)[1].strip()
+                exe = line.split("=", 1)[1].strip()
                 if exe and Path(exe).is_file():
                     return exe
     except Exception:
         pass
     return None
+
 
 # ---------- init ----------
 def mt5_init() -> bool:
@@ -395,6 +737,7 @@ def mt5_init() -> bool:
       - Logs attempts via TRIED_LOG and returns False until connected.
     """
     import os, sys
+
     global _MT5_READY
 
     if _MT5_READY:
@@ -402,10 +745,12 @@ def mt5_init() -> bool:
     TRIED_LOG.clear()
     try:
         from datetime import datetime
-        _log(f"[whoami] is_local_system={_is_localsystem()} sid={_current_user_sid()} now={datetime.utcnow().isoformat()}Z")
+
+        _log(
+            f"[whoami] is_local_system={_is_localsystem()} sid={_current_user_sid()} now={datetime.utcnow().isoformat()}Z"
+        )
     except Exception:
         pass
-
 
     # --- ATTACH-ONLY: require a running terminal and resolve its EXE path ---
 
@@ -427,9 +772,9 @@ def mt5_init() -> bool:
                 tin = MT5.terminal_info()
                 ain = MT5.account_info()
                 try:
-                    srv  = str(getattr(tin, "server", "") or "")
+                    srv = str(getattr(tin, "server", "") or "")
                     tpth = str(getattr(tin, "path", "") or "")
-                    acc  = getattr(ain, "login", None)
+                    acc = getattr(ain, "login", None)
                     _log(f"[mt5_init] server={srv} path={tpth} login={acc}")
                 except Exception:
                     pass
@@ -493,7 +838,11 @@ def mt5_init() -> bool:
             err = MT5.last_error()
         except Exception:
             err = None
-        _log("MT5: initialize failed; tried: " + (" | ".join(TRIED_LOG) or "<no attempts>") + f" | last_error={err}")
+        _log(
+            "MT5: initialize failed; tried: "
+            + (" | ".join(TRIED_LOG) or "<no attempts>")
+            + f" | last_error={err}"
+        )
         return False
 
     # --- success: log and require a real logged-in session before 'ready' ---
@@ -501,20 +850,26 @@ def mt5_init() -> bool:
         tin = MT5.terminal_info()
         ain = MT5.account_info()
         try:
-            srv  = str(getattr(tin, "server", "") or "")
+            srv = str(getattr(tin, "server", "") or "")
             tpth = str(getattr(tin, "path", "") or "")
-            acc  = getattr(ain, "login", None)
+            acc = getattr(ain, "login", None)
             _log(f"[mt5_init] server={srv} path={tpth} login={acc}")
         except Exception:
             pass
 
-        _log("MT5 init OK; connected=%s server=%s build=%s login=%s"
-             % (getattr(tin, "connected", None),
+        _log(
+            "MT5 init OK; connected=%s server=%s build=%s login=%s"
+            % (
+                getattr(tin, "connected", None),
                 getattr(tin, "server", None),
                 getattr(tin, "build", None),
-                getattr(ain, "login", None) if ain else None))
-        _log("MT5 paths: exe=%s  data=%s" %
-             (getattr(tin, "path", "?"), getattr(tin, "data_path", "?")))
+                getattr(ain, "login", None) if ain else None,
+            )
+        )
+        _log(
+            "MT5 paths: exe=%s  data=%s"
+            % (getattr(tin, "path", "?"), getattr(tin, "data_path", "?"))
+        )
         if getattr(tin, "connected", 0) != 1:
             _log("MT5: terminal not connected (keep MT5 open and logged in).")
             return False
@@ -523,14 +878,17 @@ def mt5_init() -> bool:
         return False
     # auto-detect broker TZ from last closed M1 and persist to registry
     try:
-        detect_and_write_broker_tz_any(["XAUUSD","EURUSD","USDJPY","GBPUSD","USDCAD","USDCHF"])
+        detect_and_write_broker_tz_any(
+            ["XAUUSD", "EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDCHF"]
+        )
         _ensure_broker_offset_fresh()
     except Exception:
         pass
 
-
     _MT5_READY = True
     return True
+
+
 def get_mt5_tick_price_and_ts(symbol: str):
     import MetaTrader5 as mt5
 
@@ -566,6 +924,7 @@ def get_mt5_tick_price_and_ts(symbol: str):
 
     return px, ts_ms
 
+
 def _probe(path_or_none: Optional[str]) -> bool:
     """
     Try variants so MT5.initialize succeeds without showing first-run wizard:
@@ -578,7 +937,11 @@ def _probe(path_or_none: Optional[str]) -> bool:
 
     def _try_init(p: Optional[str], portable: bool) -> bool:
         try:
-            ok = MT5.initialize(p, portable=portable) if p else MT5.initialize(portable=portable)
+            ok = (
+                MT5.initialize(p, portable=portable)
+                if p
+                else MT5.initialize(portable=portable)
+            )
         except Exception as e:
             TRIED_LOG.append(f"init({p or 'default'}, portable={portable}) EXC {e}")
             return False
@@ -589,7 +952,9 @@ def _probe(path_or_none: Optional[str]) -> bool:
             err = MT5.last_error()
         except Exception:
             err = None
-        TRIED_LOG.append(f"init({p or 'default'}, portable={portable}) -> False last_error={err}")
+        TRIED_LOG.append(
+            f"init({p or 'default'}, portable={portable}) -> False last_error={err}"
+        )
         return False
 
     p = (path_or_none or "").strip() or None
@@ -604,9 +969,9 @@ def _probe(path_or_none: Optional[str]) -> bool:
 
     # 3) If path is terminal64.exe, try terminal.exe (some brokers)
     if p and p.lower().endswith("terminal64.exe"):
-        alt = p[:-len("terminal64.exe")] + "terminal.exe"
+        alt = p[: -len("terminal64.exe")] + "terminal.exe"
         time.sleep(0.5)
-        if _try_init(alt, False):   # non-portable first
+        if _try_init(alt, False):  # non-portable first
             return True
         time.sleep(0.5)
         if _try_init(alt, True):
@@ -622,26 +987,41 @@ def _probe(path_or_none: Optional[str]) -> bool:
 
     return False
 
+
 # --- safe row accessor for numpy structured rows / dicts / objects ---
 def _ff(row, key, default=0):
     try:
         if isinstance(row, dict):
             return row.get(key, default)
         # numpy structured/recarray?
-        if hasattr(row, "dtype") and getattr(row.dtype, "names", None) and key in row.dtype.names:
+        if (
+            hasattr(row, "dtype")
+            and getattr(row.dtype, "names", None)
+            and key in row.dtype.names
+        ):
             return row[key]
         # object with attribute
         return getattr(row, key, default)
     except Exception:
         return default
 
+
 # ---------- timeframe helpers ----------
 def _tf_seconds(tf: str) -> int:
     tf = (tf or "").upper()
     return {
-        "M1":60, "M5":300, "M15":900, "M30":1800,
-        "H1":3600,"H2":7200,"H4":14400, "D1":86400, "W1":604800, "MN1":2592000
+        "M1": 60,
+        "M5": 300,
+        "M15": 900,
+        "M30": 1800,
+        "H1": 3600,
+        "H2": 7200,
+        "H4": 14400,
+        "D1": 86400,
+        "W1": 604800,
+        "MN1": 2592000,
     }.get(tf, 3600)
+
 
 def _map_tf(name: str):
     """
@@ -652,32 +1032,37 @@ def _map_tf(name: str):
         return 0
     n = (name or "").upper()
     m = {
-        "M1":  MT5.TIMEFRAME_M1,
-        "M5":  MT5.TIMEFRAME_M5,
+        "M1": MT5.TIMEFRAME_M1,
+        "M5": MT5.TIMEFRAME_M5,
         "M10": getattr(MT5, "TIMEFRAME_M10", MT5.TIMEFRAME_M5),
         "M15": MT5.TIMEFRAME_M15,
         "M30": MT5.TIMEFRAME_M30,
-        "H1":  MT5.TIMEFRAME_H1,
+        "H1": MT5.TIMEFRAME_H1,
         # H2 exists in newer MT5 builds; fall back to H1 if missing
-        "H2":  getattr(MT5, "TIMEFRAME_H2", MT5.TIMEFRAME_H1),
-        "H4":  MT5.TIMEFRAME_H4,
-        "D1":  MT5.TIMEFRAME_D1,
+        "H2": getattr(MT5, "TIMEFRAME_H2", MT5.TIMEFRAME_H1),
+        "H4": MT5.TIMEFRAME_H4,
+        "D1": MT5.TIMEFRAME_D1,
     }
     return m.get(n, 0)
+
 
 # --- helpers: broker id + current stored offset ---
 def _current_broker_id() -> str:
     try:
         import MetaTrader5 as MT5
+
         ti = MT5.terminal_info()
         company = getattr(ti, "company", "") or ""
-        server  = getattr(ti, "server", "") or ""
+        server = getattr(ti, "server", "") or ""
         return f"{company}|{server}"
     except Exception:
         return ""
 
+
 def _reg_read(name: str) -> str | None:
-    val, _src = _reg_read_value(name)  # uses identity-aware order + logs via _broker_meta_from_registry
+    val, _src = _reg_read_value(
+        name
+    )  # uses identity-aware order + logs via _broker_meta_from_registry
     try:
         return str(val) if val not in (None, "") else None
     except Exception:
@@ -707,8 +1092,10 @@ def _resolve_broker_symbol(base: str) -> str:
             desc = (getattr(s, "description", "") or "").lower()
             if "gold vs us dollar (spot)" in desc or "gold vs usd (spot)" in desc:
                 # ensure visible in Market Watch
-                try: MT5.symbol_select(s.name, True)
-                except Exception: pass
+                try:
+                    MT5.symbol_select(s.name, True)
+                except Exception:
+                    pass
                 return s.name
 
         # 2b) Prefer any visible candidate
@@ -721,13 +1108,16 @@ def _resolve_broker_symbol(base: str) -> str:
     except Exception:
         return base
 
+
 def _mt5_last_error():
     """Return (code, message) from MT5.last_error() safely."""
     try:
         import MetaTrader5 as MT5
+
         return MT5.last_error()
     except Exception:
         return (None, "unknown")
+
 
 def _mt5_reconnect():
     """
@@ -787,7 +1177,8 @@ def _mt5_reconnect():
 
     _log(f"[mt5] reconnect timeout; err={_mt5_last_error()}")
     return False
-    
+
+
 def _is_trusted_broker_tz(off: int | None, source: str | None = None) -> bool:
     try:
         off = int(off)
@@ -805,6 +1196,7 @@ def _is_trusted_broker_tz(off: int | None, source: str | None = None) -> bool:
         return False
 
     return src == "auto_detected"
+
 
 def _probe_broker_offset_min() -> int | None:
     """
@@ -835,6 +1227,7 @@ def _probe_broker_offset_min() -> int | None:
 
 # cache for this process
 _BROKER_OFF_MIN_CACHE: int | None = None
+
 
 def _broker_offset_min() -> int:
     """
@@ -877,6 +1270,7 @@ def _broker_offset_min() -> int:
     # 5) default
     raise RuntimeError("broker timezone offset is not trusted/auto_detected")
 
+
 def _ensure_broker_offset_fresh():
     """
     Load trusted Broker.TzOffsetMin into cache.
@@ -904,13 +1298,17 @@ def _ensure_broker_offset_fresh():
 
     except Exception as e:
         _log(f"[mt5_tz] invalid Broker.TzOffsetMin '{raw}': {e}")
+
+
 # --- Broker timezone: detect from MT5 bars and persist to registry ---
 
 import time as _time
+
 try:
     import winreg as _wr
 except Exception:
     _wr = None
+
 
 # --- replace _xtl_reg_write_all with this version ---
 def _xtl_reg_write_all(name: str, value: str) -> None:
@@ -924,21 +1322,21 @@ def _xtl_reg_write_all(name: str, value: str) -> None:
 
     if _is_localsystem():
         targets = [
-            (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_64, "HKU\\S-1-5-18 64"),
-            (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_32, "HKU\\S-1-5-18 32"),
-            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_64, "HKLM 64"),
-            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_32, "HKLM 32"),
-            (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_64, "HKCU 64"),
-            (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_32, "HKCU 32"),
+            (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_64, "HKU\\S-1-5-18 64"),
+            (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_32, "HKU\\S-1-5-18 32"),
+            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_64, "HKLM 64"),
+            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_32, "HKLM 32"),
+            (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_64, "HKCU 64"),
+            (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_32, "HKCU 32"),
         ]
     else:
         targets = [
-            (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_64, "HKCU 64"),
-            (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_32, "HKCU 32"),
-            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_64, "HKLM 64"),
-            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_32, "HKLM 32"),
-            (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_64, "HKU\\S-1-5-18 64"),
-            (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_32, "HKU\\S-1-5-18 32"),
+            (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_64, "HKCU 64"),
+            (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_32, "HKCU 32"),
+            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_64, "HKLM 64"),
+            (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_32, "HKLM 32"),
+            (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_64, "HKU\\S-1-5-18 64"),
+            (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_32, "HKU\\S-1-5-18 32"),
         ]
 
     for hive, subkey, view, tag in targets:
@@ -970,12 +1368,12 @@ def _xtl_reg_delete_all(name: str) -> None:
     WOW64_64 = getattr(_wr, "KEY_WOW64_64KEY", 0x0100)
     WOW64_32 = getattr(_wr, "KEY_WOW64_32KEY", 0x0200)
     targets = [
-        (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_64),
-        (_wr.HKEY_USERS,         r"S-1-5-18\Software\XTL", WOW64_32),
-        (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_64),
-        (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL",          WOW64_32),
-        (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_64),
-        (_wr.HKEY_CURRENT_USER,  r"Software\XTL",          WOW64_32),
+        (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_64),
+        (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_32),
+        (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_64),
+        (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_32),
+        (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_64),
+        (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_32),
     ]
     for hive, subkey, view in targets:
         try:
@@ -992,9 +1390,10 @@ def _xtl_reg_delete_all(name: str) -> None:
 
 
 def _tz_label(mins: int) -> str:
-    s = '+' if mins >= 0 else '-'
+    s = "+" if mins >= 0 else "-"
     m = abs(mins)
     return f"UTC{s}{m//60:02d}:{m%60:02d}"
+
 
 # --- bootstrap helpers ---
 def _pick_best_known_offset() -> tuple[int | None, str | None]:
@@ -1003,26 +1402,37 @@ def _pick_best_known_offset() -> tuple[int | None, str | None]:
     Prefers: if running as LocalSystem we try to reuse HKCU; if User, we try S-1-5-18.
     Skips None/''/out-of-range and 330 (IST) unless your broker is actually IST.
     """
-    off_cu, src_cu = _reg_read_value("Broker.TzOffsetMin")   # typically HKCU when run as user
+    off_cu, src_cu = _reg_read_value(
+        "Broker.TzOffsetMin"
+    )  # typically HKCU when run as user
     off_ls, src_ls = None, None
     # try reading S-1-5-18 directly (even if we aren't LocalSystem)
     try:
         import winreg as _wr
+
         WOW64_64 = getattr(_wr, "KEY_WOW64_64KEY", 0x0100)
         with _wr.ConnectRegistry(None, _wr.HKEY_USERS) as reg:
-            with _wr.OpenKey(reg, r"S-1-5-18\Software\XTL", 0, _wr.KEY_READ | WOW64_64) as h:
-                off_ls, _ = _wr.QueryValueEx(h, "Broker.TzOffsetMin"); src_ls = "HKU\\S-1-5-18 64"
+            with _wr.OpenKey(
+                reg, r"S-1-5-18\Software\XTL", 0, _wr.KEY_READ | WOW64_64
+            ) as h:
+                off_ls, _ = _wr.QueryValueEx(h, "Broker.TzOffsetMin")
+                src_ls = "HKU\\S-1-5-18 64"
     except Exception:
         pass
+
     def _coerce(v):
-        try: return int(v)
-        except: return None
+        try:
+            return int(v)
+        except:
+            return None
+
     cand = []
     for val, tag in [(off_cu, src_cu), (off_ls, src_ls)]:
         iv = _coerce(val)
         if iv is not None and -720 <= iv <= 900 and iv != 330:
             cand.append((iv, tag))
     return cand[0] if cand else (None, None)
+
 
 def _tz_bootstrap_to_identity_hive(off_min: int) -> None:
     """Write off_min + label into the identity-correct hive and log."""
@@ -1112,7 +1522,9 @@ def detect_and_write_broker_tz_any(symbols: list[str]) -> None:
             # Stale bar (market closed) -> this symbol's offset is unreliable; try next symbol.
             bar_age_min = (now_ms - t_close_ms) / 60_000
             if bar_age_min > 5:
-                _log(f"[mt5_detect_tz] {base}: M1 bar stale ({bar_age_min:.0f}min) - skip, try next symbol")
+                _log(
+                    f"[mt5_detect_tz] {base}: M1 bar stale ({bar_age_min:.0f}min) - skip, try next symbol"
+                )
                 continue
 
             # Persist (RE-ENABLED with freshness guard + source tag)
@@ -1133,20 +1545,28 @@ def detect_and_write_broker_tz_any(symbols: list[str]) -> None:
                     _log(f"[mt5_detect_tz] verify {_name}={_val}")
             except Exception as e:
                 _log(f"[mt5_detect_tz] verify registry failed: {e}")
-            _log(f"[mt5_detect_tz] {resolved}: DETECTED off_min={best_off} ({_tz_label(best_off)}) age={bar_age_min:.0f}min err_ms={int(best_err)}")
+            _log(
+                f"[mt5_detect_tz] {resolved}: DETECTED off_min={best_off} ({_tz_label(best_off)}) age={bar_age_min:.0f}min err_ms={int(best_err)}"
+            )
             return
 
         except Exception as e:
             _log(f"[mt5_detect_tz] {base} detection error: {e}")
             continue
 
-    _log("[mt5_detect_tz] unable to detect broker offset from any candidate (market closed?)")
+    _log(
+        "[mt5_detect_tz] unable to detect broker offset from any candidate (market closed?)"
+    )
+
+
 # ---------- rates -> dicts ----------
 def _np_to_dicts(rates) -> List[Dict]:
     out: List[Dict] = []
-    if rates is None: return out
+    if rates is None:
+        return out
     try:
         import numpy as np  # noqa
+
         if isinstance(rates, np.ndarray) and rates.size > 0:
             names = tuple(rates.dtype.names or ())
             for row in rates:
@@ -1154,9 +1574,13 @@ def _np_to_dicts(rates) -> List[Dict]:
                     t = int(row["time"] if "time" in names else row[0])
                     o = float(row["open"] if "open" in names else row[1])
                     h = float(row["high"] if "high" in names else row[2])
-                    l = float(row["low"]  if "low"  in names else row[3])
-                    c = float(row["close"]if "close" in names else row[4])
-                    v = int(  row["tick_volume"] if "tick_volume" in names else (row[5] if len(names)>=6 else 0))
+                    l = float(row["low"] if "low" in names else row[3])
+                    c = float(row["close"] if "close" in names else row[4])
+                    v = int(
+                        row["tick_volume"]
+                        if "tick_volume" in names
+                        else (row[5] if len(names) >= 6 else 0)
+                    )
                     out.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
                 except Exception:
                     continue
@@ -1166,29 +1590,39 @@ def _np_to_dicts(rates) -> List[Dict]:
                 t = int(getattr(row, "time", row[0]))
                 o = float(getattr(row, "open", row[1]))
                 h = float(getattr(row, "high", row[2]))
-                l = float(getattr(row, "low",  row[3]))
-                c = float(getattr(row, "close",row[4]))
+                l = float(getattr(row, "low", row[3]))
+                c = float(getattr(row, "close", row[4]))
                 v = int(getattr(row, "tick_volume", row[5] if len(row) > 5 else 0))
                 out.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
         except Exception:
             return []
     return out
 
+
 def _assert_tail_parity(sym, tf_code, tf_ms, rows):
     try:
         probe = MT5.copy_rates_from_pos(sym, tf_code, 1, 1)
-        if probe is None: return
-        try: probe = list(probe)
-        except: probe = [probe]
-        if len(probe) != 1 or not rows: return
+        if probe is None:
+            return
+        try:
+            probe = list(probe)
+        except:
+            probe = [probe]
+        if len(probe) != 1 or not rows:
+            return
         t_ms = int(probe[0]["time"]) * 1000
         if rows[-1]["t_open_ms"] != t_ms:
-            raise RuntimeError(f"Tail parity fail: rows[-1]={rows[-1]['t_open_ms']} vs MT5.prev={t_ms}")
+            raise RuntimeError(
+                f"Tail parity fail: rows[-1]={rows[-1]['t_open_ms']} vs MT5.prev={t_ms}"
+            )
     except Exception as e:
         _log(f"[mt5_assert] {e}")
 
+
 # ---------- PUBLIC: fetch last N CLOSED bars ----------
-def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool = False):
+def mt5_fetch_rates(
+    sym: str, timeframe, count: int = 300, include_latest: bool = False
+):
     """
     Return exactly the last `count` CLOSED bars aligned to the broker TF grid.
     If include_latest=True, also append the *previous closed* slot (still complete=True).
@@ -1207,7 +1641,6 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
         if not _mt5_reconnect():
             _log(f"[mt5_fetch_rates] MT5 not connected; aborting for {sym}/{timeframe}")
             return []
-
 
     # ---------- SAFE FIELD ACCESSOR (dict or numpy.void) ----------
     def _f(r, name, default=0):
@@ -1231,12 +1664,16 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
         "H4": 4 * 60 * 60,
         "H2": 2 * 60 * 60,
     }
-    tf_label = str(timeframe) if isinstance(timeframe, str) else getattr(timeframe, "name", "H1")
+    tf_label = (
+        str(timeframe)
+        if isinstance(timeframe, str)
+        else getattr(timeframe, "name", "H1")
+    )
     tf_label = tf_label.upper()
     if tf_label.startswith("TIMEFRAME_"):
         tf_label = tf_label.split("TIMEFRAME_", 1)[1]
     tf_sec = TF_SEC_MAP.get(tf_label, 60 * 60)
-    tf_ms  = tf_sec * 1000
+    tf_ms = tf_sec * 1000
     # --- ensure broker offset is fresh before any logging/formatting ---
     try:
         probe = _probe_broker_offset_min()
@@ -1251,17 +1688,25 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
 
     # If probe succeeded and differs (or stored missing) -> write and cache now
     try:
-       if probe is not None and -720 <= int(probe) <= 900 and (stored_int is None or int(probe) != stored_int):
-           global _BROKER_OFF_MIN_CACHE
-           src = _reg_read("Broker.TzSource") or ""
-           if _is_trusted_broker_tz(probe, src):
-               _BROKER_OFF_MIN_CACHE = int(probe)
-           else:
-               _log(f"[P0_TZ_BLOCK] ignored untrusted probe offset={probe} source={src}")
-               
-               _log(f"[mt5_tz] refreshed: stored_off={stored_int} -> probe_off={int(probe)}")
+        if (
+            probe is not None
+            and -720 <= int(probe) <= 900
+            and (stored_int is None or int(probe) != stored_int)
+        ):
+            global _BROKER_OFF_MIN_CACHE
+            src = _reg_read("Broker.TzSource") or ""
+            if _is_trusted_broker_tz(probe, src):
+                _BROKER_OFF_MIN_CACHE = int(probe)
+            else:
+                _log(
+                    f"[P0_TZ_BLOCK] ignored untrusted probe offset={probe} source={src}"
+                )
+
+                _log(
+                    f"[mt5_tz] refreshed: stored_off={stored_int} -> probe_off={int(probe)}"
+                )
     except Exception as _e:
-       _log(f"[mt5_tz] refresh error: {getattr(_e,'args',_e)}")
+        _log(f"[mt5_tz] refresh error: {getattr(_e,'args',_e)}")
 
     # Final chosen offset for this call: cache → probe → stored → 0
     try:
@@ -1275,7 +1720,9 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
         elif _is_trusted_broker_tz(stored_int, src):
             off_min_fresh = int(stored_int)
         else:
-            raise RuntimeError(f"broker timezone not trusted: probe={probe} stored={stored_int} source={src}")
+            raise RuntimeError(
+                f"broker timezone not trusted: probe={probe} stored={stored_int} source={src}"
+            )
     try:
         _log(f"[mt5_tz] probe={probe} stored={stored_int} chosen_off={off_min_fresh}")
     except Exception:
@@ -1291,24 +1738,23 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
                 _tz_bootstrap_to_identity_hive(best_off)
                 _BROKER_OFF_MIN_CACHE = int(best_off)
                 off_min_fresh = int(best_off)
-                _log(f"[tz_bootstrap] adopted trusted off_min={best_off} from {best_src}")
+                _log(
+                    f"[tz_bootstrap] adopted trusted off_min={best_off} from {best_src}"
+                )
             else:
-                _log(f"[P0_TZ_BLOCK] ignored bootstrap offset={best_off} source={src} from={best_src}")
+                _log(
+                    f"[P0_TZ_BLOCK] ignored bootstrap offset={best_off} source={src} from={best_src}"
+                )
 
         except Exception:
             pass
-
-
-
-
-
 
     # --- broker "now" (prefer live tick) ---
     local_now_ms = int(_time.time() * 1000)
     now_ms = local_now_ms
     try:
         _tick = MT5.symbol_info_tick(sym)
-        tmsc  = int(getattr(_tick, "time_msc", 0) or 0)
+        tmsc = int(getattr(_tick, "time_msc", 0) or 0)
         if tmsc > 0 and tmsc >= local_now_ms - (2 * tf_ms):
             now_ms = tmsc
     except Exception:
@@ -1318,7 +1764,7 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
 
     slot_ms = (now_ms // tf_ms) * tf_ms
 
-    need    = int(count or 300)
+    need = int(count or 300)
 
     try:
         _log(f"[mt5_fetch_rates] now_ms={now_ms} slot_ms={slot_ms} tf_ms={tf_ms}")
@@ -1331,7 +1777,9 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
         _log(f"[mt5_resolve] base={sym} resolved={resolved_sym}")
         info = MT5.symbol_info(resolved_sym)
         if info:
-            _log(f"[mt5_symbol] name={resolved_sym} visible={getattr(info,'visible',None)} desc={(getattr(info,'description','') or '')}")
+            _log(
+                f"[mt5_symbol] name={resolved_sym} visible={getattr(info,'visible',None)} desc={(getattr(info,'description','') or '')}"
+            )
     except Exception:
         info = None  # ensure defined
 
@@ -1350,7 +1798,9 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
 
     if not sel_ok:
         code, msg = _mt5_last_error()
-        _log(f"[mt5_fetch_rates] symbol_select failed for {sym} (resolved={resolved_sym}) err=({code}, '{msg}')")
+        _log(
+            f"[mt5_fetch_rates] symbol_select failed for {sym} (resolved={resolved_sym}) err=({code}, '{msg}')"
+        )
         if code == -10004 and _mt5_reconnect():
             for _ in range(3):
                 if _try_select(resolved_sym):
@@ -1379,17 +1829,21 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
     slot0_ms = slot_ms  # default in case tick2 unavailable
     try:
         _tick2 = MT5.symbol_info_tick(resolved_sym)
-        tmsc2  = int(getattr(_tick2, "time_msc", 0) or 0)
+        tmsc2 = int(getattr(_tick2, "time_msc", 0) or 0)
         if tmsc2 > 0:
-            now_ms  = tmsc2
+            now_ms = tmsc2
             slot_ms = (now_ms // tf_ms) * tf_ms
             slot0_ms = slot_ms
-            _log(f"[mt5_fetch_rates] tick2.time_msc={tmsc2} -> recomputed slot_ms={slot_ms}; slot0_ms(frozen)={slot0_ms} tf={tf_label}")
+            _log(
+                f"[mt5_fetch_rates] tick2.time_msc={tmsc2} -> recomputed slot_ms={slot_ms}; slot0_ms(frozen)={slot0_ms} tf={tf_label}"
+            )
     except Exception:
         pass
 
     try:
-        _log(f"[mt5_fetch_rates] slot0_ms(frozen)={slot0_ms} tf_ms={tf_ms} tf={tf_label}")
+        _log(
+            f"[mt5_fetch_rates] slot0_ms(frozen)={slot0_ms} tf_ms={tf_ms} tf={tf_label}"
+        )
 
         _arr = MT5.copy_rates_from_pos(resolved_sym, MT5.TIMEFRAME_M1, 1, 2)
         if _arr is None:
@@ -1400,17 +1854,20 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
             except Exception:
                 _arr = [_arr]
 
-
         if len(_arr) >= 1:
-            _rr = _arr[-1]                         # last CLOSED M1 bar
-            _m1_open_ms  = int(_f(_rr, "time", 0)) * 1000
+            _rr = _arr[-1]  # last CLOSED M1 bar
+            _m1_open_ms = int(_f(_rr, "time", 0)) * 1000
             _m1_close_ms = _m1_open_ms + 60_000
-            slot0_ms = ((_m1_close_ms // tf_ms) * tf_ms)   # snap close to TF grid
-            _log(f"[mt5_fetch_rates] anchor ok: M1 lastClosed={_m1_close_ms} -> slot0_ms={slot0_ms} (tf={tf_label})")
+            slot0_ms = (_m1_close_ms // tf_ms) * tf_ms  # snap close to TF grid
+            _log(
+                f"[mt5_fetch_rates] anchor ok: M1 lastClosed={_m1_close_ms} -> slot0_ms={slot0_ms} (tf={tf_label})"
+            )
         else:
             _log("[mt5_fetch_rates] anchor skipped: no M1 bars returned")
     except Exception as _e_anchor:
-        _log(f"[mt5_fetch_rates] anchor fallback (kept original slot0_ms); err={_e_anchor}")
+        _log(
+            f"[mt5_fetch_rates] anchor fallback (kept original slot0_ms); err={_e_anchor}"
+        )
 
     # --- MT5 readiness & TF mapping ---
     try:
@@ -1431,21 +1888,27 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
     # --- helper: fetch a range ending at slot0_ms, starting back 'back_slots' bars ---
     def _fetch_range(back_slots: int):
         from_dt = datetime.utcfromtimestamp((slot0_ms - back_slots * tf_ms) // 1000)
-        to_dt   = datetime.utcfromtimestamp(slot0_ms // 1000)
+        to_dt = datetime.utcfromtimestamp(slot0_ms // 1000)
         try:
-            _log(f"[mt5_fetch_rates] fetch_range_utc=({int(from_dt.timestamp())},{int(to_dt.timestamp())}) back={back_slots}")
+            _log(
+                f"[mt5_fetch_rates] fetch_range_utc=({int(from_dt.timestamp())},{int(to_dt.timestamp())}) back={back_slots}"
+            )
         except Exception:
             pass
         try:
             arr = MT5.copy_rates_range(resolved_sym, tf_code, from_dt, to_dt)
         except Exception as e:
             code, msg = _mt5_last_error()
-            _log(f"[mt5_fetch_rates] copy_rates_range EXC {resolved_sym}/{tf_label}: {e} last_err=({code}, '{msg}')")
+            _log(
+                f"[mt5_fetch_rates] copy_rates_range EXC {resolved_sym}/{tf_label}: {e} last_err=({code}, '{msg}')"
+            )
             if code == -10004 and _mt5_reconnect():
                 try:
                     arr = MT5.copy_rates_range(resolved_sym, tf_code, from_dt, to_dt)
                 except Exception as e2:
-                    _log(f"[mt5_fetch_rates] copy_rates_range retry EXC {resolved_sym}/{tf_label}: {e2} last_err={_mt5_last_error()}")
+                    _log(
+                        f"[mt5_fetch_rates] copy_rates_range retry EXC {resolved_sym}/{tf_label}: {e2} last_err={_mt5_last_error()}"
+                    )
                     arr = None
             else:
                 arr = None
@@ -1469,14 +1932,18 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
         if tail is None:
             tail_list = []
         else:
-             try:
-                 tail_list = list(tail)
-             except Exception:
-                 tail_list = [tail]
+            try:
+                tail_list = list(tail)
+            except Exception:
+                tail_list = [tail]
 
         if tail_list:
             try:
-                digits = int(getattr(info, "digits", 5)) if ("info" in locals() and info) else 5
+                digits = (
+                    int(getattr(info, "digits", 5))
+                    if ("info" in locals() and info)
+                    else 5
+                )
             except Exception:
                 digits = 5
 
@@ -1485,18 +1952,20 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
                 t_close_ms = t_open_ms + tf_ms
                 # keep ONLY closed bars not beyond the frozen slot
                 if t_close_ms <= slot0_ms:
-                    rows.append({
-                        "t": int(_f(r, "time", 0)),
-                        "o": float(_f(r, "open",  0.0)),
-                        "h": float(_f(r, "high",  0.0)),
-                        "l": float(_f(r, "low",   0.0)),
-                        "c": float(_f(r, "close", 0.0)),
-                        "v": int(_f(r, "tick_volume", _f(r, "real_volume", 0))),
-                        # keep existing fields:
-                        "t_open_ms": t_open_ms,
-                        "t_close_ms": t_close_ms,
-                        "complete": True,
-                    })
+                    rows.append(
+                        {
+                            "t": int(_f(r, "time", 0)),
+                            "o": float(_f(r, "open", 0.0)),
+                            "h": float(_f(r, "high", 0.0)),
+                            "l": float(_f(r, "low", 0.0)),
+                            "c": float(_f(r, "close", 0.0)),
+                            "v": int(_f(r, "tick_volume", _f(r, "real_volume", 0))),
+                            # keep existing fields:
+                            "t_open_ms": t_open_ms,
+                            "t_close_ms": t_close_ms,
+                            "complete": True,
+                        }
+                    )
 
             rows = rows[-need:]  # clamp to requested count
     except Exception as e:
@@ -1504,49 +1973,57 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
 
     if rows:
         try:
-           last = rows[-1]
-           _log(f"[mt5_fetch_rates] (pos) last CLOSED open_ms={last['t_open_ms']} close_ms={last['t_close_ms']} "
-                f"OHLC={last['o']},{last['h']},{last['l']},{last['c']} complete={last['complete']}")
-           from datetime import datetime, timezone, timedelta
-           off_min = int(off_min_fresh)
-           t_sec   = int(last["t"])
-           t_utc   = datetime.fromtimestamp(t_sec, tz=timezone.utc)
-           t_broker= t_utc.astimezone(timezone(timedelta(minutes=off_min))).strftime("%Y-%m-%d %H:%M:%S")
-           t_local = t_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-           _log(f"[mt5_fetch_rates] (pos) last CLOSED: epoch={t_sec} broker_time={t_broker} (off_min={off_min}) local_time={t_local}")
+            last = rows[-1]
+            _log(
+                f"[mt5_fetch_rates] (pos) last CLOSED open_ms={last['t_open_ms']} close_ms={last['t_close_ms']} "
+                f"OHLC={last['o']},{last['h']},{last['l']},{last['c']} complete={last['complete']}"
+            )
+            from datetime import datetime, timezone, timedelta
+
+            off_min = int(off_min_fresh)
+            t_sec = int(last["t"])
+            t_utc = datetime.fromtimestamp(t_sec, tz=timezone.utc)
+            t_broker = t_utc.astimezone(timezone(timedelta(minutes=off_min))).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            t_local = t_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            _log(
+                f"[mt5_fetch_rates] (pos) last CLOSED: epoch={t_sec} broker_time={t_broker} (off_min={off_min}) local_time={t_local}"
+            )
         except Exception:
-           pass
-           # --- sanity: force tail to match MT5's previous CLOSED bar ---
+            pass
+            # --- sanity: force tail to match MT5's previous CLOSED bar ---
         try:
             _probe = MT5.copy_rates_from_pos(resolved_sym, tf_code, 1, 1)
             if _probe is None:
                 _probe = []
             else:
-                 try:
+                try:
                     _probe = list(_probe)
-                 except Exception:
+                except Exception:
                     _probe = [_probe]
             if len(_probe) == 1 and rows:
                 _t_ms = int(_probe[0]["time"]) * 1000
                 if rows[-1]["t_open_ms"] != _t_ms:
                     r = _probe[0]
                     t_open_ms = int(r["time"]) * 1000
-                    rows[-1].update({
-                        "t": int(r["time"]),
-                        "o": float(r["open"]),
-                        "h": float(r["high"]),
-                        "l": float(r["low"]),
-                        "c": float(r["close"]),
-                        "v": int(r.get("tick_volume", r.get("real_volume", 0))),
-                        "t_open_ms": t_open_ms,
-                        "t_close_ms": t_open_ms + tf_ms,
-                        "complete": True,
-                    })
+                    rows[-1].update(
+                        {
+                            "t": int(r["time"]),
+                            "o": float(r["open"]),
+                            "h": float(r["high"]),
+                            "l": float(r["low"]),
+                            "c": float(r["close"]),
+                            "v": int(r.get("tick_volume", r.get("real_volume", 0))),
+                            "t_open_ms": t_open_ms,
+                            "t_close_ms": t_open_ms + tf_ms,
+                            "complete": True,
+                        }
+                    )
         except Exception:
             pass
         _assert_tail_parity(resolved_sym, tf_code, tf_ms, rows)
         return rows
-
 
     # --- main slice logic ---
     back_slots = max(need + 128, int(need * 1.25))
@@ -1559,9 +2036,8 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
             _log("[mt5_fetch_rates] no raw rates returned by MT5; returning []")
             return []
 
-        opens_ms  = [int(_f(r, "time", 0)) * 1000 for r in rates]
+        opens_ms = [int(_f(r, "time", 0)) * 1000 for r in rates]
         closes_ms = [o + tf_ms for o in opens_ms]
-
 
         # --- opportunistic broker-TZ detection (LOG ONLY; no more registry writes) ---
         try:
@@ -1587,8 +2063,8 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
                 best_off, best_err = None, 1e18
                 for off_min in range(-720, 901, 15):  # -12..+15h scan
                     off_try_ms = off_min * 60_000
-                    slot_try   = ((now_ms + off_try_ms) // tf_ms) * tf_ms - off_try_ms
-                    err        = abs(slot_try - last_close)
+                    slot_try = ((now_ms + off_try_ms) // tf_ms) * tf_ms - off_try_ms
+                    err = abs(slot_try - last_close)
                     if err < best_err:
                         best_err, best_off = err, off_min
                         if err <= 1500:
@@ -1629,36 +2105,42 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
             return []
 
         start_idx = max(0, end_idx - need + 1)
-        picked = rates[start_idx:end_idx + 1]
+        picked = rates[start_idx : end_idx + 1]
 
         if len(picked) < need and attempt == 0:
-            _log(f"[mt5_fetch_rates] picked={len(picked)} < need={need}; refetching deeper")
+            _log(
+                f"[mt5_fetch_rates] picked={len(picked)} < need={need}; refetching deeper"
+            )
             back_slots = need + 512
             continue
 
         # --- rows ≤ slot0_ms; round to broker digits ---
         try:
-            digits = int(getattr(info, "digits", 5)) if ("info" in locals() and info) else 5
+            digits = (
+                int(getattr(info, "digits", 5)) if ("info" in locals() and info) else 5
+            )
         except Exception:
             digits = 5
 
         rows = []
         for r in picked:
-            t_open_ms  = int(_f(r, "time", 0)) * 1000
+            t_open_ms = int(_f(r, "time", 0)) * 1000
             t_close_ms = t_open_ms + tf_ms
             if t_close_ms > slot0_ms:
                 continue
-            rows.append({
-                "t": int(_f(r, "time", 0)),
-                "o": float(_f(r, "open",  0.0)),   # ✅ no round()
-                "h": float(_f(r, "high",  0.0)),
-                "l": float(_f(r, "low",   0.0)),
-                "c": float(_f(r, "close", 0.0)),
-                "v": int(_f(r, "tick_volume", _f(r, "real_volume", 0))),
-                "t_open_ms": t_open_ms,
-                "t_close_ms": t_close_ms,
-                "complete": True,
-            })
+            rows.append(
+                {
+                    "t": int(_f(r, "time", 0)),
+                    "o": float(_f(r, "open", 0.0)),  # ✅ no round()
+                    "h": float(_f(r, "high", 0.0)),
+                    "l": float(_f(r, "low", 0.0)),
+                    "c": float(_f(r, "close", 0.0)),
+                    "v": int(_f(r, "tick_volume", _f(r, "real_volume", 0))),
+                    "t_open_ms": t_open_ms,
+                    "t_close_ms": t_close_ms,
+                    "complete": True,
+                }
+            )
 
         rows = rows[-need:]
         if len(rows) == 0:
@@ -1673,14 +2155,14 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
         if include_latest:
             try:
                 from_dt = datetime.utcfromtimestamp(int((slot0_ms - tf_ms) // 1000))
-                to_dt   = datetime.utcfromtimestamp(int(slot0_ms // 1000))
+                to_dt = datetime.utcfromtimestamp(int(slot0_ms // 1000))
                 tail = MT5.copy_rates_range(resolved_sym, tf_code, from_dt, to_dt)
                 if tail is None:
                     tail_list = []
                 else:
-                     try:
+                    try:
                         tail_list = list(tail)
-                     except Exception:
+                    except Exception:
                         tail_list = [tail]
                 if len(tail_list) >= 1:
                     rr = tail_list[-1]
@@ -1688,25 +2170,38 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
                     t_close_ms2 = t_open_ms2 + tf_ms
                     if t_close_ms2 <= slot0_ms:
                         # avoid duplicate of last row
-                        dup = (rows and rows[-1]["t_open_ms"] == t_open_ms2)
+                        dup = rows and rows[-1]["t_open_ms"] == t_open_ms2
                         if not dup:
-                            rows.append({
-                                "t": int(_f(rr, "time", 0)),
-                                "o": float(_f(rr, "open", rows[-1]["c"] if rows else 0.0)),   # ✅ no round()
-                                "h": float(_f(rr, "high", rows[-1]["c"] if rows else 0.0)),
-                                "l": float(_f(rr, "low",  rows[-1]["c"] if rows else 0.0)),
-                                "c": float(_f(rr, "close", rows[-1]["c"] if rows else 0.0)),
-                                "v": int(_f(rr, "tick_volume", _f(rr, "real_volume", 0))),
-                                "t_open_ms": t_open_ms2,
-                                "t_close_ms": t_open_ms2 + tf_ms,
-                                "complete": True,
-                            })
+                            rows.append(
+                                {
+                                    "t": int(_f(rr, "time", 0)),
+                                    "o": float(
+                                        _f(rr, "open", rows[-1]["c"] if rows else 0.0)
+                                    ),  # ✅ no round()
+                                    "h": float(
+                                        _f(rr, "high", rows[-1]["c"] if rows else 0.0)
+                                    ),
+                                    "l": float(
+                                        _f(rr, "low", rows[-1]["c"] if rows else 0.0)
+                                    ),
+                                    "c": float(
+                                        _f(rr, "close", rows[-1]["c"] if rows else 0.0)
+                                    ),
+                                    "v": int(
+                                        _f(rr, "tick_volume", _f(rr, "real_volume", 0))
+                                    ),
+                                    "t_open_ms": t_open_ms2,
+                                    "t_close_ms": t_open_ms2 + tf_ms,
+                                    "complete": True,
+                                }
+                            )
             except Exception:
                 pass
 
-
         # --- HARD CLAMP: last bar must be a CLOSED bar not beyond slot0_ms ---
-        while rows and (rows[-1].get("complete") is not True or rows[-1]["t_close_ms"] > slot0_ms):
+        while rows and (
+            rows[-1].get("complete") is not True or rows[-1]["t_close_ms"] > slot0_ms
+        ):
             rows.pop()
         rows = rows[-need:]
         if rows and rows[-1]["t_close_ms"] > slot0_ms:
@@ -1717,28 +2212,32 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
 
         try:
             last = rows[-1]
-            _log(f"[mt5_fetch_rates] last (closed/tail) open_ms={last['t_open_ms']} close_ms={last['t_close_ms']} "
-                 f"OHLC={last['o']},{last['h']},{last['l']},{last['c']} complete={last['complete']}")
+            _log(
+                f"[mt5_fetch_rates] last (closed/tail) open_ms={last['t_open_ms']} close_ms={last['t_close_ms']} "
+                f"OHLC={last['o']},{last['h']},{last['l']},{last['c']} complete={last['complete']}"
+            )
         except Exception:
             pass
         from datetime import datetime, timezone, timedelta
 
         try:
-           last = rows[-1]
-           off_min = int(off_min_fresh)        # e.g. 120 for RoboForex (UTC+2)
-           t_sec = int(last["t"])
+            last = rows[-1]
+            off_min = int(off_min_fresh)  # e.g. 120 for RoboForex (UTC+2)
+            t_sec = int(last["t"])
 
-           t_utc = datetime.fromtimestamp(t_sec, tz=timezone.utc)
-           t_broker = t_utc.astimezone(timezone(timedelta(minutes=off_min))).strftime("%Y-%m-%d %H:%M:%S")
-           t_local  = t_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            t_utc = datetime.fromtimestamp(t_sec, tz=timezone.utc)
+            t_broker = t_utc.astimezone(timezone(timedelta(minutes=off_min))).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            t_local = t_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-           _log(
+            _log(
                 f"[mt5_fetch_rates] last CLOSED:"
                 f" epoch={t_sec} broker_time={t_broker} (off_min={off_min})"
                 f" local_time={t_local} OHLC={last['o']},{last['h']},{last['l']},{last['c']} complete={last['complete']}"
-           )
+            )
         except Exception:
-           pass
+            pass
 
         # --- sanity: force tail to match MT5's previous CLOSED bar ---
         try:
@@ -1746,29 +2245,30 @@ def mt5_fetch_rates(sym: str, timeframe, count: int = 300, include_latest: bool 
             if _probe is None:
                 _probe = []
             else:
-                 try:
-                     _probe = list(_probe)
-                 except Exception:
-                     _probe = [_probe]
+                try:
+                    _probe = list(_probe)
+                except Exception:
+                    _probe = [_probe]
             if len(_probe) == 1 and rows:
                 _t_ms = int(_probe[0]["time"]) * 1000
                 if rows[-1]["t_open_ms"] != _t_ms:
                     r = _probe[0]
                     t_open_ms = int(r["time"]) * 1000
-                    rows[-1].update({
-                        "t": int(r["time"]),
-                        "o": float(r["open"]),
-                        "h": float(r["high"]),
-                        "l": float(r["low"]),
-                        "c": float(r["close"]),
-                        "v": int(r.get("tick_volume", r.get("real_volume", 0))),
-                        "t_open_ms": t_open_ms,
-                        "t_close_ms": t_open_ms + tf_ms,
-                        "complete": True,
-                    })
+                    rows[-1].update(
+                        {
+                            "t": int(r["time"]),
+                            "o": float(r["open"]),
+                            "h": float(r["high"]),
+                            "l": float(r["low"]),
+                            "c": float(r["close"]),
+                            "v": int(r.get("tick_volume", r.get("real_volume", 0))),
+                            "t_open_ms": t_open_ms,
+                            "t_close_ms": t_open_ms + tf_ms,
+                            "complete": True,
+                        }
+                    )
         except Exception:
             pass
-
 
         _assert_tail_parity(resolved_sym, tf_code, tf_ms, rows)
         return rows

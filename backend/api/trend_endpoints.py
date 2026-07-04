@@ -440,6 +440,41 @@ PROP_DAILY_KEY_PREFIX = "xtl:prop:daily"
 PROP_OPEN_RISK_KEY = "xtl:prop:open_risk"
 PROP_STATS_KEY = "xtl:prop:stats"
 
+# Execution profile support.
+# Phase 1A: helpers only, no behavior change yet.
+PROP_PROFILE_ACTIVE_KEY = "xtl:prop:profile:active"
+PROP_PROFILE_SET_KEY = "xtl:prop:profiles"
+DEFAULT_PROP_PROFILE_ID = "ftmo-main"
+
+
+def _norm_prop_profile_id(profile_id: str | None = None) -> str:
+    pid = str(profile_id or "").strip().lower()
+    if not pid:
+        try:
+            raw = R.get(PROP_PROFILE_ACTIVE_KEY)
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "ignore")
+            pid = str(raw or "").strip().lower()
+        except Exception:
+            pid = ""
+    return pid or DEFAULT_PROP_PROFILE_ID
+
+
+def _prop_profile_cfg_key(profile_id: str | None = None) -> str:
+    return f"xtl:prop:profile:{_norm_prop_profile_id(profile_id)}"
+
+
+def _prop_profile_open_risk_key(profile_id: str | None = None) -> str:
+    return f"{PROP_OPEN_RISK_KEY}:{_norm_prop_profile_id(profile_id)}"
+
+
+def _prop_profile_stats_key(profile_id: str | None = None) -> str:
+    return f"{PROP_STATS_KEY}:{_norm_prop_profile_id(profile_id)}"
+
+
+def _prop_profile_daily_key(day: str | None = None, profile_id: str | None = None) -> str:
+    return f"{PROP_DAILY_KEY_PREFIX}:{_norm_prop_profile_id(profile_id)}:{day or _prop_today()}"
+
 DEFAULT_PROP_CFG = {
     "enabled": False,
     "firm": "ftmo",
@@ -454,23 +489,100 @@ DEFAULT_PROP_CFG = {
 }
 
 
-def _get_prop_config() -> dict:
+
+def _get_prop_config_safe(profile_id: str | None = None, r=None):
+    """
+    Fail-closed prop config reader.
+
+    Executor must BLOCK when ok=False.
+    UI may still call _get_prop_config(), but executor should use this safe version.
+    """
+    pid = _norm_prop_profile_id(profile_id)
+
     try:
-        
-        raw = R.get(PROP_CFG_KEY)
-        if raw:
+        rr = r or R
+
+        keys = [_prop_profile_cfg_key(pid)]
+
+        # legacy fallback for active/default profile
+        if pid == _norm_prop_profile_id():
+            keys.append(PROP_CFG_KEY)
+
+        last_err = ""
+
+        for key in keys:
+            raw = rr.get(key)
+            if not raw:
+                last_err = f"PROP_CFG_MISSING:{key}"
+                continue
+
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "replace")
+
             cfg = json.loads(raw)
+
+            if not isinstance(cfg, dict):
+                return None, False, f"PROP_CFG_NOT_DICT:{key}"
+
+            if "enabled" not in cfg:
+                return None, False, f"PROP_CFG_ENABLED_MISSING:{key}"
+
             out = dict(DEFAULT_PROP_CFG)
             out.update(cfg)
-            return out
-    except Exception:
-        pass
-    return dict(DEFAULT_PROP_CFG)
+            out["profile_id"] = pid
+
+            log.warning(
+                "[PROP] PROP_CFG_READ_OK profile=%s key=%s enabled=%s firm=%s phase=%s account_size=%s risk_pct=%s",
+                pid,
+                key,
+                out.get("enabled"),
+                out.get("firm"),
+                out.get("phase"),
+                out.get("account_size"),
+                out.get("risk_pct"),
+            )
+
+            return out, True, None
+
+        return None, False, last_err or "PROP_CFG_MISSING"
+
+    except Exception as e:
+        log.exception("[PROP] PROP_CFG_READ_EXCEPTION profile=%s", pid)
+        return None, False, f"PROP_CFG_READ_EXCEPTION:{type(e).__name__}:{e}"
 
 
-def _save_prop_config(cfg: dict) -> dict:
+def _get_prop_config(profile_id: str | None = None) -> dict:
+    """
+    UI/backward-compatible config getter.
+
+    Important:
+    Executor must NOT treat this default as trade permission.
+    Executor must call _get_prop_config_safe().
+    """
+    cfg, ok, err = _get_prop_config_safe(profile_id)
+
+    if ok and isinstance(cfg, dict):
+        return cfg
+
+    out = dict(DEFAULT_PROP_CFG)
+    out["profile_id"] = _norm_prop_profile_id(profile_id)
+    out["_read_ok"] = False
+    out["_read_error"] = err
+
+    log.error(
+        "[PROP] PROP_CFG_READ_FAIL_DEFAULT_FOR_UI_ONLY profile=%s err=%s",
+        out["profile_id"],
+        err,
+    )
+
+    return out
+
+def _save_prop_config(cfg: dict, profile_id: str | None = None) -> dict:
     out = dict(DEFAULT_PROP_CFG)
     out.update(cfg or {})
+
+    pid = _norm_prop_profile_id(profile_id or out.get("profile_id"))
+    out["profile_id"] = pid
 
     out["firm"] = str(out.get("firm") or "ftmo").lower()
     out["phase"] = str(out.get("phase") or "challenge").lower()
@@ -488,9 +600,16 @@ def _save_prop_config(cfg: dict) -> dict:
     if out["phase"] not in PROP_FIRM_RULES[out["firm"]]["phases"]:
         raise ValueError(f"Unknown phase {out['phase']} for firm {out['firm']}")
 
-    
-    R.set(PROP_CFG_KEY, json.dumps(out))
+    R.set(_prop_profile_cfg_key(pid), json.dumps(out))
+    R.sadd(PROP_PROFILE_SET_KEY, pid)
+
+    # Keep legacy global config synced for active/default profile compatibility.
+    if pid == _norm_prop_profile_id():
+        R.set(PROP_CFG_KEY, json.dumps(out))
+
     return out
+
+
 
 def _prop_today() -> str:
     """
@@ -507,8 +626,305 @@ def _prop_today() -> str:
     except Exception:
         return time.strftime("%Y%m%d", time.gmtime())
 
-def _prop_daily_key(day: str | None = None) -> str:
-    return f"{PROP_DAILY_KEY_PREFIX}:{day or _prop_today()}"
+def _prop_prague_now_iso() -> str:
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/Prague")).isoformat()
+    except Exception:
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat()
+
+def _effective_risk_pct(
+    cfg: dict,
+    broker_equity: float | None = None,
+) -> float:
+    """
+    Dynamic FTMO risk sizing.
+
+    DD <2%      -> base risk
+    DD 2-4%     -> 50% base risk
+    DD >4%      -> 25% base risk
+    """
+
+    base = float(cfg.get("risk_pct") or 1.0)
+
+    try:
+        acct_size = float(cfg.get("account_size") or 0.0)
+        equity = float(broker_equity or 0.0)
+
+        if acct_size <= 0 or equity <= 0:
+            return base
+
+        dd_pct = max(0.0, ((acct_size - equity) / acct_size) * 100.0)
+
+        if dd_pct >= 4.0:
+            return round(base * 0.25, 4)
+
+        if dd_pct >= 2.0:
+            return round(base * 0.50, 4)
+
+        return round(base, 4)
+
+    except Exception:
+        return base
+
+def _prop_daily_key(day: str | None = None, profile_id: str | None = None) -> str:
+    # Legacy-compatible default now uses active profile namespace.
+    return f"{PROP_DAILY_KEY_PREFIX}:{_norm_prop_profile_id(profile_id)}:{day or _prop_today()}"
+
+
+
+def _ensure_prop_day_initialized(profile_id: str | None = None, broker_balance: float = 0.0) -> None:
+    """
+    Ensure current CE(S)T prop day has a start_balance initialized once.
+
+    This is still request-driven, but deterministic for the current CE(S)T day.
+    Later, we can also call this from a scheduled background loop.
+    """
+    pid = _norm_prop_profile_id(profile_id)
+    day = _prop_today()
+    daily_key = _prop_daily_key(day, pid)
+
+    try:
+        existing = R.hget(daily_key, "start_balance")
+        if existing not in (None, b"", ""):
+            return
+
+        if float(broker_balance or 0.0) <= 0:
+            return
+
+        prague_time = _prop_prague_now_iso()
+        now_ms = int(time.time() * 1000)
+
+        R.hset(daily_key, mapping={
+            "profile_id": pid,
+            "day": day,
+            "start_balance": round(float(broker_balance), 2),
+            "start_balance_source": "cest_day_initializer",
+            "start_balance_captured_ts": now_ms,
+            "start_balance_captured_prague_time": prague_time,
+            "daily_r": 0,
+            "wins_today": 0,
+            "losses_today": 0,
+        })
+        R.expire(daily_key, 3 * 24 * 3600)
+
+        log.warning(
+            "[PROP] CE_ST_DAY_INITIALIZED profile=%s day=%s start_balance=%s prague_time=%s daily_key=%s",
+            pid,
+            day,
+            round(float(broker_balance), 2),
+            prague_time,
+            daily_key,
+        )
+
+    except Exception as e:
+        try:
+            log.warning("[PROP] CE_ST_DAY_INITIALIZE_EXC profile=%s err=%r", pid, e)
+        except Exception:
+            pass
+
+
+@router.get("/prop/dashboard")
+def prop_dashboard(profile_id: str | None = None):
+    cfg = _get_prop_config(profile_id)
+    pid = str(cfg.get("profile_id") or _norm_prop_profile_id(profile_id))
+
+    risk = _get_prop_risk_state(pid)
+
+    account = {
+        "balance": risk.get("broker_balance"),
+        "equity": risk.get("broker_equity"),
+        "floating_pnl": risk.get("floating_pnl"),
+    }
+
+    open_risk_usd = float(risk.get("open_risk_usd") or 0.0)
+    max_open_risk_pct = float(cfg.get("max_open_risk_pct") or 0.0)
+    account_size = float(cfg.get("account_size") or 0.0)
+    max_open_risk_usd = account_size * (max_open_risk_pct / 100.0) if account_size > 0 else 0.0
+
+    trading_allowed = True
+    reasons = []
+
+    if bool(risk.get("trading_halted")):
+        trading_allowed = False
+        reasons.append(str(risk.get("halt_reason") or "TRADING_HALTED"))
+
+    if bool(risk.get("daily_r_blocked")):
+        trading_allowed = False
+        reasons.append(str(risk.get("daily_r_block_reason") or "DAILY_R_BLOCKED"))
+
+    if float(risk.get("ftmo_daily_loss_remaining") or 0.0) <= 0:
+        trading_allowed = False
+        reasons.append("FTMO_DAILY_LOSS_EXCEEDED")
+
+    if max_open_risk_usd > 0 and open_risk_usd >= max_open_risk_usd:
+        trading_allowed = False
+        reasons.append("MAX_OPEN_RISK_REACHED")
+
+    if int(risk.get("open_positions_count") or 0) >= int(cfg.get("max_open_positions") or 1):
+        trading_allowed = False
+        reasons.append("MAX_OPEN_POSITIONS_REACHED")
+    try:
+        _prop_eval_alerts(pid, risk)
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "profile_id": pid,
+        "trading_allowed": trading_allowed,
+        "reasons": reasons,
+        "config": {
+            "firm": cfg.get("firm"),
+            "phase": cfg.get("phase"),
+            "account_size": account_size,
+            "configured_risk_pct": cfg.get("risk_pct"),
+            "effective_risk_pct": risk.get("effective_risk_pct"),
+            "target_rr": cfg.get("target_rr"),
+            "max_open_positions": cfg.get("max_open_positions"),
+            "max_open_risk_pct": max_open_risk_pct,
+        },
+        "account": account,
+        "margin": {
+            "equity": risk.get("broker_equity"),
+            "balance": risk.get("broker_balance"),
+            "free_margin": risk.get("free_margin"),
+            "used_margin": risk.get("used_margin"),
+            "margin_level": risk.get("margin_level"),
+            "margin_utilization_pct": risk.get("margin_utilization_pct"),
+        },
+        "daily": {
+            "day": risk.get("day"),
+            "daily_key": risk.get("daily_key"),
+            "start_balance": risk.get("start_balance"),
+            "today_closed_pnl": risk.get("today_closed_pnl"),
+            "floating_pnl": risk.get("floating_pnl"),
+            "ftmo_current_daily_result": risk.get("ftmo_current_daily_result"),
+            "ftmo_daily_loss_used": risk.get("ftmo_daily_loss_used"),
+            "ftmo_daily_loss_limit": risk.get("ftmo_daily_loss_limit"),
+            "ftmo_daily_loss_remaining": risk.get("ftmo_daily_loss_remaining"),
+            "daily_r": risk.get("daily_r"),
+            "wins_today": risk.get("wins_today"),
+            "losses_today": risk.get("losses_today"),
+        },
+        "drawdown": {
+            "drawdown_pct": risk.get("drawdown_pct"),
+            "drawdown_band": risk.get("drawdown_band"),
+        },
+        "open_risk": {
+            "open_risk_usd": open_risk_usd,
+            "max_open_risk_usd": round(max_open_risk_usd, 2),
+            "daily_risk_reserved": risk.get("daily_risk_reserved"),
+            "projected_daily_loss_if_all_sl": risk.get("projected_daily_loss_if_all_sl"),
+            "open_positions_count": risk.get("open_positions_count"),
+            "open_positions": risk.get("open_positions"),
+        },
+        "halt": {
+            "trading_halted": risk.get("trading_halted"),
+            "halt_reason": risk.get("halt_reason"),
+            "halt_ts": risk.get("halt_ts"),
+            "halt_until_manual_reset": risk.get("halt_until_manual_reset"),
+            "daily_r_blocked": risk.get("daily_r_blocked"),
+            "daily_r_block_reason": risk.get("daily_r_block_reason"),
+            "consecutive_losing_days": risk.get("consecutive_losing_days"),
+        },
+    }
+def _extract_device_id_from_account_key(key: str) -> str:
+    # xtl:mt5:account:last_user:{device_id}
+    try:
+        prefix = "xtl:mt5:account:last_user:"
+        if str(key).startswith(prefix):
+            return str(key)[len(prefix):]
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_prop_profile_device(profile_id: str | None = None) -> dict:
+    """
+    Resolve execution device for a prop profile using account_login + account_server.
+    Device ID is runtime output, not hardcoded source of truth.
+    """
+    pid = _norm_prop_profile_id(profile_id)
+    cfg = _get_prop_config(pid)
+
+    want_login = str(cfg.get("account_login") or "").strip()
+    want_server = str(cfg.get("account_server") or "").strip().lower()
+    want_company = str(cfg.get("broker_company") or "").strip().lower()
+
+    best = {
+        "ok": False,
+        "profile_id": pid,
+        "device_id": "",
+        "account": None,
+        "reason": "NO_MATCH",
+    }
+
+    try:
+        for k in R.scan_iter("xtl:mt5:account:last_user:*"):
+            key = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
+            raw = R.get(key)
+            acct = json.loads(raw) if raw else {}
+            if not isinstance(acct, dict):
+                continue
+
+            dev = _extract_device_id_from_account_key(key)
+            login = str(acct.get("login") or "").strip()
+            server = str(acct.get("server") or "").strip().lower()
+            company = str(acct.get("company") or "").strip().lower()
+
+            if want_login and login != want_login:
+                continue
+            if want_server and want_server not in server:
+                continue
+            if want_company and want_company not in company:
+                continue
+
+            best = {
+                "ok": True,
+                "profile_id": pid,
+                "device_id": dev,
+                "account": acct,
+                "account_key": key,
+                "reason": "MATCH_ACCOUNT",
+            }
+
+            try:
+                cfg["last_resolved_device_id"] = dev
+                R.set(_prop_profile_cfg_key(pid), json.dumps(cfg, separators=(",", ":")))
+            except Exception:
+                pass
+
+            return best
+    except Exception as e:
+        best["reason"] = f"RESOLVE_EXC:{type(e).__name__}:{e}"
+
+    # fallback to last_resolved_device_id only if profile has no strict login/server yet
+    try:
+        dev = str(cfg.get("last_resolved_device_id") or "").strip()
+        if dev and not want_login and not want_server:
+            key = f"xtl:mt5:account:last_user:{dev}"
+            raw = R.get(key)
+            acct = json.loads(raw) if raw else {}
+            if isinstance(acct, dict) and acct:
+                return {
+                    "ok": True,
+                    "profile_id": pid,
+                    "device_id": dev,
+                    "account": acct,
+                    "account_key": key,
+                    "reason": "FALLBACK_LAST_DEVICE",
+                }
+    except Exception:
+        pass
+
+    return best
+
+
+@router.get("/prop/profile/resolve")
+def prop_profile_resolve(profile_id: str | None = None):
+    return _resolve_prop_profile_device(profile_id)
 
 
 def _reservation_ticket(j: dict) -> str:
@@ -519,6 +935,97 @@ def _reservation_ticket(j: dict) -> str:
         or j.get("position_ticket")
     )
     return str(ticket) if ticket not in (None, "", 0) else ""
+
+
+def _load_zone_watch_rows(symbols: list[str] | None = None, tf: str = "H1") -> list[dict]:
+    out = []
+    sym_filter = {str(x or "").upper().strip() for x in (symbols or []) if str(x or "").strip()}
+    tf_u = str(tf or "H1").upper().strip()
+
+    try:
+        for k in R.scan_iter(f"xtl:zone:watch:*:*:{tf_u}", count=200):
+            key = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
+            parts = key.split(":")
+            if len(parts) < 6:
+                continue
+
+            sym = parts[3].upper()
+            side = parts[4].upper()
+
+            if sym_filter and sym not in sym_filter:
+                continue
+
+            raw = R.get(key)
+            w = _json_load_twice(raw)
+            if not isinstance(w, dict):
+                continue
+
+            zone = w.get("zone_used") if isinstance(w.get("zone_used"), dict) else {}
+            zl = zone.get("low") or zone.get("level")
+            zh = zone.get("high") or zone.get("level")
+            ztf = zone.get("tf") or tf_u
+
+            try:
+                zone_text = f"{float(zl):.5f}-{float(zh):.5f} ({ztf})" if zl is not None and zh is not None else None
+            except Exception:
+                zone_text = None
+
+            state = str(w.get("state") or "WATCH").upper().strip()
+            rev_ok = bool(w.get("rev_ok")) or state == "REV_OK" or state.startswith("ENTRY_BLOCKED")
+
+            if rev_ok:
+                trigger = w.get("trigger_level")
+                if not trigger:
+                    trigger = w.get("rev_ok_bar_hi") if side == "BUY" else w.get("rev_ok_bar_lo")
+                gate = "REV_OK"
+                reason = (
+                    f"REV_OK | MARKET_CLOSED_WEEKEND | "
+                    f"ENTRY {'>' if side == 'BUY' else '<'} {float(trigger or 0):.5f}"
+                )
+            else:
+                gate = state or "WATCH"
+                reason = f"{state or 'WATCH'} | MARKET_CLOSED_WEEKEND"
+
+            live = w.get("last_price") or w.get("live_price") or w.get("price")
+
+            out.append({
+                "symbol": sym,
+                "direction": side,
+                "dir": side,
+                "opp_dir": "UP" if side == "BUY" else "DOWN",
+                "tf": tf_u,
+                "live": live,
+                "last_price": live,
+                "signal": "WAIT",
+                "gate": gate,
+                "reason": reason,
+                "zone": zone,
+                "zone_used": zone,
+                "zone_text": zone_text,
+                "market_closed": True,
+                "watch_key": key,
+                "entry_gate": {
+                    "watch_key": key,
+                    "rev_ok": rev_ok,
+                    "reason": reason,
+                    "stage": "REV_LOCKED" if rev_ok else "WATCH",
+                    "rev_state": w,
+                },
+                "created_at_ms": int(w.get("started_ms") or w.get("watch_created_ms") or 0),
+                "rev_ok_ms": int(w.get("rev_ok_ms") or 0),
+            })
+    except Exception as e:
+        try:
+            log.warning("[WATCHLIST] WEEKEND_WATCH_FALLBACK_EXC err=%r", e)
+        except Exception:
+            pass
+
+    try:
+        out.sort(key=lambda r: (str(r.get("symbol") or ""), str(r.get("direction") or "")))
+    except Exception:
+        pass
+
+    return out
 
 
 def _live_broker_tickets_for_prop() -> set[str]:
@@ -546,9 +1053,308 @@ def _live_broker_tickets_for_prop() -> set[str]:
     except Exception:
         pass
     return tickets
-def _get_prop_risk_state() -> dict:
+
+def _prop_update_losing_day_streak(profile_id: str | None = None) -> None:
+    """
+    Evaluate the previous CE(S)T prop day once, then update consecutive losing days.
+
+    Runs when current CE(S)T day changes. If previous day's closed result was negative,
+    increment streak. Otherwise reset streak to 0.
+    """
+    pid = _norm_prop_profile_id(profile_id)
+    stats_key = _prop_profile_stats_key(pid)
+    today = _prop_today()
+
+    try:
+        last_eval_day = str(R.hget(stats_key, "last_day_eval") or "")
+    except Exception:
+        last_eval_day = ""
+
+    if last_eval_day == today:
+        return
+
+    try:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        prague_now = datetime.now(ZoneInfo("Europe/Prague"))
+        prev_day = (prague_now - timedelta(days=1)).strftime("%Y%m%d")
+    except Exception:
+        prev_day = str(int(today) - 1)
+
+    prev_key = _prop_daily_key(prev_day, pid)
+    prev_daily = {}
+
+    try:
+        prev_daily = R.hgetall(prev_key) or {}
+    except Exception:
+        prev_daily = {}
+
+    def _f(d, k, default=0.0):
+        try:
+            return float(d.get(k, default) or default)
+        except Exception:
+            return float(default)
+
+    prev_closed_pnl = _f(prev_daily, "today_closed_pnl", 0.0)
+    prev_daily_result = _f(
+        prev_daily,
+        "ftmo_current_daily_result",
+        prev_closed_pnl,
+    )
+
+    try:
+        streak = int(float(R.hget(stats_key, "consecutive_losing_days") or 0))
+    except Exception:
+        streak = 0
+
+    if prev_daily_result < 0:
+        streak += 1
+        last_loss_day = prev_day
+    else:
+        streak = 0
+        last_loss_day = ""
+
+    try:
+        R.hset(stats_key, mapping={
+            "last_day_eval": today,
+            "last_evaluated_prev_day": prev_day,
+            "last_evaluated_prev_pnl": round(float(prev_daily_result), 2),
+            "consecutive_losing_days": int(streak),
+            "last_loss_day": last_loss_day,
+        })
+    except Exception:
+        pass
+
+    log.warning(
+        "[PROP] LOSING_DAY_STREAK profile=%s today=%s prev_day=%s prev_pnl=%s streak=%s",
+        pid, today, prev_day, prev_daily_result, streak
+    )
+
+    if streak >= 3:
+        _prop_set_halt(
+            pid,
+            "CONSECUTIVE_LOSING_DAYS",
+            {
+                "count": streak,
+                "last_loss_day": last_loss_day,
+                "evaluated_day": today,
+                "prev_day": prev_day,
+                "prev_pnl": round(float(prev_closed_pnl), 2),
+            },
+        )
+
+def _prop_alert_once(profile_id: str, alert_key: str, message: str) -> bool:
+    pid = _norm_prop_profile_id(profile_id)
+    stats_key = _prop_profile_stats_key(pid)
+    today = _prop_today()
+    field = f"alert_sent:{today}:{alert_key}"
+
+    try:
+        if str(R.hget(stats_key, field) or "") == "1":
+            return False
+
+        sent = _discord_post(message)
+
+        R.hset(stats_key, field, "1")
+        R.expire(stats_key, 14 * 24 * 3600)
+
+        log.warning(
+            "[PROP] ALERT_SENT profile=%s key=%s day=%s discord_sent=%s",
+            pid, alert_key, today, bool(sent)
+        )
+        return True
+
+    except Exception as e:
+        try:
+            log.warning("[PROP] ALERT_EXC profile=%s key=%s err=%r", pid, alert_key, e)
+        except Exception:
+            pass
+        return False
+
+
+def _prop_eval_alerts(profile_id: str | None, risk: dict) -> None:
+    pid = _norm_prop_profile_id(profile_id)
+    if not isinstance(risk, dict):
+        return
+
+    try:
+        band = str(risk.get("drawdown_band") or "NORMAL")
+        dd = float(risk.get("drawdown_pct") or 0.0)
+        effective_risk = float(risk.get("effective_risk_pct") or 0.0)
+
+        daily_used = float(risk.get("ftmo_daily_loss_used") or 0.0)
+        daily_limit = float(risk.get("ftmo_daily_loss_limit") or 0.0)
+        daily_remaining = float(risk.get("ftmo_daily_loss_remaining") or 0.0)
+
+        used_pct = (daily_used / daily_limit * 100.0) if daily_limit > 0 else 0.0
+
+        stats_key = _prop_profile_stats_key(pid)
+        last_band = str(R.hget(stats_key, "last_drawdown_band") or "")
+
+        if last_band != band:
+            R.hset(stats_key, "last_drawdown_band", band)
+            if last_band:
+                _prop_alert_once(
+                    pid,
+                    f"DRAWDOWN_BAND_{band}",
+                    "**🟡 XTL Drawdown Band Changed**\n"
+                    f"Profile: `{pid}`\n"
+                    f"Old Band: `{last_band}`\n"
+                    f"New Band: `{band}`\n"
+                    f"Drawdown: `{dd:.2f}%`\n"
+                    f"Effective Risk: `{effective_risk:.2f}%`"
+                )
+
+        if daily_limit > 0 and used_pct >= 80.0 and daily_remaining > 0:
+            _prop_alert_once(
+                pid,
+                "DAILY_LOSS_WARNING_80",
+                "**🟠 FTMO Daily Loss Warning**\n"
+                f"Profile: `{pid}`\n"
+                f"Used: `${daily_used:.2f}` / `${daily_limit:.2f}` ({used_pct:.1f}%)\n"
+                f"Remaining: `${daily_remaining:.2f}`"
+            )
+
+        if daily_limit > 0 and daily_remaining <= 0:
+            _prop_alert_once(
+                pid,
+                "DAILY_LOSS_BLOCK",
+                "**🔴 FTMO Daily Loss Limit Reached**\n"
+                f"Profile: `{pid}`\n"
+                f"Used: `${daily_used:.2f}` / `${daily_limit:.2f}`\n"
+                "Trading should be halted."
+            )
+        # -------------------------------------------------
+        # Margin warning/block alerts
+        # -------------------------------------------------
+        free_margin = float(risk.get("free_margin") or risk.get("broker_free_margin") or 0.0)
+        equity = float(risk.get("broker_equity") or 0.0)
+        used_margin = float(risk.get("used_margin") or risk.get("broker_used_margin") or 0.0)
+
+        margin_level = 0.0
+        margin_utilization = 0.0
+
+        if used_margin > 0:
+            margin_level = (equity / used_margin) * 100.0
+
+        if equity > 0 and used_margin > 0:
+            margin_utilization = (used_margin / equity) * 100.0
+
+        if margin_level > 0 and margin_level <= 1000.0:
+            _prop_alert_once(
+                pid,
+                "MARGIN_WARNING_1000",
+                "**🟠 Margin Warning**\n"
+                f"Profile: `{pid}`\n"
+                f"Margin Level: `{margin_level:.1f}%`\n"
+                f"Used Margin: `${used_margin:.2f}`\n"
+                f"Free Margin: `${free_margin:.2f}`\n"
+                f"Margin Utilization: `{margin_utilization:.1f}%`"
+            )
+
+        if margin_level > 0 and margin_level <= 500.0:
+            _prop_alert_once(
+                pid,
+                "MARGIN_BLOCK_500",
+                "**🔴 Margin Block Zone**\n"
+                f"Profile: `{pid}`\n"
+                f"Margin Level: `{margin_level:.1f}%`\n"
+                f"Used Margin: `${used_margin:.2f}`\n"
+                f"Free Margin: `${free_margin:.2f}`\n"
+                "No new trades should be allowed below this level."
+            )
+
+    except Exception as e:
+        try:
+            log.warning("[PROP] ALERT_EVAL_EXC profile=%s err=%r", pid, e)
+        except Exception:
+            pass
+def _prop_set_halt(profile_id: str, reason: str, meta: dict | None = None) -> None:
+    pid = _norm_prop_profile_id(profile_id)
+    stats_key = _prop_profile_stats_key(pid)
+    now_ms = int(time.time() * 1000)
+
+    rec = {
+        "trading_halted": "1",
+        "halt_reason": str(reason or "UNKNOWN"),
+        "halt_ts": now_ms,
+        "halt_until_manual_reset": "1",
+    }
+
+    if isinstance(meta, dict):
+        for k, v in meta.items():
+            rec[f"halt_meta_{k}"] = str(v)
+
+    R.hset(stats_key, mapping=rec)
+
+    log.warning(
+        "[PROP] TRADING_HALTED profile=%s reason=%s meta=%s",
+        pid, reason, meta or {}
+    )
+
+    try:
+        _discord_post(
+            "**🚨 XTL Trading Halted**\n"
+            f"Profile: `{pid}`\n"
+            f"Reason: `{reason}`\n"
+            "Trading disabled until manual resume."
+        )
+    except Exception:
+        pass
+
+
+def _prop_clear_halt(profile_id: str | None = None) -> None:
+    pid = _norm_prop_profile_id(profile_id)
+    stats_key = _prop_profile_stats_key(pid)
+
+    R.hdel(
+        stats_key,
+        "trading_halted",
+        "halt_reason",
+        "halt_ts",
+        "halt_until_manual_reset",
+        "halt_meta_daily_r",
+        "halt_meta_count",
+        "halt_meta_day",
+    )
+
+    log.warning("[PROP] TRADING_RESUMED profile=%s", pid)
+
+    try:
+        _discord_post(
+            "**✅ XTL Trading Resumed**\n"
+            f"Profile: `{pid}`\n"
+            "Manual resume completed."
+        )
+    except Exception:
+        pass
+
+@router.post("/prop/resume")
+def prop_resume(payload: dict | None = None):
+    payload = payload or {}
+    profile_id = str(payload.get("profile_id") or "").strip() or None
+    pid = _norm_prop_profile_id(profile_id)
+
+    try:
+        _prop_clear_halt(pid)
+        return {
+            "ok": True,
+            "profile_id": pid,
+            "risk": _get_prop_risk_state(pid),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+def _get_prop_risk_state(profile_id: str | None = None) -> dict:
+    pid = _norm_prop_profile_id(profile_id)
     day = _prop_today()
-    daily_key = _prop_daily_key(day)
+    daily_key = _prop_daily_key(day, pid)
+    open_risk_key = _prop_profile_open_risk_key(pid)
+    stats_key = _prop_profile_stats_key(pid)
+    try:
+        _prop_update_losing_day_streak(pid)
+    except Exception:
+        pass
 
     daily = {}
     open_risk = {}
@@ -556,8 +1362,15 @@ def _get_prop_risk_state() -> dict:
 
     try:
         daily = R.hgetall(daily_key) or {}
-        open_risk = R.hgetall(PROP_OPEN_RISK_KEY) or {}
-        stats = R.hgetall(PROP_STATS_KEY) or {}
+        open_risk = R.hgetall(open_risk_key) or {}
+
+        # Legacy fallback for ftmo-main during migration.
+        if not open_risk and pid == DEFAULT_PROP_PROFILE_ID:
+            open_risk = R.hgetall(PROP_OPEN_RISK_KEY) or {}
+
+        stats = R.hgetall(stats_key) or {}
+        if not stats and pid == DEFAULT_PROP_PROFILE_ID:
+            stats = R.hgetall(PROP_STATS_KEY) or {}
     except Exception:
         pass
 
@@ -597,14 +1410,21 @@ def _get_prop_risk_state() -> dict:
             # Drop phantom/stale reservation before counting it.
             if ticket and live_tickets and ticket not in live_tickets:
                 try:
-                    R.hdel(PROP_OPEN_RISK_KEY, k)
+                    R.hdel(open_risk_key, k)
+                    if pid == DEFAULT_PROP_PROFILE_ID:
+                        R.hdel(PROP_OPEN_RISK_KEY, k)
                     log.warning(
-                        "[PROP_RISK] DROP_ORPHAN_RESERVATION key=%s ticket=%s symbol=%s side=%s risk=%s",
-                        k, ticket, j.get("symbol"), j.get("side"), risk
+                        "[PROP_RISK] DROP_ORPHAN_RESERVATION profile=%s key=%s ticket=%s symbol=%s side=%s risk=%s",
+                        pid, k, ticket, j.get("symbol"), j.get("side"), risk
                     )
                 except Exception:
                     pass
                 continue
+
+            try:
+                j["profile_id"] = pid
+            except Exception:
+                pass
 
             total_open_risk += risk
             open_items.append(j)
@@ -621,47 +1441,85 @@ def _get_prop_risk_state() -> dict:
             R.expire(daily_key, 3 * 24 * 3600)
         except Exception:
             pass
-    # -------------------------------------------------
-    # FTMO live daily-loss model:
-    # Daily loss resets at midnight CE(S)T and is based on equity.
-    # We store start-of-day balance once, then compare live equity.
-    # -------------------------------------------------
-    broker = _get_latest_mt5_account()
+
+    # Resolve broker account from the selected prop profile.
+    resolved = {}
+
+    try:
+        resolved = _resolve_prop_profile_device(pid)
+    except Exception:
+        resolved = {}
+
+    broker = {}
+
+    if isinstance(resolved, dict) and resolved.get("ok"):
+        broker = resolved.get("account") or {}
+
+    # Fallback for legacy/single-profile installs.
+    if not broker:
+        broker = _get_latest_mt5_account()
+
     broker_balance = 0.0
     broker_equity = 0.0
     floating_pnl = 0.0
+    broker_free_margin = 0.0
+    broker_margin = 0.0
 
     try:
         broker_balance = float(broker.get("balance") or 0.0)
         broker_equity = float(broker.get("equity") or broker_balance or 0.0)
         floating_pnl = float(broker.get("floating_pnl") or 0.0)
+        broker_free_margin = float(broker.get("free_margin") or 0.0)
+        broker_margin = float(
+            broker.get("margin")
+            or broker.get("used_margin")
+            or max(0.0, broker_equity - broker_free_margin)
+            or 0.0
+        )
     except Exception:
         broker_balance = broker_equity = floating_pnl = 0.0
+    try:
+        _ensure_prop_day_initialized(pid, broker_balance)
+        daily = _decode_map(R.hgetall(daily_key) or {})
+    except Exception:
+        pass
 
     sod_balance = _f(daily, "start_balance", 0)
     if sod_balance <= 0 and broker_balance > 0:
         sod_balance = broker_balance
         try:
-            R.hset(daily_key, "start_balance", round(float(sod_balance), 2))
+            R.hset(daily_key, mapping={
+                "start_balance": round(float(sod_balance), 2),
+                "start_balance_source": "lazy_first_seen",
+                "start_balance_captured_ts": int(time.time() * 1000),
+                "start_balance_captured_prague_time": _prop_prague_now_iso(),
+            })
             R.expire(daily_key, 3 * 24 * 3600)
         except Exception:
             pass
 
-    # -------------------------------------------------
-    # Daily reset notification - once per prop day
-    # FTMO day resets at midnight CE(S)T via _prop_today().
-    # -------------------------------------------------
     try:
-        cfg = _get_prop_config()
+        cfg = _get_prop_config(pid)
         firm_u = str(cfg.get("firm") or "").lower()
 
         if firm_u == "ftmo" and broker_balance > 0:
-            notice_key = f"xtl:prop:reset_notice:{firm_u}:{day}"
+            notice_key = f"xtl:prop:reset_notice:{firm_u}:{pid}:{day}"
+            stats_key = _prop_profile_stats_key(pid)
 
-            if not R.get(notice_key):
+            last_notify_day = ""
+            try:
+                last_notify_day = str(R.hget(stats_key, "last_reset_notify_day") or "")
+            except Exception:
+                last_notify_day = ""
+
+            if last_notify_day != day and not R.get(notice_key):
+                prague_time = _prop_prague_now_iso()
+
                 msg = (
                     f"**FTMO Daily Reset**\n"
+                    f"Profile: `{pid}`\n"
                     f"New prop day: `{day}` CE(S)T\n"
+                    f"Reset detected: `{prague_time}`\n"
                     f"Start balance: `${float(sod_balance):.2f}`\n"
                     f"Current equity: `${float(broker_equity):.2f}`\n"
                     f"Floating P/L: `${float(floating_pnl):.2f}`\n"
@@ -671,17 +1529,142 @@ def _get_prop_risk_state() -> dict:
                 _discord_post(msg)
 
                 R.setex(notice_key, 36 * 3600, "1")
+                try:
+                    R.hset(stats_key, mapping={
+                        "last_reset_notify_day": day,
+                        "last_reset_notify_ts": prague_time,
+                        "last_reset_notice_key": notice_key,
+                    })
+                except Exception:
+                    pass
+
+                log.warning(
+                    "[PROP] FTMO_DAILY_RESET_NOTIFY profile=%s day=%s prague_time=%s daily_key=%s notice_key=%s",
+                    pid,
+                    day,
+                    prague_time,
+                    daily_key,
+                    notice_key,
+                )
     except Exception:
         pass
 
-    ftmo_live_daily_loss = 0.0
-    if sod_balance > 0 and broker_equity > 0:
-        ftmo_live_daily_loss = max(0.0, float(sod_balance) - float(broker_equity))
+    # -------------------------------------------------
+    # FTMO Maximum Daily Loss formula:
+    # Current Daily Result = today_closed_pnl + floating_pnl
+    # today_closed_pnl = broker_balance - day_start_balance
+    # floating_pnl     = broker_equity - broker_balance
+    # Daily loss used  = abs(min(Current Daily Result, 0))
+    # -------------------------------------------------
+    today_closed_pnl = 0.0
+    ftmo_current_daily_result = 0.0
+    ftmo_daily_loss_used = 0.0
+    ftmo_daily_loss_limit = 0.0
+    ftmo_daily_loss_remaining = 0.0
+    projected_daily_loss_if_all_sl = 0.0
+
+    try:
+        cfg = _get_prop_config(pid)
+        account_size_for_limit = float(cfg.get("account_size") or sod_balance or broker_balance or 0.0)
+        ftmo_daily_loss_limit = account_size_for_limit * 0.05
+
+        if sod_balance > 0 and broker_balance > 0:
+            today_closed_pnl = float(broker_balance) - float(sod_balance)
+
+        # Prefer broker floating_pnl; fallback to equity-balance.
+        if not floating_pnl and broker_equity > 0 and broker_balance > 0:
+            floating_pnl = float(broker_equity) - float(broker_balance)
+
+        ftmo_current_daily_result = float(today_closed_pnl) + float(floating_pnl)
+        ftmo_daily_loss_used = abs(min(float(ftmo_current_daily_result), 0.0))
+        ftmo_daily_loss_remaining = max(0.0, float(ftmo_daily_loss_limit) - float(ftmo_daily_loss_used))
+
+        # Conservative XTL projection: if every reserved open/pending trade hits SL.
+        projected_daily_loss_if_all_sl = float(ftmo_daily_loss_used) + float(total_open_risk)
+    except Exception:
+        pass
+   
+    # -------------------------------------------------
+    # Dynamic risk bands
+    # -------------------------------------------------
+    try:
+        cfg = _get_prop_config(pid)
+
+        effective_risk_pct = _effective_risk_pct(
+            cfg,
+            broker_equity,
+        )
+
+        acct_size = float(cfg.get("account_size") or 0)
+
+        if acct_size > 0:
+            drawdown_pct = max(
+                0.0,
+                ((acct_size - broker_equity) / acct_size) * 100.0,
+            )
+        else:
+            drawdown_pct = 0.0
+
+        if drawdown_pct >= 4.0:
+            drawdown_band = "HIGH"
+        elif drawdown_pct >= 2.0:
+            drawdown_band = "MEDIUM"
+        else:
+            drawdown_band = "NORMAL"
+
+    except Exception:
+        effective_risk_pct = 1.0
+        drawdown_pct = 0.0
+        drawdown_band = "NORMAL"
+    try:
+        R.hset(daily_key, mapping={
+            "profile_id": pid,
+            "day": day,
+            "start_balance": round(float(sod_balance), 2),
+            "broker_balance": round(float(broker_balance), 2),
+            "broker_equity": round(float(broker_equity), 2),
+            "floating_pnl": round(float(floating_pnl), 2),
+            "today_closed_pnl": round(float(today_closed_pnl), 2),
+            "ftmo_current_daily_result": round(float(ftmo_current_daily_result), 2),
+            "ftmo_daily_loss_used": round(float(ftmo_daily_loss_used), 2),
+            "ftmo_daily_loss_limit": round(float(ftmo_daily_loss_limit), 2),
+            "ftmo_daily_loss_remaining": round(float(ftmo_daily_loss_remaining), 2),
+            "projected_daily_loss_if_all_sl": round(float(projected_daily_loss_if_all_sl), 2),
+            "open_risk_usd": round(float(total_open_risk), 2),
+            "effective_risk_pct": round(float(effective_risk_pct), 4),
+            "drawdown_pct": round(float(drawdown_pct), 2),
+            "drawdown_band": drawdown_band,
+            "updated_ts_ms": int(time.time() * 1000),
+        })
+        R.expire(daily_key, 3 * 24 * 3600)
+    except Exception:
+        pass
+
+    margin_level = 0.0
+    margin_utilization = 0.0
+
+    try:
+        if broker_margin > 0:
+            margin_level = (broker_equity / broker_margin) * 100.0
+        if broker_equity > 0 and broker_margin > 0:
+            margin_utilization = (broker_margin / broker_equity) * 100.0
+    except Exception:
+        margin_level = 0.0
+        margin_utilization = 0.0
 
     return {
+        "profile_id": pid,
         "day": day,
         "daily_key": daily_key,
-        "daily_loss_used": _f(daily, "daily_loss_used", 0),
+        "open_risk_key": open_risk_key,
+        "stats_key": stats_key,
+        "daily_loss_used": round(float(ftmo_daily_loss_used), 2),
+        "today_closed_pnl": round(float(today_closed_pnl), 2),
+        "ftmo_current_daily_result": round(float(ftmo_current_daily_result), 2),
+        "ftmo_daily_loss_used": round(float(ftmo_daily_loss_used), 2),
+        "ftmo_daily_loss_limit": round(float(ftmo_daily_loss_limit), 2),
+        "ftmo_daily_loss_remaining": round(float(ftmo_daily_loss_remaining), 2),
+        "projected_daily_loss_if_all_sl": round(float(projected_daily_loss_if_all_sl), 2),
         "daily_risk_reserved": round(float(daily_reserved), 2),
         "max_loss_used": _f(stats, "max_loss_used", 0),
         "open_risk_usd": round(total_open_risk, 2),
@@ -693,21 +1676,55 @@ def _get_prop_risk_state() -> dict:
         ),
         "wins_today": int(_f(daily, "wins_today", 0)),
         "losses_today": int(_f(daily, "losses_today", 0)),
+        "daily_r": round(float(_f(daily, "daily_r", 0.0)), 4),
+        "daily_r_blocked": str(daily.get("daily_r_blocked") or "") == "1",
+        "daily_r_block_reason": str(daily.get("daily_r_block_reason") or ""),
         "start_balance": round(float(sod_balance), 2),
         "broker_balance": round(float(broker_balance), 2),
         "broker_equity": round(float(broker_equity), 2),
+        "trading_halted": str(stats.get("trading_halted") or "") == "1",
+        "halt_reason": str(stats.get("halt_reason") or ""),
+        "halt_ts": int(_f(stats, "halt_ts", 0)),
+        "halt_until_manual_reset": str(stats.get("halt_until_manual_reset") or "") == "1",
         "floating_pnl": round(float(floating_pnl), 2),
-        "ftmo_live_daily_loss": round(float(ftmo_live_daily_loss), 2),
+        "effective_risk_pct": round(float(effective_risk_pct), 4),
+        "drawdown_pct": round(float(drawdown_pct), 2),
+        "drawdown_band": drawdown_band,
+        "ftmo_live_daily_loss": round(float(ftmo_daily_loss_used), 2),
+        "consecutive_losing_days": int(_f(stats, "consecutive_losing_days", 0)),
+        "last_loss_day": str(stats.get("last_loss_day") or ""),
+        "last_day_eval": str(stats.get("last_day_eval") or ""),
+        "last_evaluated_prev_day": str(stats.get("last_evaluated_prev_day") or ""),
+        "last_evaluated_prev_pnl": round(float(_f(stats, "last_evaluated_prev_pnl", 0.0)), 2),
+        "free_margin": round(float(broker_free_margin), 2),
+        "used_margin": round(float(broker_margin), 2),
+        "margin_level": round(float(margin_level), 2),
+        "margin_utilization_pct": round(float(margin_utilization), 2),
     }
 
-def _reserve_prop_open_risk(trade_id: str, rec: dict) -> None:
+def _reserve_prop_open_risk(trade_id: str, rec: dict, profile_id: str | None = None) -> None:
     if not trade_id:
         return
 
-    daily_key = _prop_daily_key()
+    pid = _norm_prop_profile_id(profile_id or (rec or {}).get("profile_id"))
+    daily_key = _prop_daily_key(profile_id=pid)
+    open_risk_key = _prop_profile_open_risk_key(pid)
+
+    try:
+        if isinstance(rec, dict):
+            rec["profile_id"] = pid
+    except Exception:
+        pass
 
     # If same trade_id already exists, subtract old risk first
-    old_raw = R.hget(PROP_OPEN_RISK_KEY, trade_id)
+    old_raw = R.hget(open_risk_key, trade_id)
+
+    # Backward compatibility: if default profile and not found, check legacy hash
+    legacy_old_raw = None
+    if not old_raw and pid == DEFAULT_PROP_PROFILE_ID:
+        legacy_old_raw = R.hget(PROP_OPEN_RISK_KEY, trade_id)
+        old_raw = legacy_old_raw
+
     old = _json_load_twice(old_raw)
     if isinstance(old, dict):
         try:
@@ -717,7 +1734,11 @@ def _reserve_prop_open_risk(trade_id: str, rec: dict) -> None:
         except Exception:
             pass
 
-    R.hset(PROP_OPEN_RISK_KEY, trade_id, json.dumps(rec, default=str))
+    R.hset(open_risk_key, trade_id, json.dumps(rec, default=str))
+
+    # Keep legacy global mirrored only for default profile during transition.
+    if pid == DEFAULT_PROP_PROFILE_ID:
+        R.hset(PROP_OPEN_RISK_KEY, trade_id, json.dumps(rec, default=str))
 
     try:
         risk = float(rec.get("risk_usd") or 0)
@@ -727,19 +1748,42 @@ def _reserve_prop_open_risk(trade_id: str, rec: dict) -> None:
     R.hincrbyfloat(daily_key, "daily_risk_reserved", risk)
     R.expire(daily_key, 3 * 24 * 3600)
 
-def _release_prop_open_risk(trade_id: str, result: str | None = None, pnl_usd: float | None = None) -> None:
+    log.warning(
+        "[PROP] RISK_RESERVED profile=%s trade_id=%s risk_usd=%s open_risk_key=%s daily_key=%s",
+        pid, trade_id, risk, open_risk_key, daily_key
+    )
+
+
+def _release_prop_open_risk(
+    trade_id: str,
+    result: str | None = None,
+    pnl_usd: float | None = None,
+    profile_id: str | None = None,
+) -> None:
     if not trade_id:
         return
 
-    raw = R.hget(PROP_OPEN_RISK_KEY, trade_id)
+    pid = _norm_prop_profile_id(profile_id)
+    open_risk_key = _prop_profile_open_risk_key(pid)
+
+    raw = R.hget(open_risk_key, trade_id)
+
+    # Backward compatibility: if default profile and not found, check legacy hash.
+    legacy_raw = None
+    if not raw and pid == DEFAULT_PROP_PROFILE_ID:
+        legacy_raw = R.hget(PROP_OPEN_RISK_KEY, trade_id)
+        raw = legacy_raw
+
     log.warning(
-        "[PROP] RELEASE_ATTEMPT trade_id=%s found=%s result=%s pnl_usd=%s",
-        trade_id, bool(raw), result, pnl_usd
+        "[PROP] RELEASE_ATTEMPT profile=%s trade_id=%s found=%s result=%s pnl_usd=%s open_risk_key=%s",
+        pid, trade_id, bool(raw), result, pnl_usd, open_risk_key
     )
 
     rec = _json_load_twice(raw)
     if not isinstance(rec, dict):
-        R.hdel(PROP_OPEN_RISK_KEY, trade_id)
+        R.hdel(open_risk_key, trade_id)
+        if pid == DEFAULT_PROP_PROFILE_ID:
+            R.hdel(PROP_OPEN_RISK_KEY, trade_id)
         return
 
     try:
@@ -747,27 +1791,92 @@ def _release_prop_open_risk(trade_id: str, result: str | None = None, pnl_usd: f
     except Exception:
         risk = 0.0
 
-    R.hdel(PROP_OPEN_RISK_KEY, trade_id)
+    R.hdel(open_risk_key, trade_id)
+    if pid == DEFAULT_PROP_PROFILE_ID:
+        R.hdel(PROP_OPEN_RISK_KEY, trade_id)
+
     log.warning(
-        "[PROP] RELEASE_DONE trade_id=%s risk_usd=%s result=%s pnl_usd=%s",
-        trade_id, risk, result, pnl_usd
+        "[PROP] RELEASE_DONE profile=%s trade_id=%s risk_usd=%s result=%s pnl_usd=%s",
+        pid, trade_id, risk, result, pnl_usd
     )
 
-    daily_key = _prop_daily_key()
+    daily_key = _prop_daily_key(profile_id=pid)
     R.hincrbyfloat(daily_key, "daily_risk_reserved", -risk)
 
     if pnl_usd is not None:
         try:
             pnl = float(pnl_usd)
+            risk_for_r = float(risk or rec.get("risk_usd") or 0.0)
+
+            trade_r = 0.0
+            if risk_for_r > 0:
+                trade_r = pnl / risk_for_r
+            else:
+                if pnl < 0:
+                    trade_r = -1.0
+                elif pnl > 0:
+                    trade_r = float((rec.get("prop_check") or {}).get("target_rr") or rec.get("target_rr") or 2.0)
+
             if pnl < 0:
                 R.hincrbyfloat(daily_key, "daily_loss_used", abs(pnl))
                 R.hincrby(daily_key, "losses_today", 1)
             elif pnl > 0:
                 R.hincrby(daily_key, "wins_today", 1)
+
+            new_daily_r = R.hincrbyfloat(daily_key, "daily_r", round(float(trade_r), 4))
+
+            if float(new_daily_r) <= -2.0:
+                R.hset(daily_key, mapping={
+                    "daily_r_blocked": "1",
+                    "daily_r_blocked_ts": int(time.time() * 1000),
+                    "daily_r_block_reason": "DAILY_R_LE_-2",
+                })
+
+                _prop_set_halt(
+                    pid,
+                    "DAILY_R_LE_-2",
+                    {
+                        "daily_r": round(float(new_daily_r), 4),
+                        "day": _prop_today(),
+                        "trade_id": trade_id,
+                    },
+                )
+
+                log.warning(
+                    "[PROP] DAILY_R_BLOCK profile=%s day_key=%s daily_r=%s trade_id=%s pnl=%s risk=%s",
+                    pid, daily_key, new_daily_r, trade_id, pnl, risk_for_r
+                )
+
         except Exception:
             pass
 
     R.expire(daily_key, 3 * 24 * 3600)
+
+
+@router.get("/prop/profiles")
+def prop_profiles():
+    try:
+        raw_ids = R.smembers(PROP_PROFILE_SET_KEY) or []
+        ids = []
+        for x in raw_ids:
+            if isinstance(x, (bytes, bytearray)):
+                x = x.decode("utf-8", "ignore")
+            ids.append(str(x))
+
+        active = _norm_prop_profile_id()
+        profiles = []
+        for pid in sorted(set(ids)):
+            profiles.append(_get_prop_config(pid))
+
+        return {
+            "ok": True,
+            "active_profile_id": active,
+            "profiles": profiles,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @router.get("/prop/config")
 def prop_get_config():
     return {
@@ -804,24 +1913,55 @@ def _get_latest_mt5_account() -> dict:
 
 
 @router.get("/prop/status")
-def prop_status():
-    cfg = _get_prop_config()
+def prop_status(profile_id: str | None = None):
+    cfg = _get_prop_config(profile_id)
+    pid = str(cfg.get("profile_id") or _norm_prop_profile_id(profile_id))
 
     firm = cfg["firm"]
     phase = cfg["phase"]
-    acct = _get_latest_mt5_account()
+
+    resolved = {}
+    try:
+        resolved = _resolve_prop_profile_device(pid)
+    except Exception:
+        resolved = {}
+
+    acct = {}
+    if isinstance(resolved, dict) and resolved.get("ok"):
+        acct = resolved.get("account") or {}
+
+    if not acct:
+        acct = _get_latest_mt5_account()
 
     broker_balance = float(
         acct.get("balance")
         or cfg["account_size"]
     )
 
+    account_size = float(cfg.get("account_size") or broker_balance)
+
     broker_equity = float(
         acct.get("equity")
         or broker_balance
     )
+    effective_risk_pct = _effective_risk_pct(
+        cfg,
+        broker_equity,
+    )
 
-    account_size = float(cfg.get("account_size") or broker_balance)
+    drawdown_pct = max(
+        0.0,
+        ((account_size - broker_equity) / account_size) * 100.0,
+    )
+
+    if drawdown_pct >= 4.0:
+        drawdown_band = "HIGH"
+    elif drawdown_pct >= 2.0:
+        drawdown_band = "MEDIUM"
+    else:
+        drawdown_band = "NORMAL"
+
+    
 
     rules = PROP_FIRM_RULES[firm]["phases"][phase]
 
@@ -835,23 +1975,37 @@ def prop_status():
 
     return {
         "ok": True,
+        "profile_id": pid,
+        "profile_device": {
+            "ok": bool(isinstance(resolved, dict) and resolved.get("ok")),
+            "device_id": (resolved or {}).get("device_id") if isinstance(resolved, dict) else "",
+            "reason": (resolved or {}).get("reason") if isinstance(resolved, dict) else "",
+        },
         "config": cfg,
         "rules": rules,
-
-        "broker": {
+        "account": {
             "balance": broker_balance,
             "equity": broker_equity,
-            "margin": acct.get("margin"),
             "free_margin": acct.get("free_margin"),
             "floating_pnl": acct.get("floating_pnl"),
             "leverage": acct.get("leverage"),
+            "login": acct.get("login"),
+            "server": acct.get("server"),
+            "company": acct.get("company"),
         },
         "limits": {
             "target_usd": round(target_usd, 2) if target_usd else None,
             "daily_limit_usd": round(daily_limit_usd, 2),
             "max_loss_limit_usd": round(max_loss_limit_usd, 2),
         },
+        "risk": {
+            "drawdown_pct": round(drawdown_pct, 2),
+            "drawdown_band": drawdown_band,
+            "configured_risk_pct": cfg["risk_pct"],
+            "effective_risk_pct": effective_risk_pct,
+        },
     }
+
 
 @router.get("/prop/risk")
 def prop_risk():
@@ -864,10 +2018,26 @@ def prop_risk():
 @router.post("/prop/check")
 def prop_check(payload: dict):
     try:
-        cfg = _get_prop_config()
-        risk_state = _get_prop_risk_state()
+        payload = payload or {}
+        profile_id = str(payload.get("profile_id") or "").strip() or None
 
-        acct = _get_latest_mt5_account()
+        cfg = _get_prop_config(profile_id)
+        pid = str(cfg.get("profile_id") or _norm_prop_profile_id(profile_id))
+
+        risk_state = _get_prop_risk_state(pid)
+
+        resolved = {}
+        try:
+            resolved = _resolve_prop_profile_device(pid)
+        except Exception:
+            resolved = {}
+
+        acct = {}
+        if isinstance(resolved, dict) and resolved.get("ok"):
+            acct = resolved.get("account") or {}
+
+        if not acct:
+            acct = _get_latest_mt5_account()
 
         broker_equity = float(
             acct.get("equity")
@@ -889,37 +2059,43 @@ def prop_check(payload: dict):
             side=str(payload["side"]),
             entry=float(payload["entry"]),
             sl=float(payload["sl"]),
-            risk_pct=float(payload.get("risk_pct") or cfg["risk_pct"]),
+            risk_pct=float(
+                payload.get("risk_pct")
+                or _effective_risk_pct(
+                    cfg,
+                    broker_equity,
+                )
+            ),
             target_rr=float(payload.get("target_rr") or cfg["target_rr"]),
             daily_loss_used=float(
                 payload.get(
                     "daily_loss_used",
-                    risk_state.get("ftmo_live_daily_loss")
+                    risk_state.get("ftmo_daily_loss_used")
                     if str(payload.get("firm") or cfg["firm"]).lower() == "ftmo"
                     else risk_state["daily_loss_used"]
                 )
             ),
             max_loss_used=float(payload.get("max_loss_used", risk_state["max_loss_used"])),
             open_risk_usd=float(payload.get("open_risk_usd", risk_state["open_risk_usd"])),
-            open_positions_count=int(risk_state.get("open_positions_count", len(risk_state.get("open_positions", [])))),
+            open_positions_count=int(payload.get("open_positions_count", risk_state["open_positions_count"])),
             max_open_risk_pct=float(payload.get("max_open_risk_pct", cfg["max_open_risk_pct"])),
-            max_open_positions=int(cfg.get("max_open_positions", 1)),
+            max_open_positions=int(payload.get("max_open_positions", cfg["max_open_positions"])),
         )
+
+        if isinstance(result, dict):
+            result["profile_id"] = pid
+            result["profile_device"] = {
+                "ok": bool(isinstance(resolved, dict) and resolved.get("ok")),
+                "device_id": (resolved or {}).get("device_id") if isinstance(resolved, dict) else "",
+                "reason": (resolved or {}).get("reason") if isinstance(resolved, dict) else "",
+            }
+            result["broker_equity"] = round(float(broker_equity), 2)
 
         return {
             "ok": True,
             "config": cfg,
-            "broker": {
-                "balance": acct.get("balance"),
-                "equity": acct.get("equity"),
-                "margin": acct.get("margin"),
-                "free_margin": acct.get("free_margin"),
-                "floating_pnl": acct.get("floating_pnl"),
-                "leverage": acct.get("leverage"),
-                "account_size_used": account_size,
-            },
-            "risk": risk_state,
-            "result": result,
+            "risk_state": risk_state,
+            "check": result,
         }
 
     except Exception as e:
@@ -927,6 +2103,7 @@ def prop_check(payload: dict):
             "ok": False,
             "error": str(e),
         }
+
 
 @router.post("/prop/risk/reset")
 def prop_risk_reset(payload: dict | None = None):
@@ -2068,6 +3245,66 @@ def _get_closed_h1_bars(sym: str, dev: str | None) -> list[dict]:
             except Exception:
                 continue
 
+        return out
+    except Exception:
+        return []
+
+
+def _get_closed_h4_bars(sym: str, dev: str | None) -> list[dict]:
+    """H4 sibling of _get_closed_h1_bars — same format, for regime confirmation TF."""
+    try:
+        sym_u = (sym or "").upper().strip()
+        dev = (dev or "").strip()
+        if not sym_u or not dev:
+            return []
+        key = f"xtl:ohlc:snap:{dev}:{sym_u}:H4"
+        js = None
+        try:
+            raw = R.get(key)
+            js = _json_load_twice(raw) if raw else None
+        except Exception:
+            js = None
+        if not isinstance(js, dict):
+            try:
+                h = R.hgetall(key) or {}
+                d = {}
+                for k, v in h.items():
+                    if isinstance(k, (bytes, bytearray)): k = k.decode("utf-8", "ignore")
+                    if isinstance(v, (bytes, bytearray)): v = v.decode("utf-8", "ignore")
+                    d[str(k)] = _json_load_twice(v)
+                js = d if d else None
+            except Exception:
+                js = None
+        if not isinstance(js, dict):
+            return []
+        bars = js.get("bars") or js.get("ohlc") or []
+        if not isinstance(bars, list):
+            return []
+        out = []
+        for b in bars:
+            if not isinstance(b, dict):
+                continue
+            if b.get("complete") is False:
+                continue
+            try:
+                o = b.get("o") if b.get("o") is not None else b.get("open")
+                h = b.get("h") if b.get("h") is not None else b.get("high")
+                l = b.get("l") if b.get("l") is not None else b.get("low")
+                c = b.get("c") if b.get("c") is not None else b.get("close")
+                if o is None or h is None or l is None or c is None:
+                    continue
+                t_open = b.get("t_open_ms") or b.get("tOpen") or 0
+                t_close = b.get("t_close_ms") or b.get("tClose") or b.get("t") or 0
+                try:
+                    if isinstance(t_close, (int, float)) and 0 < float(t_close) < 10_000_000_000:
+                        t_close = int(float(t_close) * 1000)
+                except Exception:
+                    pass
+                out.append({"t_open_ms": int(t_open) if t_open else 0,
+                            "t_close_ms": int(t_close) if t_close else 0,
+                            "o": float(o), "h": float(h), "l": float(l), "c": float(c)})
+            except Exception:
+                continue
         return out
     except Exception:
         return []
@@ -9275,13 +10512,26 @@ def trend_opportunities(
         rows = _load_active_snapshots(symbols)
         # DROP null/empty symbol rows (prevents {"symbol": null} in UI)
         rows = [r for r in rows if str((r or {}).get("symbol") or "").strip()]
-        # Weekend: override gate/reason so UI never shows stale live gate labels
+
+        # If lifecycle cleanup removed old opportunity snapshots but zone watches
+        # still exist, show the watchlist from xtl:zone:watch:* on weekends.
+        if not rows:
+            rows = _load_zone_watch_rows(None, tfu)
+            try:
+                log.warning("[WATCHLIST] WEEKEND_WATCH_FALLBACK rows=%s tf=%s", len(rows), tfu)
+            except Exception:
+                pass
+        # Weekend: keep watch/zone details when rows came from xtl:zone:watch:*.
+        # Only override old frozen opportunity snapshots, not fallback watch rows.
         for _r in rows:
-            _r["gate"] = "MARKET_CLOSED"
-            _r["reason"] = "MARKET_CLOSED_WEEKEND"
-            _r["zone"] = None
-            _r["zone_text"] = None
             _r["market_closed"] = True
+            if not _r.get("watch_key"):
+                _r["gate"] = "MARKET_CLOSED"
+                _r["reason"] = "MARKET_CLOSED_WEEKEND"
+                _r["zone"] = None
+                _r["zone_text"] = None
+            else:
+                _r["reason"] = str(_r.get("reason") or "WATCH | MARKET_CLOSED_WEEKEND")
         # ------------------------------------------------------------
         # Slim default opportunities response.
         # Do NOT send full SR tree unless explicitly requested.

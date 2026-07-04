@@ -32,7 +32,7 @@ log = logging.getLogger("xtl.calendar_import")
 # ---------------------------------------------------------------------------
 DEFAULT_CSV_PATH  = "/opt/xauapi/events.csv"
 REDIS_CALENDAR_KEY = "xtl:news:calendar:daily"
-REDIS_CALENDAR_TTL = 8 * 3600   # 8 hours
+REDIS_CALENDAR_TTL = 26 * 3600   # was 8h — must outlive the daily scrape cadence 
 
 # ---------------------------------------------------------------------------
 # Helpers

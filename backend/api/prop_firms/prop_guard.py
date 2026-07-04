@@ -85,18 +85,67 @@ def compute_prop_check(
         }
 
     risk_usd = account_size * (risk_pct / 100.0)
-    loss_per_lot = sl_dist * spec["contract_size"]
 
-    raw_lots = risk_usd / loss_per_lot
+    loss_per_lot_quote = sl_dist * spec["contract_size"]
+
+    base_ccy = symbol[:3] if len(symbol) >= 6 else ""
+    quote_ccy = symbol[3:6] if len(symbol) >= 6 else ""
+
+    if symbol == "XAUUSD":
+        base_ccy = "XAU"
+        quote_ccy = "USD"
+
+    if quote_ccy == "USD":
+        conversion_rate = 1.0
+        loss_per_lot_usd = loss_per_lot_quote
+        conversion_method = "QUOTE_USD"
+
+    elif base_ccy == "USD":
+        if entry <= 0:
+            return {
+                "verdict": "BLOCK",
+                "reasons": ["Invalid entry for USD-base conversion"],
+            }
+
+        conversion_rate = float(entry)
+        loss_per_lot_usd = loss_per_lot_quote / conversion_rate
+        conversion_method = "BASE_USD_DIV_ENTRY"
+
+    else:
+        return {
+            "verdict": "BLOCK",
+            "reasons": [f"Unsupported cross-currency symbol for USD risk conversion: {symbol}"],
+        }
+
+    if loss_per_lot_usd <= 0:
+        return {
+            "verdict": "BLOCK",
+            "reasons": ["Invalid USD loss per lot"],
+        }
+
+    
+    raw_lots = risk_usd / loss_per_lot_usd
     lots = floor_to_step(raw_lots, spec["lot_step"])
 
     if lots < spec["min_lot"]:
         return {
             "verdict": "BLOCK",
             "reasons": ["Lot size below broker minimum"],
+            "debug": {
+                "risk_usd": round(risk_usd, 2),
+                "sl_dist": sl_dist,
+                "loss_per_lot_quote": round(loss_per_lot_quote, 5),
+                "loss_per_lot_usd": round(loss_per_lot_usd, 5),
+                "raw_lots": round(raw_lots, 5),
+                "min_lot": spec["min_lot"],
+                "base_ccy": base_ccy,
+                "quote_ccy": quote_ccy,
+                "conversion_method": conversion_method,
+                "conversion_rate": round(conversion_rate, 5),
+            },
         }
 
-    actual_risk_usd = lots * loss_per_lot
+    actual_risk_usd = lots * loss_per_lot_usd
     actual_risk_pct = (actual_risk_usd / account_size) * 100.0
 
     if side == "BUY":
@@ -150,6 +199,14 @@ def compute_prop_check(
         "lots": round(lots, 2),
         "risk_usd": round(actual_risk_usd, 2),
         "risk_pct": round(actual_risk_pct, 3),
+        "risk_requested_usd": round(risk_usd, 2),
+        "raw_lots": round(raw_lots, 4),
+        "loss_per_lot_quote": round(loss_per_lot_quote, 5),
+        "loss_per_lot_usd": round(loss_per_lot_usd, 5),
+        "base_ccy": base_ccy,
+        "quote_ccy": quote_ccy,
+        "conversion_method": conversion_method,
+        "conversion_rate": round(conversion_rate, 5),
         "daily_limit_usd": round(daily_limit, 2),
         "daily_room_usd": round(daily_limit - daily_loss_used, 2),
         "max_loss_limit_usd": round(max_loss_limit, 2),

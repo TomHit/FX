@@ -9,17 +9,21 @@ import threading
 
 from typing import Optional, Tuple
 import inspect
+
 # --- bootstrap log (helps before APP_DIR exists) ---
 from pathlib import Path
 import os, time, traceback
 import winreg
 
 import logging
+
 LOGGER = logging.getLogger("xtl.installer")
 if not LOGGER.handlers:
     logging.basicConfig(level=logging.INFO)
 
 BOOTLOG = Path(os.environ.get("TEMP", r"C:\Windows\Temp")) / "xtl_install_bootstrap.log"
+
+
 def blog(msg: str) -> None:
     try:
         BOOTLOG.parent.mkdir(parents=True, exist_ok=True)
@@ -28,6 +32,8 @@ def blog(msg: str) -> None:
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass  # never crash on logging
+
+
 _PROCESS_START_TS = time.time()
 # cadence memory for trend pushes: (symbol, tf) -> last_push_epoch_s
 _LAST_PUSH: dict[tuple[str, str], int] = {}
@@ -37,7 +43,6 @@ _LAST_PUSH: dict[tuple[str, str], int] = {}
 from xtl.agent_ohlc import push_ohlc_once as agent_push_ohlc_once
 from xtl.agent_price import start_price_publisher
 
-
 # ---------- constants / paths ----------
 APP_NAME = "XTL"
 DEFAULT_API_BASE = "https://api.xautrendlab.com"
@@ -46,9 +51,9 @@ APP_DIR = PF / APP_NAME / "dist" / "xtl"
 SERVICE_CANON = "XTLAgent"
 WINSW_EXE = APP_DIR / f"{SERVICE_CANON}.exe"
 WINSW_XML = APP_DIR / f"{SERVICE_CANON}.xml"
-LOG_FILE = (PF / APP_NAME / "installer.log")
-AGENT_LOG = (APP_DIR / "xtl_agent.log")
-BIND_HINT = (APP_DIR / "bind_status.txt")
+LOG_FILE = PF / APP_NAME / "installer.log"
+AGENT_LOG = APP_DIR / "xtl_agent.log"
+BIND_HINT = APP_DIR / "bind_status.txt"
 HKLM_XTL = r"SOFTWARE\XTL"
 HKLM_XTL_MIRROR = r"SOFTWARE\XauTrendLab"
 HKU_LS = r"S-1-5-18\Software\XTL"
@@ -63,27 +68,36 @@ except Exception:
     _PF = r"C:\Program Files"
 APP_DIR = Path(_PF) / "XTL" / "dist" / "xtl"
 
+
 # --- XTL convenience: delete and set across all hives we read from ---
 def _xtl_del_all_roots(name: str) -> None:
-    try: _hku_ls_del(name)
-    except Exception: pass
-    try: _reg_del(r"HKLM\Software\XTL", name)
-    except Exception: pass
-    try: _reg_del(r"HKCU\Software\XTL", name)
-    except Exception: pass
+    try:
+        _hku_ls_del(name)
+    except Exception:
+        pass
+    try:
+        _reg_del(r"HKLM\Software\XTL", name)
+    except Exception:
+        pass
+    try:
+        _reg_del(r"HKCU\Software\XTL", name)
+    except Exception:
+        pass
+
 
 # --- Write to all relevant hives/views (HKU LocalSystem + HKLM + HKCU, 64/32) ---
 def _xtl_set_all_roots(name: str, value: str) -> None:
     import winreg as _wr
+
     WOW64_64 = getattr(_wr, "KEY_WOW64_64KEY", 0x0100)
     WOW64_32 = getattr(_wr, "KEY_WOW64_32KEY", 0x0200)
     targets = [
-        (_wr.HKEY_USERS,          r"S-1-5-18\Software\XTL", WOW64_64),
-        (_wr.HKEY_USERS,          r"S-1-5-18\Software\XTL", WOW64_32),
-        (_wr.HKEY_LOCAL_MACHINE,  r"Software\XTL",          WOW64_64),
-        (_wr.HKEY_LOCAL_MACHINE,  r"Software\XTL",          WOW64_32),
-        (_wr.HKEY_CURRENT_USER,   r"Software\XTL",          WOW64_64),
-        (_wr.HKEY_CURRENT_USER,   r"Software\XTL",          WOW64_32),
+        (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_64),
+        (_wr.HKEY_USERS, r"S-1-5-18\Software\XTL", WOW64_32),
+        (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_64),
+        (_wr.HKEY_LOCAL_MACHINE, r"Software\XTL", WOW64_32),
+        (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_64),
+        (_wr.HKEY_CURRENT_USER, r"Software\XTL", WOW64_32),
     ]
     for hive, subkey, view in targets:
         try:
@@ -96,6 +110,7 @@ def _xtl_set_all_roots(name: str, value: str) -> None:
                     _wr.SetValueEx(h, name, 0, _wr.REG_SZ, str(value))
         except Exception:
             pass
+
 
 def _tz_label(off_min: int) -> str:
     sign = "+" if off_min >= 0 else "-"
@@ -122,9 +137,9 @@ def _reg_set(key_path: str, name: str, value, kind: str = "REG_SZ") -> None:
     hive = root_map.get(hive_name.upper(), winreg.HKEY_LOCAL_MACHINE)
 
     access = (
-            winreg.KEY_SET_VALUE
-            | winreg.KEY_CREATE_SUB_KEY
-            | getattr(winreg, "KEY_WOW64_64KEY", 0)
+        winreg.KEY_SET_VALUE
+        | winreg.KEY_CREATE_SUB_KEY
+        | getattr(winreg, "KEY_WOW64_64KEY", 0)
     )
     with winreg.CreateKeyEx(hive, subkey, 0, access) as k:
         ktype = {
@@ -152,6 +167,8 @@ def _reg_set(key_path: str, name: str, value, kind: str = "REG_SZ") -> None:
             value = str(value)
 
         winreg.SetValueEx(k, name, 0, ktype, value)
+
+
 # --- Generic delete of a registry value (supports HKCU/HKLM/HKU) ---
 def _reg_del(key_path: str, name: str) -> None:
     """
@@ -160,10 +177,11 @@ def _reg_del(key_path: str, name: str) -> None:
     """
     try:
         import winreg as w
+
         roots = {
             "HKCU": w.HKEY_CURRENT_USER,
             "HKLM": w.HKEY_LOCAL_MACHINE,
-            "HKU":  w.HKEY_USERS,
+            "HKU": w.HKEY_USERS,
         }
         root_token, subkey = key_path.split("\\", 1)
         root = roots.get(root_token.upper())
@@ -179,39 +197,56 @@ def _reg_del(key_path: str, name: str) -> None:
         # silent no-op on missing hive/permissions/non-Windows
         pass
 
+
 def _hklm_get(name: str) -> Optional[str]:
     try:
         for root in (r"Software\XTL", r"Software\XauTrendLab"):
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root, 0, winreg.KEY_READ) as k:
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, root, 0, winreg.KEY_READ
+            ) as k:
                 v, _ = winreg.QueryValueEx(k, name)
                 return str(v)
     except Exception:
         return None
+
+
 def _hku_ls_set(name: str, val: str) -> None:
     with winreg.CreateKeyEx(winreg.HKEY_USERS, HKU_LS, 0, winreg.KEY_SET_VALUE) as k:
         winreg.SetValueEx(k, name, 0, winreg.REG_SZ, val)
+
+
 def _hku_ls_get(name: str) -> Optional[str]:
     try:
         with winreg.OpenKey(winreg.HKEY_USERS, HKU_LS, 0, winreg.KEY_READ) as k:
-            v,_ = winreg.QueryValueEx(k, name)
+            v, _ = winreg.QueryValueEx(k, name)
             return str(v)
     except Exception:
         return None
+
+
 def _hklm_set_json(value: dict) -> None:
 
-    blob = json.dumps(value, separators=(",",":"))
+    blob = json.dumps(value, separators=(",", ":"))
     for root in (HKLM_XTL, HKLM_XTL_MIRROR):
-        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, root, 0, winreg.KEY_SET_VALUE) as k:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_LOCAL_MACHINE, root, 0, winreg.KEY_SET_VALUE
+        ) as k:
             winreg.SetValueEx(k, "ConfigJson", 0, winreg.REG_SZ, blob)
+
+
 def _hklm_get_json() -> dict:
     for root in (HKLM_XTL, HKLM_XTL_MIRROR):
         try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root, 0, winreg.KEY_READ) as k:
-                v,_ = winreg.QueryValueEx(k, "ConfigJson")
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, root, 0, winreg.KEY_READ
+            ) as k:
+                v, _ = winreg.QueryValueEx(k, "ConfigJson")
                 return json.loads(v)
         except Exception:
             pass
     return {}
+
+
 def _hku_ls_del(name: str) -> None:
     """
     Delete a value from LocalSystem hive:
@@ -220,8 +255,11 @@ def _hku_ls_del(name: str) -> None:
     """
     try:
         import winreg
+
         with winreg.ConnectRegistry(None, winreg.HKEY_USERS) as reg:
-            with winreg.OpenKey(reg, r"S-1-5-18\Software\XTL", 0, winreg.KEY_SET_VALUE) as key:
+            with winreg.OpenKey(
+                reg, r"S-1-5-18\Software\XTL", 0, winreg.KEY_SET_VALUE
+            ) as key:
                 try:
                     winreg.DeleteValue(key, name)
                 except FileNotFoundError:
@@ -234,9 +272,11 @@ def _hku_ls_del(name: str) -> None:
 def _compute_local_tz_offset_min() -> int:
     # minutes EAST of UTC; Windows exposes seconds WEST
     import time
+
     isdst = time.localtime().tm_isdst
     seconds_west = time.altzone if (isdst and time.daylight) else time.timezone
     return -int(seconds_west // 60)
+
 
 def _write_broker_meta_from_env_or_local() -> None:
     """
@@ -306,18 +346,20 @@ def _write_broker_meta_from_env_or_local() -> None:
         pass
 
 
-
 def _get_active_console_session_id():
     WTSGetActiveConsoleSessionId = ctypes.windll.kernel32.WTSGetActiveConsoleSessionId
     WTSGetActiveConsoleSessionId.restype = ctypes.wintypes.DWORD
     return int(WTSGetActiveConsoleSessionId())
 
+
 def _process_session_id(pid=None):
     pid = pid or os.getpid()
     sid = ctypes.wintypes.DWORD(0)
-    ok = ctypes.windll.kernel32.ProcessIdToSessionId(ctypes.wintypes.DWORD(pid),
-                                                     ctypes.byref(sid))
+    ok = ctypes.windll.kernel32.ProcessIdToSessionId(
+        ctypes.wintypes.DWORD(pid), ctypes.byref(sid)
+    )
     return int(sid.value) if ok else -1
+
 
 def _in_session0():
     try:
@@ -325,10 +367,12 @@ def _in_session0():
     except Exception:
         return False
 
+
 def _sid_string_from_token(hTok):
     """Return SID string (e.g., 'S-1-5-21-...') for a token using ctypes."""
     import ctypes
     from ctypes import wintypes as wt
+
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
     TokenUser = 1
@@ -345,6 +389,7 @@ def _sid_string_from_token(hTok):
     # TOKEN_USER struct -> SID*
     class SID_AND_ATTRIBUTES(ctypes.Structure):
         _fields_ = [("Sid", wt.LPVOID), ("Attributes", wt.DWORD)]
+
     class TOKEN_USER(ctypes.Structure):
         _fields_ = [("User", SID_AND_ATTRIBUTES)]
 
@@ -354,7 +399,7 @@ def _sid_string_from_token(hTok):
     # Convert SID to string
     ConvertSidToStringSidW = advapi32.ConvertSidToStringSidW
     ConvertSidToStringSidW.argtypes = [wt.LPVOID, ctypes.POINTER(wt.LPWSTR)]
-    ConvertSidToStringSidW.restype  = wt.BOOL
+    ConvertSidToStringSidW.restype = wt.BOOL
 
     lpStringSid = wt.LPWSTR()
     if not ConvertSidToStringSidW(pSid, ctypes.byref(lpStringSid)):
@@ -363,6 +408,7 @@ def _sid_string_from_token(hTok):
         return lpStringSid.value
     finally:
         ctypes.windll.kernel32.LocalFree(lpStringSid)
+
 
 def _mirror_ls_creds_to_user_hkcu(user_sid_str):
     """
@@ -376,28 +422,49 @@ def _mirror_ls_creds_to_user_hkcu(user_sid_str):
 
     # --- Reg types & constants (use DWORD for samDesired; wintypes has no REGSAM) ---
     HKEY_USERS = wt.HANDLE(0x80000003)  # predefined root
-    KEY_READ   = 0x20019
-    KEY_WRITE  = 0x20006
-    REG_SZ     = 1
-    DWORD      = wt.DWORD
+    KEY_READ = 0x20019
+    KEY_WRITE = 0x20006
+    REG_SZ = 1
+    DWORD = wt.DWORD
 
     RegOpenKeyExW = advapi32.RegOpenKeyExW
-    RegOpenKeyExW.argtypes = [wt.HANDLE, wt.LPCWSTR, DWORD, DWORD, ctypes.POINTER(wt.HANDLE)]
-    RegOpenKeyExW.restype  = wt.LONG
+    RegOpenKeyExW.argtypes = [
+        wt.HANDLE,
+        wt.LPCWSTR,
+        DWORD,
+        DWORD,
+        ctypes.POINTER(wt.HANDLE),
+    ]
+    RegOpenKeyExW.restype = wt.LONG
 
     RegCreateKeyExW = advapi32.RegCreateKeyExW
-    RegCreateKeyExW.argtypes = [wt.HANDLE, wt.LPCWSTR, DWORD, wt.LPWSTR, DWORD,
-                                DWORD, wt.LPVOID, ctypes.POINTER(wt.HANDLE), ctypes.POINTER(DWORD)]
-    RegCreateKeyExW.restype  = wt.LONG
+    RegCreateKeyExW.argtypes = [
+        wt.HANDLE,
+        wt.LPCWSTR,
+        DWORD,
+        wt.LPWSTR,
+        DWORD,
+        DWORD,
+        wt.LPVOID,
+        ctypes.POINTER(wt.HANDLE),
+        ctypes.POINTER(DWORD),
+    ]
+    RegCreateKeyExW.restype = wt.LONG
 
     RegSetValueExW = advapi32.RegSetValueExW
-    RegSetValueExW.argtypes  = [wt.HANDLE, wt.LPCWSTR, DWORD, DWORD, wt.LPCVOID, DWORD]
-    RegSetValueExW.restype   = wt.LONG
+    RegSetValueExW.argtypes = [wt.HANDLE, wt.LPCWSTR, DWORD, DWORD, wt.LPCVOID, DWORD]
+    RegSetValueExW.restype = wt.LONG
 
     RegQueryValueExW = advapi32.RegQueryValueExW
-    RegQueryValueExW.argtypes = [wt.HANDLE, wt.LPCWSTR, ctypes.POINTER(DWORD), ctypes.POINTER(DWORD),
-                                 wt.LPBYTE, ctypes.POINTER(DWORD)]
-    RegQueryValueExW.restype  = wt.LONG
+    RegQueryValueExW.argtypes = [
+        wt.HANDLE,
+        wt.LPCWSTR,
+        ctypes.POINTER(DWORD),
+        ctypes.POINTER(DWORD),
+        wt.LPBYTE,
+        ctypes.POINTER(DWORD),
+    ]
+    RegQueryValueExW.restype = wt.LONG
 
     RegCloseKey = advapi32.RegCloseKey
 
@@ -411,7 +478,20 @@ def _mirror_ls_creds_to_user_hkcu(user_sid_str):
     def _create(hroot, subkey, sam):
         h = wt.HANDLE()
         disp = DWORD(0)
-        if RegCreateKeyExW(hroot, subkey, DWORD(0), None, DWORD(0), DWORD(sam), None, ctypes.byref(h), ctypes.byref(disp)) == 0:
+        if (
+            RegCreateKeyExW(
+                hroot,
+                subkey,
+                DWORD(0),
+                None,
+                DWORD(0),
+                DWORD(sam),
+                None,
+                ctypes.byref(h),
+                ctypes.byref(disp),
+            )
+            == 0
+        ):
             return h
         return None
 
@@ -419,13 +499,27 @@ def _mirror_ls_creds_to_user_hkcu(user_sid_str):
         data_type = DWORD(0)
         cb = DWORD(0)
         # Probe for size
-        if RegQueryValueExW(hkey, name, None, ctypes.byref(data_type), None, ctypes.byref(cb)) != 0:
+        if (
+            RegQueryValueExW(
+                hkey, name, None, ctypes.byref(data_type), None, ctypes.byref(cb)
+            )
+            != 0
+        ):
             return None
         if data_type.value != REG_SZ or cb.value == 0:
             return None
         buf = (wt.WCHAR * (cb.value // ctypes.sizeof(wt.WCHAR)))()
-        if RegQueryValueExW(hkey, name, None, ctypes.byref(data_type),
-                            ctypes.cast(buf, wt.LPBYTE), ctypes.byref(cb)) != 0:
+        if (
+            RegQueryValueExW(
+                hkey,
+                name,
+                None,
+                ctypes.byref(data_type),
+                ctypes.cast(buf, wt.LPBYTE),
+                ctypes.byref(cb),
+            )
+            != 0
+        ):
             return None
         return ctypes.wstring_at(buf)
 
@@ -473,7 +567,9 @@ def _mirror_ls_creds_to_user_hkcu(user_sid_str):
                 _set_sz(dst, n, v)
                 copied.append(n)
         try:
-            alog(f"bridge(ctypes): mirrored {copied} → HKU\\{user_sid_str}\\Software\\XTL")
+            alog(
+                f"bridge(ctypes): mirrored {copied} → HKU\\{user_sid_str}\\Software\\XTL"
+            )
         except Exception:
             pass
     finally:
@@ -495,10 +591,10 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
     from ctypes import wintypes as wt
 
     # Load DLLs
-    kernel32 = ctypes.WinDLL("kernel32",  use_last_error=True)
-    advapi32 = ctypes.WinDLL("advapi32",  use_last_error=True)
-    wtsapi32 = ctypes.WinDLL("wtsapi32",  use_last_error=True)
-    userenv  = ctypes.WinDLL("userenv",   use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+    userenv = ctypes.WinDLL("userenv", use_last_error=True)
 
     # Prototypes we will use
     WTSGetActiveConsoleSessionId = kernel32.WTSGetActiveConsoleSessionId
@@ -506,74 +602,81 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
 
     WTSQueryUserToken = wtsapi32.WTSQueryUserToken
     WTSQueryUserToken.argtypes = [wt.ULONG, ctypes.POINTER(wt.HANDLE)]
-    WTSQueryUserToken.restype  = wt.BOOL
+    WTSQueryUserToken.restype = wt.BOOL
 
     DuplicateTokenEx = advapi32.DuplicateTokenEx
-    DuplicateTokenEx.argtypes = [wt.HANDLE, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, ctypes.POINTER(wt.HANDLE)]
-    DuplicateTokenEx.restype  = wt.BOOL
+    DuplicateTokenEx.argtypes = [
+        wt.HANDLE,
+        wt.DWORD,
+        wt.LPVOID,
+        wt.DWORD,
+        wt.DWORD,
+        ctypes.POINTER(wt.HANDLE),
+    ]
+    DuplicateTokenEx.restype = wt.BOOL
 
     CreateEnvironmentBlock = userenv.CreateEnvironmentBlock
     CreateEnvironmentBlock.argtypes = [ctypes.POINTER(wt.LPVOID), wt.HANDLE, wt.BOOL]
-    CreateEnvironmentBlock.restype  = wt.BOOL
+    CreateEnvironmentBlock.restype = wt.BOOL
 
     DestroyEnvironmentBlock = userenv.DestroyEnvironmentBlock
     DestroyEnvironmentBlock.argtypes = [wt.LPVOID]
-    DestroyEnvironmentBlock.restype  = wt.BOOL
+    DestroyEnvironmentBlock.restype = wt.BOOL
 
     # Define STARTUPINFO & PROCESS_INFORMATION (ctypes.wintypes does not provide them)
     class STARTUPINFO(ctypes.Structure):
         _fields_ = [
-            ("cb",            wt.DWORD),
-            ("lpReserved",    wt.LPWSTR),
-            ("lpDesktop",     wt.LPWSTR),
-            ("lpTitle",       wt.LPWSTR),
-            ("dwX",           wt.DWORD),
-            ("dwY",           wt.DWORD),
-            ("dwXSize",       wt.DWORD),
-            ("dwYSize",       wt.DWORD),
+            ("cb", wt.DWORD),
+            ("lpReserved", wt.LPWSTR),
+            ("lpDesktop", wt.LPWSTR),
+            ("lpTitle", wt.LPWSTR),
+            ("dwX", wt.DWORD),
+            ("dwY", wt.DWORD),
+            ("dwXSize", wt.DWORD),
+            ("dwYSize", wt.DWORD),
             ("dwXCountChars", wt.DWORD),
             ("dwYCountChars", wt.DWORD),
             ("dwFillAttribute", wt.DWORD),
-            ("dwFlags",       wt.DWORD),
-            ("wShowWindow",   wt.WORD),
-            ("cbReserved2",   wt.WORD),
-            ("lpReserved2",   ctypes.POINTER(ctypes.c_byte)),
-            ("hStdInput",     wt.HANDLE),
-            ("hStdOutput",    wt.HANDLE),
-            ("hStdError",     wt.HANDLE),
+            ("dwFlags", wt.DWORD),
+            ("wShowWindow", wt.WORD),
+            ("cbReserved2", wt.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+            ("hStdInput", wt.HANDLE),
+            ("hStdOutput", wt.HANDLE),
+            ("hStdError", wt.HANDLE),
         ]
 
     class PROCESS_INFORMATION(ctypes.Structure):
         _fields_ = [
-            ("hProcess",   wt.HANDLE),
-            ("hThread",    wt.HANDLE),
+            ("hProcess", wt.HANDLE),
+            ("hThread", wt.HANDLE),
             ("dwProcessId", wt.DWORD),
             ("dwThreadId", wt.DWORD),
         ]
 
     advapi32.CreateProcessAsUserW.argtypes = [
-        wt.HANDLE,          # hToken
-        wt.LPCWSTR,         # lpApplicationName
-        wt.LPWSTR,          # lpCommandLine
-        wt.LPVOID,          # lpProcessAttributes
-        wt.LPVOID,          # lpThreadAttributes
-        wt.BOOL,            # bInheritHandles
-        wt.DWORD,           # dwCreationFlags
-        wt.LPVOID,          # lpEnvironment
-        wt.LPCWSTR,         # lpCurrentDirectory
-        ctypes.POINTER(STARTUPINFO),           # lpStartupInfo
-        ctypes.POINTER(PROCESS_INFORMATION),   # lpProcessInformation
+        wt.HANDLE,  # hToken
+        wt.LPCWSTR,  # lpApplicationName
+        wt.LPWSTR,  # lpCommandLine
+        wt.LPVOID,  # lpProcessAttributes
+        wt.LPVOID,  # lpThreadAttributes
+        wt.BOOL,  # bInheritHandles
+        wt.DWORD,  # dwCreationFlags
+        wt.LPVOID,  # lpEnvironment
+        wt.LPCWSTR,  # lpCurrentDirectory
+        ctypes.POINTER(STARTUPINFO),  # lpStartupInfo
+        ctypes.POINTER(PROCESS_INFORMATION),  # lpProcessInformation
     ]
     advapi32.CreateProcessAsUserW.restype = wt.BOOL
 
     # Constants
-    MAXIMUM_ALLOWED            = 0x02000000
-    SecurityImpersonation      = 2    # SECURITY_IMPERSONATION_LEVEL
-    TokenPrimary               = 1    # TOKEN_TYPE
+    MAXIMUM_ALLOWED = 0x02000000
+    SecurityImpersonation = 2  # SECURITY_IMPERSONATION_LEVEL
+    TokenPrimary = 1  # TOKEN_TYPE
     CREATE_UNICODE_ENVIRONMENT = 0x00000400
-    CREATE_NEW_CONSOLE         = 0x00000010
-    STARTF_USESHOWWINDOW       = 0x00000001
-    SW_HIDE                    = 0
+    CREATE_NEW_CONSOLE = 0x00000010
+    STARTF_USESHOWWINDOW = 0x00000001
+    SW_HIDE = 0
 
     # 1) Find interactive session
     sess = int(WTSGetActiveConsoleSessionId())
@@ -590,15 +693,22 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
 
     # 3) Duplicate PRIMARY token
     hTok = wt.HANDLE()
-    if not DuplicateTokenEx(hUser, MAXIMUM_ALLOWED, None, SecurityImpersonation, TokenPrimary, ctypes.byref(hTok)):
+    if not DuplicateTokenEx(
+        hUser,
+        MAXIMUM_ALLOWED,
+        None,
+        SecurityImpersonation,
+        TokenPrimary,
+        ctypes.byref(hTok),
+    ):
         kernel32.CloseHandle(hUser)
         alog("bridge(ctypes): DuplicateTokenEx failed")
         return None
     kernel32.CloseHandle(hUser)
     # Mirror LocalSystem creds to this user’s HKCU so child can read DeviceId/Token
     sid = _sid_string_from_token(hTok)
-    if sid: _mirror_ls_creds_to_user_hkcu(sid)
-
+    if sid:
+        _mirror_ls_creds_to_user_hkcu(sid)
 
     # 4) Environment block from user + overlay our vars
     env_block = wt.LPVOID()
@@ -625,7 +735,7 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
         except Exception:
             pass
 
-        app_dir  = os.path.dirname(exe_path) or None
+        app_dir = os.path.dirname(exe_path) or None
         internal = os.path.join(app_dir, "_internal") if app_dir else ""
         # Build PATH safely (strings only; skip empties)
         path_parts = [
@@ -642,25 +752,26 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
         env.pop("PYTHONPATH", None)
 
         env["XTL_HOME"] = app_dir
+
         # Prefer bundled CA; else fall back to ssl_cert if provided and valid
         def _good_ca(p: str, min_bytes: int = 100_000) -> bool:
             try:
-               if not (p and os.path.isfile(p) and os.path.getsize(p) >= min_bytes):
-                   return False
-               with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                   head = fh.read(256)
-               return "-----BEGIN CERTIFICATE-----" in head
+                if not (p and os.path.isfile(p) and os.path.getsize(p) >= min_bytes):
+                    return False
+                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                    head = fh.read(256)
+                return "-----BEGIN CERTIFICATE-----" in head
             except Exception:
-               return False
+                return False
 
-        ca_path   = os.path.join(app_dir or "", "_internal", "certifi", "cacert.pem")
+        ca_path = os.path.join(app_dir or "", "_internal", "certifi", "cacert.pem")
         chosen_ca = ca_path if _good_ca(ca_path) else None
 
         if chosen_ca:
-            env["SSL_CERT_FILE"]     = chosen_ca
+            env["SSL_CERT_FILE"] = chosen_ca
             env["REQUESTS_CA_BUNDLE"] = chosen_ca
             # Make the PEM visible to THIS process too so installer api_post() uses it now
-            os.environ["SSL_CERT_FILE"]      = chosen_ca
+            os.environ["SSL_CERT_FILE"] = chosen_ca
             os.environ["REQUESTS_CA_BUNDLE"] = chosen_ca
             try:
                 sz = os.path.getsize(chosen_ca)
@@ -669,12 +780,14 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
                 pass
 
         # Encode dict → MULTI_SZ (wide) for CreateProcessAsUserW
-        items = [f"{k}={v}" for k,v in env.items()]
+        items = [f"{k}={v}" for k, v in env.items()]
         env_w = "\x00".join(items) + "\x00\x00"
         env_ptr = ctypes.create_unicode_buffer(env_w)
     finally:
-        try: DestroyEnvironmentBlock(env_block)
-        except Exception: pass
+        try:
+            DestroyEnvironmentBlock(env_block)
+        except Exception:
+            pass
 
     # 5) STARTUPINFO / PROCESS_INFORMATION
     si = STARTUPINFO()
@@ -690,16 +803,16 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
 
     # 6) Create the process
     # Build log path first (no f-string expr with backslashes)
-    pd = os.environ.get('ProgramData', r'C:\ProgramData')
-    log_dir = os.path.join(pd, 'XTL', 'logs')
+    pd = os.environ.get("ProgramData", r"C:\ProgramData")
+    log_dir = os.path.join(pd, "XTL", "logs")
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, 'xtl_agent.log')
+    log_file = os.path.join(log_dir, "xtl_agent.log")
 
     # Then build the command line
     cmd = f'cmd.exe /c ""{exe_path}" {args} >> "{log_file}" 2>&1"'
 
     cwd = workdir or (os.path.dirname(exe_path) or None)
-    alog(f"bridge(ctypes): CreateProcessAsUserW cmd=\"{exe_path}\" {args} cwd={cwd}")
+    alog(f'bridge(ctypes): CreateProcessAsUserW cmd="{exe_path}" {args} cwd={cwd}')
 
     ok = advapi32.CreateProcessAsUserW(
         hTok,
@@ -709,11 +822,11 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
         None,
         False,
         CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
-        ctypes.cast(env_ptr, wt.LPVOID),     # LPVOID env
+        ctypes.cast(env_ptr, wt.LPVOID),  # LPVOID env
         cwd,
         ctypes.byref(si),
         ctypes.byref(pi),
-        )
+    )
 
     if not ok:
         err = ctypes.get_last_error()
@@ -730,9 +843,13 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
         # Check if child exited immediately (helps diagnose env issues)
         exit_code = wt.DWORD()
         kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(exit_code))
-        alog(f"bridge(ctypes): launched child in session {sess} pid={int(pi.dwProcessId)}")
+        alog(
+            f"bridge(ctypes): launched child in session {sess} pid={int(pi.dwProcessId)}"
+        )
         if exit_code.value != 259:  # 259 == STILL_ACTIVE
-            alog(f"bridge(ctypes): child exited immediately with code={exit_code.value}")
+            alog(
+                f"bridge(ctypes): child exited immediately with code={exit_code.value}"
+            )
 
         kernel32.CloseHandle(pi.hProcess)
     except Exception as e:
@@ -747,22 +864,29 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
     Returns the child PID (int) or None on failure, with reasons logged.
     """
     import os, time, traceback, ctypes, ctypes.wintypes as wt
+
     try:
         import win32ts, win32con, win32process, win32profile, win32security, win32api
     except Exception as e:
         alog(f"bridge: pywin32 import failed: {e}")
-        return  _launch_user_session_ctypes(exe_path, args=args, workdir=workdir, hidden=hidden)
+        return _launch_user_session_ctypes(
+            exe_path, args=args, workdir=workdir, hidden=hidden
+        )
 
     # --- Enable required privileges on the service process token ---
     try:
         hProc = win32api.GetCurrentProcess()
         TOKEN_ADJUST_PRIVILEGES = 0x20
         TOKEN_QUERY = 0x8
-        hTok = win32security.OpenProcessToken(hProc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY)
+        hTok = win32security.OpenProcessToken(
+            hProc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+        )
         for priv in ("SeIncreaseQuotaPrivilege", "SeAssignPrimaryTokenPrivilege"):
             try:
                 luid = win32security.LookupPrivilegeValue(None, priv)
-                win32security.AdjustTokenPrivileges(hTok, False, [(luid, win32con.SE_PRIVILEGE_ENABLED)])
+                win32security.AdjustTokenPrivileges(
+                    hTok, False, [(luid, win32con.SE_PRIVILEGE_ENABLED)]
+                )
             except Exception as pe:
                 alog(f"bridge: AdjustTokenPrivileges {priv} failed: {pe}")
         try:
@@ -805,7 +929,7 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
             win32con.MAXIMUM_ALLOWED,
             sa,
             win32security.SecurityImpersonation,
-            win32security.TokenPrimary
+            win32security.TokenPrimary,
         )
         used_variant = "pywin32:SECURITY_ATTRIBUTES()"
     except Exception as e1:
@@ -816,7 +940,7 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
                 win32con.MAXIMUM_ALLOWED,
                 0,  # some builds expect integer ptr
                 win32security.SecurityImpersonation,
-                win32security.TokenPrimary
+                win32security.TokenPrimary,
             )
             used_variant = "pywin32:attr=0"
         except Exception as e2:
@@ -827,7 +951,7 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
                     win32con.MAXIMUM_ALLOWED,
                     None,
                     win32security.SecurityImpersonation,
-                    win32security.TokenPrimary
+                    win32security.TokenPrimary,
                 )
                 used_variant = "pywin32:attr=None"
             except Exception as e3:
@@ -838,6 +962,7 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
     if dupTok is None:
         try:
             import ctypes, ctypes.wintypes as wt
+
             advapi = ctypes.windll.advapi32
             kernel = ctypes.windll.kernel32
 
@@ -864,12 +989,22 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
 
             # DuplicateTokenEx(HANDLE, DWORD, LPSECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL, TOKEN_TYPE, PHANDLE)
             advapi.DuplicateTokenEx.argtypes = [
-                wt.HANDLE, wt.DWORD, wt.LPVOID, ctypes.c_int, ctypes.c_int, ctypes.POINTER(wt.HANDLE)
+                wt.HANDLE,
+                wt.DWORD,
+                wt.LPVOID,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(wt.HANDLE),
             ]
             advapi.DuplicateTokenEx.restype = wt.BOOL
 
             ok = advapi.DuplicateTokenEx(
-                int(hUser), DesiredAccess, None, ImpersonationLevel, TokenType, ctypes.byref(newTok)
+                int(hUser),
+                DesiredAccess,
+                None,
+                ImpersonationLevel,
+                TokenType,
+                ctypes.byref(newTok),
             )
             if not ok or not newTok.value:
                 raise OSError("ctypes DuplicateTokenEx failed")
@@ -896,15 +1031,14 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
 
     alog(f"bridge: DuplicateTokenEx succeeded using variant: {used_variant}")
 
-
     # 4) create a writable log dir under ProgramData and build a clean env
     try:
         progdata = os.environ.get("ProgramData", r"C:\ProgramData")
-        log_dir  = os.path.join(progdata, "XTL", "logs")
+        log_dir = os.path.join(progdata, "XTL", "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, "xtl_agent.log")
     except Exception:
-        log_dir  = None
+        log_dir = None
         log_file = None
 
     # Start from the *user* environment block, but convert to a dict so we can edit
@@ -913,8 +1047,10 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
     except Exception as e:
         alog(f"bridge: CreateEnvironmentBlock failed: {e}")
         try:
-            win32api.CloseHandle(dupTok); win32api.CloseHandle(hUser)
-        except Exception: pass
+            win32api.CloseHandle(dupTok)
+            win32api.CloseHandle(hUser)
+        except Exception:
+            pass
         return None
 
     # Convert the block to a dict by layering over current process env
@@ -934,11 +1070,12 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
     # Ensure embedded runtime + TLS bundle are available to the child
     try:
         import certifi  # bundled in installer
+
         ssl_cert = certifi.where()
     except Exception:
         ssl_cert = ""
 
-    app_dir     = os.path.dirname(exe_path) or ""
+    app_dir = os.path.dirname(exe_path) or ""
     internal = os.path.join(app_dir, "_internal") if app_dir else ""
 
     parts = [
@@ -946,12 +1083,11 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
         internal,
         os.path.join(internal, "pywin32_system32") if internal else "",
         os.path.join(internal, "win32") if internal else "",
-        app_dir ,
+        app_dir,
     ]
 
     # Keep only non-empty strings and join with Windows PATH separator
     env["PATH"] = os.pathsep.join(p for p in parts if p)
-
 
     # Critical: do NOT set these for a PyInstaller app
     env.pop("PYTHONHOME", None)
@@ -961,6 +1097,7 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
 
     # Prefer our bundled CA bundle; else fall back to ssl_cert (if provided)
     ca_path = os.path.join(app_dir, "_internal", "certifi", "cacert.pem")
+
     def _good_ca(p: str, min_bytes: int = 100_000) -> bool:
         try:
             if not (p and os.path.isfile(p) and os.path.getsize(p) >= min_bytes):
@@ -973,9 +1110,9 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
 
     chosen_ca = None
     if _good_ca(ca_path):
-       chosen_ca = ca_path
+        chosen_ca = ca_path
     elif ssl_cert and _good_ca(ssl_cert):
-       chosen_ca = ssl_cert
+        chosen_ca = ssl_cert
 
     if chosen_ca:
         env["SSL_CERT_FILE"] = chosen_ca
@@ -984,13 +1121,13 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
         os.environ["SSL_CERT_FILE"] = chosen_ca
         os.environ["REQUESTS_CA_BUNDLE"] = chosen_ca
         try:
-           sz = os.path.getsize(chosen_ca)
-           alog(f"bridge: CA bundle {chosen_ca} size={sz} bytes")
+            sz = os.path.getsize(chosen_ca)
+            alog(f"bridge: CA bundle {chosen_ca} size={sz} bytes")
         except Exception:
-           pass
+            pass
     # Optional: let the agent know where to log
     if log_file:
-       env["XTL_LOG_FILE"] = log_file
+        env["XTL_LOG_FILE"] = log_file
     # 5) startup info and flags
     si = win32process.STARTUPINFO()
     if hidden:
@@ -999,9 +1136,9 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
 
     cmd = f'cmd.exe /c ""{exe_path}" {args} >> "{log_file}" 2>&1"'
     cwd = workdir or app_dir or None
-    flags = (win32con.CREATE_UNICODE_ENVIRONMENT)
+    flags = win32con.CREATE_UNICODE_ENVIRONMENT
 
-    alog(f"bridge: CreateProcessAsUser cmd=\"{exe_path}\" {args} cwd={cwd}")
+    alog(f'bridge: CreateProcessAsUser cmd="{exe_path}" {args} cwd={cwd}')
     # 6) launch
     try:
         hp, ht, pid, tid = win32process.CreateProcessAsUser(
@@ -1016,6 +1153,7 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
             time.sleep(0.5)
 
             import win32process, win32con
+
             STILL_ACTIVE = 259
             try:
                 code = win32process.GetExitCodeProcess(hp)
@@ -1032,13 +1170,17 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
         return int(pid)
 
     except Exception as e:
-        alog(f"bridge: CreateProcessAsUser failed: {e}\n{traceback.format_exc(limit=1)}")
+        alog(
+            f"bridge: CreateProcessAsUser failed: {e}\n{traceback.format_exc(limit=1)}"
+        )
         return None
     finally:
         try:
-            win32api.CloseHandle(dupTok); win32api.CloseHandle(hUser)
+            win32api.CloseHandle(dupTok)
+            win32api.CloseHandle(hUser)
         except Exception:
             pass
+
 
 def _is_pid_running(pid: int) -> bool:
     """Check if a PID is alive without psutil (Win32 API)."""
@@ -1059,7 +1201,9 @@ def _is_pid_running(pid: int) -> bool:
         return False
 
 
-def service_supervise_user_agent(agent_exe, args="run", restart_backoff_s=10, ping_interval_s=5):
+def service_supervise_user_agent(
+    agent_exe, args="run", restart_backoff_s=10, ping_interval_s=5
+):
     """
     Service-side supervisor loop: keep the real user-session agent alive.
     This function must NEVER return during normal service operation.
@@ -1091,7 +1235,9 @@ def service_supervise_user_agent(agent_exe, args="run", restart_backoff_s=10, pi
                 continue
 
             if child_pid:
-                alog(f"supervisor: child exited pid={child_pid}; restarting in {restart_backoff_s}s")
+                alog(
+                    f"supervisor: child exited pid={child_pid}; restarting in {restart_backoff_s}s"
+                )
                 time.sleep(restart_backoff_s)
 
             child_pid = launch_in_active_user_session(
@@ -1115,7 +1261,8 @@ def service_supervise_user_agent(agent_exe, args="run", restart_backoff_s=10, pi
             time.sleep(restart_backoff_s)
 
     return 0
-    
+
+
 def _bind_from_registry(api_base: str) -> bool:
     """
     Robust binding flow:
@@ -1140,7 +1287,7 @@ def _bind_from_registry(api_base: str) -> bool:
         return False
 
     # Already bound?
-    dev_id  = (_hku_ls_get("DeviceId") or "").strip()
+    dev_id = (_hku_ls_get("DeviceId") or "").strip()
     dev_tok = (_hku_ls_get("DeviceToken") or "").strip()
     if ENABLE_INSTALLER_OHLC_TEST and dev_id and dev_tok:
         alog("bind: already bound (DeviceId/DeviceToken present)")
@@ -1165,7 +1312,7 @@ def _bind_from_registry(api_base: str) -> bool:
             pr = requests.post(
                 f"{api}/devices/pair/start",
                 headers={"Content-Type": "application/json"},
-                timeout=15
+                timeout=15,
             )
             alog(f"bind: /pair/start -> rc={pr.status_code} body={pr.text[:160]}")
             if not pr.ok:
@@ -1173,7 +1320,7 @@ def _bind_from_registry(api_base: str) -> bool:
                 raise RuntimeError(f"pair/start rc={pr.status_code}")
 
             data = _j(pr) or {}
-            dev_id  = (data.get("device_id") or "").strip()
+            dev_id = (data.get("device_id") or "").strip()
             dev_tok = (data.get("device_token") or "").strip()
             if not (dev_id and dev_tok):
                 raise RuntimeError("pair/start missing device_id or device_token")
@@ -1190,10 +1337,12 @@ def _bind_from_registry(api_base: str) -> bool:
                 _hku_ls_set("BindRetryAfter", str(int(time.time()) + 1800))
             except Exception:
                 pass
-            try: _hku_ls_del("BindToken")
-            except Exception: pass
             try:
-                d = (_hklm_get_json() or {})
+                _hku_ls_del("BindToken")
+            except Exception:
+                pass
+            try:
+                d = _hklm_get_json() or {}
                 d["api_base"] = api
                 d.pop("bind_token", None)
                 _hklm_set_json(d)
@@ -1207,7 +1356,7 @@ def _bind_from_registry(api_base: str) -> bool:
             f"{api}/devices/pair/bind",
             headers={"Content-Type": "application/json"},
             json={"device_id": dev_id, "bind_token": bind_token},
-            timeout=15
+            timeout=15,
         )
         alog(f"bind: /pair/bind -> rc={rb.status_code} body={rb.text[:160]}")
         if not rb.ok:
@@ -1216,10 +1365,12 @@ def _bind_from_registry(api_base: str) -> bool:
         alog(f"bind: device {dev_id} is now bound")
 
         # scrub bind token (success path)
-        try: _hku_ls_del("BindToken")
-        except Exception: pass
         try:
-            d = (_hklm_get_json() or {})
+            _hku_ls_del("BindToken")
+        except Exception:
+            pass
+        try:
+            d = _hklm_get_json() or {}
             d["api_base"] = api
             d.pop("bind_token", None)
             _hklm_set_json(d)
@@ -1235,19 +1386,33 @@ def _bind_from_registry(api_base: str) -> bool:
         try:
             _dev_id_chk = (_hku_ls_get("DeviceId") or "").strip()
             _dev_tok_chk = (_hku_ls_get("DeviceToken") or "").strip()
-            alog(f"bind: persisted creds dev_id={bool(_dev_id_chk)} dev_tok={bool(_dev_tok_chk)}")
+            alog(
+                f"bind: persisted creds dev_id={bool(_dev_id_chk)} dev_tok={bool(_dev_tok_chk)}"
+            )
         except Exception:
             _dev_id_chk, _dev_tok_chk = dev_id, dev_tok
 
         # 4) VERIFY on server by posting a heartbeat using the device token
         try:
             url = f"{api}/devices/{dev_id}/heartbeat"
-            payload = {"label": "bind-verify", "version": "bindcheck", "uptime_s": 0, "mt5_ok": False}
-            headers = {"Authorization": f"Bearer {dev_tok}", "Content-Type": "application/json"}
-            rv = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+            payload = {
+                "label": "bind-verify",
+                "version": "bindcheck",
+                "uptime_s": 0,
+                "mt5_ok": False,
+            }
+            headers = {
+                "Authorization": f"Bearer {dev_tok}",
+                "Content-Type": "application/json",
+            }
+            rv = requests.post(
+                url, headers=headers, data=json.dumps(payload), timeout=10
+            )
             alog(f"bind: heartbeat verify -> rc={rv.status_code} body={rv.text[:160]}")
             if rv.status_code != 200:
-                alog("bind: verification did not return 200; device may not be usable yet")
+                alog(
+                    "bind: verification did not return 200; device may not be usable yet"
+                )
             else:
                 alog("bind: VERIFIED on server (heartbeat 200).")
         except Exception as _ve:
@@ -1264,10 +1429,12 @@ def _bind_from_registry(api_base: str) -> bool:
         _hku_ls_set("BindRetryAfter", str(int(time.time()) + 1800))
     except Exception:
         pass
-    try: _hku_ls_del("BindToken")
-    except Exception: pass
     try:
-        d = (_hklm_get_json() or {})
+        _hku_ls_del("BindToken")
+    except Exception:
+        pass
+    try:
+        d = _hklm_get_json() or {}
         d["api_base"] = api
         d.pop("bind_token", None)
         _hklm_set_json(d)
@@ -1275,17 +1442,27 @@ def _bind_from_registry(api_base: str) -> bool:
         pass
     return False
 
+
 def api_post(api_base: str, path: str, payload: dict, token: str, timeout: int = 20):
     import requests, os
-    url = api_base.rstrip('/') + '/' + path.lstrip('/')
+
+    url = api_base.rstrip("/") + "/" + path.lstrip("/")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
     # Prefer env-configured CA file (set by the launcher); else default True
     def _good_file(p: str, min_bytes=100_000) -> bool:
         try:
-            return p and os.path.isfile(p) and os.path.getsize(p) >= min_bytes and \
-                open(p, "r", encoding="utf-8", errors="ignore").read(64).startswith("-----BEGIN CERTIFICATE-----")
+            return (
+                p
+                and os.path.isfile(p)
+                and os.path.getsize(p) >= min_bytes
+                and open(p, "r", encoding="utf-8", errors="ignore")
+                .read(64)
+                .startswith("-----BEGIN CERTIFICATE-----")
+            )
         except Exception:
             return False
+
     # 1) Prefer env PEM if it's a real file
     env_ca = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
 
@@ -1295,6 +1472,7 @@ def api_post(api_base: str, path: str, payload: dict, token: str, timeout: int =
         # 2) Try certifi.where()
         try:
             import certifi
+
             cpath = certifi.where()
             verify = cpath if _good_file(cpath) else True
         except Exception:
@@ -1303,24 +1481,40 @@ def api_post(api_base: str, path: str, payload: dict, token: str, timeout: int =
 
     try:
         # small breadcrumb so we can see which verify is used
-        which = verify if isinstance(verify, str) else ("system" if verify is True else str(verify))
+        which = (
+            verify
+            if isinstance(verify, str)
+            else ("system" if verify is True else str(verify))
+        )
         LOGGER.info("api_post: verify=%s", which)
     except Exception:
         pass
 
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout, verify=verify)
+        r = requests.post(
+            url, headers=headers, json=payload, timeout=timeout, verify=verify
+        )
         tail = (token or "")[-6:]
-        LOGGER.info("OHLC POST url=%s code=%s token_tail=%s bytes=%s",
-                    url, getattr(r, "status_code", "?"), tail,
-                    len((getattr(r, "text","") or "").encode("utf-8")))
+        LOGGER.info(
+            "OHLC POST url=%s code=%s token_tail=%s bytes=%s",
+            url,
+            getattr(r, "status_code", "?"),
+            tail,
+            len((getattr(r, "text", "") or "").encode("utf-8")),
+        )
         if getattr(r, "status_code", 0) != 200:
             LOGGER.warning("OHLC POST FAIL %s\n%s", url, (r.text or "")[:500])
         return r
     except Exception as e:
         LOGGER.warning("OHLC POST EXC %s: %s", url, e)
-        class _R: status_code = 0; ok = False; text = str(e)
+
+        class _R:
+            status_code = 0
+            ok = False
+            text = str(e)
+
         return _R()
+
 
 def ensure_device_attached(api_base: str, username_hint: str | None = None) -> None:
     """
@@ -1334,35 +1528,48 @@ def ensure_device_attached(api_base: str, username_hint: str | None = None) -> N
 
         def _set_once(name: str, val: str) -> None:
             # Mirror the guard in LS + HKLM + HKCU so it survives different contexts
-            try: _hku_ls_set(name, val)
-            except Exception: pass
-            try: _reg_set(r"HKLM\Software\XTL", name, val)
-            except Exception: pass
-            try: _reg_set(r"HKCU\Software\XTL", name, val)
-            except Exception: pass
+            try:
+                _hku_ls_set(name, val)
+            except Exception:
+                pass
+            try:
+                _reg_set(r"HKLM\Software\XTL", name, val)
+            except Exception:
+                pass
+            try:
+                _reg_set(r"HKCU\Software\XTL", name, val)
+            except Exception:
+                pass
 
         def _get_once(name: str) -> str:
-            v = (_hku_ls_get(name) or
-                 _reg_get(r"HKLM\Software\XTL", name) or
-                 _reg_get(r"HKCU\Software\XTL", name) or "")
+            v = (
+                _hku_ls_get(name)
+                or _reg_get(r"HKLM\Software\XTL", name)
+                or _reg_get(r"HKCU\Software\XTL", name)
+                or ""
+            )
             return (v or "").strip()
 
         api = api_base.rstrip("/")
-        dev_id  = (_hku_ls_get("DeviceId") or "").strip()
+        dev_id = (_hku_ls_get("DeviceId") or "").strip()
         dev_tok = (_hku_ls_get("DeviceToken") or "").strip()
 
         # Case A: No device creds at all -> allow a single /pair/start
         if not (dev_id and dev_tok):
             if not _get_once("PairStartOnce"):
                 try:
-                    pr = requests.post(f"{api}/devices/pair/start",
-                                       headers={"Content-Type": "application/json"},
-                                       timeout=10)
+                    pr = requests.post(
+                        f"{api}/devices/pair/start",
+                        headers={"Content-Type": "application/json"},
+                        timeout=10,
+                    )
                     if pr.ok:
                         data = pr.json() or {}
-                        new_id  = (data.get("device_id") or "").strip()
+                        new_id = (data.get("device_id") or "").strip()
                         new_tok = (data.get("device_token") or "").strip()
-                        pair_code = (data.get("pair_code") or data.get("code") or "").strip()
+                        pair_code = (
+                            data.get("pair_code") or data.get("code") or ""
+                        ).strip()
                         if new_id and new_tok:
                             _hku_ls_set("DeviceId", new_id)
                             _hku_ls_set("DeviceToken", new_tok)
@@ -1379,16 +1586,23 @@ def ensure_device_attached(api_base: str, username_hint: str | None = None) -> N
 
         # Case B: We DO have device creds -> never create a new device
         # Optional owner token (user/org) if the installer stored it
-        owner_tok = ((_hku_ls_get("OwnerToken") or
-                      _reg_get(r"HKCU\Software\XTL", "OwnerToken") or "")).strip()
+        owner_tok = (
+            (
+                _hku_ls_get("OwnerToken")
+                or _reg_get(r"HKCU\Software\XTL", "OwnerToken")
+                or ""
+            )
+        ).strip()
 
         # Probe device existence/attachment using device token
         r = None
         info = {}
         try:
-            r = requests.get(f"{api}/devices/{dev_id}",
-                             headers={"Authorization": f"Bearer {dev_tok}"},
-                             timeout=10)
+            r = requests.get(
+                f"{api}/devices/{dev_id}",
+                headers={"Authorization": f"Bearer {dev_tok}"},
+                timeout=10,
+            )
             if r.ok:
                 info = r.json() or {}
         except Exception:
@@ -1398,7 +1612,9 @@ def ensure_device_attached(api_base: str, username_hint: str | None = None) -> N
         # Stick a one-time marker and exit quietly (likely env/tenant mismatch or server cleanup).
         if r is not None and r.status_code == 404:
             if not _get_once("Claim404Seen"):
-                alog("attach: device not found on server (404) — suppressing auto-pair; set HKLM\\Software\\XTL\\AllowRePair=1 to permit re-pair")
+                alog(
+                    "attach: device not found on server (404) — suppressing auto-pair; set HKLM\\Software\\XTL\\AllowRePair=1 to permit re-pair"
+                )
                 _set_once("Claim404Seen", time.strftime("%Y-%m-%d %H:%M:%S"))
             return
 
@@ -1409,16 +1625,21 @@ def ensure_device_attached(api_base: str, username_hint: str | None = None) -> N
 
         # If we have an owner token and haven't seen a claim failure, try a single claim
         if owner_tok and not _get_once("ClaimTriedOnce"):
-            hdr_user = {"Authorization": f"Bearer {owner_tok}",
-                        "Content-Type": "application/json"}
+            hdr_user = {
+                "Authorization": f"Bearer {owner_tok}",
+                "Content-Type": "application/json",
+            }
 
             # 1) /devices/{id}/claim
             try:
                 resp = requests.post(
                     f"{api}/devices/{dev_id}/claim",
                     headers=hdr_user,
-                    json={"device_token": dev_tok, **({"username": username_hint} if username_hint else {})},
-                    timeout=10
+                    json={
+                        "device_token": dev_tok,
+                        **({"username": username_hint} if username_hint else {}),
+                    },
+                    timeout=10,
                 )
                 alog(f"attach: claim (user) rc={resp.status_code}")
                 if resp.ok:
@@ -1436,8 +1657,12 @@ def ensure_device_attached(api_base: str, username_hint: str | None = None) -> N
                 resp2 = requests.post(
                     f"{api}/devices/claim",
                     headers=hdr_user,
-                    json={"device_id": dev_id, "device_token": dev_tok, **({"username": username_hint} if username_hint else {})},
-                    timeout=10
+                    json={
+                        "device_id": dev_id,
+                        "device_token": dev_tok,
+                        **({"username": username_hint} if username_hint else {}),
+                    },
+                    timeout=10,
                 )
                 alog(f"attach: claim2 (user) rc={resp2.status_code}")
                 # Regardless of success, mark once to avoid loops; next beat will re-check attachment
@@ -1457,39 +1682,60 @@ def ensure_device_attached(api_base: str, username_hint: str | None = None) -> N
     except Exception as e:
         alog(f"attach: WARN ensure_device_attached failed: {e}")
 
+
 # Read a value from HKLM\Software\XTL (and mirror) if present
 
 # --- COMPAT: push_ohlc_once wrapper to accept legacy kwargs ---
 
-def push_ohlc_once_compat(api_base: str, device_id: str | None = None, token: str | None = None,
-                          symbols: list[str] | None = None, tfs: list[str] | None = None,
-                          bars: int = 300, **kw) -> None:
+
+def push_ohlc_once_compat(
+    api_base: str,
+    device_id: str | None = None,
+    token: str | None = None,
+    symbols: list[str] | None = None,
+    tfs: list[str] | None = None,
+    bars: int = 300,
+    **kw,
+) -> None:
     # persist creds for legacy paths…
     try:
-        if token: _hku_ls_set("DeviceToken", str(token))
-        if device_id: _hku_ls_set("DeviceId", str(device_id))
+        if token:
+            _hku_ls_set("DeviceToken", str(token))
+        if device_id:
+            _hku_ls_set("DeviceId", str(device_id))
     except Exception:
         pass
 
     if agent_push_ohlc_once is None:
-        alog("push_ohlc_once import missing (xtl.agent_ohlc or agent_ohlc not found) — skipping push")
+        alog(
+            "push_ohlc_once import missing (xtl.agent_ohlc or agent_ohlc not found) — skipping push"
+        )
         return
 
     # match callee signature dynamically
     import inspect
+
     sig = inspect.signature(agent_push_ohlc_once)
     allowed = set(sig.parameters.keys())
-    call_kw = {"api_base": api_base, "symbols": symbols or [], "tfs": (tfs or kw.get("tf_names") or []), "bars": bars}
-    if "device_id" in allowed and device_id: call_kw["device_id"] = device_id
-    if "token" in allowed and token: call_kw["token"] = token
+    call_kw = {
+        "api_base": api_base,
+        "symbols": symbols or [],
+        "tfs": (tfs or kw.get("tf_names") or []),
+        "bars": bars,
+    }
+    if "device_id" in allowed and device_id:
+        call_kw["device_id"] = device_id
+    if "token" in allowed and token:
+        call_kw["token"] = token
     for k, v in kw.items():
-        if k in allowed: call_kw[k] = v
+        if k in allowed:
+            call_kw[k] = v
 
-    
     res = agent_push_ohlc_once(**call_kw)
 
     try:
         from xtl.agent_ohlc import push_mt5_positions_once
+
         push_mt5_positions_once(api_base, device_id, token, mt5_account="demo")
     except Exception as e:
         alog(f"MT5 positions push failed: {e}")
@@ -1504,32 +1750,46 @@ def reg_get(name: str) -> Optional[str]:
     if v is not None and str(v).strip() != "":
         return v
     return _hklm_get(name)
+
+
 def reg_set(name: str, val: str) -> None:
     # We always write to LocalSystem hive for runtime values
     _hku_ls_set(name, val)
+
+
 def _persist_mt5_path_hklm(path: str) -> None:
     """Save terminal path for future runs under HKLM\Software\XTL (best-effort)."""
     try:
 
-        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, r"Software\XTL", 0,
-                                winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as k:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"Software\XTL",
+            0,
+            winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY,
+        ) as k:
             winreg.SetValueEx(k, "MT5.TerminalPath", 0, winreg.REG_SZ, path)
-            winreg.SetValueEx(k, "MT5Path",          0, winreg.REG_SZ, path)
+            winreg.SetValueEx(k, "MT5Path", 0, winreg.REG_SZ, path)
     except Exception:
         # not fatal if we lack rights; the current run can still use the discovered path
         pass
+
+
 def _pick_mt5_exe_gui(initial: Optional[Path] = None) -> Optional[str]:
     try:
         import tkinter as _tk
         from tkinter import filedialog as _fd
+
         root = _tk.Tk()
         root.withdraw()
         start_dir = str(initial or Path("C:/Program Files"))
         path = _fd.askopenfilename(
             title="Select MetaTrader 5 terminal (terminal64.exe)",
             initialdir=start_dir,
-            filetypes=[("MetaTrader 5 terminal", "terminal64.exe"),
-                       ("Executables", "*.exe"), ("All files", "*.*")]
+            filetypes=[
+                ("MetaTrader 5 terminal", "terminal64.exe"),
+                ("Executables", "*.exe"),
+                ("All files", "*.*"),
+            ],
         )
         try:
             root.destroy()
@@ -1538,28 +1798,32 @@ def _pick_mt5_exe_gui(initial: Optional[Path] = None) -> Optional[str]:
         if not path:
             return None
         p = Path(path)
-        return str(p.resolve()) if p.is_file() and p.suffix.lower()==".exe" else None
+        return str(p.resolve()) if p.is_file() and p.suffix.lower() == ".exe" else None
     except Exception:
         return None
+
+
 import subprocess, shlex, winreg, os
 from pathlib import Path
+
 SERVICE_CANON = "XTLAgent"
-
-
 
 
 def _svc_reg_path(name: str) -> str:
 
+    return rf"SYSTEM\CurrentControlSet\Services\{name}"
 
-    return fr"SYSTEM\CurrentControlSet\Services\{name}"
 
 def _svc_exists(name: str = SERVICE_CANON) -> bool:
     import winreg
+
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _svc_reg_path(name)):
             return True
     except OSError:
         return False
+
+
 def _svc_start_mode_ok(name: str = SERVICE_CANON) -> bool:
     """
     Return True iff service is set to Automatic (with or without DelayedAutoStart).
@@ -1571,6 +1835,7 @@ def _svc_start_mode_ok(name: str = SERVICE_CANON) -> bool:
     """
     try:
         import winreg
+
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _svc_reg_path(name)) as k:
             start, _ = winreg.QueryValueEx(k, "Start")
             if int(start) != 2:
@@ -1586,10 +1851,9 @@ def _svc_start_mode_ok(name: str = SERVICE_CANON) -> bool:
         return False
 
 
-
-
 def _svc_image_ok(expected_exe: Path = WINSW_EXE) -> bool:
     import winreg
+
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _svc_reg_path()) as k:
             image, _ = winreg.QueryValueEx(k, "ImagePath")
@@ -1597,13 +1861,17 @@ def _svc_image_ok(expected_exe: Path = WINSW_EXE) -> bool:
     except OSError:
         return False
 
+
 def _remove_legacy_xtl_service() -> None:
     """
     If an old 'xtl' service exists, stop & delete it so only XTLAgent remains.
     """
     import subprocess
+
     try:
-        out = subprocess.check_output(["sc", "query", "xtl"], text=True, stderr=subprocess.STDOUT)
+        out = subprocess.check_output(
+            ["sc", "query", "xtl"], text=True, stderr=subprocess.STDOUT
+        )
         # stop if running; ignore failures
         subprocess.run(["sc", "stop", "xtl"], capture_output=True, text=True)
         time.sleep(1)
@@ -1611,70 +1879,52 @@ def _remove_legacy_xtl_service() -> None:
     except Exception:
         pass  # nothing to remove
 
+
 def ensure_service_installed() -> None:
     _write_broker_meta_from_env_or_local()  # seed & normalize broker tz in all hives first
-    ensure_winsw_binary()     # make sure it writes/renames to WINSW_EXE
+    ensure_winsw_binary()  # make sure it writes/renames to WINSW_EXE
     write_winsw_xml()
     _remove_legacy_xtl_service()
     import subprocess
+
     subprocess.run([str(WINSW_EXE), "stop"], capture_output=True, text=True)
     subprocess.run([str(WINSW_EXE), "uninstall"], capture_output=True, text=True)
     subprocess.run([str(WINSW_EXE), "install"], capture_output=True, text=True)
     subprocess.run([str(WINSW_EXE), "start"], capture_output=True, text=True)
 
 
-
-
 def autostart_capability() -> bool:
-
 
     # returns True when the XTL service exists and is set to AutoStart
 
-
     try:
-
 
         import winreg
 
-
         name = "XTLAgent"
 
-
-        path = fr"SYSTEM\CurrentControlSet\Services\{name}"
-
+        path = rf"SYSTEM\CurrentControlSet\Services\{name}"
 
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as k:
 
-
             start, _ = winreg.QueryValueEx(k, "Start")
-
 
             return int(start) == 2  # 2=Automatic (DelayedAutoStart optional)
 
-
     except Exception:
-
 
         return False
 
 
-
-
-
 def _mt5_caps():
-
 
     try:
 
-
         c = detect_mt5_cap() or {}
-
 
         return bool(c.get("mt5")), c.get("mt5_path") or ""
 
-
     except Exception:
-
 
         return False, ""
 
@@ -1705,21 +1955,27 @@ def _persist_mt5_path_all(path: str) -> None:
     except Exception:
         pass
 
+
 def _write_atomic_bytes(dst: Path, data: bytes) -> None:
     tmp = dst.with_suffix(dst.suffix + ".tmp")
     dst.parent.mkdir(parents=True, exist_ok=True)
     with open(tmp, "wb") as f:
-        f.write(data); f.flush(); os.fsync(f.fileno())
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(dst)
+
 
 def _has_pem_headers(p: Path) -> bool:
     try:
-        if not p.is_file() or p.stat().st_size < 1000: return False
+        if not p.is_file() or p.stat().st_size < 1000:
+            return False
         with p.open("r", encoding="utf-8", errors="ignore") as fh:
             head = fh.read(4096)
         return "-----BEGIN CERTIFICATE-----" in head
     except Exception:
         return False
+
 
 # ---- TLS CA bootstrap (certifi) ----
 def _ensure_cert_bundle() -> None:
@@ -1730,12 +1986,17 @@ def _ensure_cert_bundle() -> None:
         certifi = None
     try:
         import shutil  # ensure available if you copy the bundle
+
         base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
         # Prefer the library bundle if available
         target = Path(certifi.where()) if certifi else None
         if not (target and target.exists()):
             # If already inside ...\_internal\, don't append another _internal
-            cert_dir = (base / "certifi") if base.name.lower() == "_internal" else (base / "_internal" / "certifi")
+            cert_dir = (
+                (base / "certifi")
+                if base.name.lower() == "_internal"
+                else (base / "_internal" / "certifi")
+            )
             cert_dir.mkdir(parents=True, exist_ok=True)
             if certifi:
                 src = Path(certifi.where())
@@ -1745,7 +2006,11 @@ def _ensure_cert_bundle() -> None:
                         shutil.copyfile(src, dst)
                     target = dst
             if not (target and target.exists()):
-                for p in (cert_dir / "cacert.pem", base / "certifi" / "cacert.pem", base / "_internal" / "certifi" / "cacert.pem"):
+                for p in (
+                    cert_dir / "cacert.pem",
+                    base / "certifi" / "cacert.pem",
+                    base / "_internal" / "certifi" / "cacert.pem",
+                ):
                     if p.exists():
                         target = p
                         break
@@ -1758,27 +2023,34 @@ def _ensure_cert_bundle() -> None:
     except Exception as e:
         alog(f"cert bundle setup skipped: {e}")
 
+
 # ---- end TLS CA bootstrap ----
 
 # ---------- silent subprocess ----------
 CREATE_NO_WINDOW = 0x08000000
 STARTF_USESHOWWINDOW = 0x00000001
 SW_HIDE = 0
-def _run_hidden(cmd: list[str], timeout: Optional[int]=None) -> Tuple[int,str,str]:
-    si = subprocess.STARTUPINFO(); si.dwFlags |= STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE
-    p = subprocess.run(cmd, startupinfo=si, creationflags=CREATE_NO_WINDOW,
-                       capture_output=True, text=True, timeout=timeout)
-    return p.returncode, p.stdout or "", p.stderr or ""
 
+
+def _run_hidden(cmd: list[str], timeout: Optional[int] = None) -> Tuple[int, str, str]:
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= STARTF_USESHOWWINDOW
+    si.wShowWindow = SW_HIDE
+    p = subprocess.run(
+        cmd,
+        startupinfo=si,
+        creationflags=CREATE_NO_WINDOW,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return p.returncode, p.stdout or "", p.stderr or ""
 
 
 # ---- Vendor lookup (put near the top with other constants) ----
 
 
-
-
 VENDOR_DIR = Path(sys.argv[0]).resolve().parent / "vendor"
-
 
 
 def _reg_get_dword(key_path: str, name: str, default: int = 0) -> int:
@@ -1814,6 +2086,8 @@ def _reg_get_dword(key_path: str, name: str, default: int = 0) -> int:
         return default
     except OSError:
         return default
+
+
 def _dlls_present() -> bool:
     """
     Detects if the VC++ 2015–2022 x64 runtime DLLs are present.
@@ -1823,7 +2097,7 @@ def _dlls_present() -> bool:
     try:
         win = os.environ.get("SystemRoot", r"C:\Windows")
         sys32 = Path(win) / "System32"
-        wow64 = Path(win) / "SysWOW64"   # checked opportunistically
+        wow64 = Path(win) / "SysWOW64"  # checked opportunistically
 
         # Core DLLs for the 2015–2022 runtime (VS 2015-2022 VC14)
         # vcruntime140_1.dll was added later; some systems may miss it.
@@ -1856,6 +2130,7 @@ def _dlls_present() -> bool:
     except Exception:
         return False
 
+
 # ---- VC++ (x64) silent install if missing ----
 
 
@@ -1866,14 +2141,18 @@ def _ensure_vcredist_runtime() -> None:
                and constants Path, sys, VENDOR_DIR, APP_DIR.
     """
     try:
+
         def _reg_present() -> bool:
             try:
                 # HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64 with Installed=1
-                return _reg_get_dword(
-                    r"HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64",
-                    "Installed",
-                    default=0,
-                ) == 1
+                return (
+                    _reg_get_dword(
+                        r"HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64",
+                        "Installed",
+                        default=0,
+                    )
+                    == 1
+                )
             except Exception:
                 return False
 
@@ -1886,11 +2165,13 @@ def _ensure_vcredist_runtime() -> None:
             Path(sys.argv[0]).resolve().parent / "VC_redist.x64.exe",
             VENDOR_DIR / "VC_redist.x64.exe",
             APP_DIR / "VC_redist.x64.exe",
-            ]
+        ]
         exe = next((p for p in candidates if p and p.exists()), None)
 
         if not exe:
-            log("vcredist: WARN missing VC_redist.x64.exe (runtime not found, continuing anyway)")
+            log(
+                "vcredist: WARN missing VC_redist.x64.exe (runtime not found, continuing anyway)"
+            )
             return
 
         # Run quietly, don't block forever
@@ -1898,7 +2179,9 @@ def _ensure_vcredist_runtime() -> None:
         #   0    = success
         #   1638 = another version already installed
         #   3010 = success, reboot required
-        rc, out, err = _run_hidden([str(exe), "/install", "/quiet", "/norestart"], timeout=240)
+        rc, out, err = _run_hidden(
+            [str(exe), "/install", "/quiet", "/norestart"], timeout=240
+        )
         log(f"vcredist: rc={rc} out={out.strip()} err={err.strip()}")
 
         if rc not in (0, 1638, 3010):
@@ -1906,14 +2189,15 @@ def _ensure_vcredist_runtime() -> None:
 
         # Re-check presence after attempt
         if not (_dlls_present() or _reg_present()):
-            log("vcredist: WARN VC++ 2015-2022 x64 runtime still not detected after install attempt")
+            log(
+                "vcredist: WARN VC++ 2015-2022 x64 runtime still not detected after install attempt"
+            )
 
         # Do not raise - allow the rest of the install to proceed
 
     except Exception as e:
         # Never block the install on vcredist issues
         log(f"vcredist: WARN exception {e}")
-
 
 
 # ---- _internal population / repair ----
@@ -1966,22 +2250,23 @@ def ensure_internal_runtime_complete() -> None:
             _log(f"runtime: WARN copy {src} -> {dst}: {e}")
         return False
 
-
     # --- EARLY-OUT: if _internal is already complete, do NOT run merge/download repair.
     # The deployment package ships a correct _internal; the repair below (especially the
     # python.org base_library.zip fetch) can REPLACE the correct PyInstaller base_library.zip
     # with a mismatched one. Only repair when genuinely broken.
-    _blz0    = app_internal / "base_library.zip"
+    _blz0 = app_internal / "base_library.zip"
     _py310_0 = app_internal / "python310.dll"
     if _ok_file(_blz0, min_bytes=1_000_000) and _ok_file(_py310_0, min_bytes=1):
-        _log("runtime: _internal already complete (base_library.zip + python310.dll present) - skipping repair/fetch")
+        _log(
+            "runtime: _internal already complete (base_library.zip + python310.dll present) - skipping repair/fetch"
+        )
         return
     # --- 1) Stage from common _internal folders ------------------------------
     candidates_internal = [
         here / "_internal",
         Path.cwd() / "_internal",
         here / "dist" / "xtl" / "_internal",
-        ]
+    ]
     for src_internal in candidates_internal:
         if src_internal.is_dir():
             try:
@@ -1992,8 +2277,8 @@ def ensure_internal_runtime_complete() -> None:
 
     # --- 2) Ensure critical files exist (and are sane) ----------------------
     py310 = app_internal / "python310.dll"
-    py3   = app_internal / "python3.dll"
-    blz   = app_internal / "base_library.zip"
+    py3 = app_internal / "python3.dll"
+    blz = app_internal / "base_library.zip"
 
     if not _ok_file(py310):
         _try_copy(here / "python310.dll", py310)
@@ -2004,12 +2289,12 @@ def ensure_internal_runtime_complete() -> None:
     # Try local base_library.zip copies first (require >1MB to avoid partials)
     if not _ok_file(blz, min_bytes=1_000_000):
         for src_blz in (
-                here / "base_library.zip",
-                here / "_internal" / "base_library.zip",
-                Path.cwd() / "_internal" / "base_library.zip",
-                here / "dist" / "xtl" / "_internal" / "base_library.zip",
-                VENDOR_DIR / "base_library.zip",
-                VENDOR_DIR / "_internal" / "base_library.zip",
+            here / "base_library.zip",
+            here / "_internal" / "base_library.zip",
+            Path.cwd() / "_internal" / "base_library.zip",
+            here / "dist" / "xtl" / "_internal" / "base_library.zip",
+            VENDOR_DIR / "base_library.zip",
+            VENDOR_DIR / "_internal" / "base_library.zip",
         ):
             if _ok_file(src_blz, min_bytes=1_000_000) and _try_copy(src_blz, blz):
                 break
@@ -2031,7 +2316,11 @@ def ensure_internal_runtime_complete() -> None:
                         data = resp.read()
                     with zipfile.ZipFile(io.BytesIO(data)) as zf:
                         # The embeddable package contains 'python310.zip'
-                        name_candidates = [n for n in zf.namelist() if n.lower().endswith("python310.zip")]
+                        name_candidates = [
+                            n
+                            for n in zf.namelist()
+                            if n.lower().endswith("python310.zip")
+                        ]
                         if name_candidates:
                             with zf.open(name_candidates[0], "r") as src:
                                 payload = src.read()
@@ -2039,7 +2328,9 @@ def ensure_internal_runtime_complete() -> None:
                             blz.parent.mkdir(parents=True, exist_ok=True)
                             with open(blz, "wb") as f:
                                 f.write(payload)
-                            _log(f"runtime: created {blz} from embeddable python310.zip (size={len(payload)} bytes)")
+                            _log(
+                                f"runtime: created {blz} from embeddable python310.zip (size={len(payload)} bytes)"
+                            )
                             break
                 except Exception as e_url:
                     _log(f"runtime: WARN fetch/extract failed from {url}: {e_url}")
@@ -2055,44 +2346,55 @@ def ensure_internal_runtime_complete() -> None:
     # --- 5) Ensure a valid CA bundle on disk ----------------------------------
 
     try:
-       import certifi, shutil
-       dst_cacert = app_internal / "certifi" / "cacert.pem"
-       # Prefer the certifi bundle; if missing or too small, rewrite it
-       def _size(p)-> int:
-           try: return p.stat().st_size
-           except Exception: return 0
+        import certifi, shutil
 
-       src_path = Path(getattr(certifi, "where", lambda: "")() or "")
-       ok = False
-       if src_path.is_file() and _size(src_path) >= 100_000:
+        dst_cacert = app_internal / "certifi" / "cacert.pem"
 
-           dst_cacert.parent.mkdir(parents=True, exist_ok=True)
-           shutil.copy2(src_path, dst_cacert)
-           LOGGER.info(f"cert bundle set -> {dst_cacert} (size={_size(dst_cacert)} bytes)")
-           # Make accidental truncation less likely on locked-down hosts
-           try:
-               os.chmod(dst_cacert, 0o444)  # read-only
-           except Exception:
-               pass
+        # Prefer the certifi bundle; if missing or too small, rewrite it
+        def _size(p) -> int:
+            try:
+                return p.stat().st_size
+            except Exception:
+                return 0
 
-           ok = True
-       else:
-           # Last-ditch: if a staged bundle exists in the package, use it
-           staged = here / "_internal" / "certifi" / "cacert.pem"
-           if staged.is_file() and _size(staged) >= 100_000:
-              dst_cacert.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copy2(staged, dst_cacert)
-              LOGGER.info(f"cert bundle staged -> {dst_cacert} (size={_size(dst_cacert)} bytes)")
-              ok = True
-       if not ok:
-           LOGGER.warning("cert bundle unavailable; HTTPS will fall back to system trust")
+        src_path = Path(getattr(certifi, "where", lambda: "")() or "")
+        ok = False
+        if src_path.is_file() and _size(src_path) >= 100_000:
+
+            dst_cacert.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst_cacert)
+            LOGGER.info(
+                f"cert bundle set -> {dst_cacert} (size={_size(dst_cacert)} bytes)"
+            )
+            # Make accidental truncation less likely on locked-down hosts
+            try:
+                os.chmod(dst_cacert, 0o444)  # read-only
+            except Exception:
+                pass
+
+            ok = True
+        else:
+            # Last-ditch: if a staged bundle exists in the package, use it
+            staged = here / "_internal" / "certifi" / "cacert.pem"
+            if staged.is_file() and _size(staged) >= 100_000:
+                dst_cacert.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(staged, dst_cacert)
+                LOGGER.info(
+                    f"cert bundle staged -> {dst_cacert} (size={_size(dst_cacert)} bytes)"
+                )
+                ok = True
+        if not ok:
+            LOGGER.warning(
+                "cert bundle unavailable; HTTPS will fall back to system trust"
+            )
     except Exception as e:
-           LOGGER.warning(f"runtime: WARN ensuring CA bundle failed: {e}")
-           # Harden: if base_library.zip is OK, make it read-only to avoid accidental truncation
-           try:
-               if _ok_file(blz, min_bytes=1_000_000): os.chmod(blz, 0o444)
-           except Exception:
-               pass
+        LOGGER.warning(f"runtime: WARN ensuring CA bundle failed: {e}")
+        # Harden: if base_library.zip is OK, make it read-only to avoid accidental truncation
+        try:
+            if _ok_file(blz, min_bytes=1_000_000):
+                os.chmod(blz, 0o444)
+        except Exception:
+            pass
 
     # --- 6) Final verification ----------------------------------------------
     missing = []
@@ -2107,7 +2409,9 @@ def ensure_internal_runtime_complete() -> None:
         missing.append(f"base_library.zip(>1MB, found={size} bytes)")
 
     if missing:
-        raise RuntimeError("Runtime incomplete after repair: missing/corrupt " + ", ".join(missing))
+        raise RuntimeError(
+            "Runtime incomplete after repair: missing/corrupt " + ", ".join(missing)
+        )
     # Enforce a valid CA bundle (prevent silent TLS failures later)
     dst_cacert = app_internal / "certifi" / "cacert.pem"
 
@@ -2115,10 +2419,11 @@ def ensure_internal_runtime_complete() -> None:
         ca_sz = dst_cacert.stat().st_size if dst_cacert.exists() else 0
     except Exception:
 
-       ca_sz = 0
+        ca_sz = 0
     if ca_sz < 100_000:
-           raise RuntimeError(f"CA bundle missing/corrupt: {dst_cacert} (size={ca_sz} bytes)")
-
+        raise RuntimeError(
+            f"CA bundle missing/corrupt: {dst_cacert} (size={ca_sz} bytes)"
+        )
 
 
 # ---------- logging ----------
@@ -2129,9 +2434,16 @@ def _write_line(p: Path, msg: str) -> None:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except Exception:
         pass
-def log(msg: str) -> None: _write_line(LOG_FILE, msg)
 
-def alog(msg: str) -> None: _write_line(AGENT_LOG, msg)
+
+def log(msg: str) -> None:
+    _write_line(LOG_FILE, msg)
+
+
+def alog(msg: str) -> None:
+    _write_line(AGENT_LOG, msg)
+
+
 # ---------- admin ----------
 def require_admin() -> None:
     try:
@@ -2139,17 +2451,25 @@ def require_admin() -> None:
             raise PermissionError("Installer must be run as Administrator")
     except Exception:
         pass
+
+
 # ---------- registry (HKLM / HKU LS) ----------
 import winreg
+
+
 # --- Bind TTL helpers (60 min) ---
 def _bind_ttl_secs() -> int:
     # Hard TTL: 60 minutes
     return 60 * 60
+
+
 def _now_s() -> int:
     try:
         return int(time.time())
     except Exception:
         return int(time.time())
+
+
 def _bind_mark_seen_now():
 
     try:
@@ -2158,6 +2478,8 @@ def _bind_mark_seen_now():
         reg_set("BindIssuedAt", str(_now_s()))
     except Exception:
         pass
+
+
 def _bind_remaining_secs() -> int:
     try:
         issued = int(reg_get("BindIssuedAt") or "0")
@@ -2170,11 +2492,15 @@ def _bind_remaining_secs() -> int:
     ttl = _bind_ttl_secs()
     rem = (issued + ttl) - _now_s()
     return rem if rem > 0 else 0
+
+
 def _bind_mark_seen_now_cfg():
     cfg = _hklm_get_json() or {}
     if not cfg.get("bind_issued_at"):
         cfg["bind_issued_at"] = _now_s()
         _hklm_set_json(cfg)
+
+
 def _bind_remaining_secs_cfg() -> int:
     cfg = _hklm_get_json() or {}
     issued = int(cfg.get("bind_issued_at") or 0)
@@ -2183,6 +2509,8 @@ def _bind_remaining_secs_cfg() -> int:
         issued = _now_s()
     rem = (issued + _bind_ttl_secs()) - _now_s()
     return rem if rem > 0 else 0
+
+
 def _bind_clear_token_terminal_expired():
     cfg = _hklm_get_json() or {}
     cfg["bind_token"] = ""
@@ -2190,74 +2518,176 @@ def _bind_clear_token_terminal_expired():
     _hklm_set_json(cfg)
     _hku_ls_set("BindTokenStatus", "terminal_expired")
     _hku_ls_set("BindTokenLastError", "ttl_expired")
+
+
 # one-time auth log guard
 _auth_logged = False
-def _auth_headers(extra: dict | None = None) -> dict:
 
+
+def _auth_headers(extra: dict | None = None) -> dict:
 
     h = {"User-Agent": "xtl-agent/1.0"}
 
-
     dev_id = (_hku_ls_get("DeviceId") or "").strip()
-
 
     dev_tok = (_hku_ls_get("DeviceToken") or "").strip()
 
-
     if dev_tok:
 
+        h["Authorization"] = f"Bearer {dev_tok}"
 
-        h["Authorization"]   = f"Bearer {dev_tok}"
-
-
-        h["X-Device-Token"]  = dev_tok
-
+        h["X-Device-Token"] = dev_tok
 
     if dev_id:
 
-
-        h["X-Device-Id"]     = dev_id
-
+        h["X-Device-Id"] = dev_id
 
     if extra:
 
-
         h.update(extra)
 
-
     return h
+
 
 # ---------- http session (requests or urllib) ----------
 def _rq_session():
     try:
         import requests, certifi  # noqa
-        s = requests.Session(); s.verify = certifi.where(); return s
+
+        s = requests.Session()
+        s.verify = certifi.where()
+        return s
     except Exception:
         import urllib.request, urllib.error
+
         class _R:
             def post(self, url, json=None, timeout=20):
                 data = json and __import__("json").dumps(json).encode("utf-8") or b""
-                req = urllib.request.Request(url, data=data, headers={"Content-Type":"application/json"}, method="POST")
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
                 try:
                     with urllib.request.urlopen(req, timeout=timeout) as r:
-                        return type("Resp", (), {
-                            "status_code": r.getcode(),
-                            "text": r.read().decode("utf-8","ignore"),
-                            "ok": 200 <= r.getcode() < 300,
-                            "json": lambda self: __import__("json").loads(self.text or "{}")
-                        })()
+                        return type(
+                            "Resp",
+                            (),
+                            {
+                                "status_code": r.getcode(),
+                                "text": r.read().decode("utf-8", "ignore"),
+                                "ok": 200 <= r.getcode() < 300,
+                                "json": lambda self: __import__("json").loads(
+                                    self.text or "{}"
+                                ),
+                            },
+                        )()
                 except urllib.error.HTTPError as e:
-                    txt = e.read().decode("utf-8","ignore")
-                    return type("Resp", (), {
-                        "status_code": e.code,
-                        "text": txt,
-                        "ok": False,
-                        "json": lambda self: __import__("json").loads(txt or "{}")
-                    })()
+                    txt = e.read().decode("utf-8", "ignore")
+                    return type(
+                        "Resp",
+                        (),
+                        {
+                            "status_code": e.code,
+                            "text": txt,
+                            "ok": False,
+                            "json": lambda self: __import__("json").loads(txt or "{}"),
+                        },
+                    )()
+
         return _R()
+
+
 def _join(base: str, path: str) -> str:
     return base.rstrip("/") + "/" + path.lstrip("/")
+
+
 # ---- MT5 terminal auto-detect (registry, common paths, running process) ----
+
+
+def find_mt5_terminals_all() -> list[str]:
+    """
+    Return all detected MT5 terminal paths.
+    Used for explicit selection/logging, not silent production guessing.
+    """
+    out = []
+    seen = set()
+
+    def add(p):
+        try:
+            p = str(p or "").strip().strip('"')
+            if p and os.path.isfile(p):
+                key = p.lower()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(p)
+        except Exception:
+            pass
+
+    import winreg
+
+    reg_keys = [
+        (winreg.HKEY_CURRENT_USER, r"Software\MetaQuotes\MetaTrader 5"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\MetaQuotes\MetaTrader 5"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\MetaQuotes\MetaTrader 5"),
+    ]
+    names = ["InstallPath", "TerminalPath", "Path"]
+
+    for root, sub in reg_keys:
+        try:
+            with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as k:
+                for nm in names:
+                    try:
+                        v, _ = winreg.QueryValueEx(k, nm)
+                        if v and os.path.isfile(v):
+                            add(v)
+                        elif v and os.path.isdir(v):
+                            add(os.path.join(v, "terminal64.exe"))
+                            add(os.path.join(v, "terminal.exe"))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    pf86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+
+    for base in (pf, pf86):
+        for sub in (
+            "MetaTrader 5",
+            "MetaTrader5",
+            "MetaQuotes\\MetaTrader 5",
+            "MetaQuotes\\Terminal",
+            "RoboForex MT5 Terminal",
+            "FTMO MetaTrader 5",
+            "FundingPips MetaTrader 5",
+        ):
+            add(base / sub / "terminal64.exe")
+            add(base / sub / "terminal.exe")
+
+    try:
+        rc, out_txt, err = _run_hidden(
+            [
+                "wmic",
+                "process",
+                "where",
+                "name='terminal64.exe'",
+                "get",
+                "ExecutablePath",
+                "/value",
+            ],
+            timeout=3,
+        )
+        for line in (out_txt or "").splitlines():
+            if line.strip().startswith("ExecutablePath="):
+                add(line.split("=", 1)[1].strip())
+    except Exception:
+        pass
+
+    return out
+
+
 def find_mt5_terminal() -> Optional[str]:
     """
     Try to locate a MetaTrader 5 terminal executable:
@@ -2267,10 +2697,11 @@ def find_mt5_terminal() -> Optional[str]:
     Returns a filesystem path or None.
     """
     import winreg, os
+
     candidates = []
     # 1) Registry - user and machine
     reg_keys = [
-        (winreg.HKEY_CURRENT_USER,  r"Software\MetaQuotes\MetaTrader 5"),
+        (winreg.HKEY_CURRENT_USER, r"Software\MetaQuotes\MetaTrader 5"),
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\MetaQuotes\MetaTrader 5"),
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\MetaQuotes\MetaTrader 5"),
     ]
@@ -2281,35 +2712,51 @@ def find_mt5_terminal() -> Optional[str]:
                 for nm in names:
                     try:
                         v, _ = winreg.QueryValueEx(k, nm)
-                        if v and os.path.isfile(v): candidates.append(v)
+                        if v and os.path.isfile(v):
+                            candidates.append(v)
                         elif v and os.path.isdir(v):
                             exe = os.path.join(v, "terminal64.exe")
-                            if os.path.isfile(exe): candidates.append(exe)
+                            if os.path.isfile(exe):
+                                candidates.append(exe)
                     except Exception:
                         pass
         except Exception:
             pass
     # 2) Common folders
-    pf  = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-    pf86= Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    pf86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
     for base in (pf, pf86):
         for sub in (
-            "MetaTrader 5", "MetaTrader5", "MetaQuotes\MetaTrader 5", "MetaQuotes\Terminal",
+            "MetaTrader 5",
+            "MetaTrader5",
+            "MetaQuotes\MetaTrader 5",
+            "MetaQuotes\Terminal",
         ):
-            p1 = (base / sub / "terminal64.exe")
-            p2 = (base / sub / "terminal.exe")
-            if p1.is_file(): candidates.append(p1.as_posix())
-            if p2.is_file(): candidates.append(p2.as_posix())
+            p1 = base / sub / "terminal64.exe"
+            p2 = base / sub / "terminal.exe"
+            if p1.is_file():
+                candidates.append(p1.as_posix())
+            if p2.is_file():
+                candidates.append(p2.as_posix())
     # 3) Running process via WMIC (best-effort; may be disabled on new Windows)
     try:
         rc, out, err = _run_hidden(
-            ["wmic","process","where","name='terminal64.exe'","get","ExecutablePath","/value"],
-            timeout=3
-       )
+            [
+                "wmic",
+                "process",
+                "where",
+                "name='terminal64.exe'",
+                "get",
+                "ExecutablePath",
+                "/value",
+            ],
+            timeout=3,
+        )
         for line in (out or "").splitlines():
             if line.strip().startswith("ExecutablePath="):
-                exe = line.split("=",1)[1].strip().strip('"')
-                if exe and os.path.isfile(exe): candidates.append(exe)
+                exe = line.split("=", 1)[1].strip().strip('"')
+                if exe and os.path.isfile(exe):
+                    candidates.append(exe)
     except Exception:
         pass
     # Prefer 64-bit terminal if multiple
@@ -2317,6 +2764,8 @@ def find_mt5_terminal() -> Optional[str]:
         if c.lower().endswith("terminal64.exe"):
             return c
     return candidates[0] if candidates else None
+
+
 # ---- Capability probe: is MT5 usable on this machine? ----
 def detect_mt5_cap() -> dict:
     """
@@ -2328,15 +2777,17 @@ def detect_mt5_cap() -> dict:
     mt5_module = False
     try:
         import MetaTrader5  # type: ignore
+
         mt5_module = True
     except Exception:
         pass
     mt5_path = find_mt5_terminal() or ""
     status = "ok" if (mt5_module and mt5_path) else "missing"
     return {"mt5": status, "mt5_path": mt5_path, "mt5_module": bool(mt5_module)}
+
+
 # ---- UI prompt helpers (safe, optional) ----
 def _is_interactive_session() -> bool:
-
     """
     Best-effort: show UI only if we're running in a user session, not as a service.
     We also allow forcing silent via env XTL_NO_UI=1.
@@ -2345,11 +2796,14 @@ def _is_interactive_session() -> bool:
         return False
     try:
         import ctypes
+
         user32 = ctypes.windll.user32
         # If there's a foreground window, assume UI is OK
         return bool(user32.GetForegroundWindow())
     except Exception:
         return False
+
+
 def _msgbox_yesno(title: str, text: str) -> bool:
     """
     Shows a topmost Yes/No information dialog. Returns True if 'Yes'.
@@ -2357,16 +2811,19 @@ def _msgbox_yesno(title: str, text: str) -> bool:
     """
     try:
         import ctypes
+
         MB_ICONINFORMATION = 0x40
-        MB_YESNO          = 0x04
-        MB_TOPMOST        = 0x40000
-        IDYES             = 6
+        MB_YESNO = 0x04
+        MB_TOPMOST = 0x40000
+        IDYES = 6
         rc = ctypes.windll.user32.MessageBoxW(
             None, text, title, MB_ICONINFORMATION | MB_YESNO | MB_TOPMOST
         )
         return rc == IDYES
     except Exception:
         return False
+
+
 def _open_url(url: str) -> None:
     try:
         os.startfile(url)  # best on Windows; falls back below if blocked
@@ -2375,10 +2832,16 @@ def _open_url(url: str) -> None:
             subprocess.Popen(["cmd", "/c", "start", "", url], close_fds=True)
         except Exception:
             pass
+
+
 # ---------- utils ----------
 def _vcpp_ok() -> bool:
-   sys32 = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32"
-   return (sys32/"vcruntime140.dll").is_file() and (sys32/"vcruntime140_1.dll").is_file()
+    sys32 = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32"
+    return (sys32 / "vcruntime140.dll").is_file() and (
+        sys32 / "vcruntime140_1.dll"
+    ).is_file()
+
+
 def _copytree(src: Path, dst: Path) -> None:
     """Idempotent copy: create dirs if missing; overwrite files; never delete existing content."""
     dst.mkdir(parents=True, exist_ok=True)
@@ -2393,14 +2856,16 @@ def _copytree(src: Path, dst: Path) -> None:
             except Exception:
                 # best-effort; continue on individual file errors
                 pass
+
+
 def _sc_query(name: str) -> str:
-    rc, out, err = _run_hidden(["sc","query",name])
-    return (out+err)
+    rc, out, err = _run_hidden(["sc", "query", name])
+    return out + err
+
+
 def _sc_delete(name: str) -> None:
-    _run_hidden(["sc","stop",name]); _run_hidden(["sc","delete",name])
-
-
-
+    _run_hidden(["sc", "stop", name])
+    _run_hidden(["sc", "delete", name])
 
 
 def deploy_files(src_exe: Path) -> None:
@@ -2425,12 +2890,14 @@ def deploy_files(src_exe: Path) -> None:
     try:
         blog(f"DEPLOY_DEBUG src_exe={src_exe}")
         blog(f"DEPLOY_DEBUG src_exe_exists={src_exe.exists()}")
-        blog(f"DEPLOY_DEBUG src_exe_size={src_exe.stat().st_size if src_exe.exists() else -1}")
+        blog(
+            f"DEPLOY_DEBUG src_exe_size={src_exe.stat().st_size if src_exe.exists() else -1}"
+        )
         blog(f"DEPLOY_DEBUG here={here}")
         blog(f"DEPLOY_DEBUG APP_DIR={APP_DIR}")
     except Exception as e:
         blog(f"DEPLOY_DEBUG source_check_failed={e}")
-        
+
     APP_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1) xtl.exe
@@ -2443,10 +2910,13 @@ def deploy_files(src_exe: Path) -> None:
             if dst_exe.stat().st_size != src_exe.stat().st_size:
                 raise RuntimeError(
                     f"xtl.exe deploy size mismatch: src={src_exe.stat().st_size} "
-                    f"dst={dst_exe.stat().st_size} — file likely locked by running service")
+                    f"dst={dst_exe.stat().st_size} — file likely locked by running service"
+                )
 
             try:
-                blog(f"DEPLOY_DEBUG dst_exe_size_after_copy={dst_exe.stat().st_size if dst_exe.exists() else -1}")
+                blog(
+                    f"DEPLOY_DEBUG dst_exe_size_after_copy={dst_exe.stat().st_size if dst_exe.exists() else -1}"
+                )
             except Exception as e:
                 blog(f"DEPLOY_DEBUG dst_size_check_failed={e}")
     except Exception as e:
@@ -2458,7 +2928,7 @@ def deploy_files(src_exe: Path) -> None:
         here / "_internal",
         Path.cwd() / "_internal",
         here / "dist" / "xtl" / "_internal",
-        ]
+    ]
     src_internal = next((p for p in candidates if p.exists()), None)
     blog(f"deploy_files: src_internal={src_internal}")
     if src_internal:
@@ -2483,6 +2953,7 @@ def deploy_files(src_exe: Path) -> None:
         try:
             import certifi  # type: ignore
             from pathlib import Path as _P
+
             cpath = getattr(certifi, "where", lambda: "")() or ""
             if cpath:
                 p = _P(cpath)
@@ -2504,7 +2975,9 @@ def deploy_files(src_exe: Path) -> None:
                 dst_cacert.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_ca, dst_cacert)
                 sz = dst_cacert.stat().st_size if dst_cacert.exists() else 0
-                blog(f"deploy_files: refreshed CA bundle -> {dst_cacert} (size={sz} bytes)")
+                blog(
+                    f"deploy_files: refreshed CA bundle -> {dst_cacert} (size={sz} bytes)"
+                )
                 # Make accidental truncation less likely
                 try:
                     os.chmod(dst_cacert, 0o444)
@@ -2513,14 +2986,21 @@ def deploy_files(src_exe: Path) -> None:
             except Exception as e:
                 blog(f"deploy_files: WARN failed to copy CA bundle: {e}")
         else:
-            blog("deploy_files: WARN no valid CA bundle source found; HTTPS will use system trust")
+            blog(
+                "deploy_files: WARN no valid CA bundle source found; HTTPS will use system trust"
+            )
 
     # 3) Optional sidecars that may sit next to the exe (copy if present)
     sidecars = [
-        "XTLAgent.exe", "XTLAgent.xml", "XTLAgent.wrapper",
-        "winsw.exe", "WinSW-x64.exe",
-        "Run-XTL.bat", "install.cmd",
-        "README.txt", "xtl.cfg",
+        "XTLAgent.exe",
+        "XTLAgent.xml",
+        "XTLAgent.wrapper",
+        "winsw.exe",
+        "WinSW-x64.exe",
+        "Run-XTL.bat",
+        "install.cmd",
+        "README.txt",
+        "xtl.cfg",
     ]
     for name in sidecars:
         s = here / name
@@ -2537,19 +3017,29 @@ def deploy_files(src_exe: Path) -> None:
 def preflight() -> None:
     require_admin()
     py310 = APP_DIR / "_internal" / "python310.dll"
-    py3   = APP_DIR / "_internal" / "python3.dll"
+    py3 = APP_DIR / "_internal" / "python3.dll"
     if not (py310.is_file() and py3.is_file()):
-        raise RuntimeError("Runtime incomplete after repair: _internal/python310.dll and python3.dll required")
+        raise RuntimeError(
+            "Runtime incomplete after repair: _internal/python310.dll and python3.dll required"
+        )
     sys32 = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32"
-    if not ((sys32/"vcruntime140.dll").is_file() and (sys32/"vcruntime140_1.dll").is_file()):
+    if not (
+        (sys32 / "vcruntime140.dll").is_file()
+        and (sys32 / "vcruntime140_1.dll").is_file()
+    ):
         raise RuntimeError("VC++ 2015-2022 x64 missing after install attempt")
+
+
 def upsert_config(api_base: str, bind_token: Optional[str]) -> dict:
     d = _hklm_get_json() or {}
     d["api_base"] = api_base or DEFAULT_API_BASE
-    d.setdefault("device_id",""); d.setdefault("device_token","")
-    d["bind_token"] = (bind_token or d.get("bind_token") or "")
+    d.setdefault("device_id", "")
+    d.setdefault("device_token", "")
+    d["bind_token"] = bind_token or d.get("bind_token") or ""
     _hklm_set_json(d)
     return d
+
+
 def ensure_winsw_binary() -> None:
     r"""
     Ensure WinSW is available at WINSW_EXE by preferring *bundled* copies.
@@ -2618,6 +3108,8 @@ def ensure_winsw_binary() -> None:
     except PermissionError as e:
         # service may still be holding a handle from a previous run
         log(f"winsw: destination in use; keeping existing binary. ({e})")
+
+
 def write_winsw_xml(service_name: str | None = None) -> None:
     """
     Emit WinSW XML. 'service_name' is optional and ignored unless provided;
@@ -2649,12 +3141,16 @@ def write_winsw_xml(service_name: str | None = None) -> None:
 </service>
 """
     WINSW_XML.write_text(xml, encoding="utf-8")
+
+
 def _choose_service_id():
     import re
+
     did = (_hku_ls_get("DeviceId") or "").strip()
-    suf = re.sub(r'[^A-Za-z0-9]', '', did)[-6:] or "DEV"
+    suf = re.sub(r"[^A-Za-z0-9]", "", did)[-6:] or "DEV"
     sid = f"XTLAgent_{suf}"
     return sid, sid
+
 
 def install_service_idempotent() -> str:
     """
@@ -2700,73 +3196,126 @@ def install_service_idempotent() -> str:
         return uniq
 
     # 3) Still blocked -> surface clear guidance
-    raise RuntimeError("Could not install service (names unavailable). If an uninstall is pending, reboot and rerun.")
+    raise RuntimeError(
+        "Could not install service (names unavailable). If an uninstall is pending, reboot and rerun."
+    )
 
-def start_service_and_wait(name: str, timeout_s: int=30) -> None:
+
+def start_service_and_wait(name: str, timeout_s: int = 30) -> None:
     _run_hidden(["sc", "start", name])
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         out = _sc_query(name)
-        if re.search(r"STATE\s+:\s+4\s+RUNNING", out): return
+        if re.search(r"STATE\s+:\s+4\s+RUNNING", out):
+            return
         time.sleep(1.0)
     wrap = APP_DIR / f"{name}.wrapper.log"
     if not wrap.exists():
         wrap = APP_DIR / "XTLAgent.wrapper.log"
-        if not wrap.exists(): wrap = APP_DIR / "wrapper.log"
+        if not wrap.exists():
+            wrap = APP_DIR / "wrapper.log"
     if wrap.exists():
-        try: log("Wrapper tail:\n" + "\n".join(wrap.read_text(errors="ignore").splitlines()[-100:]))
-        except Exception: pass
-    raise RuntimeError("Service did not reach RUNNING in time. If wrapper shows 'Failed to start embedded python', install VC++ and ensure _internal is complete.")
+        try:
+            log(
+                "Wrapper tail:\n"
+                + "\n".join(wrap.read_text(errors="ignore").splitlines()[-100:])
+            )
+        except Exception:
+            pass
+    raise RuntimeError(
+        "Service did not reach RUNNING in time. If wrapper shows 'Failed to start embedded python', install VC++ and ensure _internal is complete."
+    )
+
+
 def _ensure_service_auto_start(name: str) -> None:
     try:
         _run_hidden(["sc", "config", name, "start=", "auto"])
     except Exception as e:
         log(f"ensure service auto-start failed: {e}")
 
+
 def _configure_service_recovery(service_name: str = "XTLAgent") -> None:
     """Make SCM restart our service after failures and use delayed auto-start."""
     try:
         import subprocess
+
         # 3 restarts with 5s delay; reset failure count after 60s
-        subprocess.run(["sc", "failure", service_name,
-                        "reset=", "60",
-                        "actions=", "restart/5000/restart/5000/restart/5000"],
-                       check=False, capture_output=True)
+        subprocess.run(
+            [
+                "sc",
+                "failure",
+                service_name,
+                "reset=",
+                "60",
+                "actions=",
+                "restart/5000/restart/5000/restart/5000",
+            ],
+            check=False,
+            capture_output=True,
+        )
         # delayed auto-start helps race conditions during boot
-        subprocess.run(["sc", "config", service_name, "start=", "delayed-auto"],
-                       check=False, capture_output=True)
+        subprocess.run(
+            ["sc", "config", service_name, "start=", "delayed-auto"],
+            check=False,
+            capture_output=True,
+        )
         alog("service: applied recovery + delayed-auto configuration")
     except Exception as e:
         alog(f"service: recovery config warn: {e}")
 
-def write_bind_hint(msg: str) -> None:
-    try: BIND_HINT.write_text(msg+"\n", encoding="utf-8")
-    except Exception: pass
 
-def pair_start(api_base: str) -> Tuple[str,str]:
+def write_bind_hint(msg: str) -> None:
+    try:
+        BIND_HINT.write_text(msg + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def pair_start(api_base: str) -> Tuple[str, str]:
     s = _rq_session()
     r = s.post(_join(api_base, "/devices/pair/start"), json={})
-    if getattr(r,"status_code",0) != 200:
-        raise RuntimeError(f"pair/start http {getattr(r,'status_code',0)} {getattr(r,'text','')[:160]}")
-    j = r.json() if hasattr(r,"json") else {}
+    if getattr(r, "status_code", 0) != 200:
+        raise RuntimeError(
+            f"pair/start http {getattr(r,'status_code',0)} {getattr(r,'text','')[:160]}"
+        )
+    j = r.json() if hasattr(r, "json") else {}
     dev = (j.get("device_id") or j.get("id") or "").strip()
     tok = (j.get("device_token") or j.get("token") or "").strip()
-    if not (dev and tok): raise RuntimeError("pair/start returned malformed payload")
+    if not (dev and tok):
+        raise RuntimeError("pair/start returned malformed payload")
     return dev, tok
+
+
 def verify_post_start() -> None:
     api_ok = _hku_ls_get("ApiBase") is not None
     dev_ok = bool(_hku_ls_get("DeviceId") and _hku_ls_get("DeviceToken"))
     bts_ok = _hku_ls_get("BindTokenStatus") is not None
     if not api_ok or not (dev_ok or bts_ok):
-        raise RuntimeError("agent failed before init - check runtime/VC++/workingdirectory")
+        raise RuntimeError(
+            "agent failed before init - check runtime/VC++/workingdirectory"
+        )
+
+
 # -------------------- agent (service/run) - minimal but functional --------------------
 _stop = threading.Event()
+
+
 def _graceful(signum=None, frame=None):
     _stop.set()
-for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None), getattr(signal, "SIGBREAK", None)):
+
+
+for _sig in (
+    getattr(signal, "SIGTERM", None),
+    getattr(signal, "SIGINT", None),
+    getattr(signal, "SIGBREAK", None),
+):
     if _sig:
-        try: signal.signal(_sig, _graceful)
-        except Exception: pass
+        try:
+            signal.signal(_sig, _graceful)
+        except Exception:
+            pass
+
+
 def _auto_bind_if_needed(api_base: str) -> None:
     """
     If a bind_token exists in HKLM config and the device is not yet bound in the
@@ -2795,7 +3344,9 @@ def _auto_bind_if_needed(api_base: str) -> None:
                     _bind_clear_token_terminal_expired()
                 except Exception:
                     pass
-                write_bind_hint("Auto-bind token expired (TTL). Please regenerate a new token.")
+                write_bind_hint(
+                    "Auto-bind token expired (TTL). Please regenerate a new token."
+                )
                 return
         except Exception:
             # If TTL helpers misbehave, proceed anyway (best-effort bind).
@@ -2843,7 +3394,11 @@ def _auto_bind_if_needed(api_base: str) -> None:
             pass
         write_bind_hint(f"Auto-bind exception: {e!s}")
         alog(f"auto-bind: exception {e!r}")
-def push_ohlc_once_legacy(api_base: str, symbols: list[str], tf_names: list[str], bars: int = 301) -> None:
+
+
+def push_ohlc_once_legacy(
+    api_base: str, symbols: list[str], tf_names: list[str], bars: int = 301
+) -> None:
     """
     Pull the most recent `bars` candles from MT5 per symbol/timeframe and POST each bar.
     - Assumes MetaTrader5 has been initialized already by caller.
@@ -2874,77 +3429,83 @@ def push_ohlc_once_legacy(api_base: str, symbols: list[str], tf_names: list[str]
                 # copy last N bars (MT5 returns numpy-structured array; index 0..bars-1)
                 rates = mt5.copy_rates_from_pos(sym, tf, 0, bars)
                 if not rates:
-                   alog(f"ohlc batch {sym}/{name} -> no data")
-                   continue
+                    alog(f"ohlc batch {sym}/{name} -> no data")
+                    continue
                 last_code = None
                 # Send newest ? oldest (or invert if your API expects ascending)
                 for r in reversed(rates):
                     bar = {
                         "symbol": sym,
                         "tf": name,
-                        "t": int(r["time"]),      # epoch seconds (UTC per MT5)
+                        "t": int(r["time"]),  # epoch seconds (UTC per MT5)
                         "o": float(r["open"]),
                         "h": float(r["high"]),
                         "l": float(r["low"]),
                         "c": float(r["close"]),
-                        "v": int(r["tick_volume"] if "tick_volume" in r.dtype.names else r["real_volume"] if "real_volume" in r.dtype.names else 0),
+                        "v": int(
+                            r["tick_volume"]
+                            if "tick_volume" in r.dtype.names
+                            else (
+                                r["real_volume"]
+                                if "real_volume" in r.dtype.names
+                                else 0
+                            )
+                        ),
                     }
                     resp = s.post(_join(api_base, "/ohlc/ingest"), json=bar)
                     last_code = getattr(resp, "status_code", None)
                     # optional: throttle a tiny bit to avoid flooding
                 alog(f"ohlc batch {sym}/{name} -> last={last_code} count={len(rates)}")
             except Exception as e:
-               alog(f"ohlc batch err {sym}/{name}: {e!s}")
+                alog(f"ohlc batch err {sym}/{name}: {e!s}")
+
+
 import json, time, os
 
 
 import urllib.request
-AGENT_VERSION = os.environ.get("XTL_AGENT_VERSION", "1.0.2")
-def _reg_get(hive_path: str, name: str) -> str:
 
+AGENT_VERSION = os.environ.get("XTL_AGENT_VERSION", "1.0.2")
+
+
+def _reg_get(hive_path: str, name: str) -> str:
 
     # minimal helper - replace with your existing reg_get
 
-
     try:
-
 
         import winreg
 
-
         hive, subkey = hive_path.split("\\", 1)
-
 
         hive_obj = {"HKU": winreg.HKEY_USERS, "HKLM": winreg.HKEY_LOCAL_MACHINE}[hive]
 
-
         with winreg.OpenKey(hive_obj, subkey) as k:
-
 
             val, _ = winreg.QueryValueEx(k, name)
 
-
             return str(val)
 
-
     except Exception:
-
 
         return ""
 
 
-
 # --- One-shot OHLC pusher that the HB loop calls --------------------------------
-def agent_push_ohlc_once(api_base: str, symbols: list[str], tfs: list[str], bars: int = 300) -> bool:
+def agent_push_ohlc_once(
+    api_base: str, symbols: list[str], tfs: list[str], bars: int = 300
+) -> bool:
     """
     Resolves DeviceId/Token from the LocalSystem hive and calls the real agent
     pusher (xtl.agent_ohlc.push_ohlc_once). Adds loud logging around the call.
     Returns True if a POST was attempted, False if skipped.
     """
     dev_id = (_hku_ls_get("DeviceId") or "").strip()
-    tok    = (_hku_ls_get("DeviceToken") or "").strip()
+    tok = (_hku_ls_get("DeviceToken") or "").strip()
     if not dev_id or not tok:
-        alog("OHLC: no DeviceId/DeviceToken in HKU\\S-1-5-18\\Software\\XTL — skip push_once")
+        alog(
+            "OHLC: no DeviceId/DeviceToken in HKU\\S-1-5-18\\Software\\XTL — skip push_once"
+        )
         return False
 
     # lazy import with alias to avoid packaging issues
@@ -2955,7 +3516,9 @@ def agent_push_ohlc_once(api_base: str, symbols: list[str], tfs: list[str], bars
         return False
 
     # log plan
-    alog(f"OHLC: POST plan -> /devices/{dev_id}/ohlc symbols={symbols} tfs={tfs} bars={bars}")
+    alog(
+        f"OHLC: POST plan -> /devices/{dev_id}/ohlc symbols={symbols} tfs={tfs} bars={bars}"
+    )
 
     # attempt the real push (new signature)
     try:
@@ -2982,21 +3545,29 @@ def agent_push_ohlc_once(api_base: str, symbols: list[str], tfs: list[str], bars
     # --- FORCE at least one POST per TF so we can see it server-side ---
     if ENABLE_INSTALLER_OHLC_TEST:
         try:
-            for sym in (symbols or []):
-                 for tf in (tfs or []):
-                     payload_min = {
-                         "symbol": sym,
-                         "timeframe": tf,
-                         "bars": [],   # empty is OK; route should still log and hydrate keys
-                         "count": 0,
-                         "written_at": int(time.time() * 1000),
-                     }
-                     alog(f"OHLC: CALL api_post smoke dev={dev_id} sym={sym} tf={tf}")
-                     r = api_post(api_base, f"/devices/{dev_id}/ohlc", payload_min, tok, timeout=20)
-                     status = getattr(r, "status_code", 0)
-                     ok = bool(getattr(r, "ok", False))
-                     body = (getattr(r, "text", "") or "")[:200]
-                     alog(f"OHLC: RESULT dev={dev_id} sym={sym} tf={tf} status={status} ok={ok} body={body}")
+            for sym in symbols or []:
+                for tf in tfs or []:
+                    payload_min = {
+                        "symbol": sym,
+                        "timeframe": tf,
+                        "bars": [],  # empty is OK; route should still log and hydrate keys
+                        "count": 0,
+                        "written_at": int(time.time() * 1000),
+                    }
+                    alog(f"OHLC: CALL api_post smoke dev={dev_id} sym={sym} tf={tf}")
+                    r = api_post(
+                        api_base,
+                        f"/devices/{dev_id}/ohlc",
+                        payload_min,
+                        tok,
+                        timeout=20,
+                    )
+                    status = getattr(r, "status_code", 0)
+                    ok = bool(getattr(r, "ok", False))
+                    body = (getattr(r, "text", "") or "")[:200]
+                    alog(
+                        f"OHLC: RESULT dev={dev_id} sym={sym} tf={tf} status={status} ok={ok} body={body}"
+                    )
         except Exception as e:
             alog(f"OHLC: smoke post exception: {e!s}")
     # --- END FORCE ---
@@ -3007,26 +3578,24 @@ def agent_push_ohlc_once(api_base: str, symbols: list[str], tfs: list[str], bars
 
 def load_device_creds() -> tuple[str, str]:
 
-
     # Prefer LocalSystem hive where the service runs
-
 
     dev_id = _reg_get(r"HKU\S-1-5-18\Software\XTL", "DeviceId") or ""
 
-
-    token  = _reg_get(r"HKU\S-1-5-18\Software\XTL", "DeviceToken") or ""
-
+    token = _reg_get(r"HKU\S-1-5-18\Software\XTL", "DeviceToken") or ""
 
     return dev_id.strip(), token.strip()
 
 
-def post_device_heartbeat(api_base: str,
-                          status: str = "running",
-                          mt5_ok: bool = True,
-                          api_ok: bool = True,
-                          autostart_ok: bool = True,
-                          version: str = AGENT_VERSION,
-                          last_error: str | None = None) -> tuple[int, str]:
+def post_device_heartbeat(
+    api_base: str,
+    status: str = "running",
+    mt5_ok: bool = True,
+    api_ok: bool = True,
+    autostart_ok: bool = True,
+    version: str = AGENT_VERSION,
+    last_error: str | None = None,
+) -> tuple[int, str]:
     """
     POST /devices/<dev_id>/heartbeat with Authorization: Bearer <DeviceToken>.
     Sends a schema-safe superset of fields to satisfy stricter validators.
@@ -3038,6 +3607,7 @@ def post_device_heartbeat(api_base: str,
     # Minimal + safe extras
     try:
         import platform
+
         label = (_hku_ls_get("DeviceLabel") or platform.node() or "").strip()[:64]
     except Exception:
         label = ""
@@ -3065,16 +3635,25 @@ def post_device_heartbeat(api_base: str,
     url = f"{api_base.rstrip('/')}/devices/{dev_id}/heartbeat"
     try:
         import requests
-        r = requests.post(url, json=body, headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        }, timeout=20)
+
+        r = requests.post(
+            url,
+            json=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=20,
+        )
         # Return code + text (so 422 shows precise validation error)
         return int(getattr(r, "status_code", 599)), (getattr(r, "text", "") or "")
     except Exception as e:
         return 599, f"{type(e).__name__}: {e}"
 
-def mt5_account_sync_loop(api_base: str, device_id: str, device_token: str, _stop, mt5_account: str = "demo"):
+
+def mt5_account_sync_loop(
+    api_base: str, device_id: str, device_token: str, _stop, mt5_account: str = "demo"
+):
     """
     Fast prop-mode account sync.
     Pushes balance/equity/margin/free_margin/floating_pnl every 2 seconds.
@@ -3098,6 +3677,7 @@ def mt5_account_sync_loop(api_base: str, device_id: str, device_token: str, _sto
 
         _stop.wait(2)
 
+
 def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
     s = _rq_session()
 
@@ -3105,10 +3685,12 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
         return (_hku_ls_get("DeviceId") or "", _hku_ls_get("DeviceToken") or "")
 
     # --- NEW: local cadence & last-push scheduler ---
-    poll_every = max(15, min(interval_sec or 60, 600))  # start from hb arg, clamp 15s..10m
+    poll_every = max(
+        15, min(interval_sec or 60, 600)
+    )  # start from hb arg, clamp 15s..10m
     next_ohlc_at = 0.0  # force an early push after first HB parse
     last_symbols = ["XAUUSD"]
-    last_tfs = ["M15","H1","H4"]
+    last_tfs = ["M15", "H1", "H4"]
     account_sync_started = False
 
     made_online = False
@@ -3144,13 +3726,13 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
             except Exception:
                 caps = {}
             payload["caps"] = {"mt5": caps.get("mt5"), "mt5_path": caps.get("mt5_path")}
-            payload["mt5_ok"]       = bool(payload["caps"].get("mt5"))
-            payload["mt5_path"]     = payload["caps"].get("mt5_path") or ""
+            payload["mt5_ok"] = bool(payload["caps"].get("mt5"))
+            payload["mt5_path"] = payload["caps"].get("mt5_path") or ""
             payload["autostart_ok"] = autostart_capability()
-            payload["api_ok"]       = True
-            payload["platform"]     = "windows"
-            payload["tz"]           = (time.tzname[0] if time.tzname else "")
-            payload["uptime_s"]     = max(0, int(time.time() - _PROCESS_START_TS))
+            payload["api_ok"] = True
+            payload["platform"] = "windows"
+            payload["tz"] = time.tzname[0] if time.tzname else ""
+            payload["uptime_s"] = max(0, int(time.time() - _PROCESS_START_TS))
 
             # headers (bearer optional; route is tolerant)
             headers = _auth_headers()
@@ -3164,7 +3746,7 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
             if send_online_hint:
                 payload["status"] = "running"
                 payload["online"] = True
-                payload["state"]  = "running"
+                payload["state"] = "running"
                 attempts_with_online_flag += 1
 
             # --- canonical heartbeat ---
@@ -3184,7 +3766,7 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
                     ensure_device_attached(api_base)
                 except Exception as e:
                     alog(f"attach: ensure_device_attached error: {e}")
-                    
+
             if mt5_ok_flag and device_id and device_token and not account_sync_started:
                 threading.Thread(
                     target=mt5_account_sync_loop,
@@ -3195,11 +3777,18 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
                 alog("MT5_ACCOUNT_SYNC started every 2 sec")
 
             dev_for_log = device_id or (_hku_ls_get("DeviceId") or "")
-            alog(f"heartbeat /devices/{dev_for_log or '<id>'}/heartbeat {code} {(resp or '')[:160]}")
-            if code and 200 <= code < 300 and (
-                    ('"status":"running"' in (resp or "")) or
-                    ('"online":true'    in (resp or "")) or
-                    ('"ok":true'        in (resp or "")) ):
+            alog(
+                f"heartbeat /devices/{dev_for_log or '<id>'}/heartbeat {code} {(resp or '')[:160]}"
+            )
+            if (
+                code
+                and 200 <= code < 300
+                and (
+                    ('"status":"running"' in (resp or ""))
+                    or ('"online":true' in (resp or ""))
+                    or ('"ok":true' in (resp or ""))
+                )
+            ):
                 made_online = True
             if code in (401, 403):
                 _hku_ls_set("BindTokenStatus", "backoff")
@@ -3216,8 +3805,14 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
                 tr = (js or {}).get("trend") or {}
                 push_now = bool(tr.get("push_now", False))
                 trend_active = bool(tr.get("active", False))
-                symbols = [str(x).strip() for x in (tr.get("symbols") or []) if str(x).strip()]
-                tfs = [str(x).strip().upper() for x in (tr.get("tfs") or []) if str(x).strip()]
+                symbols = [
+                    str(x).strip() for x in (tr.get("symbols") or []) if str(x).strip()
+                ]
+                tfs = [
+                    str(x).strip().upper()
+                    for x in (tr.get("tfs") or [])
+                    if str(x).strip()
+                ]
                 cadence = int(tr.get("interval_sec") or 60)
             except Exception:
                 pass
@@ -3230,7 +3825,9 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
 
             # One-shot push on nudge
             if push_now:
-                alog(f"HB: trend push_now -> pushing OHLC once symbols={symbols} tfs={tfs}")
+                alog(
+                    f"HB: trend push_now -> pushing OHLC once symbols={symbols} tfs={tfs}"
+                )
                 try:
                     push_ohlc_once_compat(
                         api_base=api_base,
@@ -3265,20 +3862,14 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
                                 _mark_pushed(sym, tfu, now_s)
                             except Exception as e:
                                 alog(f"HB: cadence ohlc error {sym}/{tfu}: {e!s}")
-            
-            
+
             # -------------------------------------------------
             # Push MT5 open positions + account snapshot
             # -------------------------------------------------
-            
 
             if mt5_ok_flag and device_id and device_token:
                 try:
                     from xtl.agent_ohlc import push_mt5_positions_once
-                        
-                    
-
-                    
 
                     # positions
                     push_mt5_positions_once(
@@ -3288,15 +3879,14 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
                         mt5_account="demo",
                     )
 
-                    
                 except Exception as e:
                     alog(f"HB: mt5 push failed: {e}")
-                            
 
         except Exception as e:
             alog(f"heartbeat error: {e!s}")
 
         _stop.wait(interval_sec)
+
 
 def read_config() -> dict:
     """
@@ -3309,6 +3899,7 @@ def read_config() -> dict:
       5) %LocalAppData%\XTL
     Returns {} on any error. Guarantees a dict (may include 'mt5' sub-dict).
     """
+
     def _try_load(p: Path) -> dict | None:
         try:
             if not p or not p.exists() or not p.is_file():
@@ -3350,7 +3941,11 @@ def read_config() -> dict:
     # ProgramData + LocalAppData fallbacks
     try:
         pd = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "XTL"
-        la = Path(os.environ.get("LocalAppData", "")) / "XTL" if os.environ.get("LocalAppData") else None
+        la = (
+            Path(os.environ.get("LocalAppData", "")) / "XTL"
+            if os.environ.get("LocalAppData")
+            else None
+        )
         candidates += [pd / "xtl.cfg", pd / "xtl.json"]
         if la:
             candidates += [la / "xtl.cfg", la / "xtl.json"]
@@ -3383,23 +3978,31 @@ def _maybe_mt5_worker(api_base: str) -> None:
 
         # Ensure MT5 terminal path (auto-detect if missing)
         mt5_path = (reg_get("MT5.TerminalPath") or reg_get("MT5Path") or "").strip()
+
         if not mt5_path:
-            guess = find_mt5_terminal() if "find_mt5_terminal" in globals() else None
-            if guess:
-                mt5_path = guess
-                alog(f"MT5: auto-detected terminal at {mt5_path}")
-            else:
-                alog("MT5: no terminal detected; worker disabled (this is OK).")
-                return  # graceful skip
+            detected = []
+            try:
+                detected = find_mt5_terminals_all()
+            except Exception:
+                detected = []
 
-            # Persist MT5 path for service + user + machine (HKU LS + HKCU + HKLM)
-            _persist_mt5_path_all(mt5_path)
+            alog(
+                "MT5: no configured MT5.TerminalPath/MT5Path. "
+                f"Detected terminals={detected}. Worker disabled; user must select broker terminal."
+            )
+            return
 
+        if not os.path.isfile(mt5_path):
+            alog(
+                "MT5: configured terminal path does not exist. "
+                f"MT5Path={mt5_path}. Worker disabled."
+            )
+            return
         # Persist MT5 path for the service (LocalSystem) + current user + env
         try:
-            _hku_ls_set("MT5Path", mt5_path)                               # LocalSystem hive
-            _reg_set(r"HKCU\Software\XTL", "MT5Path", mt5_path)            # interactive user
-            os.environ["XTL_MT5_PATH"] = mt5_path                          # env fallback
+            _hku_ls_set("MT5Path", mt5_path)  # LocalSystem hive
+            _reg_set(r"HKCU\Software\XTL", "MT5Path", mt5_path)  # interactive user
+            os.environ["XTL_MT5_PATH"] = mt5_path  # env fallback
         except Exception as _e:
             alog(f"MT5: WARN failed to persist terminal path: {_e}")
 
@@ -3421,14 +4024,16 @@ def _maybe_mt5_worker(api_base: str) -> None:
             device_token = (_hku_ls_get("DeviceToken") or "").strip()
             if device_id and device_token:
                 break
-            alog("OHLC: waiting for bind (no DeviceId/DeviceToken yet). Will retry in 1s…")
+            alog(
+                "OHLC: waiting for bind (no DeviceId/DeviceToken yet). Will retry in 1s…"
+            )
             time.sleep(1)
 
         if not device_id or not device_token:
-            alog("OHLC: still not bound after wait; worker exiting (supervisor will respawn).")
+            alog(
+                "OHLC: still not bound after wait; worker exiting (supervisor will respawn)."
+            )
             return
-
-
 
         # ---------------- NEW: start MT5 command worker ----------------
         # This polls /devices/{device_id}/mt5/next and posts /mt5/ack.
@@ -3452,6 +4057,7 @@ def _maybe_mt5_worker(api_base: str) -> None:
                 # 2) fallback: load by file path (your layout: wizard\xtl\agent_ohlc.py)
                 if start_mt5_cmd_worker is None:
                     import importlib.util
+
                     here = os.path.dirname(os.path.abspath(__file__))
 
                     candidates = [
@@ -3460,7 +4066,9 @@ def _maybe_mt5_worker(api_base: str) -> None:
                     ]
                     p = next((x for x in candidates if os.path.exists(x)), None)
                     if not p:
-                        raise RuntimeError(f"agent_ohlc.py not found. Tried: {candidates}")
+                        raise RuntimeError(
+                            f"agent_ohlc.py not found. Tried: {candidates}"
+                        )
 
                     spec = importlib.util.spec_from_file_location("agent_ohlc", p)
                     mod = importlib.util.module_from_spec(spec)  # type: ignore
@@ -3485,15 +4093,14 @@ def _maybe_mt5_worker(api_base: str) -> None:
             alog(f"MT5 CMD: failed to start worker: {type(e).__name__}: {e}")
         # ---------------- END NEW BLOCK ----------------
 
-
-
-
         # Cadence
         s_per_cycle = int(mt5_cfg.get("period_sec") or 60)
         if s_per_cycle < 15:
             s_per_cycle = 15
 
-        alog(f"OHLC: starting worker symbols={symbols} tfs={tfs} bars={bars} every {s_per_cycle}s")
+        alog(
+            f"OHLC: starting worker symbols={symbols} tfs={tfs} bars={bars} every {s_per_cycle}s"
+        )
 
         # Main loop
         while not _stop.is_set():
@@ -3520,12 +4127,14 @@ def _maybe_mt5_worker(api_base: str) -> None:
     except Exception as e:
         alog(f"OHLC: worker failed to start: {e}")
 
+
 def _hb_interval_sec_default():
     try:
         v = int((_hklm_get_json() or {}).get("HeartbeatSec") or 60)
         return min(300, max(30, v))  # clamp
     except Exception:
         return 60
+
 
 def agent_main_foreground() -> None:
     """
@@ -3552,7 +4161,9 @@ def agent_main_foreground() -> None:
     except Exception:
         cfg = {}
 
-    api_base = (ls_api or cfg.get("api_base") or DEFAULT_API_BASE or "").strip() or DEFAULT_API_BASE
+    api_base = (
+        ls_api or cfg.get("api_base") or DEFAULT_API_BASE or ""
+    ).strip() or DEFAULT_API_BASE
 
     # Persist ApiBase to LocalSystem hive for post-start diagnostics/UI
     try:
@@ -3592,13 +4203,22 @@ def agent_main_foreground() -> None:
         if ENABLE_INSTALLER_OHLC_TEST and dev_id and dev_tok:
             # Defaults that match your server Trend settings
             _symbols = ["XAUUSD"]
-            _tfs     = ["M15", "H1", "H4"]
+            _tfs = ["M15", "H1", "H4"]
             alog("run: pushing one-shot OHLC after bind")
             from xtl.agent_ohlc import push_ohlc_once
-            push_ohlc_once_compat(api_base=api_base, device_id=dev_id, token=dev_tok,
-                                  symbols=_symbols, tfs=_tfs, bars=300)
+
+            push_ohlc_once_compat(
+                api_base=api_base,
+                device_id=dev_id,
+                token=dev_tok,
+                symbols=_symbols,
+                tfs=_tfs,
+                bars=300,
+            )
         else:
-            alog("run: device not bound (no DeviceId/DeviceToken) — skipping one-shot push")
+            alog(
+                "run: device not bound (no DeviceId/DeviceToken) — skipping one-shot push"
+            )
     except Exception as _e:
         alog(f"run: one-shot push failed: {_e}")
 
@@ -3640,7 +4260,7 @@ def agent_main_foreground() -> None:
         )
         t.start()
         return t
-        
+
     def _spawn_mt5_positions() -> threading.Thread:
         def _loop():
             try:
@@ -3742,360 +4362,50 @@ def agent_main_service():
             ok = _bind_from_registry(api)
             alog(f"service: bind result -> {ok}")
 
-
         # Always start the supervisor (even if we were already bound)
         alog("service: starting user-session supervisor")
         # Read MT5 path once here (from LS hive or HKLM) and pass to child so it never falls back to roaming MetaQuotes
-        mt5_exe = (_hku_ls_get("MT5.TerminalPath")
-           or _hku_ls_get("MT5Path")
-           or reg_get("MT5.TerminalPath")
-           or reg_get("MT5Path")
-           or "").strip()
-
-
+        mt5_exe = (
+            _hku_ls_get("MT5.TerminalPath")
+            or _hku_ls_get("MT5Path")
+            or reg_get("MT5.TerminalPath")
+            or reg_get("MT5Path")
+            or ""
+        ).strip()
 
         # Append a safe hint flag + env to force the exact terminal; also set cwd for the child
         child_args = "run" + (f' --mt5-path="{mt5_exe}"' if mt5_exe else "")
         # Export env var for the child; remove if unset
         try:
             if mt5_exe:
-               os.environ["XTL_MT5_PATH"] = mt5_exe
+                os.environ["XTL_MT5_PATH"] = mt5_exe
             else:
-               os.environ.pop("XTL_MT5_PATH", None)
+                os.environ.pop("XTL_MT5_PATH", None)
         except Exception:
             pass
         service_supervise_user_agent(
-           str(APP_DIR / "xtl.exe"),
-           args=child_args,
-           restart_backoff_s=10,
-           ping_interval_s=5,
+            str(APP_DIR / "xtl.exe"),
+            args=child_args,
+            restart_backoff_s=10,
+            ping_interval_s=5,
         )
 
     except Exception as _e:
         alog(f"service: bind preflight error: {_e}")
 
+
 # --------------------------- installer commands ---------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _is_admin() -> bool:
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     try:
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     except Exception:
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
         return False
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _elevate_and_exit(args: list[str]) -> None:
@@ -4104,6 +4414,7 @@ def _elevate_and_exit(args: list[str]) -> None:
     No extra cmd window; direct ShellExecuteW on this exe.
     """
     import ctypes, shlex
+
     exe = str(Path(sys.argv[0]).resolve())
     params = " ".join(shlex.quote(a) for a in args)
     try:
@@ -4132,6 +4443,7 @@ def _read_sidecar_cfg() -> dict:
         pass
     return {}
 
+
 def _read_embedded_cfg_from_self() -> dict:
     """
     If you've embedded a JSON blob inside the exe (optional), pull it out.
@@ -4145,6 +4457,7 @@ def _read_embedded_cfg_from_self() -> dict:
     except Exception:
         pass
     return {}
+
 
 def _resolve_bind_inputs() -> tuple[str, str]:
     """
@@ -4166,13 +4479,28 @@ def _resolve_bind_inputs() -> tuple[str, str]:
         tok_hkcu = ""
     # Sidecar / embedded
     side = _read_sidecar_cfg()
-    emb  = _read_embedded_cfg_from_self()
+    emb = _read_embedded_cfg_from_self()
 
-    api = (api_cli or side.get("api_base") or emb.get("api_base") or api_env
-           or _hklm_get_json().get("api_base") or DEFAULT_API_BASE)
-    tok = (tok_cli or tok_env or tok_hkcu or side.get("bind_token") or emb.get("bind_token") or "")
+    api = (
+        api_cli
+        or side.get("api_base")
+        or emb.get("api_base")
+        or api_env
+        or _hklm_get_json().get("api_base")
+        or DEFAULT_API_BASE
+    )
+    tok = (
+        tok_cli
+        or tok_env
+        or tok_hkcu
+        or side.get("bind_token")
+        or emb.get("bind_token")
+        or ""
+    )
 
     return api.strip(), tok.strip()
+
+
 def cmd_mt5_prompt() -> int:
     """One-shot GUI to select MT5 terminal exe, then persist to HKLM + LS hive."""
     try:
@@ -4186,12 +4514,16 @@ def cmd_mt5_prompt() -> int:
             # Fallback: tiny Tk file picker (non-blocking for installer since we spawn this cmd separately)
             import tkinter as tk
             from tkinter import filedialog, messagebox
+
             root = tk.Tk()
             root.withdraw()
-            messagebox.showinfo("XTL Agent", "Please locate your MetaTrader 5 terminal (terminal64.exe).")
+            messagebox.showinfo(
+                "XTL Agent",
+                "Please locate your MetaTrader 5 terminal (terminal64.exe).",
+            )
             mt5_path = filedialog.askopenfilename(
                 title="Select MetaTrader 5 terminal",
-                filetypes=[("terminal64.exe", "terminal64.exe"), ("All files", "*.*")]
+                filetypes=[("terminal64.exe", "terminal64.exe"), ("All files", "*.*")],
             )
             root.destroy()
 
@@ -4212,8 +4544,9 @@ def cmd_mt5_prompt() -> int:
         return 1
 
 
-
-def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None) -> int:
+def cmd_install(
+    api_base: Optional[str] = None, bind_token: Optional[str] = None
+) -> int:
     """
     Install the XTL agent as a Windows service:
       - Elevate if needed
@@ -4256,7 +4589,12 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
         # wait for the service to actually stop + release handles
         for _ in range(20):  # up to ~20s
             try:
-                out = subprocess.run(["sc", "query", "XTLAgent"], capture_output=True, text=True, timeout=10)
+                out = subprocess.run(
+                    ["sc", "query", "XTLAgent"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
                 if "STOPPED" in (out.stdout or ""):
                     break
             except Exception:
@@ -4264,7 +4602,11 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
             time.sleep(1)
         # kill any stray xtl.exe children still holding the binary/_internal
         try:
-            subprocess.run(["taskkill", "/F", "/IM", "xtl.exe", "/T"], capture_output=True, timeout=20)
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "xtl.exe", "/T"],
+                capture_output=True,
+                timeout=20,
+            )
         except Exception as e:
             log(f"install: taskkill xtl.exe warn: {e}")
         time.sleep(2)  # let Windows release file handles
@@ -4278,13 +4620,19 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
 
         deploy_files(src_exe)
         import hashlib
-        
+
         # Resolve APP_DIR (destination where the service runs)
         def _resolve_app_dir() -> Path:
             candidates = [
-                Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "XTL" / "dist" / "xtl",
-                Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files")) / "XTL" / "dist" / "xtl",
-                ]
+                Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+                / "XTL"
+                / "dist"
+                / "xtl",
+                Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files"))
+                / "XTL"
+                / "dist"
+                / "xtl",
+            ]
             for c in candidates:
                 if c.exists():
                     return c
@@ -4309,10 +4657,8 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
         except Exception as e:
             log(f"install: sha check failed: {e}")
 
-        
-
-        #log("install: ensure_internal_runtime_complete()...")
-        #ensure_internal_runtime_complete()
+        # log("install: ensure_internal_runtime_complete()...")
+        # ensure_internal_runtime_complete()
 
         # Optional visibility to the embedded runtime landing
         try:
@@ -4342,10 +4688,10 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
         # Ensure broker meta is present and fresh each install/repair
         _write_broker_meta_from_env_or_local()
 
-
         # 2) Hygiene: clear LocalSystem creds from any prior attempt
         try:
-            _hku_ls_del("DeviceId"); _hku_ls_del("DeviceToken")
+            _hku_ls_del("DeviceId")
+            _hku_ls_del("DeviceToken")
         except Exception:
             pass
 
@@ -4358,7 +4704,9 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
         # 4) Stage BindToken only in LS hive; scrub any user-scoped token
         if bind_token:
             _hku_ls_set("BindToken", bind_token)
-            alog(r"install: saved BindToken to HKU\S-1-5-18\Software\XTL (HKLM has api_base only)")
+            alog(
+                r"install: saved BindToken to HKU\S-1-5-18\Software\XTL (HKLM has api_base only)"
+            )
             try:
                 _reg_del(r"HKCU\Software\XTL", "BindToken")
             except Exception:
@@ -4369,13 +4717,12 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
         # 5) Fire a best-effort one-shot MT5 worker (non-blocking; safe if MT5 not ready yet)
         # Run a one-shot MT5 worker ONLY if already bound; otherwise skip to avoid wait-loop
         try:
-           if (_hku_ls_get("DeviceId") and _hku_ls_get("DeviceToken")):
-               _maybe_mt5_worker(api_eff)
-           else:
-               alog("install: skipping _maybe_mt5_worker (device not bound yet)")
+            if _hku_ls_get("DeviceId") and _hku_ls_get("DeviceToken"):
+                _maybe_mt5_worker(api_eff)
+            else:
+                alog("install: skipping _maybe_mt5_worker (device not bound yet)")
         except Exception:
-           pass
-
+            pass
 
         # 6) Create/update service and mark AutoStart
         svc_name = install_service_idempotent()
@@ -4387,7 +4734,6 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
         start_service_and_wait(svc_name, timeout_s=30)
         # Re-seed broker meta now that the service (LocalSystem profile) exists for sure
         _write_broker_meta_from_env_or_local()
-
 
         # 8) Brief settle + optional auto-bind attempt (harmless if already bound)
         time.sleep(2)
@@ -4408,8 +4754,11 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
             if need_mt5:
                 exe = str(Path(sys.argv[0]).resolve())
                 import subprocess
+
                 DETACHED_PROCESS = 0x00000008
-                subprocess.Popen([exe, "mt5-prompt"], close_fds=True, creationflags=DETACHED_PROCESS)
+                subprocess.Popen(
+                    [exe, "mt5-prompt"], close_fds=True, creationflags=DETACHED_PROCESS
+                )
                 alog("install: launched mt5-prompt in background")
         except Exception as e:
             alog(f"install: mt5-prompt launch skipped: {e}")
@@ -4424,20 +4773,28 @@ def cmd_install(api_base: Optional[str] = None, bind_token: Optional[str] = None
 
 def cmd_repair() -> int:
     if not _is_admin():
-       _elevate_and_exit(["repair"])
+        _elevate_and_exit(["repair"])
     return cmd_install()
+
+
 # ------------------------------- CLI entry --------------------------------
 def _parse_cli_kv(args: list[str]) -> tuple[Optional[str], Optional[str]]:
-    a = None; t = None
+    a = None
+    t = None
     for x in args:
-        if x.startswith("api="): a = x.split("=",1)[1]
-        elif x.startswith("token="): t = x.split("=",1)[1]
-    return a,t
+        if x.startswith("api="):
+            a = x.split("=", 1)[1]
+        elif x.startswith("token="):
+            t = x.split("=", 1)[1]
+    return a, t
+
+
 # ---- CLI verb wrappers ----
 def cmd_run() -> int:
     # foreground agent (no service)
     _ensure_cert_bundle()
     return agent_main_foreground()
+
 
 def cmd_start() -> int:
     """
@@ -4465,6 +4822,7 @@ def cmd_start() -> int:
         log(f"start: ERROR {e}")
         return 1
 
+
 def cmd_stop() -> int:
     # graceful stop of the Windows service
     try:
@@ -4473,6 +4831,8 @@ def cmd_stop() -> int:
     except Exception as e:
         log(f"stop: ERROR {e}")
         return 1
+
+
 def _print_help() -> None:
     print(
         "XTL Agent\n"
@@ -4484,25 +4844,38 @@ def _print_help() -> None:
         "  xtl.exe run          Run in foreground (no service)\n"
         "  xtl.exe service      Service entry (WinSW)\n"
         "  xtl.exe help         Show this help\n",
-        flush=True
+        flush=True,
     )
+
+
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         args = ["install"]
 
     cmd = (args[0] or "").lower().strip()
-    if   cmd == "install":  return cmd_install()
-    elif cmd == "repair":   return cmd_repair()
-    elif cmd == "start":    return cmd_start()
-    elif cmd == "stop":     return cmd_stop()
-    elif cmd == "run":      return cmd_run()
-    elif cmd == "service":  return agent_main_service()
-    elif cmd == "mt5-prompt":  return cmd_mt5_prompt()
-    elif cmd == "help":     _print_help(); return 0
+    if cmd == "install":
+        return cmd_install()
+    elif cmd == "repair":
+        return cmd_repair()
+    elif cmd == "start":
+        return cmd_start()
+    elif cmd == "stop":
+        return cmd_stop()
+    elif cmd == "run":
+        return cmd_run()
+    elif cmd == "service":
+        return agent_main_service()
+    elif cmd == "mt5-prompt":
+        return cmd_mt5_prompt()
+    elif cmd == "help":
+        _print_help()
+        return 0
     else:
         print(f"Unknown command: {cmd}", flush=True)
         _print_help()
         return 2
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

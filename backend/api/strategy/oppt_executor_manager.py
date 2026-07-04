@@ -104,6 +104,15 @@ def start_oppt_executor_manager() -> None:
             except Exception:
                 log.exception("[OPPT] manager loop error pid=%s", pid)
                 last_stats = {"enabled": enabled_n, "ticked": 0}
+            # ── analytics: finalize closed trades once per cycle (never blocks) ──
+            try:
+                from api.xtl_analytics import sweep_closed_trades
+                _sw = sweep_closed_trades()
+                if _sw and _sw.get("finalized"):
+                    log.info("[ANALYTICS] sweep finalized=%s checked=%s",
+                             _sw.get("finalized"), _sw.get("checked"))
+            except Exception:
+                log.exception("[ANALYTICS] sweep error pid=%s", pid)
 
             # Adaptive sleep:
             # - base sleep when enabled users exist

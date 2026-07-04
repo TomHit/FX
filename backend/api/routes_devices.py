@@ -498,7 +498,7 @@ class Mt5AckPayload(BaseModel):
 class Mt5PositionsPayload(BaseModel):
     positions: list = []
     mt5_account: str = "demo"
-
+    closed_deals: list = []
     model_config = ConfigDict(extra="ignore")
 
 
@@ -559,17 +559,61 @@ def mt5_positions(
         # Agent may push every ~60s, executor may tick later, so 60s TTL is too tight.
         R.setex(key, 900, json.dumps(positions, default=str))
         R.setex(f"xtl:mt5:pos:last:{dev_id}:{acct}", 900, key)
+
+        # -------------------------------------------------
+        # MT5 deal-history passive storage
+        # Agent sends closed_deals when a previously-open
+        # broker ticket disappears from MT5 positions.
+        # Safe Phase-1: store only, no lifecycle mutation.
+        # -------------------------------------------------
+        closed_deals = payload.closed_deals if isinstance(payload.closed_deals, list) else []
+        stored_deals = 0
+
+        for deal in closed_deals:
+            if not isinstance(deal, dict):
+                continue
+
+            try:
+                pid = int(deal.get("position_id") or 0)
+            except Exception:
+                pid = 0
+
+            if pid <= 0:
+                continue
+
+            deal["stored_at_ms"] = int(time.time() * 1000)
+            deal["device_id"] = str(dev_id)
+            deal["mt5_account"] = str(acct)
+
+            R.setex(
+                f"xtl:mt5:deal:{pid}",
+                14 * 24 * 3600,
+                json.dumps(deal, separators=(",", ":"), default=str),
+            )
+            stored_deals += 1
+
+            try:
+                print(
+                    f"[MT5_DEAL] STORED position_id={pid} symbol={deal.get('symbol')} "
+                    f"close_price={deal.get('close_price')} net_profit={deal.get('net_profit')} "
+                    f"ok={deal.get('ok')} device={dev_id}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
         R.hset(
             _hkey(dev_id),
             mapping={
                 "last_mt5_pos_ms": str(int(time.time() * 1000)),
                 "last_mt5_pos_count": str(len(positions)),
+                "last_mt5_deals_count": str(stored_deals),
             },
         )
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"redis_error:{type(e).__name__}")
 
-    return {"ok": True, "count": len(positions), "key": key}
+    return {"ok": True, "count": len(positions), "key": key, "deals": stored_deals}
 
 class Mt5AccountPayload(BaseModel):
     account: dict = {}
