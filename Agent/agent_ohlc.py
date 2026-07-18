@@ -27,7 +27,100 @@ log = logging.getLogger("xtl.agent")
 
 _last_sent_bar: dict[tuple[str, str], int] = {}  # (symbol, TF) -> last 't' sent
 _LAST_MT5_POSITIONS: dict[int, dict] = {}
+_MT5_POS_STATE_LOADED = False
 
+
+def _mt5_pos_state_path(dev_id: str, mt5_account: str = "demo") -> Path:
+    base = os.environ.get("XTL_AGENT_STATE_DIR")
+
+    if base:
+        root = Path(base)
+    elif os.name == "nt":
+        root = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "XTL" / "state"
+    else:
+        root = Path.home() / ".xtl"
+
+    return root / f"mt5_positions_{dev_id}_{mt5_account}.json"
+
+def _load_last_mt5_positions(dev_id: str, mt5_account: str = "demo") -> dict[int, dict]:
+    try:
+        p = _mt5_pos_state_path(dev_id, mt5_account)
+        if not p.exists():
+            return {}
+
+        data = json.loads(p.read_text(encoding="utf-8-sig") or "{}")
+        positions = data.get("positions") or {}
+
+        out = {}
+        for k, v in positions.items():
+            try:
+                tk = int(k)
+                if tk > 0 and isinstance(v, dict):
+                    out[tk] = v
+            except Exception:
+                pass
+
+        return out
+    except Exception as e:
+        try:
+            log.warning("MT5_POS_STATE_LOAD_FAIL err=%s", e)
+        except Exception:
+            pass
+        return {}
+
+
+
+
+def _save_last_mt5_positions(
+    dev_id: str,
+    mt5_account: str,
+    positions_by_ticket: dict[int, dict],
+) -> None:
+    p = _mt5_pos_state_path(dev_id, mt5_account)
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "saved_at_ms": int(time.time() * 1000),
+            "device_id": str(dev_id),
+            "mt5_account": str(mt5_account),
+            "positions": {
+                str(k): v
+                for k, v in (positions_by_ticket or {}).items()
+            },
+        }
+
+        tmp = p.with_suffix(".tmp")
+
+        tmp.write_text(
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+
+        tmp.replace(p)
+
+        log.warning(
+            "MT5_POS_STATE_SAVED file=%s positions=%s",
+            str(p),
+            len(positions_by_ticket or {}),
+        )
+
+    except Exception as e:
+        try:
+            log.warning(
+                "MT5_POS_STATE_SAVE_FAIL "
+                "file=%s positions=%s err=%s",
+                str(p),
+                len(positions_by_ticket or {}),
+                e,
+            )
+        except Exception:
+            pass
 # Force-pack critical modules under PyInstaller
 try:
     import unicodedata, charset_normalizer, idna, urllib3  # noqa: F401
@@ -80,6 +173,27 @@ except ImportError:
         )
 
 DEFAULT_TFS = ["M1", "M15", "H1", "H4"]
+
+# Canonical logical symbols published by the Agent.
+#
+# DXY is resolved by mt5_client._resolve_broker_symbol() to the
+# broker-native symbol, for example:
+#   FTMO         -> DXY.cash
+#   another firm -> DXY / USDX / USDIndex / other supported alias
+#
+# The API/Redis symbol remains canonical "DXY", while the underlying
+# OHLC comes from that device's own broker-native DXY instrument.
+DEFAULT_SYMBOLS = [
+    "XAUUSD",
+    "EURUSD",
+    "USDJPY",
+    "GBPUSD",
+    "USDCAD",
+    "USDCHF",
+    "DXY",
+]
+
+DEFAULT_SYMBOLS_CSV = ",".join(DEFAULT_SYMBOLS)
 # Self-contained registry getter (prefers registry, falls back to env)
 
 
@@ -162,9 +276,21 @@ TF_SEC = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600, "H2": 7200, "H4": 14400}
 def push_mt5_positions_once(
     api_base: str, dev_id: str, token: str, mt5_account: str = "demo"
 ) -> bool:
-    global _LAST_MT5_POSITIONS
+    global _LAST_MT5_POSITIONS, _MT5_POS_STATE_LOADED
 
     try:
+        # P0: load previous broker positions from disk once after agent restart.
+        # This lets us detect trades that closed while the agent was stopped.
+        if not _MT5_POS_STATE_LOADED:
+            _LAST_MT5_POSITIONS = _load_last_mt5_positions(dev_id, mt5_account)
+            _MT5_POS_STATE_LOADED = True
+            log.warning(
+                "MT5_POS_STATE_LOADED dev=%s acct=%s previous_positions=%s",
+                dev_id,
+                mt5_account,
+                len(_LAST_MT5_POSITIONS or {}),
+            )
+
         positions = mt5_get_open_positions()
 
         current_positions = {}
@@ -187,30 +313,42 @@ def push_mt5_positions_once(
         for tk in disappeared:
             prev_pos = _LAST_MT5_POSITIONS.get(tk) or {}
             try:
-                deal = mt5_get_deal_summary(int(tk), 7)
-                if isinstance(deal, dict):
+                # Use larger window for startup recovery.
+                deal = mt5_get_deal_summary(int(tk), 14)
+
+                if isinstance(deal, dict) and deal.get("ok") is True:
                     deal["prev_position"] = prev_pos
+                    deal["recovery_source"] = "agent_position_state"
                     closed_deals.append(deal)
+
                     log.warning(
-                        "MT5_DEAL_CAPTURE ticket=%s ok=%s symbol=%s close_price=%s net_profit=%s error=%s prev_symbol=%s",
+                        "MT5_DEAL_CAPTURE ticket=%s ok=%s broker_reason=%s symbol=%s close_price=%s net_profit=%s prev_symbol=%s",
                         tk,
                         deal.get("ok"),
+                        deal.get("broker_reason"),
                         deal.get("symbol"),
                         deal.get("close_price"),
                         deal.get("net_profit"),
-                        deal.get("error"),
                         prev_pos.get("symbol"),
                     )
+                else:
+                    log.warning(
+                        "MT5_DEAL_CAPTURE_SKIP ticket=%s ok=%s error=%s prev_symbol=%s",
+                        tk,
+                        deal.get("ok") if isinstance(deal, dict) else None,
+                        deal.get("error") if isinstance(deal, dict) else "bad_deal_payload",
+                        prev_pos.get("symbol"),
+                    )
+
             except Exception as e:
                 log.warning("MT5_DEAL_CAPTURE_EXC ticket=%s err=%s", tk, e)
 
-        _LAST_MT5_POSITIONS = dict(current_positions)
-
         log.warning(
-            "MT5_POS_PUSH_START dev=%s acct=%s positions=%s closed_deals=%s",
+            "MT5_POS_PUSH_START dev=%s acct=%s positions=%s disappeared=%s closed_deals=%s",
             dev_id,
             mt5_account,
             len(positions or []),
+            len(disappeared or []),
             len(closed_deals or []),
         )
 
@@ -230,14 +368,22 @@ def push_mt5_positions_once(
             timeout=10,
         )
 
-        return bool(getattr(r, "status_code", 0) == 200)
+        ok = bool(getattr(r, "status_code", 0) == 200)
+
+        # Save current snapshot after successful API push.
+        # This becomes the restart recovery baseline.
+        if ok:
+            _LAST_MT5_POSITIONS = dict(current_positions)
+            _save_last_mt5_positions(dev_id, mt5_account, _LAST_MT5_POSITIONS)
+
+        return ok
+
     except Exception as e:
         try:
             log.warning("push_mt5_positions_once failed: %s", e)
         except Exception:
             pass
         return False
-
 
 def push_mt5_account_once(
     api_base: str, dev_id: str, token: str, mt5_account: str = "demo"
@@ -268,7 +414,9 @@ def push_mt5_account_once(
         )
 
         log.warning(
-            "MT5_ACCOUNT_PUSH dev=%s acct=%s balance=%s equity=%s margin=%s free=%s pnl=%s code=%s",
+            "MT5_ACCOUNT_PUSH "
+            "dev=%s acct=%s balance=%s equity=%s margin=%s free=%s pnl=%s "
+            "broker_tz=%s broker_offset=%s tz_source=%s code=%s",
             dev_id,
             mt5_account,
             account.get("balance"),
@@ -276,6 +424,9 @@ def push_mt5_account_once(
             account.get("margin"),
             account.get("free_margin"),
             account.get("floating_pnl"),
+            account.get("broker_timezone"),
+            account.get("broker_tz_offset_minutes"),
+            account.get("broker_timezone_source"),
             getattr(r, "status_code", 0),
         )
 
@@ -389,9 +540,33 @@ def _mt5_account_meta() -> dict:
         "is_demo": is_demo,
         "account_type": account_type,
     }
+    # Broker timezone metadata (already detected by Agent)
+    try:
+        tz = _broker_tz_meta() or {}
+    except Exception:
+        tz = {}
+    # Publish only trusted runtime-detected broker timezone.
+    if bool(tz.get("tz_valid")):
+        out["broker_timezone"] = str(
+            tz.get("tz_name") or ""
+        ).strip()
+
+        out["broker_tz_offset_minutes"] = int(
+            tz.get("tz_offset_min")
+        )
+
+        out["broker_timezone_source"] = str(
+            tz.get("tz_source") or ""
+        ).strip()
+    
 
     # remove None values to keep payload small/clean
-    return {k: v for k, v in out.items() if v is not None}
+    # Remove None and empty-string values.
+    return {
+        k: v
+        for k, v in out.items()
+        if v is not None and v != ""
+    }
 
 
 def aggregate_from_m1(m1_bars, tf_label, broker_offset_min=0, max_out=200):
@@ -726,7 +901,7 @@ def ensure_registry_defaults():
     """Create default Symbols/Timeframes/IncludeLatest in HKU\S-1-5-18\Software\XTL if absent."""
     path = r"S-1-5-18\Software\XTL"
     defaults = {
-        "Symbols": "XAUUSD,EURUSD,USDJPY,GBPUSD,USDCAD,USDCHF",
+        "Symbols": DEFAULT_SYMBOLS_CSV,
         "Timeframes": "M1,M5,M15,H1,H2,H4",
         "IncludeLatest": "0",
     }
@@ -745,7 +920,7 @@ def ensure_registry_defaults():
 
 # --- Install/Config versioning (bump on each installer build) ---
 CONFIG_VERSION = os.environ.get(
-    "XTL_CONFIG_VERSION", "2025-11-10"
+    "XTL_CONFIG_VERSION", "2026-07-17-dxy-h1-v1",
 )  # installer can override
 
 
@@ -788,9 +963,18 @@ def _reg_delete_value(root, subkey, name):
 
 def reset_registry_tf_symbols(
     include_latest="0",
-    symbols="XAUUSD,EURUSD,USDJPY,GBPUSD,USDCAD,USDCHF",
+    symbols=None,
     timeframes="M1,M15,H1,H4",
 ):
+    """
+    Hard reset the three user-tunable keys under
+    HKU\\S-1-5-18\\Software\\XTL.
+
+    Called on a new installation or when
+    XTL_RESET_REGISTRY=1.
+    """
+    if symbols is None:
+        symbols = DEFAULT_SYMBOLS_CSV
     """
     Hard reset the three user-tunable keys under HKU\S-1-5-18\Software\XTL.
     Called on 'new installation' or when XTL_RESET_REGISTRY=1.
@@ -856,7 +1040,7 @@ def _agent_pull_cfg():
 
     # Defaults if not present
     if not syms_raw:
-        syms_raw = "XAUUSD,EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD"  # 6 instruments
+        syms_raw = DEFAULT_SYMBOLS_CSV  # 6 trading instruments + DXY
     if not tfs_raw:
         tfs_raw = "M1,M15,H1,H2,H4"
 
@@ -1613,6 +1797,17 @@ def start_ohlc_worker(
     log.info(
         f"OHLC: starting worker symbols={symbols} tfs={tfs} bars={bars} every {period_sec}s"
     )
+
+    # Dedicated account heartbeat
+    th_acc = threading.Thread(
+        target=_mt5_account_heartbeat_loop,
+        args=(api_base, device_id, token, "demo", 5),
+        name="mt5-account-heartbeat",
+        daemon=True,
+    )
+    th_acc.start()
+
+    # Existing OHLC worker
     th = threading.Thread(
         target=_ohlc_loop,
         args=(api_base, device_id, token, symbols, tfs, bars, period_sec),
@@ -1620,8 +1815,8 @@ def start_ohlc_worker(
         daemon=True,
     )
     th.start()
-    return th
 
+    return th
 
 def start_mt5_cmd_worker(api_base, device_id, token, poll_sec=2):
     log.info("MT5 CMD: starting worker")
@@ -1634,7 +1829,15 @@ def start_mt5_cmd_worker(api_base, device_id, token, poll_sec=2):
     th.start()
     return th
 
+def _mt5_account_heartbeat_loop(api_base, device_id, token, mt5_account="demo", period_sec=5):
+    while True:
+        try:
+            push_mt5_account_once(api_base, device_id, token, mt5_account=mt5_account)
+        except Exception as e:
+            log.warning("MT5 account heartbeat failed: %s", e)
 
+        time.sleep(float(period_sec or 5))
+        
 def _ohlc_loop(api_base, device_id, token, symbols, tfs, bars, period_sec):
     next_run = time.time()
     while True:
@@ -1643,6 +1846,8 @@ def _ohlc_loop(api_base, device_id, token, symbols, tfs, bars, period_sec):
             log.info("OHLC: tick begin")
 
             _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars)
+
+            
 
             try:
                 push_mt5_positions_once(api_base, device_id, token, mt5_account="demo")
@@ -1834,7 +2039,7 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
 
     # fallbacks if everything is empty
     if not syms:
-        syms = ["XAUUSD", "EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDCHF"]
+        syms = list(DEFAULT_SYMBOLS)
 
     log.info(
         "worker plan: symbols=%s tfs=%s include_latest=%s", syms, tflist, include_latest
@@ -1854,7 +2059,12 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
             return 0
 
     for sym in syms:
-        for tf in tflist:
+        sym_u = str(sym or "").upper().strip()
+
+        # Phase-1 DXY analytics needs H1 only.
+        # All normal trading symbols keep their configured timeframes.
+        symbol_tfs = ["H1"] if sym_u == "DXY" else tflist
+        for tf in symbol_tfs:
             # --- fetch with guard (closed bars + optional forming tail) ---
             try:
                 tf_bars = 1500 if tf.upper() == "H1" else int(bars or 300)
@@ -1886,7 +2096,7 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
                 continue
 
             last_t_s = _to_sec(last_closed.get("t"))
-            key = (sym, tf)
+            key = (sym_u, tf.upper())
             if _last_sent_bar.get(key) == last_t_s:
                 log.debug(
                     "worker: up-to-date %s/%s (last_closed=%s)", sym, tf, last_t_s
@@ -1990,11 +2200,11 @@ def push_ohlc_once(
         syms = list(dict.fromkeys((cli_syms or []) + (reg_syms or [])))
 
         if not syms:
-            syms = ["XAUUSD", "EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDCHF"]
+            syms = list(DEFAULT_SYMBOLS)
 
     except Exception as e:
         log.warning("normalize inputs failed; using defaults (%s)", e)
-        syms = ["XAUUSD", "EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDCHF"]
+        syms = list(DEFAULT_SYMBOLS)
 
     # Timeframes: hard-wire our basket; do NOT depend on registry or CLI tfs
     tflist = FIXED_TFS[:]

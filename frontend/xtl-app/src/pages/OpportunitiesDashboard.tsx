@@ -297,6 +297,12 @@ type ApiRow = {
   decision?: string;                   // "BUY" | "SELL" | "ABSTAIN"
   opp_delta_pct?: number | null;
   opp_delta_thr?: number | null;
+  usd_bias_h4?: "up" | "down" | "flat";
+  usd_bias_h1?: "up" | "down" | "flat";
+  trade_vs_usd?: "aligned" | "against" | "n/a";
+  pair_trend_h4?: "up" | "down" | "flat";
+  pair_trend_h1?: "up" | "down" | "flat";
+  trade_vs_htf?: "aligned" | "against" | "n/a";
 
   // Strategy-side signal (optional; may be absent)
   signal?: string | null;             // e.g., "BUY", "SELL", "BUY@1234.5"
@@ -312,6 +318,7 @@ type ApiRow = {
   hit_ts_ms?: number | null;
   expired_ts_ms?: number | null;
   updated_ms?: number | null;
+ 
  
 
 };
@@ -372,6 +379,12 @@ type OppRow = {
   gateZoneLevel?: number | null;
   gateZoneTf?: string | null;
   gateZoneType?: string | null;
+  usd_bias_h4?: "up" | "down" | "flat";
+  usd_bias_h1?: "up" | "down" | "flat";
+  trade_vs_usd?: "aligned" | "against" | "n/a";
+  pair_trend_h4?: "up" | "down" | "flat";
+  pair_trend_h1?: "up" | "down" | "flat";
+  trade_vs_htf?: "aligned" | "against" | "n/a";
 
   updatedBrokerMs: number | null;
   device: string | null;
@@ -386,7 +399,21 @@ type OppRow = {
   h1Zone?: any;
   h4Zone?: any;
   resolvedDir?: string | null;
+  tradeState?: string | null;
+  tradeStatus?: string | null;
 
+  mt5Ticket?: number | null;
+
+  hasLocalOpenTrade?: boolean | null;
+  brokerPositionPresent?: boolean | null;
+  brokerDealPresent?: boolean | null;
+  brokerReconciliationPending?: boolean | null;
+
+  entryBlocked?: boolean | null;
+  entryBlockReason?: string | null;
+
+  activeTradeSide?: string | null;
+  tradeStateReason?: string | null;
 
   signalText?: string | null;
   signal?: string | null;
@@ -738,8 +765,60 @@ const slPriceOrig =
   (typeof (r as any).sl_price_orig === "number" ? (r as any).sl_price_orig : null) ??
   (typeof (r as any).stop_loss_1h === "number" ? (r as any).stop_loss_1h : null);
 
+const tradeState =
+  typeof (r as any).trade_state === "string"
+    ? String((r as any).trade_state).toUpperCase()
+    : null;
 
+const tradeStatus =
+  typeof (r as any).trade_status === "string"
+    ? String((r as any).trade_status)
+    : null;
 
+const mt5Ticket =
+  typeof (r as any).mt5_ticket === "number"
+    ? Number((r as any).mt5_ticket)
+    : null;
+
+const hasLocalOpenTrade =
+  typeof (r as any).has_local_open_trade === "boolean"
+    ? Boolean((r as any).has_local_open_trade)
+    : null;
+
+const brokerPositionPresent =
+  typeof (r as any).broker_position_present === "boolean"
+    ? Boolean((r as any).broker_position_present)
+    : null;
+
+const brokerDealPresent =
+  typeof (r as any).broker_deal_present === "boolean"
+    ? Boolean((r as any).broker_deal_present)
+    : null;
+
+const brokerReconciliationPending =
+  typeof (r as any).broker_reconciliation_pending === "boolean"
+    ? Boolean((r as any).broker_reconciliation_pending)
+    : null;
+
+const entryBlocked =
+  typeof (r as any).entry_blocked === "boolean"
+    ? Boolean((r as any).entry_blocked)
+    : null;
+
+const entryBlockReason =
+  typeof (r as any).entry_block_reason === "string"
+    ? String((r as any).entry_block_reason)
+    : null;
+
+const activeTradeSide =
+  typeof (r as any).active_trade_side === "string"
+    ? String((r as any).active_trade_side).toUpperCase()
+    : null;
+
+const tradeStateReason =
+  typeof (r as any).trade_state_reason === "string"
+    ? String((r as any).trade_state_reason)
+    : null;
 
   const probUp = r.prob_up ?? r.p_up ?? null;
   const oppScore = r.opp_score ?? null;
@@ -1124,6 +1203,17 @@ if (!srMajor && !srNearest && srLabel) srMajor = srLabel;
     h1Zone,
     h4Zone,
     resolvedDir: (r as any)?.entry_gate?.resolved_dir ?? (r as any)?.resolved_dir ?? null,
+    tradeState,
+    tradeStatus,
+    mt5Ticket,
+    hasLocalOpenTrade,
+    brokerPositionPresent,
+    brokerDealPresent,
+    brokerReconciliationPending,
+    entryBlocked,
+    entryBlockReason,
+    activeTradeSide,
+    tradeStateReason,
     h1BuyStatus: (r as any)?.h1BuyStatus ?? (r as any)?.entry_gate?.h1_buy_status ?? null,
     h4BuyStatus: (r as any)?.h4BuyStatus ?? (r as any)?.entry_gate?.h4_buy_status ?? null,
     h1SellStatus: (r as any)?.h1SellStatus ?? (r as any)?.entry_gate?.h1_sell_status ?? null,
@@ -1134,11 +1224,12 @@ if (!srMajor && !srNearest && srLabel) srMajor = srLabel;
     regime: (r as any)?.regime ?? null,
     bslSsl: (r as any)?.bsl_ssl ?? null,
     liqConfidence: (r as any)?.liq_confidence ?? null,
-
-
-
-
-
+    usd_bias_h4: (r as any)?.usd_bias_h4 ?? null,
+    usd_bias_h1: (r as any)?.usd_bias_h1 ?? null,
+    trade_vs_usd: (r as any)?.trade_vs_usd ?? null,
+    pair_trend_h4: (r as any)?.pair_trend_h4 ?? null,
+    pair_trend_h1: (r as any)?.pair_trend_h1 ?? null,
+    trade_vs_htf: (r as any)?.trade_vs_htf ?? null,
   };
 }
 
@@ -1197,10 +1288,17 @@ type ApiResponse = {
   tf: string;
   rows: ApiRow[];
   history?: ApiHistoryRow[];
+  usd_strength?: {
+    usd_bias_h4: "up" | "down" | "flat";
+    usd_bias_h1: "up" | "down" | "flat";
+    usd_strength_h4: number;
+    usd_strength_h1: number;
+  } | null;
 };
 
 function useOpportunities() {
   const [rows, setRows] = React.useState<OppRow[]>([]);
+  const [usdStrength, setUsdStrength] = React.useState<ApiResponse["usd_strength"]>(null);
   
   const [history, setHistory] = React.useState<HistoryRow[]>([]);
   const [lastAt, setLastAt] = React.useState<number | null>(null);
@@ -1239,6 +1337,7 @@ function useOpportunities() {
           (js as any).reason || "Backend reported error in /trend/opportunities"
         );
       }
+      setUsdStrength(js.usd_strength ?? null);
 
       const mappedRows =
         (js.rows || [])
@@ -1269,7 +1368,19 @@ function useOpportunities() {
       // 1) Update / insert frozen snapshots from freshly mapped rows
       for (const r of mappedRows) {
         // If backend says it's already done, don't keep it in live.
-        if (r.status && r.status !== "active") {
+        const keepOpenTradeLifecycleRow =
+          r.hasLocalOpenTrade === true &&
+          (
+            r.tradeState === "TRADE_ACTIVE" ||
+            r.tradeState === "BROKER_RECON_PENDING" ||
+            r.tradeState === "BROKER_CLOSE_PENDING"
+          );
+
+        if (
+          r.status &&
+          r.status !== "active" &&
+          !keepOpenTradeLifecycleRow
+        ) {
           frozenRef.current.delete(r.symbol);
           continue;
         }
@@ -1367,7 +1478,7 @@ function useOpportunities() {
     return () => window.clearInterval(id);
   }, []);
 
-  return { rows, history, lastAt, error, refetch: fetchOnce };
+  return { rows, history, lastAt, error, refetch: fetchOnce, usdStrength };
 }
 
 /* --------------------------
@@ -1413,9 +1524,13 @@ const Pill: React.FC<{
  * -------------------------- */
 
 function OpportunitiesDashboard() {
-  const { rows, history, lastAt, error, refetch } = useOpportunities();
+  const { rows, history, lastAt, error, refetch, usdStrength } = useOpportunities();
   const { prices: livePrices, updatedAt: livePricesUpdatedAt } = useLivePrices(30_000);
   const lastUpdatedLabel = lastAt ? fmtTime(lastAt) : "";
+  const biasArrow = (b?: string | null) =>
+    b === "up" ? "↑" : b === "down" ? "↓" : "→";
+  const usdColor = (b?: string | null) =>
+    b === "up" ? "text-emerald-400" : b === "down" ? "text-rose-400" : "text-slate-400";
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5 px-3 pb-10 pt-4">
@@ -1454,6 +1569,17 @@ function OpportunitiesDashboard() {
               Refresh
             </button>
           </div>
+          {usdStrength && (
+            <div className="mt-1 flex items-center gap-2 text-[11px]">
+              <span className="uppercase tracking-wide text-slate-500">USD Strength</span>
+              <span className={usdColor(usdStrength.usd_bias_h4)}>
+                H4 {biasArrow(usdStrength.usd_bias_h4)}
+              </span>
+              <span className={usdColor(usdStrength.usd_bias_h1)}>
+                H1 {biasArrow(usdStrength.usd_bias_h1)}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1622,6 +1748,34 @@ function OpportunitiesDashboard() {
                           <span className="inline-flex w-fit items-center rounded-full border border-slate-700/70 bg-slate-900/70 px-2 py-0.5 text-[10px] font-semibold text-slate-200">
                             {r.signalText || "WATCHING"}
                           </span>
+                          {r.trade_vs_usd && r.trade_vs_usd !== "n/a" && (
+                            <span
+                              className={
+                                r.trade_vs_usd === "aligned"
+                                  ? "inline-flex w-fit items-center rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200"
+                                  : "inline-flex w-fit items-center rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-200"
+                              }
+                            >
+                              {r.trade_vs_usd === "aligned" ? "✓ USD" : "⚠ USD"}
+                              {r.usd_bias_h4 ? ` ${r.usd_bias_h4 === "up" ? "↑" : r.usd_bias_h4 === "down" ? "↓" : "→"}` : ""}
+                            </span>
+                          )}
+                          {(r.pair_trend_h4 || r.pair_trend_h1) && (
+                            <span className="inline-flex w-fit items-center rounded-full border border-slate-700/70 bg-slate-900/50 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
+                              TREND H4{biasArrow(r.pair_trend_h4)} H1{biasArrow(r.pair_trend_h1)}
+                            </span>
+                          )}
+                          {r.trade_vs_htf && r.trade_vs_htf !== "n/a" && (
+                            <span
+                              className={
+                                r.trade_vs_htf === "aligned"
+                                  ? "inline-flex w-fit items-center rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200"
+                                  : "inline-flex w-fit items-center rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-200"
+                              }
+                            >
+                              {r.trade_vs_htf === "aligned" ? "✓ TREND" : "⚠ TREND"}
+                            </span>
+                          )}
 
                           {statusText !== "ACTIVE" && (
                             <span
@@ -1679,7 +1833,48 @@ function OpportunitiesDashboard() {
                         </div>
                       </td>
                       <td className="px-3 py-2 text-xs text-slate-200 whitespace-nowrap">
-                          {r.gateReason || "WATCHING"}
+                        <div className="flex flex-col gap-1">
+                          {r.tradeState === "TRADE_ACTIVE" ? (
+                            <>
+                              <span className="inline-flex w-fit rounded-full border border-emerald-400/60 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200">
+                                TRADE ACTIVE
+                              </span>
+
+                              <span className="text-[10px] text-slate-400">
+                                {r.activeTradeSide || ""}
+                                {r.mt5Ticket ? ` · Ticket ${r.mt5Ticket}` : ""}
+                              </span>
+                            </>
+                          ) : r.tradeState === "BROKER_RECON_PENDING" ? (
+                            <>
+                              <span className="inline-flex w-fit rounded-full border border-amber-400/60 bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-200">
+                                BROKER RECON PENDING
+                              </span>
+
+                              <span className="text-[10px] text-amber-300/80">
+                                {r.mt5Ticket ? `Ticket ${r.mt5Ticket}` : "Broker deal missing"}
+                              </span>
+
+                              <span className="text-[10px] text-slate-500">
+                                {r.entryBlockReason || "New entry blocked"}
+                              </span>
+                            </>
+                          ) : r.tradeState === "BROKER_CLOSE_PENDING" ? (
+                            <>
+                              <span className="inline-flex w-fit rounded-full border border-sky-400/60 bg-sky-500/15 px-2 py-0.5 text-[10px] font-semibold text-sky-200">
+                                BROKER CLOSE PENDING
+                              </span>
+
+                              <span className="text-[10px] text-slate-400">
+                                {r.mt5Ticket ? `Ticket ${r.mt5Ticket}` : "Waiting reconciliation"}
+                              </span>
+                            </>
+                           ) : (
+                             <span>
+                               {r.gateReason || "WATCHING"}
+                             </span>
+                           )}
+                        </div>
                       </td>
 
                       <td className="hidden md:table-cell px-3 py-2">

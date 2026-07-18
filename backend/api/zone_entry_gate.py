@@ -666,9 +666,20 @@ def _pick_display_zones_from_sr(sr_all: dict, price: float, atr: float, tf_tag: 
 
     return out
 
-def _watch_key(sym: str, direction: str, tf_tag: str) -> str:
-    return f"xtl:zone:watch:{(sym or '').upper().strip()}:{(direction or '').upper().strip()}:{(tf_tag or 'H1').upper().strip()}"
+from api.tenant_keys import zone_watch_key
 
+def _watch_key(
+    uid: str,
+    sym: str,
+    direction: str,
+    tf_tag: str = "H1",
+) -> str:
+    return zone_watch_key(
+        uid,
+        sym,
+        direction,
+        tf_tag,
+    )
 def _zone_cooldown_key(sym: str, direction: str, tf_tag: str) -> str:
     return f"xtl:zone:cooldown:{(sym or '').upper().strip()}:{(direction or '').upper().strip()}:{(tf_tag or 'H1').upper().strip()}"
 
@@ -751,10 +762,11 @@ def _atr14_from_bars(bars: list) -> float | None:
 def zone_reversal_gate(
     *,
     R,
+    uid: str,
     sym: str,
     direction: str,
     row_h1: dict,
-    sr: dict,
+    sr: dict | None,
     now_ms: int,
     tf_tag: str = "H1",
     pinned_device: str | None = None,
@@ -775,6 +787,20 @@ def zone_reversal_gate(
     sym_u = (sym or "").upper().strip()
     dir_u = (direction or "").upper().strip()
     tfu = (tf_tag or "H1").upper()
+    uid_u = str(uid or "").strip()
+
+    if not uid_u:
+        return False, {
+            "blocked": True,
+            "stage": "ZONE_GATE",
+            "reason": "UID_REQUIRED_FOR_ZONE_GATE",
+            "tf": tfu,
+            "rev_ok": False,
+            "zone": None,
+            "planned_zone": None,
+            "zone_used": None,
+            "rev_state": None,
+        }
 
     gate: Dict[str, Any] = {"blocked": True, "reason": "unknown", "tf": tfu}
     now_ms_pick = int(now_ms)
@@ -918,10 +944,15 @@ def zone_reversal_gate(
         # can make gate pick one candle behind.
         # ------------------------------------------------------------
         try:
-            _snap_cutoff_ms = int(snap_last_closed or 0)
+            _snap_cutoff_ms = _to_ms_any(
+                snap_last_closed or 0
+            )
         except Exception:
             _snap_cutoff_ms = 0
 
+        
+
+        
         complete_bars = [
             b for b in (bars or [])
             if isinstance(b, dict)
@@ -993,10 +1024,33 @@ def zone_reversal_gate(
     # 0C) compute closed_ms for the selected closed bar (needed for watch started_ms)
     closed_ms = 0
     try:
-        closed_ms = _to_ms_any(c.get("t_close_ms") or c.get("tCloseMs") or c.get("t_close"))
-        if not closed_ms:
-            t_open_ms = _to_ms_any(c.get("t_open_ms") or c.get("ts_ms") or c.get("t"))
-            closed_ms = int(t_open_ms + tf_ms) if t_open_ms else 0
+        closed_ms = _to_ms_any(
+            c.get("t_close_ms")
+            or c.get("tCloseMs")
+            or c.get("t_close")
+        )
+
+        t_open_ms = _to_ms_any(
+            c.get("t_open_ms")
+            or c.get("tOpenMs")
+            or c.get("open_time_ms")
+            or c.get("ts_ms")
+            or c.get("t")
+            or c.get("time")
+            or c.get("ts")
+        )
+
+        # Some snapshots incorrectly set t_close_ms equal to t_open_ms.
+        # A completed H1 candle close must be open time + tf_ms.
+        if (
+            t_open_ms
+            and (
+                not closed_ms
+                or int(closed_ms) <= int(t_open_ms)
+            )
+        ):
+            closed_ms = int(t_open_ms + tf_ms)
+
     except Exception:
         closed_ms = 0
 
@@ -1332,7 +1386,12 @@ def zone_reversal_gate(
 
     def _load_watch_for_dir(d: str):
         try:
-            k = _watch_key(sym_u, d, tfu)
+            k = _watch_key(
+                uid_u,
+                sym_u,
+                d,
+                tfu,
+            )
             raw = R.get(k)
             if not raw:
                 return None, k
@@ -1341,7 +1400,7 @@ def zone_reversal_gate(
             obj = json.loads(raw) if isinstance(raw, str) else raw
             return (obj if isinstance(obj, dict) else None), k
         except Exception:
-            return None, _watch_key(sym_u, d, tfu)
+            return None, _watch_key(uid_u,sym_u, d, tfu)
 
     # Prefer active frozen watch over newly resolved direction
     for d0 in ("BUY", "SELL"):
@@ -1359,7 +1418,7 @@ def zone_reversal_gate(
 
     # If no frozen watch exists, use newly resolved direction
     if watch is None:
-        wkey = _watch_key(sym_u, resolved_dir, tfu)
+        wkey = _watch_key(uid_u,sym_u, resolved_dir, tfu)
         try:
             raw = R.get(wkey)
             if raw:
@@ -1372,44 +1431,87 @@ def zone_reversal_gate(
         if isinstance(watch, dict) and isinstance(watch.get("zone_used"), dict):
             zone_used = watch.get("zone_used")
     # ------------------------------------------------------------
-    # Broker-truth stale TRADE_ACTIVE cleanup
-    # If watch says TRADE_ACTIVE but broker snapshot has no active
-    # XTL position for this symbol, clear stale watch so next zone
-    # can form after TP/SL/manual close.
+    # ------------------------------------------------------------
+    # Preserve TRADE_ACTIVE until executor completes broker-close
+    # reconciliation.
+    #
+    # A missing broker position does NOT mean the trade lifecycle
+    # is complete. The position may have just closed at TP/SL/manual
+    # exit, while the executor is still waiting for or applying the
+    # MT5 deal record.
+    #
+    # Ownership:
+    #   zone_entry_gate.py -> display/preserve active state only
+    #   oppt_executor.py   -> close ledger, release risk, set cooldown,
+    #                        then clear/reset the watch
     # ------------------------------------------------------------
     try:
         if isinstance(watch, dict):
-            _watch_state = str(watch.get("state") or "").upper().strip()
-            _watch_trade_state = str(watch.get("trade_state") or "").upper().strip()
+            _watch_state = str(
+                watch.get("state") or ""
+            ).upper().strip()
 
-            if _watch_state == "TRADE_ACTIVE" or _watch_trade_state == "TRADE_ACTIVE":
+            _watch_trade_state = str(
+                watch.get("trade_state") or ""
+            ).upper().strip()
+
+            if (
+                _watch_state == "TRADE_ACTIVE"
+                or _watch_trade_state == "TRADE_ACTIVE"
+            ):
                 _broker_active = False
 
                 for _pk in R.scan_iter("xtl:mt5:pos:*:demo"):
                     _rawp = R.get(_pk)
+
                     try:
-                        if isinstance(_rawp, (bytes, bytearray)):
-                            _rawp = _rawp.decode("utf-8", "ignore")
-                        _arrp = json.loads(_rawp) if _rawp else []
+                        if isinstance(
+                            _rawp,
+                            (bytes, bytearray),
+                        ):
+                            _rawp = _rawp.decode(
+                                "utf-8",
+                                "ignore",
+                            )
+
+                        _arrp = (
+                            json.loads(_rawp)
+                            if _rawp
+                            else []
+                        )
                     except Exception:
                         _arrp = []
+
                     if not isinstance(_arrp, list):
                         continue
 
                     for _bp in _arrp:
                         if not isinstance(_bp, dict):
                             continue
-                        if str(_bp.get("symbol") or "").upper().strip() != sym_u:
+
+                        if (
+                            str(
+                                _bp.get("symbol") or ""
+                            ).upper().strip()
+                            != sym_u
+                        ):
                             continue
 
                         try:
-                            _magic = int(_bp.get("magic") or 0)
+                            _magic = int(
+                                _bp.get("magic") or 0
+                            )
                         except Exception:
                             _magic = 0
 
-                        _comment = str(_bp.get("comment") or "").upper().strip()
+                        _comment = str(
+                            _bp.get("comment") or ""
+                        ).upper().strip()
 
-                        if _magic == 20251227 or _comment.startswith("XTL"):
+                        if (
+                            _magic == 20251227
+                            or _comment.startswith("XTL")
+                        ):
                             _broker_active = True
                             break
 
@@ -1417,24 +1519,64 @@ def zone_reversal_gate(
                         break
 
                 if not _broker_active:
+                    _ticket = 0
+
                     try:
-                        R.delete(wkey)
-                        R.delete(f"xtl:watch:break_state:{sym_u}:{str(resolved_dir).upper()}:H1")
+                        _ticket = int(
+                            watch.get("mt5_ticket")
+                            or watch.get("broker_ticket")
+                            or watch.get("position_ticket")
+                            or 0
+                        )
                     except Exception:
-                        pass
+                        _ticket = 0
+
+                    _deal_exists = False
+
+                    if _ticket > 0:
+                        try:
+                            _deal_raw = R.get(
+                                f"xtl:mt5:deal:{_ticket}"
+                            )
+
+                            if isinstance(
+                                _deal_raw,
+                                (bytes, bytearray),
+                            ):
+                                _deal_raw = _deal_raw.decode(
+                                    "utf-8",
+                                    "ignore",
+                                )
+
+                            _deal_obj = (
+                                json.loads(_deal_raw)
+                                if _deal_raw
+                                else {}
+                            )
+
+                            _deal_exists = bool(
+                                isinstance(_deal_obj, dict)
+                                and _deal_obj.get("ok")
+                            )
+                        except Exception:
+                            _deal_exists = False
 
                     log.warning(
-                        "[WATCHLIST] STALE_TRADE_ACTIVE_CLEARED sym=%s side=%s key=%s reason=NO_BROKER_POSITION",
+                        "[WATCHLIST] TRADE_ACTIVE_PRESERVED "
+                        "sym=%s side=%s key=%s ticket=%s "
+                        "broker_position=False deal_exists=%s "
+                        "reason=WAIT_EXECUTOR_RECON",
                         sym_u,
                         str(resolved_dir).upper(),
                         wkey,
+                        _ticket,
+                        _deal_exists,
                     )
-
-                    watch = None
 
     except Exception as _e:
         log.warning(
-            "[WATCHLIST] STALE_TRADE_ACTIVE_CLEAR_EXC sym=%s side=%s key=%s err=%r",
+            "[WATCHLIST] TRADE_ACTIVE_PRESERVE_EXC "
+            "sym=%s side=%s key=%s err=%r",
             sym_u,
             str(resolved_dir).upper(),
             wkey,
@@ -1520,7 +1662,10 @@ def zone_reversal_gate(
                         if _open_ms and _open_ms < 10_000_000_000:
                             _open_ms *= 1000
                         _close_ms = _to_ms_any(_b.get("t_close_ms") or _b.get("tCloseMs") or _b.get("t_close"))
-                        if not _close_ms and _open_ms:
+                        if (
+                            _open_ms > 0
+                            and _close_ms <= _open_ms
+                        ):
                             _close_ms = int(_open_ms + tf_ms)
                         latest_complete_close_ms = max(int(latest_complete_close_ms or 0), int(_close_ms or 0))
             except Exception:
@@ -2071,7 +2216,12 @@ def zone_reversal_gate(
                     try:
                         for _s in ("BUY", "SELL"):
                             for _t in ("H1", "H4"):
-                                _dk = f"xtl:zone:watch:{sym_u}:{_s}:{_t}"
+                                _dk = _watch_key(
+                                    uid_u,
+                                    sym_u,
+                                    _s,
+                                    _t,
+                                )
                                 _dj = _json_load(R.get(_dk)) or {}
                                 _dst = str(_dj.get("state") or "").upper().strip() if isinstance(_dj, dict) else ""
                                 if not _is_protected_watch_state(_dst):
@@ -2393,7 +2543,7 @@ def zone_reversal_gate(
                     if not bool(_b.get("complete", True)):
                         continue
 
-                    _b_ms = _to_ms_any(
+                    _b_open_ms = _to_ms_any(
                         _b.get("t_open_ms")
                         or _b.get("tOpenMs")
                         or _b.get("open_time_ms")
@@ -2402,46 +2552,118 @@ def zone_reversal_gate(
                         or _b.get("ts")
                         or 0
                     )
-                    _b_ms = int(_b_ms or 0)
-                    if _b_ms <= int(_old_rev_ms or 0):
+                    _b_open_ms = int(
+                        _b_open_ms or 0
+                    )
+
+                    _b_close_ms = _to_ms_any(
+                        _b.get("t_close_ms")
+                        or _b.get("tCloseMs")
+                        or _b.get("close_time_ms")
+                        or 0
+                    )
+                    _b_close_ms = int(
+                        _b_close_ms or 0
+                    )
+
+                    # H1 snapshots may omit t_close_ms or incorrectly copy
+                    # t_open_ms into it. Normalize both cases to open + tf_ms.
+                    if (
+                        _b_open_ms > 0
+                        and _b_close_ms <= _b_open_ms
+                    ):
+                        _b_close_ms = (
+                            _b_open_ms + int(tf_ms)
+                        )
+
+                    # rev_ok_ms is the previous RC CLOSE time.
+                    # Therefore compare candidate CLOSE time,
+                    # not candidate open time.
+                    if (
+                        _snap_cutoff_ms > 0
+                        and _b_close_ms > _snap_cutoff_ms
+                    ):
+                        continue
+                    if (
+                        _b_close_ms
+                        <= int(_old_rev_ms or 0)
+                    ):
                         continue
 
-                    _bh = float(_b.get("h") or _b.get("high") or 0.0)
-                    _bl = float(_b.get("l") or _b.get("low") or 0.0)
-                    _bc = float(_b.get("c") or _b.get("close") or 0.0)
+                    _bh = float(
+                        _b.get("h")
+                        or _b.get("high")
+                        or 0.0
+                    )
+                    _bl = float(
+                        _b.get("l")
+                        or _b.get("low")
+                        or 0.0
+                    )
+                    _bc = float(
+                        _b.get("c")
+                        or _b.get("close")
+                        or 0.0
+                    )
 
                     if _dir == "SELL":
-                        _valid = bool(_bh >= float(zl) and _bc < float(zl))
+                        _valid = bool(
+                            _bh >= float(zl)
+                            and _bc < float(zl)
+                        )
                     else:
-                        _valid = bool(_bl <= float(zh) and _bc > float(zh))
+                        _valid = bool(
+                            _bl <= float(zh)
+                            and _bc > float(zh)
+                        )
 
                     if _valid:
-                        _best_rc = {
-                            "ms": int(_b_ms),
+                        _candidate_rc = {
+                            "open_ms": int(_b_open_ms),
+                            "close_ms": int(_b_close_ms),
                             "hi": float(_bh),
                             "lo": float(_bl),
                             "cl": float(_bc),
                         }
 
+                        # Latest valid RC wins regardless of snapshot bar order.
+                        if (
+                            _best_rc is None
+                            or int(_candidate_rc["close_ms"])
+                            > int(_best_rc["close_ms"])
+                        ):
+                            _best_rc = _candidate_rc
             except Exception as _scan_exc:
                 if debug_gate:
                     gate["dbg_latest_rc_scan_exc"] = f"{type(_scan_exc).__name__}:{_scan_exc}"
 
             if _best_rc:
                 _newer_rc = True
-                _cur_closed_ms = int(_best_rc["ms"])
+
+                _cur_open_ms = int(
+                    _best_rc["open_ms"]
+                )
+                _cur_closed_ms = int(
+                    _best_rc["close_ms"]
+                )
+
                 hi = float(_best_rc["hi"])
                 lo = float(_best_rc["lo"])
                 cl = float(_best_rc["cl"])
                 log.warning(
-                    "[RC_PICK] sym=%s rc_ms=%s hi=%s lo=%s cl=%s snap_last_closed=%s dbg_h1_snap_key=%s",
+                    "[RC_PICK] sym=%s "
+                    "rc_open_ms=%s rc_close_ms=%s "
+                    "hi=%s lo=%s cl=%s "
+                    "snap_last_closed=%s "
+                    "dbg_h1_snap_key=%s",
                     sym_u,
+                    _cur_open_ms,
                     _cur_closed_ms,
                     hi,
                     lo,
                     cl,
                     snap_last_closed,
-                    k if 'k' in locals() else None,
+                    k if "k" in locals() else None,
                 )
             else:
                 _rc_reject_reason = {
@@ -2457,6 +2679,59 @@ def zone_reversal_gate(
                 gate["dbg_latest_rc_not_refreshed"] = _rc_reject_reason
             if _newer_rc:
                 _prev_state_for_rc_refresh = str(watch.get("state") or "").upper()
+                # ---------------------------------------------------------
+                # RC refresh latency instrumentation
+                # ---------------------------------------------------------
+                try:
+                    # ---------------------------------------------------------
+                    # RC refresh timing instrumentation
+                    #
+                    # Measure only server receive -> gate refresh latency.
+                    # Do not subtract broker candle timestamps from server UTC.
+                    # ---------------------------------------------------------
+                    _rc_refresh_server_ms = int(time.time() * 1000)
+
+                    try:
+                        _snap_server_received_ms = int(
+                            (snap or {}).get("server_received_ms")
+                            or (snap or {}).get("serverNow")
+                            or 0
+                        )
+                    except Exception:
+                        _snap_server_received_ms = 0
+
+                    if _snap_server_received_ms > 0:
+                        _refresh_latency_ms = max(
+                            0,
+                            int(_rc_refresh_server_ms)
+                            - int(_snap_server_received_ms),
+                        )
+                    else:
+                        _refresh_latency_ms = None
+
+                    log.warning(
+                        "[WATCHLIST] RC_REFRESH "
+                        "sym=%s side=%s "
+                        "old_rev_ok_ms=%s "
+                        "new_rev_ok_ms=%s "
+                        "rc_open_ms=%s "
+                        "broker_last_closed_ms=%s "
+                        "snapshot_received_ms=%s "
+                        "refresh_server_ms=%s "
+                        "latency_ms=%s",
+                        sym_u,
+                        _dir,
+                        int(_old_rev_ms),
+                        int(_cur_closed_ms),
+                        int(_cur_open_ms),
+                        int(snap_last_closed or 0),
+                        int(_snap_server_received_ms or 0),
+                        int(_rc_refresh_server_ms),
+                        _refresh_latency_ms,
+                    )
+
+                except Exception:
+                    pass
                 watch["state"] = _prev_state_for_rc_refresh if _prev_state_for_rc_refresh.startswith("ENTRY_BLOCKED") else "REV_OK"
                 watch["rev_ok"] = True
                 watch["rev_ok_ms"] = int(_cur_closed_ms)
@@ -2468,15 +2743,38 @@ def zone_reversal_gate(
                 watch["rev_ok_bar_hi"] = float(hi)
                 watch["rev_ok_bar_lo"] = float(lo)
                 watch["rev_ok_bar_close"] = float(cl)
-
+                watch["rc_high"] = float(hi)
+                watch["rc_low"] = float(lo)
+                watch["rc_close"] = float(cl)
                 # Full REV_OK snapshot for audit/UI/executor consistency
                 _dir_for_trigger = str(watch.get("direction") or resolved_dir).upper()
-                watch["rc_open_ms"] = int(_cur_closed_ms)
-                watch["rc_close_ms"] = int(_cur_closed_ms)
+                watch["rc_open_ms"] = int(
+                    _cur_open_ms
+                )
+                watch["rc_close_ms"] = int(
+                    _cur_closed_ms
+                )
                 watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
                 watch["frozen_at_ms"] = int(now_ms_pick)
                 watch["last_price"] = float((live_px if "live_px" in locals() else 0) or cl)
                 watch["updated_at_ms"] = int(now_ms_pick)
+                watch["dbg_latest_rc_refreshed"] = int(_cur_open_ms)
+                watch["dbg_rc_refresh_server_ms"] = int(
+                    _rc_refresh_server_ms
+                )
+                watch["dbg_rc_snapshot_received_ms"] = int(
+                    _snap_server_received_ms or 0
+                )
+                watch["dbg_rc_refresh_latency_ms"] = (
+                    int(_refresh_latency_ms)
+                    if _refresh_latency_ms is not None
+                    else None
+                )
+                watch["dbg_rc_refresh_latency_basis"] = (
+                    "SERVER_RECEIVE_TIME"
+                    if _snap_server_received_ms > 0
+                    else "UNAVAILABLE"
+                )
 
                 _refresh_set_ok = False  # set by final persist after RC cleanup below
 
@@ -2695,7 +2993,12 @@ def zone_reversal_gate(
                 try:
                     for _s in ("BUY", "SELL"):
                         for _t in ("H1", "H4"):
-                            _wk_inv = f"xtl:zone:watch:{sym_u}:{_s}:{_t}"
+                            _wk_inv = _watch_key(
+                                uid_u,
+                                sym_u,
+                                _s,
+                                _t,
+                            )
                             # GUARD: if a live/confirmed trade is riding this watch,
                             # do NOT delete it — that orphans the open broker position
                             # and forces a source-stripping BROKER_REPAIR. The trade
@@ -3027,8 +3330,26 @@ def zone_reversal_gate(
             watch["rev_ok_bar_close"] = float(cl)
 
             _dir_for_trigger = str(watch.get("direction") or resolved_dir).upper()
-            watch["rc_open_ms"] = int(closed_ms)
-            watch["rc_close_ms"] = int(closed_ms)
+            _rc_open_ms = _to_ms_any(
+                c.get("t_open_ms")
+                or c.get("tOpenMs")
+                or c.get("open_time_ms")
+                or c.get("t")
+                or c.get("time")
+                or c.get("ts")
+                or 0
+            )
+
+            watch["rc_open_ms"] = int(
+                _rc_open_ms or 0
+            )
+            watch["rc_close_ms"] = int(
+                closed_ms
+            )
+
+            watch["rc_high"] = float(hi)
+            watch["rc_low"] = float(lo)
+            watch["rc_close"] = float(cl)
             watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
             watch["frozen_at_ms"] = int(now_ms_pick)
             watch["last_price"] = float((live_px if "live_px" in locals() else 0) or cl)
@@ -3082,7 +3403,14 @@ def zone_reversal_gate(
                     _clear_side = "SELL" if _active_side == "BUY" else "BUY"
 
                     try:
-                        R.delete(f"xtl:zone:watch:{sym_u}:{_clear_side}:H1")
+                        R.delete(
+                            _watch_key(
+                            uid_u,
+                            sym_u,
+                            _clear_side,
+                            "H1",
+                        )
+                    )
                         R.delete(f"xtl:watch:break_state:{sym_u}:{_clear_side}:H1")
                     except Exception:
                         pass
@@ -3263,7 +3591,12 @@ def zone_reversal_gate(
         try:
             for _s in ("BUY", "SELL"):
                 for _t in ("H1", "H4"):
-                    _wk_inv2 = f"xtl:zone:watch:{sym_u}:{_s}:{_t}"
+                    _wk_inv2 = _watch_key(
+                        uid_u,
+                        sym_u,
+                        _s,
+                        _t,
+                    ) 
                     # GUARD: never delete a watch with a live/confirmed trade.
                     try:
                         _wj2 = _json_load(R.get(_wk_inv2)) or {}

@@ -11,6 +11,7 @@ const apiUrl = (path: string) =>
   `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}`;
 
 type PropConfig = {
+  profile_id: string;
   enabled: boolean;
   firm: string;
   phase: string;
@@ -21,181 +22,470 @@ type PropConfig = {
   max_open_positions: number;
   account_name?: string;
   account_id?: string;
+  account_login?: string;
+  account_server?: string;
+  broker_company?: string;
+  account_type?: string;
+  is_demo?: boolean;
 };
 
-const accountProfiles = [
-  {
-    id: "fundingpips_25k_p1",
-    label: "FundingPips 25K Phase 1",
-    firm: "fundingpips",
-    phase: "phase_1_8",
-    size: 25000,
-    targetPct: 8,
-    dailyPct: 5,
-    maxLossPct: 10,
-  },
-  {
-    id: "ftmo_25k_challenge",
-    label: "FTMO 25K Challenge",
-    firm: "ftmo",
-    phase: "challenge",
-    size: 25000,
-    targetPct: 10,
-    dailyPct: 5,
-    maxLossPct: 10,
-  },
-  {
-    id: "ftmo_100k_challenge",
-    label: "FTMO 100K Challenge",
-    firm: "ftmo",
-    phase: "challenge",
-    size: 100000,
-    targetPct: 10,
-    dailyPct: 5,
-    maxLossPct: 10,
-  },
-  {
-    id: "fundingpips_100k_funded",
-    label: "FundingPips 100K Funded",
-    firm: "fundingpips",
-    phase: "funded",
-    size: 100000,
-    targetPct: null,
-    dailyPct: 5,
-    maxLossPct: 10,
-  },
-];
+type ProfilesResponse = {
+  ok: boolean;
+  active_profile_id: string;
+  profiles: PropConfig[];
+  error?: string;
+};
 
-const money = (v: any) =>
-  typeof v === "number"
-    ? `$${v.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
-    : "NA";
+type StatusResponse = {
+  ok: boolean;
+  profile_id?: string;
+  config?: PropConfig;
+  rules?: Record<string, any>;
+  limits?: {
+    target_usd?: number | null;
+    daily_limit_usd?: number;
+    max_loss_limit_usd?: number;
+  };
+  risk?: Record<string, any>;
+  account?: Record<string, any>;
+  profile_device?: {
+    ok?: boolean;
+    device_id?: string;
+    reason?: string;
+  };
+  error?: string;
+};
 
-export default function Propfirm() {
-  const [status, setStatus] = useState<any>(null);
-  const [risk, setRisk] = useState<any>(null);
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState("");
+type RiskResponse = {
+  ok: boolean;
+  config?: PropConfig;
+  risk?: Record<string, any>;
+  error?: string;
+};
 
-  async function load() {
-    setErr("");
-    try {
-      const [s, r] = await Promise.all([
-        fetch(apiUrl("/trend/prop/status"), {
-          credentials: "include",
-          cache: "no-store",
-        }).then((x) => x.json()),
-        fetch(apiUrl("/trend/prop/risk"), {
-          credentials: "include",
-          cache: "no-store",
-        }).then((x) => x.json()),
-      ]);
-      setStatus(s);
-      setRisk(r);
-    } catch (e: any) {
-      setErr(String(e?.message || e));
-    }
+const money = (value: any) => {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return "NA";
   }
 
-  useEffect(() => {
-    load();
-  }, []);
+  return `$${numericValue.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  })}`;
+};
 
-  const cfg: PropConfig | undefined = status?.config;
-  const rs = risk?.risk;
-  const limits = status?.limits;
+const textOrNA = (value: any) => {
+  if (value === null || value === undefined || value === "") {
+    return "NA";
+  }
 
-  const selectedProfile = useMemo(() => {
-    if (!cfg) return accountProfiles[0];
-    return (
-      accountProfiles.find(
-        (a) =>
-          a.id === cfg.account_id ||
-          (a.firm === cfg.firm &&
-            a.phase === cfg.phase &&
-            Number(a.size) === Number(cfg.account_size))
-      ) || accountProfiles[0]
-    );
-  }, [cfg]);
+  return String(value);
+};
 
-  async function activateProfile(id: string) {
-    const p = accountProfiles.find((x) => x.id === id);
-    if (!p || !cfg) return;
+export default function Propfirm() {
+  const [profilesData, setProfilesData] =
+    useState<ProfilesResponse | null>(null);
 
-    const nextConfig = {
-      ...cfg,
-      enabled: true,
-      firm: p.firm,
-      phase: p.phase,
-      account_size: p.size,
-      account_name: p.label,
-      account_id: p.id,
-    };
+  const [status, setStatus] =
+    useState<StatusResponse | null>(null);
 
-    setSaving(true);
+  const [risk, setRisk] =
+    useState<RiskResponse | null>(null);
 
-    setStatus((prev: any) =>
-      prev
-        ? {
-            ...prev,
-            config: nextConfig,
-            limits: {
-              target_usd:
-                p.targetPct === null ? null : p.size * (p.targetPct / 100),
-              daily_limit_usd: p.size * (p.dailyPct / 100),
-              max_loss_limit_usd: p.size * (p.maxLossPct / 100),
-            },
-          }
-        : prev
-    );
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const [viewedProfileId, setViewedProfileId] =
+    useState("");
+
+  async function fetchJson<T>(
+    path: string,
+    init?: RequestInit
+  ): Promise<T> {
+    const response = await fetch(apiUrl(path), {
+      credentials: "include",
+      cache: "no-store",
+      ...init,
+    });
+
+    let data: any = null;
 
     try {
-      const res = await fetch(apiUrl("/trend/prop/config"), {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(nextConfig),
-      }).then((x) => x.json());
+      data = await response.json();
+    } catch {
+      data = null;
+    }
 
-      if (!res?.ok) throw new Error(res?.error || "Save failed");
-      await load();
-    } catch (e: any) {
-      setErr(String(e?.message || e));
+    if (!response.ok) {
+      throw new Error(
+        data?.detail ||
+          data?.error ||
+          `Request failed with status ${response.status}`
+      );
+    }
+
+    return data as T;
+  }
+
+  async function load(profileIdToView?: string) {
+    setErr("");
+
+    try {
+      const profilesRes = await fetchJson<ProfilesResponse>(
+        "/trend/prop/profiles"
+      );
+
+      if (!profilesRes?.ok) {
+        throw new Error(
+          profilesRes?.error || "Failed to load prop profiles"
+        );
+      }
+
+      const backendActiveProfileId = String(
+        profilesRes.active_profile_id || ""
+      ) .trim()
+        .toLowerCase();
+
+      if (!backendActiveProfileId) {
+        throw new Error(
+          "No active prop profile is configured"
+        );
+      }
+
+      const requestedViewProfileId = String(
+        profileIdToView ||
+        viewedProfileId ||
+        backendActiveProfileId
+      ) .trim()
+        .toLowerCase();
+
+      const profileExists = profilesRes.profiles?.some(
+        (profile) =>
+          profile.profile_id === requestedViewProfileId
+      );
+
+      const displayProfileId = profileExists
+        ? requestedViewProfileId
+        : backendActiveProfileId;
+
+      const encodedProfileId =
+        encodeURIComponent(displayProfileId);
+
+      const [statusRes, riskRes] = await Promise.all([
+        fetchJson<StatusResponse>(
+          `/trend/prop/status?profile_id=${encodedProfileId}`
+        ),
+        fetchJson<RiskResponse>(
+          `/trend/prop/risk?profile_id=${encodedProfileId}`
+        ),
+      ]);
+
+      if (!statusRes?.ok) {
+        throw new Error(
+          statusRes?.error ||
+          "Failed to load prop status"
+        );
+      }
+
+      if (!riskRes?.ok) {
+        throw new Error(
+          riskRes?.error ||
+          "Failed to load prop risk"
+        );
+      }
+
+      setViewedProfileId(displayProfileId);
+      setProfilesData(profilesRes);
+      setStatus(statusRes);
+      setRisk(riskRes);
+    } catch (error: any) {
+      setErr(String(error?.message || error));
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => {
+    void load();
+  }, []);
+  
+
+  async function activateProfile(profileId: string) {
+    const requestedProfileId = String(
+      profileId || ""
+    ).trim();
+
+    if (!requestedProfileId || saving) {
+      return;
+    }
+
+    // Always keep the clicked account selected for inspection.
+    setViewedProfileId(requestedProfileId);
+    // Prevent the previous account's status from appearing
+    // while the selected account is loading.
+    setStatus(null);
+    setRisk(null);
+    setSaving(true);
+    setErr("");
+
+    try {
+      const res = await fetchJson<{
+        ok: boolean;
+        active_profile_id?: string;
+        config?: PropConfig;
+        error?: string;
+      }>("/trend/prop/profile/active", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          profile_id: requestedProfileId,
+        }),
+      });
+
+      if (!res?.ok) {
+        throw new Error(
+          res?.error ||
+          "Failed to activate profile"
+        );
+      }
+
+      // Activation succeeded. Reload this profile as active.
+      await load(requestedProfileId);
+      setErr("");
+    } catch (error: any) {
+      // Do not restore the dropdown to the active account.
+      // Keep the failed profile selected and load its status.
+      setErr(String(error?.message || error));
+
+      try {
+        await load(requestedProfileId);
+      } catch {
+        // Preserve the activation error.
+      }
+
+      setErr(String(error?.message || error));
     } finally {
       setSaving(false);
     }
   }
+
+ 
+  async function enableAndActivateProfile(
+    profile: PropConfig
+  ) {
+    const profileId = String(
+      profile?.profile_id || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    if (!profileId || saving) {
+      return;
+    }
+
+    setSaving(true);
+    setErr("");
+    setViewedProfileId(profileId);
+
+    try {
+      const activeRes = await fetchJson<{
+        ok: boolean;
+        active_profile_id?: string;
+        config?: PropConfig;
+        error?: string;
+      }>("/trend/prop/profile/enable-and-activate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          profile_id: profileId,
+        }),
+      });
+
+      if (!activeRes?.ok) {
+        throw new Error(
+          activeRes?.error ||
+            "Failed to enable and activate profile"
+        );
+      }
+
+      await load(profileId);
+      setErr("");
+    } catch (error: any) {
+      const message = String(
+        error?.message || error
+      );
+
+      try {
+        await load(profileId);
+      } catch {
+        // Keep the original error.
+      }
+
+      setErr(message);
+    } finally {
+      setSaving(false);
+    }
+  }
+  
+  const activeProfileId = String(
+    profilesData?.active_profile_id || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const selectValue =
+    viewedProfileId || activeProfileId;
+
+  const selectedProfile = useMemo(() => {
+    return (
+      profilesData?.profiles?.find(
+        (profile) =>
+          profile.profile_id === selectValue
+      ) || null
+    );
+  }, [profilesData, selectValue]);
+
+  // Never use status belonging to the previously selected profile.
+  const statusMatchesSelection =
+    String(status?.profile_id || "")
+      .trim()
+      .toLowerCase() === selectValue;
+
+  const riskMatchesSelection =
+    String(risk?.config?.profile_id || "")
+      .trim()
+      .toLowerCase() === selectValue;
+
+  const cfg =
+    statusMatchesSelection
+      ? status?.config || selectedProfile || undefined
+      : selectedProfile || undefined;
+
+  const rs =
+    riskMatchesSelection
+      ? risk?.risk
+      : undefined;
+
+  const limits =
+    statusMatchesSelection
+      ? status?.limits
+      : undefined;
+  const activeTitle =
+    cfg?.account_name ||
+    selectedProfile?.account_name ||
+    selectedProfile?.profile_id ||
+    "No active profile";
+
+  const selectedIsActive =
+    Boolean(selectValue) &&
+    selectValue === activeProfileId;
+
+  const profileDevice =
+    statusMatchesSelection
+      ? status?.profile_device
+      : undefined;
+
+  const deviceConnected =
+    Boolean(profileDevice?.ok);
+
+  const profileEnabled =
+    Boolean(cfg?.enabled);
+
+  const executionReady =
+    selectedIsActive &&
+    profileEnabled &&
+    deviceConnected;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-6">
       <div className="max-w-7xl mx-auto space-y-6">
         <div className="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold">Prop Firm</h1>
+            <h1 className="text-2xl font-bold">
+              Prop Firm
+            </h1>
+
             <p className="text-sm text-slate-400">
-              One active execution account controls XTL lot size, SL/TP and risk guards.
+              One active execution account controls XTL
+              lot size, SL/TP and risk guards.
             </p>
           </div>
 
           <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 min-w-[280px]">
-            <label className="block text-xs text-slate-400 mb-1">
+            <label
+              htmlFor="active-prop-profile"
+              className="block text-xs text-slate-400 mb-1"
+            >
               Active Execution Account
             </label>
+
             <select
-              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"
-              value={selectedProfile.id}
-              onChange={(e) => activateProfile(e.target.value)}
+              id="active-prop-profile"
+              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm disabled:opacity-60"
+              value={selectValue}
+              onChange={(event) => {
+                const nextProfileId = String(
+                  event.target.value || ""
+                )
+                  .trim()
+                  .toLowerCase();
+
+                /*
+                 * Selecting a profile changes only the viewed account.
+                 * Activation is performed explicitly using the button.
+                 */
+                setViewedProfileId(nextProfileId);
+                setStatus(null);
+                setRisk(null);
+                setErr("");
+
+                void load(nextProfileId);
+              }}
+              disabled={
+                loading ||
+                saving ||
+                !profilesData?.profiles?.length
+              }
             >
-              {accountProfiles.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.label}
+              
+              {!profilesData?.profiles?.length ? (
+                <option value="">
+                  No profiles available
                 </option>
+              ) : null}
+
+              {profilesData?.profiles?.map((profile) => (
+                
+                <option
+                  key={profile.profile_id}
+                  value={profile.profile_id}
+                >
+                  {profile.account_name ||
+                      profile.profile_id}
+                  {" — "}
+                  {profile.account_login || "No login"}
+                  {" / "}
+                  {profile.account_server || "No server"}
+                  {profile.enabled ? "" : " [Disabled]"}
+                </option>
+                
               ))}
             </select>
-            <div className="text-xs text-emerald-300 mt-2">
-              Executor uses this selected account.
+
+            <div className="text-xs text-slate-400 mt-2">
+              Select an account to inspect it, then explicitly enable or activate it.
             </div>
-            {saving && <div className="text-xs text-amber-300 mt-1">Saving...</div>}
+
+            {saving ? (
+              <div className="text-xs text-amber-300 mt-1">
+                Changing active profile...
+              </div>
+            ) : null}
           </div>
         </div>
 
@@ -205,110 +495,667 @@ export default function Propfirm() {
           </div>
         ) : null}
 
-        <div className="rounded-2xl border border-emerald-800/60 bg-emerald-950/20 p-5">
-          <div className="text-xs text-emerald-300">ACTIVE FOR XTL EXECUTION</div>
-          <div className="text-2xl font-bold mt-1">
-            {cfg?.account_name || selectedProfile.label}
+        {loading ? (
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 text-sm text-slate-400">
+            Loading prop-firm account...
           </div>
-          <div className="text-sm text-slate-300 mt-1">
-            {cfg?.firm?.toUpperCase()} / {cfg?.phase} / {money(cfg?.account_size)}
-          </div>
-          <div className="text-xs text-slate-400 mt-2">
-            Every ENTRY_CAND is checked against this account before MT5 enqueue or Discord manual signal.
-          </div>
-        </div>
+        ) : null}
 
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <Card title="Target" value={money(limits?.target_usd)} sub="Profit target" />
-          <Card title="Daily Loss Limit" value={money(limits?.daily_limit_usd)} sub="Hard firm rule" />
-          <Card title="Max Loss Limit" value={money(limits?.max_loss_limit_usd)} sub="Overall drawdown" />
-          <Card title="Open Risk" value={money(rs?.open_risk_usd)} sub={`${rs?.open_positions?.length || 0} open positions`} />
-        </div>
+        {!loading ? (
+          <>
+            <div
+              className={[
+                "rounded-2xl border p-5",
+                executionReady
+                  ? "border-emerald-800/60 bg-emerald-950/20"
+                  : "border-amber-800/60 bg-amber-950/20",
+              ].join(" ")}
+            >
+              <div
+                className={[
+                  "text-xs",
+                  executionReady
+                    ? "text-emerald-300"
+                    : "text-amber-300",
+                ].join(" ")}
+              >
+                {executionReady
+                  ? "ACTIVE FOR XTL EXECUTION"
+                  : selectedIsActive
+                    ? "NOT READY FOR XTL EXECUTION"
+                    : "SELECTED ACCOUNT IS NOT ACTIVE"}
+              </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <Panel title="Active Rules">
-            <Row label="Firm" value={cfg?.firm?.toUpperCase()} />
-            <Row label="Phase" value={cfg?.phase} />
-            <Row label="Account Size" value={money(cfg?.account_size)} />
-            <Row label="Risk / Trade" value={`${cfg?.risk_pct ?? "NA"}%`} />
-            <Row label="Target RR" value={`${cfg?.target_rr ?? "NA"}R`} />
-            <Row label="Max Open Risk" value={`${cfg?.max_open_risk_pct ?? "NA"}%`} />
-            <Row label="Max Positions" value={cfg?.max_open_positions ?? "NA"} />
-          </Panel>
+              <div className="text-2xl font-bold mt-1">
+                {activeTitle}
+              </div>
 
-          <Panel title="Risk State">
-            <Row label="Day" value={rs?.day} />
-            <Row label="Daily Loss Used" value={money(rs?.daily_loss_used)} />
-            <Row label="Risk Reserved" value={money(rs?.daily_risk_reserved)} />
-            <Row label="Max Loss Used" value={money(rs?.max_loss_used)} />
-            <Row label="Wins Today" value={rs?.wins_today ?? "NA"} />
-            <Row label="Losses Today" value={rs?.losses_today ?? "NA"} />
-          </Panel>
-        </div>
+              <div className="text-sm text-slate-300 mt-1">
+                {textOrNA(
+                  cfg?.firm?.toUpperCase()
+                )}{" "}
+                / {textOrNA(cfg?.phase)} /{" "}
+                {money(cfg?.account_size)}
+              </div>
 
-        <Panel title="Open Positions">
-          {!rs?.open_positions?.length ? (
-            <div className="text-sm text-slate-400">No open prop risk reserved.</div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead className="text-slate-400">
-                  <tr>
-                    <th className="text-left py-2">Symbol</th>
-                    <th className="text-left py-2">Side</th>
-                    <th className="text-left py-2">Lots</th>
-                    <th className="text-left py-2">Risk</th>
-                    <th className="text-left py-2">Entry</th>
-                    <th className="text-left py-2">SL</th>
-                    <th className="text-left py-2">TP</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rs.open_positions.map((p: any, i: number) => (
-                    <tr key={i} className="border-t border-slate-800">
-                      <td className="py-2">{p.symbol}</td>
-                      <td>{p.side}</td>
-                      <td>{p.lots}</td>
-                      <td>{money(Number(p.risk_usd || 0))}</td>
-                      <td>{p.entry}</td>
-                      <td>{p.sl}</td>
-                      <td>{p.tp}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div className="text-xs text-slate-400 mt-2">
+                Every ENTRY_CAND is checked against
+                this account before MT5 enqueue or
+                Discord manual signal.
+              </div>
+              {!executionReady ? (
+                <div className="mt-3 rounded-lg border border-amber-800 bg-amber-950/30 p-3 text-sm text-amber-200">
+                  {!profileEnabled
+                    ? deviceConnected
+                      ? "This broker account is connected but its XTL execution profile is disabled. Click “Enable & Use This Account”."
+                      : "This profile is disabled and its configured broker account is not connected."
+                    : !deviceConnected
+                      ? profileDevice?.reason ||
+                        "The configured broker account is not connected."
+                      : !selectedIsActive
+                        ? "This profile is enabled and connected, but it is not the active execution account."
+                        : "This account is not ready for XTL execution."}
+                </div>
+              ) : null}
+
+              {selectedProfile ? (
+                <div className="mt-4 flex flex-wrap gap-3">
+                  {!profileEnabled ? (
+                    <button
+                      type="button"
+                      disabled={
+                        saving ||
+                        !deviceConnected
+                      }
+                      onClick={() => {
+                        void enableAndActivateProfile(
+                          selectedProfile
+                        );
+                      }}
+                      className={[
+                        "rounded-lg border px-4 py-2 text-sm font-medium",
+                        saving || !deviceConnected
+                          ? "cursor-not-allowed border-slate-700 bg-slate-900 text-slate-500"
+                          : "border-emerald-700 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50",
+                      ].join(" ")}
+                    >
+                      {saving
+                        ? "Enabling..."
+                        : "Enable & Use This Account"}
+                    </button>
+                  ) : !selectedIsActive ? (
+                    <button
+                      type="button"
+                      disabled={
+                        saving ||
+                        !deviceConnected
+                      }
+                      onClick={() => {
+                        void activateProfile(
+                          selectedProfile.profile_id
+                        );
+                      }}
+                      className={[
+                        "rounded-lg border px-4 py-2 text-sm font-medium",
+                        saving || !deviceConnected
+                          ? "cursor-not-allowed border-slate-700 bg-slate-900 text-slate-500"
+                          : "border-cyan-700 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/50",
+                      ].join(" ")}
+                    >
+                      {saving
+                        ? "Activating..."
+                        : "Use This Account"}
+                    </button>
+                  ) : (
+                    <div className="rounded-lg border border-emerald-700 bg-emerald-950/40 px-4 py-2 text-sm font-medium text-emerald-300">
+                      Active execution account
+                    </div>
+                  )}
+                </div>
+              ) : null} 
+              <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                <StatusBadge
+                  ok={Boolean(cfg?.enabled)}
+                  trueText="Profile enabled"
+                  falseText="Profile disabled"
+                />
+
+                <StatusBadge
+                  ok={deviceConnected}
+                  trueText="Broker account connected"
+                  falseText={
+                    profileDevice?.reason ||
+                    "Broker account not connected"
+                  }
+                />
+
+                <span className="rounded-full border border-slate-700 px-2 py-1 text-slate-300">
+                  Selected: {selectValue || "NA"}
+                </span>
+
+                <span className="rounded-full border border-slate-700 px-2 py-1 text-slate-300">
+                  Active: {activeProfileId || "NA"}
+                </span>
+
+                {profileDevice?.device_id ? (
+                  <span className="rounded-full border border-slate-700 px-2 py-1 text-slate-300">
+                    Device:{" "}
+                    {profileDevice.device_id}
+                  </span>
+                ) : null}
+              </div>
             </div>
-          )}
-        </Panel>
+
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <Card
+                title="Target"
+                value={money(limits?.target_usd)}
+                sub="Profit target"
+              />
+
+              <Card
+                title="Daily Loss Limit"
+                value={money(
+                  limits?.daily_limit_usd ??
+                    rs?.daily_loss_limit
+                )}
+                sub="Hard firm rule"
+              />
+
+              <Card
+                title="Max Loss Limit"
+                value={money(
+                  limits?.max_loss_limit_usd
+                )}
+                sub="Overall drawdown"
+              />
+
+              <Card
+                title="Open Risk"
+                value={money(rs?.open_risk_usd)}
+                sub={`${
+                  rs?.open_positions_count ??
+                  rs?.open_positions?.length ??
+                  0
+                } open positions`}
+              />
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <Panel title="Active Rules">
+                <Row
+                  label="Profile ID"
+                  value={selectValue}
+                />
+
+                <Row
+                  label="Firm"
+                  value={cfg?.firm?.toUpperCase()}
+                />
+
+                <Row
+                  label="Phase"
+                  value={cfg?.phase}
+                />
+
+                <Row
+                  label="Account Name"
+                  value={cfg?.account_name}
+                />
+
+                <Row
+                  label="Account Size"
+                  value={money(cfg?.account_size)}
+                />
+
+                <Row
+                  label="Risk / Trade"
+                  value={
+                    cfg?.risk_pct !== undefined
+                      ? `${cfg.risk_pct}%`
+                      : "NA"
+                  }
+                />
+
+                <Row
+                  label="Target RR"
+                  value={
+                    cfg?.target_rr !== undefined
+                      ? `${cfg.target_rr}R`
+                      : "NA"
+                  }
+                />
+
+                <Row
+                  label="Max Open Risk"
+                  value={
+                    cfg?.max_open_risk_pct !==
+                    undefined
+                      ? `${cfg.max_open_risk_pct}%`
+                      : "NA"
+                  }
+                />
+
+                <Row
+                  label="Max Positions"
+                  value={cfg?.max_open_positions}
+                />
+
+                <Row
+                  label="Enabled"
+                  value={cfg?.enabled ? "Yes" : "No"}
+                />
+              </Panel>
+
+              <Panel title="Risk State">
+                <Row
+                  label="Day"
+                  value={rs?.day}
+                />
+
+                <Row
+                  label="Daily Result"
+                  value={money(
+                    rs?.current_daily_result
+                  )}
+                />
+
+                <Row
+                  label="Daily Loss Used"
+                  value={money(
+                    rs?.daily_loss_used
+                  )}
+                />
+
+                <Row
+                  label="Daily Loss Remaining"
+                  value={money(
+                    rs?.daily_loss_remaining
+                  )}
+                />
+
+                <Row
+                  label="Risk Reserved"
+                  value={money(
+                    rs?.daily_risk_reserved
+                  )}
+                />
+
+                <Row
+                  label="Projected Loss at All SL"
+                  value={money(
+                    rs?.projected_daily_loss_if_all_sl
+                  )}
+                />
+
+                <Row
+                  label="Max Loss Used"
+                  value={money(rs?.max_loss_used)}
+                />
+
+                <Row
+                  label="Wins Today"
+                  value={rs?.wins_today}
+                />
+
+                <Row
+                  label="Losses Today"
+                  value={rs?.losses_today}
+                />
+
+                <Row
+                  label="Daily R"
+                  value={
+                    rs?.daily_r !== undefined
+                      ? `${Number(rs.daily_r).toFixed(
+                          2
+                        )}R`
+                      : "NA"
+                  }
+                />
+
+                <Row
+                  label="Trading Halted"
+                  value={
+                    rs?.trading_halted
+                      ? "Yes"
+                      : "No"
+                  }
+                />
+
+                {rs?.trading_halted ? (
+                  <Row
+                    label="Halt Reason"
+                    value={rs?.halt_reason}
+                  />
+                ) : null}
+              </Panel>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <Panel title="Broker Account">
+                <Row
+                  label="Login"
+                  value={
+                    status?.account?.login ??
+                    cfg?.account_login
+                  }
+                />
+
+                <Row
+                  label="Server"
+                  value={
+                    status?.account?.server ??
+                    cfg?.account_server
+                  }
+                />
+
+                <Row
+                  label="Company"
+                  value={
+                    status?.account?.company ??
+                    cfg?.broker_company
+                  }
+                />
+
+                <Row
+                  label="Balance"
+                  value={money(
+                    status?.account?.balance ??
+                    rs?.broker_balance
+                  )}
+                />
+
+                <Row
+                  label="Equity"
+                  value={money(
+                    status?.account?.equity ??
+                    rs?.broker_equity
+                  )}
+                />
+
+                <Row
+                  label="Free Margin"
+                  value={money(
+                    status?.account?.free_margin ??
+                    rs?.free_margin
+                  )}
+                />
+
+                <Row
+                  label="Floating P/L"
+                  value={money(
+                    status?.account?.floating_pnl ??
+                    rs?.floating_pnl
+                  )}
+                />
+
+                <Row
+                  label="Leverage"
+                  value={
+                    status?.account?.leverage
+                      ? `1:${status.account.leverage}`
+                      : "NA"
+                  }
+                />
+              </Panel>
+
+              <Panel title="Broker Snapshot">
+                <Row
+                  label="Connected"
+                  value={
+                    deviceConnected ? "Yes" : "No"
+                  }
+                />
+
+                <Row
+                  label="Device ID"
+                  value={profileDevice?.device_id}
+                />
+
+                <Row
+                  label="Resolution"
+                  value={profileDevice?.reason}
+                />
+
+                <Row
+                  label="Snapshot Valid"
+                  value={
+                    rs?.snapshot_valid
+                      ? "Yes"
+                      : "No"
+                  }
+                />
+
+                <Row
+                  label="Snapshot Fresh"
+                  value={
+                    rs?.snapshot_fresh
+                      ? "Yes"
+                      : "No"
+                  }
+                />
+
+                <Row
+                  label="Snapshot Age"
+                  value={
+                    rs?.snapshot_age_ms != null
+                      ? `${Math.round(Number(rs.snapshot_age_ms) / 1000)} sec`
+                      : "NA"
+                  }
+                />
+
+                <Row
+                  label="Drawdown"
+                  value={
+                    rs?.drawdown_pct !== undefined
+                      ? `${rs.drawdown_pct}%`
+                      : "NA"
+                  }
+                />
+
+                <Row
+                  label="Drawdown Band"
+                  value={rs?.drawdown_band}
+                />
+              </Panel>
+            </div>
+
+            <Panel title="Open Positions">
+              {!rs?.open_positions?.length ? (
+                <div className="text-sm text-slate-400">
+                  No open prop risk reserved.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead className="text-slate-400">
+                      <tr>
+                        <th className="text-left py-2">
+                          Symbol
+                        </th>
+                        <th className="text-left py-2">
+                          Side
+                        </th>
+                        <th className="text-left py-2">
+                          Lots
+                        </th>
+                        <th className="text-left py-2">
+                          Risk
+                        </th>
+                        <th className="text-left py-2">
+                          Entry
+                        </th>
+                        <th className="text-left py-2">
+                          SL
+                        </th>
+                        <th className="text-left py-2">
+                          TP
+                        </th>
+                        <th className="text-left py-2">
+                          Source
+                        </th>
+                      </tr>
+                    </thead>
+
+                    <tbody>
+                      {rs.open_positions.map(
+                        (position: any, index: number) => (
+                          <tr
+                            key={
+                              position.trade_id ||
+                              position.ticket ||
+                              `${position.symbol}-${index}`
+                            }
+                            className="border-t border-slate-800"
+                          >
+                            <td className="py-2">
+                              {textOrNA(
+                                position.symbol
+                              )}
+                            </td>
+
+                            <td>
+                              {textOrNA(
+                                position.side
+                              )}
+                            </td>
+
+                            <td>
+                              {textOrNA(
+                                position.lots ??
+                                  position.volume
+                              )}
+                            </td>
+
+                            <td>
+                              {money(
+                                position.risk_usd
+                              )}
+                            </td>
+
+                            <td>
+                              {textOrNA(
+                                position.entry ??
+                                  position.price_open
+                              )}
+                            </td>
+
+                            <td>
+                              {textOrNA(position.sl)}
+                            </td>
+
+                            <td>
+                              {textOrNA(position.tp)}
+                            </td>
+
+                            <td>
+                              {textOrNA(
+                                position.source
+                              )}
+                            </td>
+                          </tr>
+                        )
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </Panel>
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+  
+
+
+function StatusBadge({
+  ok,
+  trueText,
+  falseText,
+}: {
+  ok: boolean;
+  trueText: string;
+  falseText: string;
+}) {
+  return (
+    <span
+      className={[
+        "rounded-full border px-2 py-1",
+        ok
+          ? "border-emerald-700 text-emerald-300 bg-emerald-950/30"
+          : "border-amber-700 text-amber-300 bg-amber-950/30",
+      ].join(" ")}
+    >
+      {ok ? trueText : falseText}
+    </span>
+  );
+}
+
+function Card({
+  title,
+  value,
+  sub,
+}: {
+  title: string;
+  value: any;
+  sub: string;
+}) {
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+      <div className="text-xs text-slate-400">
+        {title}
+      </div>
+
+      <div className="text-2xl font-bold mt-1">
+        {value}
+      </div>
+
+      <div className="text-xs text-slate-500 mt-1">
+        {sub}
       </div>
     </div>
   );
 }
 
-function Card({ title, value, sub }: { title: string; value: any; sub: string }) {
-  return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
-      <div className="text-xs text-slate-400">{title}</div>
-      <div className="text-2xl font-bold mt-1">{value}</div>
-      <div className="text-xs text-slate-500 mt-1">{sub}</div>
-    </div>
-  );
-}
-
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+function Panel({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
   return (
     <section className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
-      <h2 className="text-lg font-semibold mb-4">{title}</h2>
-      <div className="space-y-2 text-sm">{children}</div>
+      <h2 className="text-lg font-semibold mb-4">
+        {title}
+      </h2>
+
+      <div className="space-y-2 text-sm">
+        {children}
+      </div>
     </section>
   );
 }
 
-function Row({ label, value }: { label: string; value: any }) {
+function Row({
+  label,
+  value,
+}: {
+  label: string;
+  value: any;
+}) {
   return (
     <div className="flex justify-between gap-4 border-b border-slate-800/60 pb-2">
-      <span className="text-slate-400">{label}</span>
-      <span className="font-medium text-right">{value ?? "NA"}</span>
+      <span className="text-slate-400">
+        {label}
+      </span>
+
+      <span className="font-medium text-right break-all">
+        {textOrNA(value)}
+      </span>
     </div>
   );
 }

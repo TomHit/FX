@@ -38,6 +38,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("xtl.news_adapter")
@@ -280,7 +281,15 @@ def _scrape_forexfactory(lookahead_hours: int = 48) -> List[dict]:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://www.forexfactory.com/",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Connection": "keep-alive",
         }
 
         resp = requests.get(
@@ -330,26 +339,29 @@ def _scrape_forexfactory(lookahead_hours: int = 48) -> List[dict]:
                 if not event_name:
                     continue
 
-                # Time — ForexFactory uses Eastern Time (UTC-5 conservative)
+                
+                # Time — ForexFactory publishes in US Eastern; convert to UTC
+                # with real DST handling (EST -5 / EDT -4) via zoneinfo.
                 time_cell = row.select_one("td.calendar__time")
                 time_text = time_cell.text.strip() if time_cell else ""
-                event_dt  = None
+                event_dt   = None
+                time_known = False
                 if time_text and ":" in time_text:
                     try:
                         t = datetime.strptime(time_text.lower(), "%I:%M%p")
-                        event_dt = (
-                            datetime.combine(current_date, t.time())
-                            .replace(tzinfo=timezone.utc)
-                            + timedelta(hours=5)
+                        _et = datetime.combine(current_date, t.time()).replace(
+                            tzinfo=ZoneInfo("America/New_York")
                         )
+                        event_dt   = _et.astimezone(timezone.utc)
+                        time_known = True
                     except Exception:
                         pass
 
+                # Timeless event: keep the date at UTC midnight, do NOT fabricate 13:30.
                 if event_dt is None:
                     event_dt = datetime.combine(
                         current_date, datetime.min.time(), tzinfo=timezone.utc
-                    ).replace(hour=13, minute=30)
-
+                    )
                 if event_dt < now_utc or event_dt > cutoff:
                     continue
 
@@ -393,8 +405,16 @@ def _scrape_investing(lookahead_hours: int = 48) -> List[dict]:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
             "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.investing.com",
             "Referer": "https://www.investing.com/economic-calendar/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Connection": "keep-alive",
         }
 
         now_utc = datetime.now(timezone.utc)
@@ -440,19 +460,23 @@ def _scrape_investing(lookahead_hours: int = 48) -> List[dict]:
                 time_cell = row.select_one("td.time")
                 time_text = time_cell.text.strip() if time_cell else ""
                 event_dt  = None
+                time_known = False
                 if time_text and ":" in time_text:
                     try:
+                        # Investing.com requested with timeZone=0 (UTC) — already UTC.
                         t = datetime.strptime(time_text, "%H:%M")
                         event_dt = now_utc.replace(
                             hour=t.hour, minute=t.minute,
                             second=0, microsecond=0
                         )
+                        time_known = True
                     except Exception:
                         pass
 
+                # Timeless event: keep the date, don't fabricate 13:30.
                 if event_dt is None:
                     event_dt = now_utc.replace(
-                        hour=13, minute=30, second=0, microsecond=0
+                        hour=0, minute=0, second=0, microsecond=0
                     )
 
                 if event_dt < now_utc or event_dt > cutoff:

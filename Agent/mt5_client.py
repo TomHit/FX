@@ -82,19 +82,69 @@ def mt5_get_open_positions() -> list[dict]:
             return []
 
         out = []
+        symbol_meta_cache: dict[str, dict] = {}
+
         for p in positions:
             try:
+                symbol = str(getattr(p, "symbol", "") or "").upper().strip()
+                if not symbol:
+                    continue
+
+                if symbol not in symbol_meta_cache:
+                    info = MT5.symbol_info(symbol)
+
+                    if info is not None:
+                        try:
+                            digits = int(getattr(info, "digits", 0) or 0)
+                        except Exception:
+                            digits = 0
+
+                        try:
+                            point = float(getattr(info, "point", 0.0) or 0.0)
+                        except Exception:
+                            point = 0.0
+
+                        try:
+                            trade_tick_size = float(
+                                getattr(info, "trade_tick_size", 0.0) or 0.0
+                            )
+                        except Exception:
+                            trade_tick_size = 0.0
+
+                        # Some brokers may not expose trade_tick_size.
+                        # point remains the valid broker precision fallback.
+                        if trade_tick_size <= 0:
+                            trade_tick_size = point
+
+                        symbol_meta_cache[symbol] = {
+                            "digits": digits,
+                            "point": point,
+                            "trade_tick_size": trade_tick_size,
+                        }
+                    else:
+                        symbol_meta_cache[symbol] = {
+                            "digits": None,
+                            "point": None,
+                            "trade_tick_size": None,
+                        }
+
+                symbol_meta = symbol_meta_cache[symbol]
+
+                position_type = int(getattr(p, "type", 0) or 0)
+
                 out.append(
                     {
                         "ticket": int(getattr(p, "ticket", 0) or 0),
-                        "symbol": str(getattr(p, "symbol", "") or "").upper(),
-                        "type": int(getattr(p, "type", 0) or 0),
-                        "side": (
-                            "BUY" if int(getattr(p, "type", 0) or 0) == 0 else "SELL"
-                        ),
+                        "symbol": symbol,
+                        "type": position_type,
+                        "side": "BUY" if position_type == 0 else "SELL",
                         "volume": float(getattr(p, "volume", 0.0) or 0.0),
-                        "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
-                        "price_current": float(getattr(p, "price_current", 0.0) or 0.0),
+                        "price_open": float(
+                            getattr(p, "price_open", 0.0) or 0.0
+                        ),
+                        "price_current": float(
+                            getattr(p, "price_current", 0.0) or 0.0
+                        ),
                         "profit": float(getattr(p, "profit", 0.0) or 0.0),
                         "sl": float(getattr(p, "sl", 0.0) or 0.0),
                         "tp": float(getattr(p, "tp", 0.0) or 0.0),
@@ -102,6 +152,13 @@ def mt5_get_open_positions() -> list[dict]:
                         "comment": str(getattr(p, "comment", "") or ""),
                         "time": int(getattr(p, "time", 0) or 0),
                         "time_msc": int(getattr(p, "time_msc", 0) or 0),
+
+                        # Broker-native symbol precision.
+                        "digits": symbol_meta.get("digits"),
+                        "point": symbol_meta.get("point"),
+                        "trade_tick_size": symbol_meta.get(
+                            "trade_tick_size"
+                        ),
                     }
                 )
             except Exception:
@@ -220,6 +277,9 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
                     "fee": float(getattr(d, "fee", 0.0) or 0.0),
                     "symbol": str(getattr(d, "symbol", "") or "").upper(),
                     "comment": str(getattr(d, "comment", "") or ""),
+                    "reason": int(getattr(d, "reason", -1)),
+                    "magic": int(getattr(d, "magic", 0) or 0),
+                    "external_id": str(getattr(d, "external_id", "") or ""),
                 }
                 all_rows.append(row)
 
@@ -260,10 +320,38 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
             close_time_ms = max(int(x.get("time_msc") or 0) for x in close_deals)
         if close_time_ms <= 0 and all_rows:
             close_time_ms = int(all_rows[-1].get("time_msc") or 0)
+            
+        close_deal = close_deals[-1] if close_deals else {}
+
+        close_reason_code = int(close_deal.get("reason", -1)) if close_deal else -1
+        close_comment = str(close_deal.get("comment") or "").lower()
+
+        broker_reason = "BROKER_CLOSED"
+
+        # Prefer broker comment because MT5 writes clear text like:
+        # [tp 1.33659] / [sl 1.42022]
+        if "tp" in close_comment or "take profit" in close_comment:
+            broker_reason = "TP"
+        elif "sl" in close_comment or "stop loss" in close_comment:
+            broker_reason = "SL"
+        elif "so" in close_comment or "stop out" in close_comment:
+            broker_reason = "STOP_OUT"
+        elif "manual" in close_comment:
+            broker_reason = "MANUAL"
+
+        # Fallback to MT5 reason code if comment is empty/non-standard.
+        # Observed in your stored deals: SL=4, TP=5.
+        elif close_reason_code == 5:
+            broker_reason = "TP"
+        elif close_reason_code == 4:
+            broker_reason = "SL"
 
         summary = {
             "ok": True,
             "position_id": pid,
+            "position_ticket": pid,
+            "broker_reason": broker_reason,
+            "close_reason_code": close_reason_code,
             "symbol": str(
                 open_deal.get("symbol")
                 or (all_rows[0].get("symbol") if all_rows else "")
@@ -279,16 +367,33 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
             "fee": round(float(fee or 0.0), 2),
             "net_profit": round(float(net_profit or 0.0), 2),
             "deal_count": len(all_rows),
+
             "entry_deal_ticket": int(open_deal.get("ticket") or 0),
+
             "exit_deal_ticket": (
                 int(close_deals[-1].get("ticket") or 0) if close_deals else 0
             ),
+
             "close_order_ticket": (
                 int(close_deals[-1].get("order") or 0) if close_deals else 0
             ),
+
+            # ----- New broker close metadata -----
+            "exit_deal_reason": close_reason_code,
+            "exit_comment": (
+                str(close_deal.get("comment") or "")
+                if close_deal else ""
+            ),
+            "exit_magic": (
+                int(close_deal.get("magic") or 0)
+                if close_deal else 0
+            ),
+            # -------------------------------------
+
             "comment": str(
                 close_deals[-1].get("comment") or open_deal.get("comment") or ""
             ),
+
             "raw_deals": all_rows,
             "created_at_ms": int(time.time() * 1000),
         }
@@ -300,6 +405,7 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
             "ok": False,
             "error": f"deal_summary_exc:{type(e).__name__}:{e}",
             "position_id": int(position_id or 0),
+            
         }
 
 
@@ -1071,43 +1177,243 @@ def _reg_read(name: str) -> str | None:
 
 # ---------- symbol resolution ----------
 # --- Helper: resolve actual broker symbol name (handles suffix variants) ---
+# Cache logical symbol -> broker-native symbol.
+# Resolution is stable for the lifetime of the connected MT5 session.
+_BROKER_SYMBOL_CACHE: dict[str, str] = {}
+
+
 def _resolve_broker_symbol(base: str) -> str:
     """
-    Prefer the exact RoboForex 'Gold vs US Dollar (spot)' symbol that matches the chart feed.
-    Fallback to visible exact match, then to first visible candidate.
+    Resolve a canonical XTL symbol to the actual broker-native MT5 symbol.
+
+    Normal instruments:
+      - prefer exact symbol
+      - otherwise support broker suffixes such as XAUUSD.a
+
+    Canonical DXY:
+      - resolve per broker/device
+      - examples: DXY.cash, DXY, USDX, USDIndex
+      - never borrow another device's feed
+      - return the actual symbol available in this MT5 terminal
+
+    The caller continues publishing under the canonical XTL symbol supplied
+    to mt5_fetch_rates(), while the bars come from the resolved broker symbol.
     """
+
+    logical = str(base or "").strip()
+    logical_u = logical.upper()
+
+    if not logical:
+        return logical
+
+    cached = _BROKER_SYMBOL_CACHE.get(logical_u)
+    if cached:
+        try:
+            if MT5.symbol_info(cached) is not None:
+                return cached
+        except Exception:
+            pass
+
+        _BROKER_SYMBOL_CACHE.pop(logical_u, None)
+
     try:
-        # 1) Exact visible match first
-        info = MT5.symbol_info(base)
-        if info and getattr(info, "visible", False):
-            return base
+        # -------------------------------------------------
+        # Special canonical DXY resolution.
+        # -------------------------------------------------
+        if logical_u == "DXY":
+            exact_candidates = [
+                "DXY.cash",   # FTMO confirmed
+                "DXY",
+                "USDX",
+                "USDIndex",
+                "USDINDEX",
+                
+            ]
 
-        # 2) Search all candidates that start with base
-        cands = MT5.symbols_get(f"{base}*") or []
-        if not cands:
-            return base
-
-        # 2a) Prefer RoboForex 'Gold vs US Dollar (spot)' description
-        for s in cands:
-            desc = (getattr(s, "description", "") or "").lower()
-            if "gold vs us dollar (spot)" in desc or "gold vs usd (spot)" in desc:
-                # ensure visible in Market Watch
+            for candidate in exact_candidates:
                 try:
-                    MT5.symbol_select(s.name, True)
+                    info = MT5.symbol_info(candidate)
+                except Exception:
+                    info = None
+
+                if info is None:
+                    continue
+
+                try:
+                    MT5.symbol_select(candidate, True)
                 except Exception:
                     pass
-                return s.name
 
-        # 2b) Prefer any visible candidate
-        for s in cands:
-            if getattr(s, "visible", False):
-                return s.name
+                _BROKER_SYMBOL_CACHE[logical_u] = candidate
 
-        # 2c) Fallback to the first candidate name
-        return cands[0].name
-    except Exception:
-        return base
+                _log(
+                    "[dxy_resolve] "
+                    f"logical=DXY broker_symbol={candidate} "
+                    f"description={getattr(info, 'description', '')!r}"
+                )
 
+                return candidate
+
+            # Broker suffix/prefix discovery.
+            discovered = []
+
+            for pattern in (
+                "DXY*",
+                "*DXY*",
+                "USDX*",
+                "*USDX*",
+                "USDIndex*",
+                "*USDIndex*",
+            ):
+                try:
+                    symbols = MT5.symbols_get(pattern) or []
+                except Exception:
+                    symbols = []
+
+                for item in symbols:
+                    name = str(
+                        getattr(item, "name", None)
+                        or getattr(item, "symbol", None)
+                        or ""
+                    ).strip()
+
+                    if name and name not in discovered:
+                        discovered.append(name)
+
+            # Last discovery fallback: inspect descriptions for Dollar Index.
+            if not discovered:
+                try:
+                    for item in MT5.symbols_get() or []:
+                        name = str(
+                            getattr(item, "name", None)
+                            or getattr(item, "symbol", None)
+                            or ""
+                        ).strip()
+
+                        description = str(
+                            getattr(item, "description", None)
+                            or ""
+                        ).lower()
+
+                        if (
+                            name
+                            and (
+                                "dollar index" in description
+                                or "us dollar index" in description
+                            )
+                        ):
+                            discovered.append(name)
+                except Exception:
+                    pass
+
+            for candidate in discovered:
+                try:
+                    if not MT5.symbol_select(candidate, True):
+                        continue
+                except Exception:
+                    continue
+
+                info = MT5.symbol_info(candidate)
+
+                _BROKER_SYMBOL_CACHE[logical_u] = candidate
+
+                _log(
+                    "[dxy_resolve] "
+                    f"logical=DXY broker_symbol={candidate} "
+                    f"description={getattr(info, 'description', '')!r}"
+                )
+
+                return candidate
+
+            _log(
+                "[dxy_resolve] logical=DXY result=NOT_FOUND"
+            )
+
+            # Returning DXY lets the normal select path fail safely.
+            return logical
+
+        # -------------------------------------------------
+        # Existing normal-symbol resolution.
+        # -------------------------------------------------
+        info = MT5.symbol_info(logical)
+
+        if info is not None:
+            try:
+                MT5.symbol_select(logical, True)
+            except Exception:
+                pass
+
+            _BROKER_SYMBOL_CACHE[logical_u] = logical
+            return logical
+
+        candidates = MT5.symbols_get(f"{logical}*") or []
+
+        if not candidates:
+            return logical
+
+        # Preserve the existing special preference for the spot-gold feed.
+        if logical_u == "XAUUSD":
+            for item in candidates:
+                description = str(
+                    getattr(item, "description", None)
+                    or ""
+                ).lower()
+
+                if (
+                    "gold vs us dollar (spot)" in description
+                    or "gold vs usd (spot)" in description
+                ):
+                    name = str(
+                        getattr(item, "name", None)
+                        or getattr(item, "symbol", None)
+                        or ""
+                    ).strip()
+
+                    if name:
+                        try:
+                            MT5.symbol_select(name, True)
+                        except Exception:
+                            pass
+
+                        _BROKER_SYMBOL_CACHE[logical_u] = name
+                        return name
+
+        for item in candidates:
+            if not getattr(item, "visible", False):
+                continue
+
+            name = str(
+                getattr(item, "name", None)
+                or getattr(item, "symbol", None)
+                or ""
+            ).strip()
+
+            if name:
+                _BROKER_SYMBOL_CACHE[logical_u] = name
+                return name
+
+        name = str(
+            getattr(candidates[0], "name", None)
+            or getattr(candidates[0], "symbol", None)
+            or logical
+        ).strip()
+
+        if name:
+            try:
+                MT5.symbol_select(name, True)
+            except Exception:
+                pass
+
+            _BROKER_SYMBOL_CACHE[logical_u] = name
+            return name
+
+    except Exception as exc:
+        _log(
+            "[symbol_resolve] "
+            f"logical={logical} err={type(exc).__name__}:{exc}"
+        )
+
+    return logical
 
 def _mt5_last_error():
     """Return (code, message) from MT5.last_error() safely."""

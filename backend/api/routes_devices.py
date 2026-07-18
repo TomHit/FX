@@ -618,6 +618,7 @@ def mt5_positions(
 class Mt5AccountPayload(BaseModel):
     account: dict = {}
     mt5_account: str = "demo"
+    ts_ms: int | None = None
     model_config = ConfigDict(extra="ignore")
 
 
@@ -642,6 +643,10 @@ def mt5_account(
         acct_type = "demo"
 
     account = payload.account if isinstance(payload.account, dict) else {}
+    account = dict(account)
+
+    if payload.ts_ms:
+        account["updated_ts_ms"] = int(payload.ts_ms)
 
     key = f"xtl:mt5:account:{dev_id}:{acct_type}"
 
@@ -1218,6 +1223,7 @@ def post_ohlc(
 
         snap_val = {
             "serverNow": server_now_ms,
+            "server_received_ms": server_now_ms,  
             "lastClosedTs": last_closed_ms,
             "nextCloseTs": next_close_ms,
             "bars": bars_sec,                              # <<< seconds here

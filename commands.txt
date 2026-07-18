@@ -1,7 +1,7 @@
 #BEST SR
 
 
-DEV=dev_4ad056c8ad1649ecb929c771c70ac888
+DEV=dev_cc81d77be27141c5a134a0eeca49ae7a
 curl -s -H "X-Device-Id: $DEV" "http://127.0.0.1:8000/trend/opportunities?symbols=EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,XAUUSD" \
  | python3 -c "import sys,json
 rows=json.load(sys.stdin)['rows']
@@ -13,7 +13,120 @@ for r in rows:
           'best_resistance=', (br.get('level') if isinstance(br,dict) else None),
           'scored=', len(sr.get('scored_supports') or [])+len(sr.get('scored_resistances') or []),
           'reason=', r.get('reason'))"
+		 
+		 
+		 
+DEV=dev_cc81d77be27141c5a134a0eeca49ae7a
+curl -s -H "X-Device-Id: $DEV" "http://127.0.0.1:8000/trend/opportunities?symbols=EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,XAUUSD" \
+ | python3 -c "
+import sys,json
+rows=json.load(sys.stdin)['rows']
+def levels(lst): return [z for z in (lst or []) if isinstance(z,dict) and z.get('level') is not None]
+for r in rows:
+    sr=r.get('sr') or {}
+    price=r.get('price') or r.get('live_price') or sr.get('price')
+    print(r.get('symbol'), 'price=', price)
+    for side in ('scored_supports','scored_resistances'):
+        lst=levels(sr.get(side))
+        if not lst: continue
+        by_score=sorted(lst, key=lambda z:-float(z.get('sr_score') or 0))
+        by_near=sorted(lst, key=lambda z:abs(float(z['level'])-float(price))) if price else lst
+        cs=by_score[0]; cn=by_near[0]
+        chg='  <-- CHANGES' if cs.get('level')!=cn.get('level') else ''
+        print(f\"   {side.replace('scored_',''):11} score#1={cs.get('level')}(sc{cs.get('sr_score')},t{cs.get('touches')})  nearest={cn.get('level')}(sc{cn.get('sr_score')},t{cn.get('touches')}){chg}\")
+"
+
 ************************************************************
+#macro and direction check:
+
+/opt/xauapi/.venv/bin/python -c "
+import sys; sys.path.insert(0,'/opt/xauapi')
+from api.usd_strength import macro_bias_for_trade
+from api.trend_endpoints import R
+print(macro_bias_for_trade(R, 'XAUUSD', 'SELL'))
+"
+
+/opt/xauapi/.venv/bin/python -c "
+import sys; sys.path.insert(0,'/opt/xauapi')
+from api.usd_strength import usd_strength_all, pair_htf_trend
+from api.trend_endpoints import R
+print('=== USD STRENGTH ===')
+print(usd_strength_all(R))
+print()
+print('=== PER-PAIR TRENDS ===')
+for s in ['EURUSD','GBPUSD','USDJPY','USDCHF','USDCAD','XAUUSD']:
+    print(f'{s}: H4={pair_htf_trend(R,s,\"H4\")}  H1={pair_htf_trend(R,s,\"H1\")}')
+"
+*********************************************************************
+
+#deal check:
+
+
+
+*****************************************************************
+#news check:
+cd /opt/xauapi && /opt/xauapi/.venv/bin/python -c "
+import api.xtl_analytics as A
+from api.trend_endpoints import R
+import json, time
+from datetime import datetime, timezone
+
+now = int(time.time()*1000)
+raw = R.get('xtl:news:calendar:daily')
+events = json.loads(raw).get('events', []) if raw else []
+
+uid='f3a3cf2e-6095-495c-a5fd-94227948cd3a'
+h = R.hgetall(f'xtl:strategy:oppt:open:{uid}') or {}
+print('OPEN TRADES vs UPCOMING EVENTS (next 24h)\n')
+if not h:
+    print('  (no open trades)')
+for fk, rawp in h.items():
+    rawp = rawp.decode() if isinstance(rawp,(bytes,bytearray)) else rawp
+    p = json.loads(rawp)
+    sym = str(p.get('symbol') or '').upper()
+    side = p.get('side')
+    ccys = A._currencies_for_symbol(sym)
+    upcoming = sorted([e for e in events
+                       if str(e.get('currency','')).upper() in ccys
+                       and now <= int(e.get('time_ms',0)) <= now + 24*3600000],
+                      key=lambda e: int(e.get('time_ms',0)))
+    flag = '⚠️ EVENT RISK' if upcoming else 'clear'
+    print(f'{sym} {side} -> {flag}')
+    for e in upcoming[:3]:
+        dt = datetime.fromtimestamp(int(e['time_ms'])/1000, timezone.utc)
+        hrs = round((int(e['time_ms'])-now)/3600000,1)
+        print(f\"    {dt.strftime('%m-%d %H:%M UTC')} | {e['currency']} {e['event'][:30]} | in {hrs}h\")
+    print()
+"
+
+***********************************************************
+
+#order placed:
+
+journalctl -u xauapi -f \
+| grep -E "MT5_POS_PUSH_START|MT5_DEAL|mt5/positions|ERROR|Traceback"
+
+
+journalctl -u xauapi -f \
+| grep -E "MT5_POS|last_mt5_pos|MT5_DEAL|/mt5/positions|Traceback|ERROR|redis_error"
+
+
+journalctl -u xauapi -f \
+| grep XAUUSD \
+| grep -E "REV_OK|REV_WATCH|AFTER_CROSS|BREAK_CHECK|ENTRY_READY|RC_LOCKED|ZONE_INVALIDATED|CLEAR|DELETE"
+
+*******************************************************
+journalctl -u xauapi -f \
+| grep -E "ENTRY_EVENT_ADDED|ENTRY_CAND|CLAIM_RESULT|duplicate_exec_claim|BLOCK_ENTRY|OK_ENTRY|QTY_DECISION|MT5_ENQUEUE|MT5_ENQUEUE_RES|MT5_ACK|ORDER_PENDING|TRADE_ACTIVE|BROKER_CLOSED|BROKER_REPAIR|RELEASE_ATTEMPT|RELEASE_DONE|RELEASE_FAILED|DAILY_OUTCOME|ZONE_COOLDOWN|ENTRY_FAIL|tick_user failed|Traceback|ERROR"
+*******************************************************
+
+journalctl -u xauapi -f \
+| grep -E "USDCHF|ENTRY_EVENT_ADDED|ENTRY_CAND|OK_ENTRY|MT5_ENQUEUE|MT5_ENQUEUE_RES|MT5_ACK|BROKER_CLOSED|RELEASE_DONE|DAILY_OUTCOME|ENTRY_FAIL|ERROR|Traceback"
+
+
+journalctl -u xauapi -f | grep -E "USDCAD|ENTRY_CAND|QTY_DECISION|OK_ENTRY|BLOCK_ENTRY|MAX_OPEN|PROP_CAPACITY|same_symbol_active|MT5_ENQUEUE|MT5_ENQUEUE_RES|ENTRY_BLOCK_PRESERVE"
+
+***********************************************************
 redis-cli --no-auth-warning -a 'xau12345' GET "xtl:zone:watch:XAUUSD:BUY:H1" \
   | python3 -c "
 import sys,json
@@ -74,25 +187,135 @@ xargs -r redis-cli -a xau12345 DEL
 redis-cli -a xau12345 --scan --pattern "xtl:oppt:cache:*" | \
 xargs -r redis-cli -a xau12345 DEL
 
+*****************************************************
+#clean
+
+# ---------- 1. Delete all H1 watch states ----------
+redis-cli -a xau12345 --scan --pattern "xtl:zone:watch:*:*:H1" \
+| xargs -r -n100 redis-cli -a xau12345 DEL
+
+# ---------- 2. Delete all breakout states ----------
+redis-cli -a xau12345 --scan --pattern "xtl:watch:break_state:*" \
+| xargs -r -n100 redis-cli -a xau12345 DEL
+
+# ---------- 3. Delete entry claims ----------
+redis-cli -a xau12345 --scan --pattern "xtl:watch:entry_claim:*" \
+| xargs -r -n100 redis-cli -a xau12345 DEL
+
+# ---------- 4. Delete pending ENTRY_EVENT queue ----------
+redis-cli -a xau12345 --scan --pattern "xtl:entry:event:*" \
+| xargs -r -n100 redis-cli -a xau12345 DEL
+
+echo "Watch state reset complete."
+
 ****************************************************
 
 USDCHF clean
 
 # Remove watch state
-redis-cli -a xau12345 DEL xtl:zone:watch:USDCHF:SELL:H1
+redis-cli -a xau12345 DEL xtl:zone:watch:USDCAD:SELL:H1
 
 # Remove breakout tracking
-redis-cli -a xau12345 DEL xtl:watch:break_state:USDCHF:SELL:H1
+redis-cli -a xau12345 DEL xtl:watch:break_state:USDCAD:SELL:H1
 
 # Remove entry claim if it exists
-redis-cli -a xau12345 --scan --pattern "xtl:watch:entry_claim:USDCHF:SELL:H1:*" \
+redis-cli -a xau12345 --scan --pattern "xtl:watch:entry_claim:USDCAD:SELL:H1:*" \
 | xargs -r redis-cli -a xau12345 DEL
 
 ***********************************************************
+#delete for all symbols:
 
-clean all symbol, claim and watch
+#!/bin/bash
 
+deleted=0
 
+for k in $(redis-cli -a xau12345 --scan); do
+    case "$k" in
+        xtl:zone:watch:*|\
+        xtl:watch:break_state:*|\
+        xtl:watch:entry_claim:*|\
+        xtl:oppt:exec_claim:*|\
+        xtl:entry:claim:*|\
+        xtl:entry:alert:*|\
+        xtl:entry:candidate:*|\
+        xtl:watch:entry:*|\
+        xtl:watch:cross:*|\
+        xtl:watch:trigger:*)
+            echo "DEL $k"
+            redis-cli -a xau12345 DEL "$k" >/dev/null
+            deleted=$((deleted + 1))
+            ;;
+    esac
+done
+
+echo "Cleanup complete. Deleted $deleted keys."
+
+********************************************************
+# Clean watch / claim / break / exec-claim keys
+# Skip USDCAD (change this symbol if needed)
+
+for k in $(redis-cli -a xau12345 --scan); do
+    case "$k" in
+        *USDCAD*)
+            continue
+            ;;
+    esac
+
+    case "$k" in
+        xtl:zone:watch:*|\
+        xtl:watch:break_state:*|\
+        xtl:watch:entry_claim:*|\
+        xtl:oppt:exec_claim:*|\
+        xtl:entry:claim:*|\
+        xtl:entry:alert:*|\
+        xtl:entry:candidate:*|\
+        xtl:watch:entry:*|\
+        xtl:watch:cross:*|\
+        xtl:watch:trigger:*)
+            echo "DEL $k"
+            redis-cli -a xau12345 DEL "$k" >/dev/null
+            ;;
+    esac
+done
+
+echo "Cleanup complete."
+
+*************************************************
+#!/bin/bash
+
+deleted=0
+
+for k in $(redis-cli -a xau12345 --scan); do
+    case "$k" in
+        *USDCAD*)
+            continue
+            ;;
+    esac
+
+    case "$k" in
+        xtl:zone:watch:*|\
+        xtl:watch:break_state:*|\
+        xtl:watch:entry_claim:*|\
+        xtl:oppt:exec_claim:*|\
+        xtl:entry:claim:*|\
+        xtl:entry:alert:*|\
+        xtl:entry:candidate:*|\
+        xtl:watch:entry:*|\
+        xtl:watch:cross:*|\
+        xtl:watch:trigger:*)
+            echo "DEL $k"
+            redis-cli -a xau12345 DEL "$k" >/dev/null
+            deleted=$((deleted + 1))
+            ;;
+    esac
+done
+
+echo "Cleanup complete. Deleted $deleted keys."
+************************************************************
+#verify keys deleted.
+redis-cli -a xau12345 --scan \
+| grep -E "xtl:zone:watch|xtl:watch:break_state|xtl:watch:entry_claim" \
+| sort
 
 *************************************************
 
@@ -130,6 +353,58 @@ curl -s "http://127.0.0.1:8000/trend/opportunities?tf=H1&symbols=USDJPY&debug_ga
   zone_used
 }'
 
+**********************************************
+#orphaned trade : ORDER_PENDING trades that have no MT5 ticket,
+python3 - <<'PY'
+import json
+import subprocess
+
+def redis_scan(pattern):
+    out = subprocess.check_output(
+        ["redis-cli","-a","xau12345","--scan","--pattern",pattern],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    return [x.strip() for x in out.splitlines() if x.strip()]
+
+found = False
+
+for key in redis_scan("xtl:strategy:oppt:open:*"):
+    raw = subprocess.check_output(
+        ["redis-cli","-a","xau12345","HVALS",key],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+
+    for line in raw.splitlines():
+        try:
+            t = json.loads(line)
+        except Exception:
+            continue
+
+        if str(t.get("trade_state","")).upper() != "ORDER_PENDING":
+            continue
+
+        ticket = t.get("mt5_ticket")
+        if ticket not in (None,"",0,"0"):
+            continue
+
+        print("="*90)
+        print("KEY        :", key)
+        print("TRADE_ID   :", t.get("trade_id"))
+        print("SYMBOL     :", t.get("symbol"))
+        print("SIDE       :", t.get("side"))
+        print("PROFILE    :", t.get("profile_id"))
+        print("DEVICE     :", t.get("device_id"))
+        print("JOB_ID     :", t.get("mt5_job_id"))
+        print("OPENED_MS  :", t.get("opened_at_ms"))
+        print("ORDER_TYPE :", t.get("order_type","MARKET"))
+        found = True
+
+if not found:
+    print("No ORDER_PENDING trades without MT5 ticket.")
+PY
+
 *************************************************
 journalctl -u xauapi -f --no-pager \
 | grep -E "SKIP_ENTRY_FUTURE_RC|BREAK_CHECK|AFTER_CROSS|ENTRY_CAND|MT5_ENQUEUE|ERROR|Traceback"
@@ -145,8 +420,8 @@ sudo systemctl start xauapi
 sudo systemctl enable xauapi
 
 # restart after any code/env change
+	
 sudo systemctl restart xauapi
-
 sudo systemctl cat xauapi | sed -n '1,200p'
 
 
