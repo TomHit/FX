@@ -26,6 +26,8 @@ from api.trend_endpoints import (
     _reserve_prop_open_risk,
     _release_prop_open_risk,
     _resolve_prop_profile_device,
+    _user_active_prop_profile_id,
+    _discord_notify_rc_trigger, 
 )
 
 from api.prop_firms.prop_config import SYMBOL_SPECS
@@ -68,6 +70,195 @@ def _sticky_dev_key(user_id: str, sym: str, tf: str = "M1") -> str:
 
 def _mt5_cmdq_key(dev_id: str) -> str:
     return f"xtl:mt5:cmdq:{dev_id}"
+
+def _normalize_mt5_account_type(value) -> str:
+    account_type = str(value or "").strip().lower()
+
+    if account_type in ("demo", "live"):
+        return account_type
+
+    return ""
+
+
+def _mt5_account_type_from_trade_mode(value) -> str:
+    """
+    MT5 ACCOUNT_TRADE_MODE:
+      0 = DEMO
+      1 = CONTEST
+      2 = REAL
+
+    Challenge accounts commonly report DEMO or CONTEST.
+    The Redis snapshot namespace must follow the actual MT5 mode.
+    """
+    try:
+        trade_mode = int(value)
+    except Exception:
+        return ""
+
+    if trade_mode == 2:
+        return "live"
+
+    if trade_mode in (0, 1):
+        return "demo"
+
+    return ""
+
+
+def _resolve_runtime_mt5_account_type(
+    uid: str,
+    profile_id: str,
+    fallback: str | None = None,
+) -> tuple[str, str]:
+    """
+    Resolve the broker snapshot namespace from the UID-owned profile's
+    actual connected MT5 account.
+
+    Returns:
+        account_type, device_id
+
+    account_type is "demo" or "live". Empty values mean fail closed.
+    """
+    uid_u = str(uid or "").strip()
+    profile_u = str(profile_id or "").strip().lower()
+
+    if not uid_u or not profile_u:
+        return "", ""
+
+    try:
+        resolved = _resolve_prop_profile_device(
+            profile_u,
+            uid_u,
+        )
+    except Exception:
+        log.exception(
+            "[PROP] MT5_ACCOUNT_TYPE_PROFILE_RESOLVE_EXC "
+            "uid=%s profile=%s",
+            uid_u,
+            profile_u,
+        )
+        return "", ""
+
+    if (
+        not isinstance(resolved, dict)
+        or not resolved.get("ok")
+    ):
+        log.error(
+            "[PROP] MT5_ACCOUNT_TYPE_PROFILE_RESOLVE_FAILED "
+            "uid=%s profile=%s reason=%s",
+            uid_u,
+            profile_u,
+            (
+                resolved.get("reason")
+                if isinstance(resolved, dict)
+                else "BAD_RESOLVE_PAYLOAD"
+            ),
+        )
+        return "", ""
+
+    device_id = str(
+        resolved.get("device_id") or ""
+    ).strip()
+
+    if not device_id:
+        log.error(
+            "[PROP] MT5_ACCOUNT_TYPE_DEVICE_MISSING "
+            "uid=%s profile=%s",
+            uid_u,
+            profile_u,
+        )
+        return "", ""
+
+    try:
+        trade_mode_raw = R.hget(
+            f"device:{device_id}",
+            "mt5_account_trade_mode",
+        )
+
+        account_type = _mt5_account_type_from_trade_mode(
+            trade_mode_raw
+        )
+
+        if account_type:
+            return account_type, device_id
+
+    except Exception:
+        log.exception(
+            "[PROP] MT5_ACCOUNT_TYPE_DEVICE_READ_EXC "
+            "uid=%s profile=%s device=%s",
+            uid_u,
+            profile_u,
+            device_id,
+        )
+        return "", ""
+
+    # Temporary compatibility fallback. It is used only when the
+    # device does not publish trade mode at all.
+    fallback_type = _normalize_mt5_account_type(
+        fallback
+    )
+
+    if fallback_type:
+        log.warning(
+            "[PROP] MT5_ACCOUNT_TYPE_FALLBACK "
+            "uid=%s profile=%s device=%s account_type=%s",
+            uid_u,
+            profile_u,
+            device_id,
+            fallback_type,
+        )
+        return fallback_type, device_id
+
+    log.error(
+        "[PROP] MT5_ACCOUNT_TYPE_UNRESOLVED "
+        "uid=%s profile=%s device=%s",
+        uid_u,
+        profile_u,
+        device_id,
+    )
+
+    return "", ""
+
+
+def _mt5_job_queue_state(
+    device_id: str,
+    job_id: str,
+) -> tuple[bool, bool]:
+    """
+    Return:
+        job_is_queued, queue_read_reliable
+
+    A Redis error is not proof that the command disappeared.
+    """
+    device_u = str(device_id or "").strip()
+    job_u = str(job_id or "").strip()
+
+    if not device_u or not job_u:
+        return False, False
+
+    queue_key = _mt5_cmdq_key(device_u)
+
+    try:
+        rows = R.lrange(queue_key, 0, -1) or []
+    except Exception:
+        log.exception(
+            "[OPPT] MT5_CMDQ_READ_FAILED "
+            "device=%s job_id=%s key=%s",
+            device_u,
+            job_u,
+            queue_key,
+        )
+        return False, False
+
+    for raw in rows:
+        cmd = _sj(raw, {})
+
+        if not isinstance(cmd, dict):
+            continue
+
+        if str(cmd.get("job_id") or "").strip() == job_u:
+            return True, True
+
+    return False, True
 
 def _mt5_ack_key(job_id: str) -> str:
     return f"xtl:mt5:ack:{job_id}"
@@ -197,6 +388,7 @@ def _clear_exec_claim_for_trade(r, uid: str, trade: dict, reason: str) -> bool:
         return False
 
 def _find_broker_position_for_pending(
+    uid: str,
     pos: dict,
     mt5_account: str,
 ) -> tuple[dict | None, bool]:
@@ -204,6 +396,10 @@ def _find_broker_position_for_pending(
     Return:
         (matching_position, broker_check_reliable)
     """
+    uid_u = str(uid or "").strip()
+
+    if not uid_u:
+        return None, False
     symbol = str(
         pos.get("symbol")
         or ""
@@ -225,7 +421,7 @@ def _find_broker_position_for_pending(
     try:
         if profile_id:
             resolved = _resolve_prop_profile_device(
-                profile_id
+                profile_id,uid_u,
             )
 
             if (
@@ -245,6 +441,7 @@ def _find_broker_position_for_pending(
                 return None, False
 
         live = _broker_xtl_positions(
+            uid_u,
             account_type=mt5_account,
             profile_id=profile_id or None,
         )
@@ -405,12 +602,115 @@ def _reconcile_stale_order_pending(
         if deadline_ms <= 0 or now < deadline_ms:
             continue
 
+        # -------------------------------------------------
+        # A command still present in the exact device queue has
+        # not failed. The Agent may be offline, delayed or still
+        # processing earlier commands.
+        #
+        # Never remove the UUID open ledger, release risk or mark
+        # MARKET_ACK_TIMEOUT while the command remains queued.
+        # -------------------------------------------------
+        queue_device_id = str(
+            pos.get("device_id") or ""
+        ).strip()
+
+        (
+            job_still_queued,
+            queue_read_reliable,
+        ) = _mt5_job_queue_state(
+            queue_device_id,
+            job_id,
+        )
+
+        if not queue_read_reliable:
+            log.error(
+                "[OPPT] MARKET_ACK_TIMEOUT_DEFER_QUEUE_UNKNOWN "
+                "uid=%s tid=%s sym=%s job_id=%s "
+                "device_id=%s age_ms=%s",
+                uid,
+                trade_id,
+                pos.get("symbol"),
+                job_id,
+                queue_device_id,
+                age_ms,
+            )
+            continue
+
+        if job_still_queued:
+            pos["queue_wait_detected"] = True
+            pos["queue_wait_detected_at_ms"] = now
+            pos["queue_wait_age_ms"] = int(age_ms)
+
+            # Extend the watchdog deadline while the command is
+            # demonstrably still waiting in the device queue.
+            pos["ack_deadline_ms"] = int(
+                now + MARKET_ACK_TIMEOUT_MS
+            )
+
+            _open_trade(
+                uid,
+                pos,
+            )
+
+            log.warning(
+                "[OPPT] MARKET_ORDER_PENDING_STILL_QUEUED "
+                "uid=%s tid=%s sym=%s side=%s "
+                "job_id=%s device_id=%s age_ms=%s "
+                "next_deadline_ms=%s",
+                uid,
+                trade_id,
+                pos.get("symbol"),
+                pos.get("side"),
+                job_id,
+                queue_device_id,
+                age_ms,
+                pos.get("ack_deadline_ms"),
+            )
+            continue
+
         # Critical safety check:
         # the ACK may have been lost after the broker opened a position.
+        pending_profile_id = str(
+            pos.get("profile_id")
+            or _user_active_prop_profile_id(uid)
+            or ""
+        ).strip().lower()
+
+        (
+            pending_account_type,
+            pending_device_id,
+        ) = _resolve_runtime_mt5_account_type(
+            uid=uid,
+            profile_id=pending_profile_id,
+            fallback=(
+                pos.get("mt5_account")
+                or mt5_account
+            ),
+        )
+
+        if not pending_account_type:
+            log.error(
+                "[OPPT] MARKET_ACK_TIMEOUT_DEFER_ACCOUNT_UNKNOWN "
+                "uid=%s tid=%s sym=%s profile=%s",
+                uid,
+                trade_id,
+                pos.get("symbol"),
+                pending_profile_id,
+            )
+            continue
+
+        if (
+            pending_device_id
+            and not pos.get("device_id")
+        ):
+            pos["device_id"] = pending_device_id
+
+        pos["mt5_account"] = pending_account_type
         broker_pos, broker_check_reliable = (
             _find_broker_position_for_pending(
+                uid,
                 pos,
-                mt5_account,
+                pending_account_type
             )
         )
 
@@ -593,7 +893,7 @@ def _tick_prop_watchdog(
     - Existing FTMO halt reason, comments and trade IDs remain unchanged.
     """
     try:
-        prop_cfg, cfg_ok, cfg_err = _get_prop_config_safe(profile_id)
+        prop_cfg, cfg_ok, cfg_err = _get_prop_config_safe(uid,profile_id)
 
         if not cfg_ok or not isinstance(prop_cfg, dict):
             log.error(
@@ -608,8 +908,15 @@ def _tick_prop_watchdog(
         pid = str(
             prop_cfg.get("profile_id")
             or profile_id
-            or "ftmo-main"
+            or ""
         ).strip().lower()
+
+        if not pid:
+            log.error(
+                "[PROP] WATCHDOG_PROFILE_MISSING uid=%s",
+                uid,
+            )
+            return
 
         firm = str(
             prop_cfg.get("firm")
@@ -626,7 +933,7 @@ def _tick_prop_watchdog(
             firm.replace("_", " ").title(),
         )
 
-        risk = _get_prop_risk_state(pid)
+        risk = _get_prop_risk_state(uid,pid)
         open_risk = float(risk.get("open_risk_usd") or 0.0)
 
         account_size = float(
@@ -708,12 +1015,19 @@ def _tick_prop_watchdog(
 
         # Profile-scoped keys prevent FTMO/FundedNext/FundingPips collisions.
         alert70_key = (
-            f"xtl:prop:watchdog:alert70:{pid}:{day}"
+            f"xtl:prop:watchdog:alert70:"
+            f"{uid}:{pid}:{day}"
         )
+
         alert80_key = (
-            f"xtl:prop:watchdog:alert80:{pid}:{day}"
+            f"xtl:prop:watchdog:alert80:"
+            f"{uid}:{pid}:{day}"
         )
-        halt_key = f"xtl:prop:watchdog:openrisk:{pid}:{day}"
+
+        halt_key = (
+            f"xtl:prop:watchdog:openrisk:"
+            f"{uid}:{pid}:{day}"
+        )
 
         if (
             max_open_risk_usd > 0
@@ -724,6 +1038,7 @@ def _tick_prop_watchdog(
             if R.set(halt_key, "1", nx=True, ex=36 * 3600):
 
                _prop_set_halt(
+                   uid,
                    pid,
                    "PROP_OPEN_RISK_LIMIT_EXCEEDED",
                    {
@@ -800,6 +1115,7 @@ def _tick_prop_watchdog(
             }
 
             _prop_set_halt(
+                uid,
                 pid,
                 halt_reason,
                 halt_meta,
@@ -816,6 +1132,7 @@ def _tick_prop_watchdog(
                 )
 
             for bp in _broker_xtl_positions(
+                uid,
                 account_type=mt5_account,
                 profile_id=pid,
             ):
@@ -837,7 +1154,8 @@ def _tick_prop_watchdog(
                     continue
 
                 close_claim_key = (
-                    f"xtl:prop:emergency_closing:{pid}:{ticket}"
+                    f"xtl:prop:emergency_closing:"
+                    f"{uid}:{pid}:{ticket}"
                 )
 
                 if not R.set(
@@ -898,14 +1216,17 @@ def _tick_ftmo_watchdog(
     uid: str,
     mt5_account: str = "demo",
 ) -> None:
-    """
-    Backward-compatible FTMO watchdog wrapper.
+    pid = str(
+        _user_active_prop_profile_id(uid)
+        or ""
+    ).strip().lower()
 
-    Keep this function while existing callers and tests still reference it.
-    """
+    if not pid:
+        return
+
     _tick_prop_watchdog(
         uid=uid,
-        profile_id="ftmo-main",
+        profile_id=pid,
         mt5_account=mt5_account,
     )
 def _broker_price_step(bp: dict) -> float:
@@ -982,49 +1303,6 @@ def _broker_price_was_changed(
 
     return abs(normalized_original - broker_price) > epsilon
 
-def _update_prop_daily_outcome_on_close(pos: dict, pnl: float) -> None:
-    try:
-        from api.trend_endpoints import _prop_day_key, _prop_daily_key
-
-        profile_id = str(pos.get("profile_id") or "ftmo-main")
-        day = _prop_day_key(profile_id)
-        daily_key = _prop_daily_key(profile_id, day)
-
-        risk_usd = float(
-            pos.get("risk_usd")
-            or pos.get("reserved_risk_usd")
-            or pos.get("prop_risk_usd")
-            or 0.0
-        )
-
-        pnl_f = float(pnl or 0.0)
-        r_delta = (pnl_f / risk_usd) if risk_usd > 0 else 0.0
-
-        pipe = R.pipeline()
-        if pnl_f > 0:
-            pipe.hincrby(daily_key, "wins_today", 1)
-        elif pnl_f < 0:
-            pipe.hincrby(daily_key, "losses_today", 1)
-
-        pipe.hincrbyfloat(daily_key, "daily_r", round(float(r_delta), 4))
-        pipe.hset(daily_key, "last_closed_trade_id", str(pos.get("trade_id") or ""))
-        pipe.hset(daily_key, "last_closed_symbol", str(pos.get("symbol") or ""))
-        pipe.hset(daily_key, "last_closed_pnl", round(pnl_f, 2))
-        pipe.hset(daily_key, "last_closed_r", round(float(r_delta), 4))
-        pipe.expire(daily_key, 3 * 24 * 3600)
-        pipe.execute()
-
-        log.warning(
-            "[PROP] DAILY_OUTCOME_UPDATE trade_id=%s sym=%s pnl=%s risk=%s r_delta=%s daily_key=%s",
-            pos.get("trade_id"),
-            pos.get("symbol"),
-            round(pnl_f, 2),
-            round(risk_usd, 2),
-            round(float(r_delta), 4),
-            daily_key,
-        )
-    except Exception as e:
-        log.warning("[PROP] DAILY_OUTCOME_UPDATE_EXC err=%r", e)
 def _make_repair_prop_check(
     *,
     prop_cfg: dict,
@@ -1214,17 +1492,23 @@ def _broker_live_position_count(device_id: str, account_type: str = "demo") -> i
 
 
 def _broker_xtl_positions(
+    uid: str,
     account_type: str = "demo",
     profile_id: str | None = None,
 ) -> list[dict]:
+    
     """
     Return current broker-open XTL positions.
 
     Routing rules:
-    - profile_id supplied: read only the MT5 snapshot strictly bound
-      to that prop profile.
-    - profile_id omitted: preserve legacy behavior and scan all devices.
+    - UID and profile_id are required.
+    - Read only the MT5 snapshot strictly bound to
+      that UID-owned prop profile.
+    - Never scan all connected devices.
     """
+
+    
+    
     out: list[dict] = []
     seen: set[int] = set()
     acct = str(account_type or "demo").strip().lower()
@@ -1233,7 +1517,7 @@ def _broker_xtl_positions(
 
     if profile_id:
         try:
-            resolved = _resolve_prop_profile_device(profile_id)
+            resolved = _resolve_prop_profile_device(profile_id,uid,)
         except Exception as e:
             log.error(
                 "[PROP] BROKER_POS_PROFILE_RESOLVE_EXC "
@@ -1256,34 +1540,57 @@ def _broker_xtl_positions(
             )
             return []
 
-        dev_id = str(resolved.get("device_id") or "").strip()
+        dev_id = str(
+            resolved.get("device_id") or ""
+        ).strip()
+
         if not dev_id:
             log.error(
                 "[PROP] BROKER_POS_PROFILE_DEVICE_MISSING "
-                "profile=%s",
+                "uid=%s profile=%s",
+                uid,
                 profile_id,
             )
             return []
 
-        keys = [f"xtl:mt5:pos:{dev_id}:{acct}"]
+        keys = [
+            f"xtl:mt5:pos:{dev_id}:{acct}"
+        ]
 
     else:
-        # Legacy callers intentionally inspect all connected MT5 devices.
-        try:
-            keys = list(R.scan_iter(f"xtl:mt5:pos:*:{acct}"))
-        except Exception:
-            keys = []
+        # Multi-user safety:
+        # Every runtime caller must resolve an explicit
+        # UID-owned prop profile before reading broker
+        # positions. Never scan all MT5 devices.
+        log.error(
+            "[PROP] BROKER_POS_PROFILE_REQUIRED "
+            "uid=%s account_type=%s",
+            uid,
+            acct,
+        )
+        return []
 
     for key in keys:
         try:
             key_s = (
-                key.decode("utf-8", "ignore")
-                if isinstance(key, (bytes, bytearray))
+                key.decode(
+                    "utf-8",
+                    "ignore",
+                )
+                if isinstance(
+                    key,
+                    (bytes, bytearray),
+                )
                 else str(key)
             )
 
             raw = R.get(key_s)
-            arr = _sj(raw, []) if raw else []
+
+            arr = (
+                _sj(raw, [])
+                if raw
+                else []
+            )
 
             if not isinstance(arr, list):
                 continue
@@ -1340,6 +1647,7 @@ def _broker_xtl_positions(
                 bpc["device_id"] = dev_id
                 bpc["snapshot_key"] = key_s
                 bpc["profile_id"] = str(profile_id or "")
+                bpc["mt5_account"] = acct
 
                 out.append(bpc)
                 seen.add(ticket)
@@ -1357,6 +1665,7 @@ def _broker_xtl_positions(
     return out
 
 def _broker_has_active_xtl_symbol(
+    uid: str,
     symbol: str,
     account_type: str = "demo",
     profile_id: str | None = None,
@@ -1365,7 +1674,7 @@ def _broker_has_active_xtl_symbol(
     if not sym:
         return None
 
-    for bp in _broker_xtl_positions(
+    for bp in _broker_xtl_positions(uid,
         account_type=account_type,
         profile_id=profile_id,
     ):
@@ -1375,7 +1684,7 @@ def _broker_has_active_xtl_symbol(
     return None
 
 
-def _sync_watches_for_broker_active_position(bp: dict, reason: str = "BROKER_ACTIVE") -> None:
+def _sync_watches_for_broker_active_position(uid: str,bp: dict, reason: str = "BROKER_ACTIVE") -> None:
     """Broker-truth symbol guard.
 
     If broker has an active XTL position, no opposite-side REV_OK/ENTRY_READY
@@ -1384,6 +1693,18 @@ def _sync_watches_for_broker_active_position(bp: dict, reason: str = "BROKER_ACT
     temporarily behind.
     """
     try:
+        uid_u = str(uid or "").strip()
+
+        if not uid_u:
+            log.warning(
+                "[WATCHLIST] BROKER_ACTIVE_SYMBOL_GUARD_SKIP "
+                "reason=missing_uid ticket=%s symbol=%s",
+                bp.get("ticket"),
+                bp.get("symbol"),
+            )
+            return
+
+    
         sym = str(bp.get("symbol") or "").upper().strip()
         side = str(bp.get("side") or "").upper().strip()
         ticket = int(bp.get("ticket") or 0)
@@ -1393,13 +1714,27 @@ def _sync_watches_for_broker_active_position(bp: dict, reason: str = "BROKER_ACT
         opp_side = "SELL" if side == "BUY" else "BUY"
 
         # Opposite side must not remain REV_OK/ENTRY_READY while broker position exists.
-        R.delete(_zone_watch_key(uid,sym, opp_side, "H1"))
-        R.delete(f"xtl:watch:break_state:{sym}:{opp_side}:H1")
-        for k in R.scan_iter(f"xtl:watch:entry_claim:{sym}:{opp_side}:H1:*"):
+        R.delete(_zone_watch_key(uid_u,sym, opp_side, "H1"))
+        R.delete(
+            break_state_key(
+                uid_u,
+                sym,
+                opp_side,
+                "H1",
+            )
+        )
+        for k in R.scan_iter(
+            entry_claim_pattern(
+                uid_u,
+                sym,
+                opp_side,
+                "H1",
+            )
+        ):
             R.delete(k)
 
         # Same side must always show broker-truth TRADE_ACTIVE.
-        same_key = _zone_watch_key(sym, side, "H1")
+        same_key = _zone_watch_key(uid_u,sym, side, "H1")
         raw_w = R.get(same_key)
         w = _sj(raw_w, {}) if raw_w else {}
 
@@ -1418,6 +1753,19 @@ def _sync_watches_for_broker_active_position(bp: dict, reason: str = "BROKER_ACT
         w["broker_active_reason"] = str(reason or "BROKER_ACTIVE")
         w["broker_active_seen_ms"] = now_ms()
         w["device_id"] = str(bp.get("device_id") or w.get("device_id") or "")
+        w["mt5_account"] = str(
+            bp.get("mt5_account")
+            or (
+                str(bp.get("snapshot_key") or "").rsplit(
+                    ":",
+                    1,
+                )[-1]
+                if bp.get("snapshot_key")
+                else ""
+            )
+            or w.get("mt5_account")
+            or ""
+        ).lower().strip()
         w["qty"] = float(bp.get("volume") or 0)
         w["entry_price"] = float(bp.get("price_open") or 0)
         w["last_price"] = float(bp.get("price_current") or 0)
@@ -1569,7 +1917,13 @@ def _get_enabled_user_ids(limit: int = 500) -> list[str]:
         out = out[:limit]
     return out
 
-from api.tenant_keys import zone_watch_key
+from api.tenant_keys import (
+    zone_watch_key,
+    zone_watch_pattern,
+    break_state_key,
+    entry_claim_key,
+    entry_claim_pattern,
+)
 
 def _zone_watch_key(
     uid: str,
@@ -1693,13 +2047,22 @@ def _enqueue_mt5_market_order(
     mt5_account: str = "demo",
     profile_id: str | None = None,
 ) -> dict:
+    uid_u = str(
+        user_id or ""
+    ).strip()
+
+    if not uid_u:
+        return {
+            "ok": False,
+            "error": "UID_REQUIRED",
+        }
     dev_id = None
     resolved_account = None
     resolve_reason = ""
 
     if profile_id:
         try:
-            res = _resolve_prop_profile_device(profile_id)
+            res = _resolve_prop_profile_device(profile_id,uid_u,)
             if isinstance(res, dict) and res.get("ok") and res.get("device_id"):
                 dev_id = str(res.get("device_id"))
                 resolved_account = res.get("account")
@@ -1718,9 +2081,12 @@ def _enqueue_mt5_market_order(
             ),
         }
 
-    if not profile_id and not dev_id:
-        dev_id = _pick_device_for_symbol(user_id, sym)
-        resolve_reason = "LEGACY_PICK_DEVICE_FOR_SYMBOL"
+    if not profile_id:
+        return {
+            "ok": False,
+            "error": "PROP_PROFILE_REQUIRED",
+            "profile_id": "",
+        }
 
     if not dev_id:
         return {"ok": False, "error": "no_device", "profile_id": str(profile_id or ""), "profile_resolve_reason": resolve_reason}
@@ -1792,7 +2158,7 @@ def _enqueue_mt5_close_position(
 
     if profile_id:
         try:
-            resolved = _resolve_prop_profile_device(profile_id)
+            resolved = _resolve_prop_profile_device(profile_id,uid,)
         except Exception as e:
             return {
                 "ok": False,
@@ -2243,6 +2609,7 @@ def _alert_to_event(row: dict) -> Optional[dict]:
                     pass
 
             if crossed:
+
                 now_e = now_ms()
 
                 try:
@@ -2277,9 +2644,24 @@ def _alert_to_event(row: dict) -> Optional[dict]:
                 try:
                     # Prefer stored watch_key; fallback to constructing it directly
                     # so zone is always released even if watch_key wasn't saved in snapshot
-                    wkey = eg.get("watch_key") or rs.get("watch_key")
-                    if not wkey and sym and side:
-                        wkey = f"xtl:zone:watch:{sym.upper().strip()}:{side.upper().strip()}:H1"
+                    wkey = (
+                        eg.get("watch_key")
+                        or rs.get("watch_key")
+                    )
+
+                    event_uid = str(
+                        row.get("uid")
+                        or row.get("user_id")
+                        or ""
+                    ).strip()
+
+                    if not wkey and event_uid and sym and side:
+                        wkey = _zone_watch_key(
+                            event_uid,
+                            sym,
+                            side,
+                            "H1",
+                        )
                     if wkey:
                         try:
                             raw_w = R.get(str(wkey))
@@ -2368,26 +2750,73 @@ def _open_trade(uid: str, pos: Dict[str, Any]) -> None:
         pass
 
     R.hset(OPEN_KEY.format(uid=uid), pos["trade_id"], json.dumps(pos))
-def _clear_trade_lifecycle_keys(uid: str,pos: Dict[str, Any]) -> None:
+
+def _clear_trade_lifecycle_keys(
+    uid: str,
+    pos: Dict[str, Any],
+) -> None:
     try:
-        sym = str(pos.get("symbol") or "").upper().strip()
-        side = str(pos.get("side") or "").upper().strip()
+        uid_u = str(uid or "").strip()
+
+        if not uid_u:
+            log.warning(
+                "[OPPT] SKIP_LIFECYCLE_CLEAR missing_uid "
+                "trade_id=%s symbol=%s",
+                pos.get("trade_id"),
+                pos.get("symbol"),
+            )
+            return
+
+        sym = str(
+            pos.get("symbol") or ""
+        ).upper().strip()
+
         if not sym:
             return
 
-        # clear both sides because opposite stale watch may exist
-        for s in ("BUY", "SELL"):
-            R.delete(_zone_watch_key(uid, sym, s, "H1"))
-            R.delete(_zone_watch_key(uid, sym, s, "H4"))
+        # Clear both sides because an opposite stale watch may exist.
+        for side in ("BUY", "SELL"):
+            R.delete(
+                _zone_watch_key(
+                    uid_u,
+                    sym,
+                    side,
+                    "H1",
+                )
+            )
+            R.delete(
+                _zone_watch_key(
+                    uid_u,
+                    sym,
+                    side,
+                    "H4",
+                )
+            )
 
-        # clear active opportunity pointers
-        R.delete(ACTIVE_OPP_KEY.format(symbol=sym, direction="UP"))
-        R.delete(ACTIVE_OPP_KEY.format(symbol=sym, direction="DOWN"))
+        # These active-opportunity pointers are still global today.
+        # Keep current behaviour for now; migrate this key family separately.
+        R.delete(
+            ACTIVE_OPP_KEY.format(
+                symbol=sym,
+                direction="UP",
+            )
+        )
+        R.delete(
+            ACTIVE_OPP_KEY.format(
+                symbol=sym,
+                direction="DOWN",
+            )
+        )
 
-        
-    except Exception:
-        pass
-
+    except Exception as exc:
+        log.warning(
+            "[OPPT] LIFECYCLE_CLEAR_FAILED "
+            "uid=%s trade_id=%s symbol=%s err=%r",
+            uid,
+            pos.get("trade_id"),
+            pos.get("symbol"),
+            exc,
+        )
 def _remove_open_trade(uid: str, trade_id: str) -> None:
     try:
         R.hdel(OPEN_KEY.format(uid=uid), trade_id)
@@ -2475,6 +2904,404 @@ def _is_ticket_recently_closed(ticket: int) -> bool:
         return bool(tk > 0 and R.exists(_closed_ticket_key(tk)))
     except Exception:
         return False
+
+def _reconcile_orphan_broker_deals(
+    uid: str,
+    profile_id: str,
+    mt5_account: str,
+) -> int:
+    """
+    Finalize broker deal records that never reached the UUID open ledger.
+
+    Safety:
+      - only the UID-owned active profile device;
+      - exact demo/live namespace;
+      - XTL magic/comment required;
+      - closed ledger and closed-ticket marker checked;
+      - existing _apply_broker_deal_to_closed() reused;
+      - existing _close_trade() remains the only finalizer.
+    """
+    uid_u = str(uid or "").strip()
+    profile_u = str(profile_id or "").strip().lower()
+    account_u = _normalize_mt5_account_type(
+        mt5_account
+    )
+
+    if (
+        not uid_u
+        or not profile_u
+        or account_u not in ("demo", "live")
+    ):
+        return 0
+
+    # Avoid scanning deal history on every two-second executor tick.
+    scan_lock = (
+        f"xtl:oppt:orphan_deal_scan:"
+        f"{uid_u}:{profile_u}:{account_u}"
+    )
+
+    try:
+        if not R.set(
+            scan_lock,
+            "1",
+            nx=True,
+            ex=30,
+        ):
+            return 0
+    except Exception:
+        return 0
+
+    (
+        resolved_account,
+        resolved_device,
+    ) = _resolve_runtime_mt5_account_type(
+        uid=uid_u,
+        profile_id=profile_u,
+        fallback=account_u,
+    )
+
+    if (
+        not resolved_device
+        or resolved_account != account_u
+    ):
+        return 0
+
+    closed_tickets: set[int] = set()
+
+    try:
+        for raw_closed in R.lrange(
+            CLOSED_KEY.format(uid=uid_u),
+            0,
+            -1,
+        ) or []:
+            closed_row = _sj(raw_closed, {})
+
+            if not isinstance(closed_row, dict):
+                continue
+
+            try:
+                closed_ticket = int(
+                    closed_row.get("mt5_ticket")
+                    or closed_row.get("broker_ticket")
+                    or closed_row.get("position_ticket")
+                    or 0
+                )
+            except Exception:
+                closed_ticket = 0
+
+            if closed_ticket > 0:
+                closed_tickets.add(closed_ticket)
+
+    except Exception:
+        log.exception(
+            "[OPPT] ORPHAN_DEAL_CLOSED_LEDGER_READ_FAILED "
+            "uid=%s",
+            uid_u,
+        )
+        return 0
+
+    recovered_count = 0
+
+    for deal_key in R.scan_iter(
+        "xtl:mt5:deal:*",
+        count=100,
+    ):
+        try:
+            deal = _sj(
+                R.get(deal_key),
+                {},
+            )
+
+            if (
+                not isinstance(deal, dict)
+                or not deal.get("ok")
+            ):
+                continue
+
+            deal_device = str(
+                deal.get("device_id") or ""
+            ).strip()
+
+            deal_account = _normalize_mt5_account_type(
+                deal.get("mt5_account")
+            )
+
+            # Strict UID/profile/device ownership.
+            if deal_device != resolved_device:
+                continue
+
+            if deal_account != account_u:
+                continue
+
+            try:
+                ticket = int(
+                    deal.get("position_ticket")
+                    or deal.get("position_id")
+                    or str(deal_key).rsplit(":", 1)[-1]
+                    or 0
+                )
+            except Exception:
+                ticket = 0
+
+            if ticket <= 0:
+                continue
+
+            if ticket in closed_tickets:
+                continue
+
+            if _is_ticket_recently_closed(ticket):
+                continue
+
+            prev_position = (
+                deal.get("prev_position")
+                if isinstance(
+                    deal.get("prev_position"),
+                    dict,
+                )
+                else {}
+            )
+
+            raw_deals = (
+                deal.get("raw_deals")
+                if isinstance(
+                    deal.get("raw_deals"),
+                    list,
+                )
+                else []
+            )
+
+            entry_deal = {}
+
+            for raw_deal in raw_deals:
+                if not isinstance(raw_deal, dict):
+                    continue
+
+                try:
+                    entry_code = int(
+                        raw_deal.get("entry")
+                    )
+                except Exception:
+                    entry_code = -1
+
+                if entry_code == 0:
+                    entry_deal = raw_deal
+                    break
+
+            comment = str(
+                prev_position.get("comment")
+                or entry_deal.get("comment")
+                or ""
+            )
+
+            try:
+                magic = int(
+                    prev_position.get("magic")
+                    or entry_deal.get("magic")
+                    or 0
+                )
+            except Exception:
+                magic = 0
+
+            if (
+                magic != 20251227
+                and not comment.upper().startswith("XTL")
+            ):
+                continue
+
+            symbol = str(
+                deal.get("symbol")
+                or prev_position.get("symbol")
+                or entry_deal.get("symbol")
+                or ""
+            ).upper().strip()
+
+            side = str(
+                prev_position.get("side") or ""
+            ).upper().strip()
+
+            if side not in ("BUY", "SELL"):
+                try:
+                    entry_type = int(
+                        entry_deal.get("type")
+                    )
+
+                    side = (
+                        "BUY"
+                        if entry_type == 0
+                        else "SELL"
+                    )
+                except Exception:
+                    side = ""
+
+            if (
+                not symbol
+                or side not in ("BUY", "SELL")
+            ):
+                continue
+
+            entry_price = _sf(
+                deal.get("open_price")
+                or prev_position.get("price_open")
+                or entry_deal.get("price"),
+                0.0,
+            )
+
+            qty = _sf(
+                deal.get("volume")
+                or prev_position.get("volume")
+                or entry_deal.get("volume"),
+                0.0,
+            )
+
+            zone_meta = {}
+
+            try:
+                zone_meta = _sj(
+                    R.get(
+                        f"xtl:trade:zone_by_ticket:{ticket}"
+                    ),
+                    {},
+                ) or {}
+            except Exception:
+                zone_meta = {}
+
+            entry_zone = (
+                zone_meta.get("entry_zone")
+                if isinstance(zone_meta, dict)
+                else None
+            )
+            original_trade_id = ""
+
+            if isinstance(zone_meta, dict):
+                original_trade_id = str(
+                    zone_meta.get("trade_id")
+                    or zone_meta.get("tid")
+                    or zone_meta.get("opportunity_id")
+                    or ""
+                ).strip()
+
+            recovered_trade_id = (
+                original_trade_id
+                or (
+                    f"BROKER_DEAL_RECOVERY:"
+                    f"{symbol}:{side}:{ticket}"
+                )
+            )
+
+            recovered_pos = {
+                "trade_id": recovered_trade_id,
+                "symbol": symbol,
+                "side": side,
+                "direction": side,
+                "entry_price": float(entry_price),
+                "qty": float(qty),
+                "opened_at_ms": int(
+                    deal.get("open_time_ms")
+                    or prev_position.get("time_msc")
+                    or 0
+                ),
+                "broker_open_time_ms": int(
+                    deal.get("open_time_ms") or 0
+                ),
+                "source": "broker_deal_recovery",
+                "execution_mode": "mt5",
+                "mt5_account": account_u,
+                "device_id": resolved_device,
+                "profile_id": profile_u,
+                "status": "filled",
+                "trade_state": "TRADE_ACTIVE",
+                "mt5_ticket": ticket,
+                "mt5_fill_price": float(entry_price),
+                "sl_price": _sf(
+                    prev_position.get("sl"),
+                    0.0,
+                ),
+                "tp_price": _sf(
+                    prev_position.get("tp"),
+                    0.0,
+                ),
+                "entry_zone": entry_zone,
+                "entry_zone_low": (
+                    _sf(entry_zone.get("low"), 0.0)
+                    if isinstance(entry_zone, dict)
+                    else None
+                ),
+                "entry_zone_high": (
+                    _sf(entry_zone.get("high"), 0.0)
+                    if isinstance(entry_zone, dict)
+                    else None
+                ),
+                "entry_zone_level": (
+                    _sf(entry_zone.get("level"), 0.0)
+                    if isinstance(entry_zone, dict)
+                    else None
+                ),
+                "recovery_source": (
+                    "MT5_DEAL_MISSING_UUID_LEDGER"
+                ),
+                "recovered_at_ms": now_ms(),
+                "broker_comment": comment,
+                "broker_magic": magic,
+            }
+
+            (
+                exit_price,
+                exit_reason,
+                broker_meta,
+            ) = _apply_broker_deal_to_closed(
+                recovered_pos,
+                deal,
+                "BROKER_CLOSED",
+            )
+
+            broker_meta.update({
+                "recovery_source": (
+                    "orphan_broker_deal_reconciliation"
+                ),
+                "profile_id": profile_u,
+                "device_id": resolved_device,
+                "mt5_account": account_u,
+                "deal_key": str(deal_key),
+            })
+
+            log.warning(
+                "[OPPT] ORPHAN_BROKER_DEAL_RECOVER "
+                "uid=%s profile=%s device=%s account=%s "
+                "sym=%s side=%s ticket=%s reason=%s pnl=%s",
+                uid_u,
+                profile_u,
+                resolved_device,
+                account_u,
+                symbol,
+                side,
+                ticket,
+                exit_reason,
+                deal.get("net_profit"),
+            )
+
+            # Single existing finalizer:
+            # closed ledger, risk accounting, cooldown,
+            # ticket marker and lifecycle cleanup.
+            _close_trade(
+                uid_u,
+                recovered_pos,
+                float(exit_price),
+                exit_reason,
+                meta=broker_meta,
+            )
+
+            closed_tickets.add(ticket)
+            recovered_count += 1
+
+        except Exception:
+            log.exception(
+                "[OPPT] ORPHAN_BROKER_DEAL_RECOVER_FAILED "
+                "uid=%s key=%s",
+                uid_u,
+                deal_key,
+            )
+
+    return recovered_count
 def _save_state(uid: str, st: dict) -> None:
     key = STATE_KEY.format(uid=uid)
     st["updated_at_ms"] = now_ms()
@@ -2534,16 +3361,43 @@ def _clear_watchlist_entry_block(ev: dict, reason: str = "ENTRY_BLOCKED_CAPACITY
 
         sym = str(ev.get("symbol") or "").upper().strip()
         side = str(ev.get("side") or "").upper().strip()
+        event_uid = str(
+            ev.get("uid")
+            or ev.get("user_id")
+            or ""
+        ).strip()
+
+        if not event_uid:
+            log.warning(
+                "[WATCHLIST] SKIP_ENTRY_BLOCK_CLEAR "
+                "reason=missing_uid trade_id=%s symbol=%s side=%s",
+                ev.get("trade_id"),
+                sym,
+                side,
+            )
+            return
         wk = str(ev.get("watch_key") or "").strip()
         if not wk and sym and side:
-            wk = f"xtl:zone:watch:{sym}:{side}:H1"
+            wk = _zone_watch_key(
+                event_uid,
+                sym,
+                side,
+                "H1",
+            )
 
         ck = str(ev.get("claim_key") or "").strip()
         if ck:
             R.delete(ck)
 
         if sym and side:
-            R.delete(f"xtl:watch:break_state:{sym}:{side}:H1")
+            R.delete(
+                break_state_key(
+                    event_uid,
+                    sym,
+                    side,
+                    "H1",
+                )
+            )
 
         block_state = _entry_block_state(reason)
         retry_sec = int(os.getenv("XTL_ENTRY_BLOCK_RETRY_SEC", "30"))
@@ -2638,19 +3492,41 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
     
 
     try:
+        close_profile_id = str(
+            pos.get("profile_id")
+            or ""
+        ).strip().lower()
+
+        if not close_profile_id:
+            close_profile_id = str(
+                _user_active_prop_profile_id(uid)
+                or ""
+            ).strip().lower()
+
+        if not close_profile_id:
+            raise ValueError(
+                "PROP_PROFILE_MISSING_ON_CLOSE"
+            )
+
         _release_prop_open_risk(
-            trade_id=str(pos.get("trade_id") or ""),
-            result=str(reason or "").lower(),
-            pnl_usd=float(closed.get("pnl") or 0.0),
-            profile_id=str(
-                pos.get("profile_id")
-                or pos.get("account_id")
-                or "ftmo-main"
+            uid=uid,
+            trade_id=str(
+                pos.get("trade_id") or ""
             ),
+            result=str(
+                reason or ""
+            ).lower(),
+            pnl_usd=float(
+                closed.get("pnl") or 0.0
+            ),
+            profile_id=close_profile_id,
         )
+
     except Exception as e:
         log.warning(
-            "[PROP] RELEASE_FAILED trade_id=%s reason=%s err=%r",
+            "[PROP] RELEASE_FAILED "
+            "uid=%s trade_id=%s reason=%s err=%r",
+            uid,
             pos.get("trade_id"),
             reason,
             e,
@@ -2739,7 +3615,10 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
         )
 
         close_observed_ms = int(
-            broker_deal.get("stored_at_ms")
+            broker_deal.get("close_time_ms")
+            or closed.get("broker_close_time_ms")
+            or closed.get("closed_at_ms")
+            or broker_deal.get("stored_at_ms")
             or broker_deal.get("created_at_ms")
             or now_ms()
         )
@@ -2896,7 +3775,10 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
             )
 
             _closed_at_ms = int(
-                _broker_deal.get("stored_at_ms")
+                _broker_deal.get("close_time_ms")
+                or closed.get("broker_close_time_ms")
+                or closed.get("closed_at_ms")
+                or _broker_deal.get("stored_at_ms")
                 or _broker_deal.get("created_at_ms")
                 or _now_ms
             )
@@ -2989,7 +3871,7 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
         pass
 
     _remove_open_trade(uid, str(pos.get("trade_id") or ""))
-    _clear_trade_lifecycle_keys(pos)
+    _clear_trade_lifecycle_keys(uid,pos)
     _clear_exec_claim_for_trade(
         r=R,
         uid=uid,
@@ -3010,17 +3892,72 @@ def tick_user(uid: str) -> None:
     if exec_mode not in ("paper", "mt5"):
         exec_mode = "paper"
 
-    mt5_account = str(st.get("mt5_account") or "demo").strip().lower()
-    if mt5_account not in ("demo", "live"):
-        mt5_account = "demo"
+    mt5_account = _normalize_mt5_account_type(
+        st.get("mt5_account")
+    )
+
+    watchdog_profile_id = ""
+
     if exec_mode == "mt5":
-        # Resolve the active prop profile inside _tick_prop_watchdog().
-        # Missing active-profile state safely falls back to ftmo-main.
-        _tick_prop_watchdog(
+        watchdog_profile_id = str(
+            _user_active_prop_profile_id(uid)
+            or ""
+        ).strip().lower()
+
+        if not watchdog_profile_id:
+            log.error(
+                "[PROP] EXECUTOR_PROFILE_REQUIRED "
+                "uid=%s",
+                uid,
+            )
+            return
+
+        (
+            resolved_mt5_account,
+            resolved_mt5_device,
+        ) = _resolve_runtime_mt5_account_type(
             uid=uid,
-            profile_id=None,
-            mt5_account=mt5_account,
+            profile_id=watchdog_profile_id,
+            fallback=mt5_account,
         )
+
+        if (
+            resolved_mt5_account
+            not in ("demo", "live")
+            or not resolved_mt5_device
+        ):
+            log.error(
+                "[PROP] EXECUTOR_MT5_ACCOUNT_UNRESOLVED "
+                "uid=%s profile=%s",
+                uid,
+                watchdog_profile_id,
+            )
+            return
+
+        mt5_account = resolved_mt5_account
+
+        log.warning(
+            "[PROP] EXECUTOR_MT5_ACCOUNT_RESOLVED "
+            "uid=%s profile=%s device=%s "
+            "account_type=%s",
+            uid,
+            watchdog_profile_id,
+            resolved_mt5_device,
+            mt5_account,
+        )
+
+        if not watchdog_profile_id:
+            log.warning(
+                "[PROP] WATCHDOG_SKIP "
+                "uid=%s reason=ACTIVE_PROFILE_MISSING",
+                uid,
+            )
+        else:
+            _tick_prop_watchdog(
+                uid=uid,
+                profile_id=watchdog_profile_id,
+                mt5_account=mt5_account,
+            )
 
 
     qty = _sf(st.get("qty"), 1.0)
@@ -3051,10 +3988,41 @@ def tick_user(uid: str) -> None:
     # -------------------------------------------------
     try:
         if exec_mode == "mt5":
-            for _bp_active in _broker_xtl_positions(mt5_account):
-                _sync_watches_for_broker_active_position(_bp_active, "BROKER_ACTIVE_PRE_ACK")
+            active_profile_id = str(
+                _user_active_prop_profile_id(uid)
+                or ""
+            ).strip().lower()
+
+            if not active_profile_id:
+                log.warning(
+                    "[WATCHLIST] BROKER_ACTIVE_PRE_ACK_GUARD_SKIP "
+                    "uid=%s reason=PROP_PROFILE_MISSING",
+                    uid,
+                )
+            else:
+                for _bp_active in _broker_xtl_positions(
+                    uid,
+                    account_type=mt5_account,
+                    profile_id=active_profile_id,
+                ):
+                    _sync_watches_for_broker_active_position(
+                        uid,
+                        _bp_active,
+                        "BROKER_ACTIVE_PRE_ACK",
+                    )
+
     except Exception as e:
-        log.warning("[WATCHLIST] BROKER_ACTIVE_PRE_ACK_GUARD_FAILED uid=%s err=%r", uid, e)
+        log.warning(
+            "[WATCHLIST] BROKER_ACTIVE_PRE_ACK_GUARD_FAILED "
+            "uid=%s profile=%s err=%r",
+            uid,
+            (
+                active_profile_id
+                if "active_profile_id" in locals()
+                else ""
+            ),
+            e,
+        )
 
     # -------------------------------------------------
     # 0) MT5 ACK RECONCILIATION (update open trades)
@@ -3136,14 +4104,45 @@ def tick_user(uid: str) -> None:
                     _tk = int(pos.get("mt5_ticket") or 0)
                     if _tk > 0:
                         _zmeta = {
-                            "entry_zone":       pos.get("entry_zone"),
-                            "entry_zone_low":   pos.get("entry_zone_low"),
-                            "entry_zone_high":  pos.get("entry_zone_high"),
-                            "entry_zone_level": pos.get("entry_zone_level"),
-                            "entry_zone_tf":    pos.get("entry_zone_tf"),
-                            "entry_zone_kind":  pos.get("entry_zone_kind"),
+                            "trade_id": str(
+                                pos.get("trade_id") or ""
+                            ),
+                            "user_id": str(uid or ""),
+                            "profile_id": str(
+                                pos.get("profile_id") or ""
+                            ),
+                            "device_id": str(
+                                pos.get("device_id") or ""
+                            ),
+                            "mt5_account": str(
+                                pos.get("mt5_account") or ""
+                            ).lower().strip(),
+                            "symbol": str(
+                                pos.get("symbol") or ""
+                            ).upper().strip(),
+                            "side": str(
+                                pos.get("side") or ""
+                            ).upper().strip(),
+                            "mt5_ticket": _tk,
+                            "entry_zone": pos.get("entry_zone"),
+                            "entry_zone_low": pos.get(
+                                "entry_zone_low"
+                            ),
+                            "entry_zone_high": pos.get(
+                                "entry_zone_high"
+                            ),
+                            "entry_zone_level": pos.get(
+                                "entry_zone_level"
+                            ),
+                            "entry_zone_tf": pos.get(
+                                "entry_zone_tf"
+                            ),
+                            "entry_zone_kind": pos.get(
+                                "entry_zone_kind"
+                            ),
+                            "stored_at_ms": now_ms(),
                         }
-                        if _zmeta.get("entry_zone") or _zmeta.get("entry_zone_level"):
+                        if _zmeta.get("trade_id"):
                             R.set(f"xtl:trade:zone_by_ticket:{_tk}",
                                   json.dumps(_zmeta), ex=7*24*3600)  # 7-day TTL
                 except Exception:
@@ -3276,8 +4275,12 @@ def tick_user(uid: str) -> None:
                     # Release the short watch entry claim.
                     try:
                         for _claim_key in R.scan_iter(
-                            f"xtl:watch:entry_claim:"
-                            f"{_sym_fail}:{_side_fail}:H1:*",
+                            entry_claim_pattern(
+                                uid,
+                                _sym_fail,
+                                _side_fail,
+                                "H1",
+                            ),
                             count=50,
                         ):
                             R.delete(_claim_key)
@@ -3515,23 +4518,83 @@ def tick_user(uid: str) -> None:
                     continue
 
                 keys_to_try = []
+
+                profile_id = str(
+                    pos.get("profile_id")
+                    or ""
+                ).strip().lower()
+
+                # Prefer the device already stored on the trade,
+                # but only as a candidate for this same user/trade.
                 if dev_id:
-                    keys_to_try.append(f"xtl:mt5:pos:{dev_id}:{mt5_account}")
+                    keys_to_try.append(
+                        f"xtl:mt5:pos:"
+                        f"{dev_id}:{mt5_account}"
+                    )
 
-                try:
-                    leader_dev = str(R.get(f"xtl:user:{uid}:trend:leader") or "").strip().strip('"')
-                    if leader_dev:
-                        keys_to_try.append(f"xtl:mt5:pos:{leader_dev}:{mt5_account}")
-                except Exception:
-                    pass
+                # Resolve the exact UID-owned profile binding.
+                if profile_id:
+                    try:
+                        resolved = _resolve_prop_profile_device(
+                            profile_id,
+                            uid,
+                        )
 
-                try:
-                    for k in R.scan_iter(f"xtl:mt5:pos:*:{mt5_account}"):
-                        ks = str(k)
-                        if ks not in keys_to_try:
-                            keys_to_try.append(ks)
-                except Exception:
-                    pass
+                        if (
+                            isinstance(resolved, dict)
+                            and resolved.get("ok")
+                        ):
+                            resolved_dev = str(
+                                resolved.get("device_id")
+                                or ""
+                            ).strip()
+
+                            if resolved_dev:
+                                resolved_key = (
+                                    f"xtl:mt5:pos:"
+                                    f"{resolved_dev}:"
+                                    f"{mt5_account}"
+                                )
+
+                                if resolved_key not in keys_to_try:
+                                    keys_to_try.append(
+                                        resolved_key
+                                    )
+                        else:
+                            log.warning(
+                                "[OPPT] BROKER_RECON_PROFILE_RESOLVE_FAILED "
+                                "uid=%s profile=%s tid=%s reason=%s",
+                                uid,
+                                profile_id,
+                                pos.get("trade_id"),
+                                (
+                                    resolved.get("reason")
+                                    if isinstance(
+                                        resolved,
+                                        dict,
+                                    )
+                                    else "BAD_RESOLVE_PAYLOAD"
+                                ),
+                            )
+
+                    except Exception as e:
+                        log.warning(
+                            "[OPPT] BROKER_RECON_PROFILE_RESOLVE_EXC "
+                            "uid=%s profile=%s tid=%s err=%r",
+                            uid,
+                            profile_id,
+                            pos.get("trade_id"),
+                            e,
+                        )
+                else:
+                    log.warning(
+                        "[OPPT] BROKER_RECON_PROFILE_MISSING "
+                        "uid=%s tid=%s sym=%s",
+                        uid,
+                        pos.get("trade_id"),
+                        pos.get("symbol"),
+                    )
+
                 open_tickets = set()
 
                 raw = None
@@ -3617,34 +4680,40 @@ def tick_user(uid: str) -> None:
                             e,
                         )
                     try:
-                        prop_cfg, prop_cfg_ok, prop_cfg_err = _get_prop_config_safe()
+                        prop_profile_id = str(
+                            pos.get("profile_id")
+                            or ""
+                        ).strip().lower()
+
+                        prop_cfg, prop_cfg_ok, prop_cfg_err = (
+                            _get_prop_config_safe(
+                                uid,
+                                prop_profile_id or None,
+                            )
+                        )
                         if not prop_cfg_ok:
                             log.error(
-                                "[PROP] PROP_CFG_READ_FAIL_BROKER_RECON uid=%s sym=%s ticket=%s err=%s",
+                                "[PROP] PROP_CFG_READ_FAIL_BROKER_RECON "
+                                "uid=%s profile=%s sym=%s "
+                                "ticket=%s err=%s",
                                 uid,
+                                prop_profile_id,
                                 pos.get("symbol"),
                                 ticket,
                                 prop_cfg_err,
                             )
                             prop_cfg = {
                                 "enabled": False,
+                                "profile_id": prop_profile_id,
                                 "_read_ok": False,
                                 "_read_error": prop_cfg_err,
                             }
 
-                        prop_profile_id = "ftmo-main"
-                        try:
-                            prop_profile_id = str(
-                                prop_cfg.get("profile_id")
-                                or prop_cfg.get("account_id")
-                                or prop_profile_id
-                            )
-                        except Exception:
-                            pass
+                        
                         tid0 = str(pos.get("trade_id") or "").strip()
 
                         if bool(prop_cfg.get("enabled")) and tid0:
-                            risk_state0 = _get_prop_risk_state(prop_profile_id)
+                            risk_state0 = _get_prop_risk_state(uid,prop_profile_id)
                             
                             already_reserved = any(
                                 str(x.get("trade_id") or "") == tid0
@@ -3679,6 +4748,7 @@ def tick_user(uid: str) -> None:
 
                                 if risk_usd0 > 0:
                                     _reserve_prop_open_risk(
+                                        uid,
                                         tid0,
                                         {
                                             "trade_id": tid0,
@@ -3720,7 +4790,7 @@ def tick_user(uid: str) -> None:
                         )
                 if ticket not in open_tickets:
                     try:
-                        _all_live = _broker_xtl_positions(mt5_account)
+                        _all_live = _broker_xtl_positions(uid,account_type=mt5_account,profile_id=repair_profile_id,)
                     except Exception:
                         _all_live = []
 
@@ -3822,31 +4892,45 @@ def tick_user(uid: str) -> None:
     try:
         if exec_mode == "mt5":
             try:
-                repair_cfg, repair_cfg_ok, repair_cfg_err = _get_prop_config_safe()
+                repair_profile_id = str(
+                    _user_active_prop_profile_id(uid)
+                    or ""
+                ).strip().lower()
 
-                if not repair_cfg_ok or not isinstance(repair_cfg, dict):
+                if not repair_profile_id:
+                    log.warning(
+                        "[OPPT] SKIP_BROKER_REPAIR_PROFILE_MISSING "
+                        "uid=%s",
+                        uid,
+                    )
+                    return
+
+                (
+                    repair_cfg,
+                    repair_cfg_ok,
+                    repair_cfg_err,
+                ) = _get_prop_config_safe(
+                    uid,
+                    repair_profile_id,
+                )
+
+                if (
+                    not repair_cfg_ok
+                    or not isinstance(repair_cfg, dict)
+                ):
                     log.warning(
                         "[OPPT] SKIP_BROKER_REPAIR_PROP_CFG_FAIL "
-                        "uid=%s err=%s",
+                        "uid=%s profile=%s err=%s",
                         uid,
+                        repair_profile_id,
                         repair_cfg_err,
                     )
                     return
 
-                repair_profile_id = str(
-                    repair_cfg.get("profile_id")
-                    or repair_cfg.get("account_id")
-                    or ""
-                ).strip()
-
-                if not repair_profile_id:
-                    log.warning(
-                        "[OPPT] SKIP_BROKER_REPAIR_PROFILE_MISSING uid=%s",
-                        uid,
-                    )
-                    return
-
-                risk_state = _get_prop_risk_state(repair_profile_id)
+                risk_state = _get_prop_risk_state(
+                    uid,
+                    repair_profile_id,
+                )
                 if not bool(risk_state.get("snapshot_valid", False)):
                     log.warning(
                         "[OPPT] SKIP_BROKER_REPAIR_STALE_SNAPSHOT uid=%s age_ms=%s",
@@ -3872,7 +4956,45 @@ def tick_user(uid: str) -> None:
                 except Exception:
                     pass
 
-            pos_keys = list(R.scan_iter(f"xtl:mt5:pos:*:{mt5_account}"))
+            repair_profile_id = str(
+                _user_active_prop_profile_id(uid)
+                or ""
+            ).strip().lower()
+
+            if not repair_profile_id:
+                log.warning(
+                    "[OPPT] SKIP_BROKER_REPAIR "
+                    "uid=%s reason=PROFILE_MISSING",
+                    uid,
+                )
+                return
+
+            resolved = _resolve_prop_profile_device(
+                repair_profile_id,
+                uid,
+            )
+
+            repair_dev = str(
+                resolved.get("device_id")
+                or ""
+            ).strip()
+
+            if not repair_dev:
+                log.warning(
+                    "[OPPT] SKIP_BROKER_REPAIR "
+                    "uid=%s profile=%s "
+                    "reason=DEVICE_NOT_CONNECTED",
+                    uid,
+                    repair_profile_id,
+                )
+                return
+
+            pos_keys = [
+                (
+                    f"xtl:mt5:pos:"
+                    f"{repair_dev}:{mt5_account}"
+                )
+            ]
 
             for pk in pos_keys:
                 rawp = R.get(pk)
@@ -3979,7 +5101,12 @@ def tick_user(uid: str) -> None:
                     # 2) FALLBACK: watch zone_used
                     if _entry_zone is None:
                         try:
-                            _wk = f"xtl:zone:watch:{sym}:{side}:H1"
+                            _wk = _zone_watch_key(
+                                uid,
+                                sym,
+                                side,
+                                "H1",
+                            )
                             _wr = R.get(_wk)
                             _wj = _sj(_wr, {}) if _wr else {}
                             if isinstance(_wj, dict):
@@ -4013,31 +5140,49 @@ def tick_user(uid: str) -> None:
                     # -------------------------------------------------
                     # Prop metadata (must exist BEFORE repaired record)
                     # -------------------------------------------------
-                    prop_cfg, prop_cfg_ok, prop_cfg_err = _get_prop_config_safe()
+
+                    prop_profile_id = str(
+                        _user_active_prop_profile_id(uid)
+                        or ""
+                    ).strip().lower()
+
+                    if not prop_profile_id:
+                        log.error(
+                            "[PROP] PROP_PROFILE_MISSING_BROKER_REPAIR "
+                            "uid=%s sym=%s",
+                            uid,
+                            sym,
+                        )
+                        return
+
+                    (
+                        prop_cfg,
+                        prop_cfg_ok,
+                        prop_cfg_err,
+                    ) = _get_prop_config_safe(
+                        uid,
+                        prop_profile_id,
+                    )
 
                     if not prop_cfg_ok:
                         log.error(
-                            "[PROP] PROP_CFG_READ_FAIL_BROKER_REPAIR uid=%s sym=%s err=%s",
+                            "[PROP] PROP_CFG_READ_FAIL_BROKER_REPAIR "
+                            "uid=%s profile=%s sym=%s err=%s",
                             uid,
+                            prop_profile_id,
                             sym,
                             prop_cfg_err,
                         )
+
                         prop_cfg = {
                             "enabled": False,
+                            "profile_id": prop_profile_id,
                             "_read_ok": False,
                             "_read_error": prop_cfg_err,
                         }
-                    prop_profile_id = "ftmo-main"
-                    try:
-                        prop_profile_id = str(
-                            prop_cfg.get("profile_id")
-                            or prop_cfg.get("account_id")
-                            or prop_profile_id
-                        )
-                    except Exception:
-                        pass
 
                     risk_usd = 0.0
+
                     if bool(prop_cfg.get("enabled")):
                         risk_usd = _risk_usd_from_broker_position(
                             sym,
@@ -4057,22 +5202,7 @@ def tick_user(uid: str) -> None:
                         risk_usd=float(risk_usd or 0.0),
                     )
 
-                    try:
-                        _planned_rr = float(_repair_prop_check.get("planned_rr") or 0.0)
-                        _min_rr = 1.90
-
-                        if _planned_rr < _min_rr:
-                            log.warning(
-                                "[OPPT] SKIP_BROKER_REPAIR_LOW_RR uid=%s sym=%s side=%s ticket=%s planned_rr=%.4f min_rr=%.2f entry=%s sl=%s tp=%s",
-                                uid, sym, side, ticket, _planned_rr, _min_rr, entry_px, sl0, tp0,
-                            )
-                            continue
-                    except Exception as e:
-                        log.warning(
-                            "[OPPT] SKIP_BROKER_REPAIR_RR_CHECK_EXC uid=%s sym=%s side=%s ticket=%s err=%r",
-                            uid, sym, side, ticket, e,
-                        )
-                        continue
+                    
 
                     
 
@@ -4109,6 +5239,7 @@ def tick_user(uid: str) -> None:
 
                         "source": "broker_repair",
                         "execution_mode": "mt5",
+                        "mt5_account": mt5_account,
 
                         "device_id": dev_from_key,
 
@@ -4170,6 +5301,7 @@ def tick_user(uid: str) -> None:
 
                             if risk_usd > 0:
                                 _reserve_prop_open_risk(
+                                    uid,
                                     repaired["trade_id"],
                                     {
                                         "trade_id": repaired["trade_id"],
@@ -4217,6 +5349,46 @@ def tick_user(uid: str) -> None:
                     )
     except Exception as e:
         log.warning("[OPPT] BROKER_REPAIR_OPEN failed uid=%s err=%r", uid, e)
+    # -------------------------------------------------
+    # 0d) MT5 CLOSED-DEAL ORPHAN RECONCILIATION
+    #
+    # A delayed broker fill may have lost its local UUID
+    # open-ledger row. Reuse the canonical close finalizer
+    # for any UID/profile/device-owned deal not yet closed.
+    # -------------------------------------------------
+    try:
+        if exec_mode == "mt5":
+            orphan_profile_id = str(
+                _user_active_prop_profile_id(uid)
+                or ""
+            ).strip().lower()
+
+            if orphan_profile_id:
+                orphan_recovered = (
+                    _reconcile_orphan_broker_deals(
+                        uid=uid,
+                        profile_id=orphan_profile_id,
+                        mt5_account=mt5_account,
+                    )
+                )
+
+                if orphan_recovered:
+                    log.warning(
+                        "[OPPT] ORPHAN_BROKER_DEALS_RECOVERED "
+                        "uid=%s profile=%s account=%s count=%s",
+                        uid,
+                        orphan_profile_id,
+                        mt5_account,
+                        orphan_recovered,
+                    )
+
+    except Exception:
+        log.exception(
+            "[OPPT] ORPHAN_BROKER_DEAL_SCAN_FAILED "
+            "uid=%s account=%s",
+            uid,
+            mt5_account,
+        )
 
     # final authoritative state
     open_trades = _list_open_trades(uid)
@@ -4280,7 +5452,12 @@ def tick_user(uid: str) -> None:
     # OPPT rows are advisory/history only.
     # -------------------------------------------------
     try:
-        for wkey in R.scan_iter("xtl:zone:watch:*:*:H1"):
+        for wkey in R.scan_iter(
+            zone_watch_pattern(
+                uid,
+                "H1",
+            )
+        ):
             try:
                 raw_w = R.get(wkey)
                 watch = _sj(raw_w, {}) if raw_w else {}
@@ -4288,13 +5465,28 @@ def tick_user(uid: str) -> None:
                     continue
 
                 parts = str(wkey).split(":")
-                if len(parts) < 6:
+                if len(parts) < 7:
+                    log.warning(
+                        "[WATCHLIST] SKIP_BAD_WATCH_KEY "
+                        "uid=%s key=%s",
+                        uid,
+                        wkey,
+                    )
+                    continue
+                key_uid = str(parts[3] or "").strip()
+                sym_w = str(parts[4] or "").upper().strip()
+                side_w = str(parts[5] or "").upper().strip()
+                tf_w = str(parts[6] or "").upper().strip()
+
+                if key_uid != str(uid or "").strip():
                     continue
 
-                sym_w = parts[3].upper().strip()
-                side_w = parts[4].upper().strip()
+                if not sym_w:
+                    continue
 
                 if side_w not in ("BUY", "SELL"):
+                    continue
+                if tf_w != "H1":
                     continue
 
                 # Broker-truth guard: while any active XTL broker position exists
@@ -4302,14 +5494,44 @@ def tick_user(uid: str) -> None:
                 # This blocks both same-side duplicate and opposite-side reversal
                 # setups even when Redis open ledger is missing or delayed.
                 try:
-                    _bp_active = _broker_has_active_xtl_symbol(sym_w, mt5_account) if exec_mode == "mt5" else None
+                    _active_profile_id = str(
+                        watch.get("profile_id")
+                        or _user_active_prop_profile_id(uid)
+                        or ""
+                    ).strip().lower()
+
+                    _bp_active = (
+                        _broker_has_active_xtl_symbol(
+                            uid=uid,
+                            symbol=sym_w,
+                            account_type=mt5_account,
+                            profile_id=_active_profile_id,
+                        )
+                        if exec_mode == "mt5"
+                        and _active_profile_id
+                        else None
+                    )
+
                     if _bp_active:
-                        _sync_watches_for_broker_active_position(_bp_active, "BROKER_ACTIVE_WATCH_SCAN")
+                        _sync_watches_for_broker_active_position(
+                            uid,
+                            _bp_active,
+                            "BROKER_ACTIVE_WATCH_SCAN",
+                        )
                         continue
+
                 except Exception as e:
                     log.warning(
-                        "[WATCHLIST] BROKER_ACTIVE_WATCH_SCAN_FAILED sym=%s side=%s err=%r",
-                        sym_w, side_w, e,
+                        "[WATCHLIST] BROKER_ACTIVE_WATCH_SCAN_FAILED "
+                        "sym=%s side=%s profile=%s err=%r",
+                        sym_w,
+                        side_w,
+                        (
+                            _active_profile_id
+                            if "_active_profile_id" in locals()
+                            else ""
+                        ),
+                        e,
                     )
 
                 state_w = str(watch.get("state") or "").upper().strip()
@@ -4416,82 +5638,165 @@ def tick_user(uid: str) -> None:
                 if bool(watch.get("entry_triggered")):
                     continue
 
-                trig_hi = _sf(watch.get("rev_ok_bar_hi"), 0.0)
-                trig_lo = _sf(watch.get("rev_ok_bar_lo"), 0.0)
+                trig_hi = _sf(
+                    watch.get("rev_ok_bar_hi"),
+                    0.0,
+                )
 
-                # live price from current device-independent price key fallback
-                # live price from selected/online trading device, not random stale scan key
+                trig_lo = _sf(
+                    watch.get("rev_ok_bar_lo"),
+                    0.0,
+                )
+
+                # Live price from the device strictly bound to this
+                # UID-owned prop profile.
                 live_px = 0.0
+
                 try:
-                    prop_cfg_px, prop_cfg_px_ok, prop_cfg_px_err = _get_prop_config_safe()
+                    profile_id_px = str(
+                        watch.get("profile_id")
+                        or _user_active_prop_profile_id(uid)
+                        or ""
+                    ).strip().lower()
+
+                    if not profile_id_px:
+                        log.warning(
+                            "[PROP] LIVE_PRICE_PROFILE_MISSING "
+                            "uid=%s sym=%s",
+                            uid,
+                            sym_w,
+                        )
+                        continue
+
+                    (
+                        prop_cfg_px,
+                        prop_cfg_px_ok,
+                        prop_cfg_px_err,
+                    ) = _get_prop_config_safe(
+                        uid,
+                        profile_id_px,
+                    )
 
                     dev_for_px = ""
 
-                    if prop_cfg_px_ok and isinstance(prop_cfg_px, dict):
-                        profile_id_px = str(
-                            prop_cfg_px.get("profile_id")
-                            or prop_cfg_px.get("account_id")
-                            or ""
-                        ).strip()
+                    if (
+                        prop_cfg_px_ok
+                        and isinstance(
+                            prop_cfg_px,
+                            dict,
+                        )
+                    ):
+                        try:
+                            resolved_px = _resolve_prop_profile_device(
+                                profile_id_px,
+                                uid,
+                            )
 
-                        if profile_id_px:
-                            try:
-                                resolved_px = _resolve_prop_profile_device(profile_id_px)
-
-                                if isinstance(resolved_px, dict) and resolved_px.get("ok"):
-                                    dev_for_px = str(
-                                        resolved_px.get("device_id") or ""
-                                    ).strip()
-                                else:
-                                    log.warning(
-                                        "[PROP] LIVE_PRICE_PROFILE_RESOLVE_FAILED "
-                                        "uid=%s profile=%s sym=%s reason=%s",
-                                        uid,
-                                        profile_id_px,
-                                        sym_w,
-                                        (
-                                           resolved_px.get("reason")
-                                           if isinstance(resolved_px, dict)
-                                           else "BAD_RESOLVE_PAYLOAD"
-                                        ),
-                                    )
-
-                            except Exception as e:
+                            if (
+                                isinstance(
+                                    resolved_px,
+                                    dict,
+                                )
+                                and resolved_px.get("ok")
+                            ):
+                                dev_for_px = str(
+                                    resolved_px.get("device_id") or ""
+                                ).strip()
+                            else:
                                 log.warning(
-                                    "[PROP] LIVE_PRICE_PROFILE_RESOLVE_EXC "
-                                    "uid=%s profile=%s sym=%s err=%r",
+                                    "[PROP] "
+                                    "LIVE_PRICE_PROFILE_RESOLVE_FAILED "
+                                    "uid=%s profile=%s "
+                                    "sym=%s reason=%s",
                                     uid,
                                     profile_id_px,
                                     sym_w,
-                                    e,
+                                    (
+                                        resolved_px.get("reason")
+                                        if isinstance(
+                                            resolved_px,
+                                            dict,
+                                        )
+                                        else "BAD_RESOLVE_PAYLOAD"
+                                    ),
                                 )
+
+                        except Exception as e:
+                            log.warning(
+                                "[PROP] "
+                                "LIVE_PRICE_PROFILE_RESOLVE_EXC "
+                                "uid=%s profile=%s "
+                                "sym=%s err=%r",
+                                uid,
+                                profile_id_px,
+                                sym_w,
+                                e,
+                            )
+
                     else:
                         log.warning(
                             "[PROP] LIVE_PRICE_CFG_READ_FAIL "
-                            "uid=%s sym=%s err=%s",
+                            "uid=%s profile=%s "
+                            "sym=%s err=%s",
                             uid,
+                            profile_id_px,
                             sym_w,
                             prop_cfg_px_err,
                         )
-                    if dev_for_px:
-                        pk = f"xtl:price:{dev_for_px}:{sym_w}"
-                        pr = _sj(R.get(pk), {})
-                        if isinstance(pr, dict):
-                            px0 = _sf(pr.get("price"), 0.0)
-                            ts0 = _si(pr.get("ts_ms"), 0)
 
-                            # reject stale price older than 2 minutes
-                            if px0 > 0 and ts0 > 0 and (now_ms() - ts0) <= 120000:
+                    if dev_for_px:
+                        pk = (
+                            f"xtl:price:"
+                            f"{dev_for_px}:{sym_w}"
+                        )
+
+                        pr = _sj(
+                            R.get(pk),
+                            {},
+                        )
+
+                        if isinstance(pr, dict):
+                            px0 = _sf(
+                                pr.get("price"),
+                                0.0,
+                            )
+
+                            ts0 = _si(
+                                pr.get("ts_ms"),
+                                0,
+                            )
+
+                            if (
+                                px0 > 0
+                                and ts0 > 0
+                                and (now_ms() - ts0) <= 120000
+                            ):
                                 live_px = px0
 
-                    
                 except Exception:
+                    log.exception(
+                        "[PROP] LIVE_PRICE_READ_EXC "
+                        "uid=%s profile=%s sym=%s",
+                        uid,
+                        (
+                            profile_id_px
+                            if "profile_id_px" in locals()
+                            else ""
+                        ),
+                        sym_w,
+                    )
+
                     live_px = 0.0
+
                 if live_px <= 0:
                     continue
-                rev_ok_ms = _si(watch.get("rev_ok_ms"), 0)
 
-                # RC must exist.
+                rev_ok_ms = _si(
+                    watch.get("rev_ok_ms"),
+                    0,
+                )
+
+                # RC must exist
                 # rev_ok_ms is broker-candle time. Normalize it to server UTC before
                 # comparing with now_ms(), otherwise UTC+ broker candles look "future".
                 if rev_ok_ms <= 0:
@@ -4594,14 +5899,34 @@ def tick_user(uid: str) -> None:
                         )
                         try:
                             R.delete(str(wkey))
-                            R.delete(f"xtl:watch:break_state:{sym_w}:{side_w}:H1")
-                            for _ck in R.scan_iter(f"xtl:watch:entry_claim:{sym_w}:{side_w}:H1:*", count=50):
+                            R.delete(
+                                break_state_key(
+                                    uid,
+                                    sym_w,
+                                    side_w,
+                                    "H1",
+                                )
+                            )
+                            for _ck in R.scan_iter(
+                                entry_claim_pattern(
+                                    uid,
+                                    sym_w,
+                                    side_w,
+                                    "H1",
+                                ),
+                                count=50,
+                            ):
                                 R.delete(_ck)
                         except Exception:
                             pass
                         continue
 
-                break_key = f"xtl:watch:break_state:{sym_w}:{side_w}:H1"
+                break_key = break_state_key(
+                    uid,
+                    sym_w,
+                    side_w,
+                    "H1",
+                )
 
                 prev_px = 0.0
                 prev_ts = 0
@@ -4694,6 +6019,125 @@ def tick_user(uid: str) -> None:
 
                 if not crossed:
                     continue
+
+                # -------------------------------------------------
+                # P0: RC trigger-cross Discord alert.
+                #
+                # This belongs in the actual runtime BREAK_CHECK
+                # path and must execute before entry/state/claim
+                # guards. Redis NX dedupe inside the helper prevents
+                # repeated messages while price remains beyond the
+                # trigger.
+                # -------------------------------------------------
+                now_e = now_ms()
+
+                try:
+                    watch["symbol"] = str(sym_w).upper()
+                    watch["direction"] = str(side_w).upper()
+                    watch["watch_key"] = str(wkey)
+
+                    watch["rc_trigger_crossed"] = True
+                    if not watch.get("rc_trigger_crossed"):
+                        watch["rc_trigger_crossed_ms"] = int(now_e)
+                        watch["rc_trigger_cross_price"] = float(live_px)
+
+                    watch["rc_trigger_crossed"] = True
+                    watch["rc_trigger_cross_level"] = float(trigger_level)
+                    watch["rc_trigger_cross_level"] = float(
+                        trigger_level
+                    )
+
+                    # Preserve the cross evidence on the live watch.
+                    try:
+                        R.set(
+                            str(wkey),
+                            json.dumps(
+                                watch,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                            ex=7 * 24 * 3600,
+                        )
+
+                        log.warning(
+                            "[RC_TRIGGER] CROSS_PERSISTED "
+                            "sym=%s side=%s trigger=%s live=%s "
+                            "watch=%s",
+                            sym_w,
+                            side_w,
+                            trigger_level,
+                            live_px,
+                            wkey,
+                        )
+
+                    except Exception as exc:
+                        log.warning(
+                            "[RC_TRIGGER] WATCH_PERSIST_FAILED "
+                            "sym=%s side=%s trigger=%s live=%s "
+                            "watch=%s err=%r",
+                            sym_w,
+                            side_w,
+                            trigger_level,
+                            live_px,
+                            wkey,
+                            exc,
+                        )
+
+                    notify_result = (
+                        _discord_notify_rc_trigger(
+                            watch=watch,
+                            live_price=float(
+                                live_px
+                            ),
+                            now_ms=int(now_e),
+                        )
+                    )
+                    # Persist Discord result fields added by helper.
+                    try:
+                        R.set(
+                            str(wkey),
+                            json.dumps(
+                                watch,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                            ex=7 * 24 * 3600,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "[RC_TRIGGER] RESULT_PERSIST_FAILED "
+                            "sym=%s side=%s watch=%s err=%r",
+                            sym_w,
+                            side_w,
+                            wkey,
+                            exc,
+                        )
+
+                    log.warning(
+                        "[RC_TRIGGER] DISCORD_NOTIFY_RESULT "
+                        "sym=%s side=%s trigger=%s live=%s "
+                        "watch=%s result=%r",
+                        sym_w,
+                        side_w,
+                        trigger_level,
+                        live_px,
+                        wkey,
+                        notify_result,
+                    )
+
+                except Exception as exc:
+                    log.warning(
+                        "[RC_TRIGGER] DISCORD_NOTIFY_FAILED "
+                        "sym=%s side=%s trigger=%s live=%s "
+                        "watch=%s err=%r",
+                        sym_w,
+                        side_w,
+                        trigger_level,
+                        live_px,
+                        wkey,
+                        exc,
+                    )
+
                 log.warning(
                     "[WATCHLIST] AFTER_CROSS sym=%s side=%s entry_triggered=%s state=%s",
                     sym_w,
@@ -4712,7 +6156,17 @@ def tick_user(uid: str) -> None:
                 if state_now in ("ORDER_PENDING", "TRADE_ACTIVE"):
                     continue
 
-                claim_key = f"xtl:watch:entry_claim:{sym_w}:{side_w}:H1:{int(watch.get('rev_ok_ms') or watch.get('started_ms') or 0)}"
+                claim_key = entry_claim_key(
+                    uid,
+                    sym_w,
+                    side_w,
+                    int(
+                        watch.get("rev_ok_ms")
+                        or watch.get("started_ms")
+                        or 0
+                    ),
+                    "H1",
+                )
                 claimed = R.set(claim_key, str(now_ms()), nx=True, ex=120)
                 log.warning(
                     "[WATCHLIST] CLAIM_RESULT sym=%s side=%s claimed=%s claim_key=%s",
@@ -4858,16 +6312,52 @@ def tick_user(uid: str) -> None:
         ).strip()
 
         if not exit_profile_id:
-            try:
-                exit_cfg, exit_cfg_ok, _ = _get_prop_config_safe()
-                if exit_cfg_ok and isinstance(exit_cfg, dict):
-                    exit_profile_id = str(
-                        exit_cfg.get("profile_id")
-                        or exit_cfg.get("account_id")
-                        or ""
-                    ).strip()
-            except Exception:
-                exit_profile_id = ""
+            exit_profile_id = str(
+                _user_active_prop_profile_id(uid)
+                or ""
+            ).strip().lower()
+
+        if not exit_profile_id:
+            log.error(
+                "[PROP] EXIT_PROFILE_MISSING "
+                "uid=%s tid=%s sym=%s",
+                uid,
+                tid,
+                sym,
+            )
+            continue
+
+        try:
+            (
+                exit_cfg,
+                exit_cfg_ok,
+                _,
+            ) = _get_prop_config_safe(
+                uid,
+                exit_profile_id,
+            )
+
+            if (
+                exit_cfg_ok
+                and isinstance(
+                    exit_cfg,
+                    dict,
+                )
+            ):
+                exit_profile_id = str(
+                    exit_cfg.get("profile_id")
+                    or exit_profile_id
+                ).strip().lower()
+
+        except Exception:
+            log.exception(
+                "[PROP] EXIT_PROFILE_CFG_READ_EXC "
+                "uid=%s profile=%s tid=%s",
+                uid,
+                exit_profile_id,
+                tid,
+            )
+            continue
         exit_price = _sf(ev.get("exit_price"), 0.0)
         if exit_price <= 0:
             exit_price = _sf(pos.get("tp_price") or pos.get("sl_price"), 0.0)
@@ -4950,62 +6440,184 @@ def tick_user(uid: str) -> None:
             dbg_n += 1
 
         # Global max_positions should not block other symbols.
-        # We enforce one active trade per symbol below.
-        # Keep max_positions only as optional safety when > 0 and explicitly wanted.
-        if False and len(open_trades) >= max_positions:
-            break
+        # One active XTL trade per symbol is enforced below.
+        
 
+        tid = str(
+            ev.get("trade_id") or ""
+        ).strip()
 
-        tid = str(ev.get("trade_id") or "").strip()
-        sym = str(ev.get("symbol") or "").upper().strip()
-        side = str(ev.get("side") or "").upper().strip()
-        if not tid or not sym or side not in ("BUY", "SELL"):
+        sym = str(
+            ev.get("symbol") or ""
+        ).upper().strip()
+
+        side = str(
+            ev.get("side") or ""
+        ).upper().strip()
+
+        if (
+            not tid
+            or not sym
+            or side not in ("BUY", "SELL")
+        ):
             continue
 
         if tid in open_by_id:
             continue
+
+        # Resolve the exact UID-owned profile once and reuse it
+        # for broker checks and prop configuration.
+        prop_profile_id = str(
+            ev.get("profile_id")
+            or _user_active_prop_profile_id(uid)
+            or ""
+        ).strip().lower()
+
+        if not prop_profile_id:
+            log.error(
+                "[PROP] SKIP_ENTRY_PROFILE_MISSING "
+                "uid=%s sym=%s side=%s tid=%s",
+                uid,
+                sym,
+                side,
+                tid,
+            )
+
+            _clear_watchlist_entry_block(
+                ev,
+                "PROP_PROFILE_MISSING",
+            )
+            continue
+
+        # Preserve ownership on every downstream event/trade record.
+        ev["uid"] = uid
+        ev["user_id"] = uid
+        ev["profile_id"] = prop_profile_id
+
         _same_sym_open = [
-            t for t in open_trades
-            if str(t.get("symbol") or "").upper().strip() == sym
-            and str(t.get("execution_mode") or "paper").lower() == exec_mode
-            and str(t.get("status") or "").lower() in ("sent", "pending", "filled")
+            t
+            for t in open_trades
+            if (
+                str(
+                    t.get("symbol") or ""
+                ).upper().strip()
+                == sym
+            )
+            and (
+                str(
+                    t.get("execution_mode")
+                    or "paper"
+                ).lower()
+                == exec_mode
+            )
+            and (
+                str(
+                    t.get("status") or ""
+                ).lower()
+                in (
+                    "sent",
+                    "pending",
+                    "filled",
+                )
+            )
         ]
 
         _broker_same_sym = []
+
         if exec_mode == "mt5":
             try:
-                for pk in R.scan_iter(f"xtl:mt5:pos:*:{mt5_account}"):
-                    rawp = R.get(pk)
-                    arr = _sj(rawp, []) if rawp else []
-                    if not isinstance(arr, list):
-                        continue
-                    for bp in arr:
-                        if not isinstance(bp, dict):
-                            continue
-                        if str(bp.get("symbol") or "").upper().strip() != sym:
-                            continue
+                broker_positions = _broker_xtl_positions(
+                    uid,
+                    account_type=mt5_account,
+                    profile_id=prop_profile_id,
+                )
 
-                        magic = int(bp.get("magic") or 0)
-                        comment = str(bp.get("comment") or "")
-                        if magic == 20251227 or comment.upper().startswith("XTL"):
-                            _broker_same_sym.append(bp)
+                for bp in broker_positions or []:
+                    if not isinstance(bp, dict):
+                        continue
+
+                    if (
+                        str(
+                            bp.get("symbol") or ""
+                        ).upper().strip()
+                        != sym
+                    ):
+                        continue
+
+                    _broker_same_sym.append(bp)
+
             except Exception:
-                pass
+                log.exception(
+                    "[OPPT] SAME_SYMBOL_BROKER_CHECK_FAILED "
+                    "uid=%s profile=%s sym=%s "
+                    "side=%s tid=%s",
+                    uid,
+                    prop_profile_id,
+                    sym,
+                    side,
+                    tid,
+                )
 
         if _same_sym_open or _broker_same_sym:
             try:
                 if _broker_same_sym:
-                    _bp0 = dict(_broker_same_sym[0])
-                    _bp0.setdefault("symbol", sym)
-                    _bp0.setdefault("side", str(_bp0.get("side") or "").upper().strip() or side)
-                    _sync_watches_for_broker_active_position(_bp0, "BROKER_ACTIVE_ENTRY_SKIP")
+                    _bp0 = dict(
+                        _broker_same_sym[0]
+                    )
+
+                    _bp0.setdefault(
+                        "symbol",
+                        sym,
+                    )
+
+                    _bp0.setdefault(
+                        "side",
+                        str(
+                            _bp0.get("side") or ""
+                        ).upper().strip()
+                        or side,
+                    )
+
+                    _bp0.setdefault(
+                        "profile_id",
+                        prop_profile_id,
+                    )
+
+                    _sync_watches_for_broker_active_position(
+                        uid,
+                        _bp0,
+                        "BROKER_ACTIVE_ENTRY_SKIP",
+                    )
+
             except Exception:
-                pass
+                log.exception(
+                    "[OPPT] BROKER_ACTIVE_WATCH_SYNC_FAILED "
+                    "uid=%s profile=%s sym=%s "
+                    "side=%s tid=%s",
+                    uid,
+                    prop_profile_id,
+                    sym,
+                    side,
+                    tid,
+                )
+
             log.warning(
-                "[OPPT] SKIP_ENTRY same_symbol_active uid=%s sym=%s side=%s tid=%s redis_open=%s broker_open=%s",
-                uid, sym, side, tid, len(_same_sym_open), len(_broker_same_sym)
+                "[OPPT] SKIP_ENTRY same_symbol_active "
+                "uid=%s profile=%s sym=%s side=%s "
+                "tid=%s redis_open=%s broker_open=%s",
+                uid,
+                prop_profile_id,
+                sym,
+                side,
+                tid,
+                len(_same_sym_open),
+                len(_broker_same_sym),
             )
-            _clear_watchlist_entry_block(ev, "SAME_SYMBOL_ACTIVE")
+
+            _clear_watchlist_entry_block(
+                ev,
+                "SAME_SYMBOL_ACTIVE",
+            )
             continue
         try:
             score = float(ev.get("score") or 0.0)
@@ -5064,7 +6676,40 @@ def tick_user(uid: str) -> None:
 
         tp_price = _sf(ev.get("tp_price"), 0.0)
         sl_price = _sf(ev.get("sl_price"), 0.0)
-        prop_cfg_pre, prop_cfg_pre_ok, prop_cfg_pre_err = _get_prop_config_safe()
+        prop_profile_id = str(
+            ev.get("profile_id")
+            or ""
+        ).strip().lower()
+
+        if not prop_profile_id:
+            prop_profile_id = str(
+                _user_active_prop_profile_id(uid)
+                or ""
+            ).strip().lower()
+
+        if not prop_profile_id:
+            log.error(
+                "[PROP] BLOCK_ENTRY_PROFILE_MISSING "
+                "uid=%s sym=%s side=%s tid=%s",
+                uid,
+                sym,
+                side,
+                tid,
+            )
+            _clear_watchlist_entry_block(
+                ev,
+                "PROP_PROFILE_MISSING",
+            )
+            continue
+
+        (
+            prop_cfg_pre,
+            prop_cfg_pre_ok,
+            prop_cfg_pre_err,
+        ) = _get_prop_config_safe(
+            uid,
+            prop_profile_id,
+        )
 
         if not prop_cfg_pre_ok:
             log.error(
@@ -5172,7 +6817,15 @@ def tick_user(uid: str) -> None:
                 continue
 
         else:
-             watch_key = ev.get("watch_key") or f"xtl:zone:watch:{sym}:{side}:H1"
+             watch_key = (
+                 ev.get("watch_key")
+                 or _zone_watch_key(
+                     uid,
+                     sym,
+                     side,
+                     "H1",
+                 )
+             )
              watch = {}
 
              try:
@@ -5393,59 +7046,120 @@ def tick_user(uid: str) -> None:
         # PROP FIRM COMPLIANCE CHECK
         # Runs after ENTRY_CLAIM so only one executor reserves risk.
         # -------------------------------------------------
+
         prop_check = None
-        prop_cfg, prop_cfg_ok, prop_cfg_err = _get_prop_config_safe()
-        prop_profile_id = "ftmo-main"
+
+        prop_profile_id = str(
+            ev.get("profile_id")
+            or _user_active_prop_profile_id(uid)
+            or ""
+        ).strip().lower()
+
+        if not prop_profile_id:
+            log.error(
+                "[PROP] BLOCK_ENTRY_PROFILE_MISSING_AFTER_CLAIM "
+                "uid=%s tid=%s sym=%s side=%s",
+                uid,
+                tid,
+                sym,
+                side,
+            )
+
+            try:
+                R.delete(
+                    ENTRY_CLAIM_KEY.format(
+                        alert_id=alert_id,
+                    )
+                )
+            except Exception:
+                pass
+
+            try:
+                R.delete(exec_claim_key)
+            except Exception:
+                pass
+
+            _clear_watchlist_entry_block(
+                ev,
+                "PROP_PROFILE_MISSING",
+            )
+            continue
+
+        (
+            prop_cfg,
+            prop_cfg_ok,
+            prop_cfg_err,
+        ) = _get_prop_config_safe(
+            uid,
+            prop_profile_id,
+        )
 
         if not prop_cfg_ok:
             log.error(
-                "[PROP] BLOCK_ENTRY_PROP_CFG_READ_FAIL_AFTER_CLAIM uid=%s tid=%s sym=%s side=%s err=%s",
+                "[PROP] BLOCK_ENTRY_PROP_CFG_READ_FAIL_AFTER_CLAIM "
+                "uid=%s profile=%s tid=%s sym=%s side=%s err=%s",
                 uid,
+                prop_profile_id,
                 tid,
                 sym,
                 side,
                 prop_cfg_err,
             )
+
             try:
-                R.delete(ENTRY_CLAIM_KEY.format(alert_id=alert_id))
+                R.delete(
+                    ENTRY_CLAIM_KEY.format(
+                        alert_id=alert_id,
+                    )
+                )
             except Exception:
                 pass
+
             try:
                 R.delete(exec_claim_key)
             except Exception:
                 pass
-            _clear_watchlist_entry_block(ev, "PROP_CFG_READ_FAIL")
-            continue
 
-        prop_profile_id = str(
-            prop_cfg.get("profile_id")
-            or prop_cfg.get("account_id")
-            or "ftmo-main"
-        )
+            _clear_watchlist_entry_block(
+                ev,
+                "PROP_CFG_READ_FAIL",
+            )
+            continue
 
         if not bool(prop_cfg.get("enabled")):
             log.error(
-                "[PROP] BLOCK_ENTRY_PROP_DISABLED_AFTER_CLAIM uid=%s tid=%s sym=%s side=%s profile=%s",
+                "[PROP] BLOCK_ENTRY_PROP_DISABLED_AFTER_CLAIM "
+                "uid=%s profile=%s tid=%s sym=%s side=%s",
                 uid,
+                prop_profile_id,
                 tid,
                 sym,
                 side,
-                prop_profile_id,
             )
+
             try:
-                R.delete(ENTRY_CLAIM_KEY.format(alert_id=alert_id))
+                R.delete(
+                    ENTRY_CLAIM_KEY.format(
+                        alert_id=alert_id,
+                    )
+                )
             except Exception:
                 pass
+
             try:
                 R.delete(exec_claim_key)
             except Exception:
                 pass
-            _clear_watchlist_entry_block(ev, "PROP_DISABLED")
+
+            _clear_watchlist_entry_block(
+                ev,
+                "PROP_DISABLED",
+            )
             continue
 
         if bool(prop_cfg.get("enabled")):
             try:
-                risk_state = _get_prop_risk_state(prop_profile_id)
+                risk_state = _get_prop_risk_state(uid,prop_profile_id)
                 if bool(risk_state.get("trading_halted")):
                     halt_reason = str(risk_state.get("halt_reason") or "TRADING_HALTED")
                     log.warning(
@@ -5649,7 +7363,7 @@ def tick_user(uid: str) -> None:
         resolved = {}
 
         try:
-            resolved = _resolve_prop_profile_device(prop_profile_id)
+            resolved = _resolve_prop_profile_device(prop_profile_id,uid,)
         except Exception as e:
             log.error(
                 "[PROP] PROFILE_DEVICE_RESOLVE_EXC "
@@ -5703,34 +7417,110 @@ def tick_user(uid: str) -> None:
 
             continue
 
-        _live_pos_count = _broker_live_position_count(device_id, _acct_type)
+        # -------------------------------------------------
+        # P0: UID/profile-scoped max-open-position guard.
+        #
+        # Count Redis ORDER_PENDING immediately because the
+        # broker position snapshot can lag after MT5 enqueue.
+        # -------------------------------------------------
+        _open_trades_now = _list_open_trades(uid)
 
-        if _max_open_positions > 0 and _live_pos_count >= _max_open_positions:
+        _ledger_active = [
+            t
+            for t in (_open_trades_now or [])
+            if isinstance(t, dict)
+            and str(
+                t.get("execution_mode") or ""
+            ).lower().strip() == "mt5"
+            and str(
+                t.get("profile_id") or ""
+            ).lower().strip() == prop_profile_id
+            and (
+                str(
+                    t.get("status") or ""
+                ).lower().strip()
+                in (
+                    "sent",
+                    "pending",
+                    "filled",
+                )
+                or str(
+                    t.get("trade_state") or ""
+                ).upper().strip()
+                in (
+                    "ORDER_PENDING",
+                    "TRADE_ACTIVE",
+                )
+            )
+        ]
+
+        _ledger_active_count = len(_ledger_active)
+
+        _live_pos_count = _broker_live_position_count(
+            device_id,
+            _acct_type,
+        )
+
+        # Broker snapshot may lag Redis after enqueue.
+        _effective_open_count = max(
+            _ledger_active_count,
+            _live_pos_count,
+        )
+
+        if (
+            _max_open_positions > 0
+            and _effective_open_count >= _max_open_positions
+        ):
             log.warning(
-                "[PROP] BLOCK_ENTRY uid=%s tid=%s sym=%s side=%s reason=MAX_OPEN_POSITIONS_REACHED "
-                "broker_live_positions=%s max_open_positions=%s device_id=%s",
+                "[PROP] BLOCK_ENTRY "
+                "uid=%s profile=%s tid=%s sym=%s side=%s "
+                "reason=MAX_OPEN_POSITIONS_REACHED "
+                "ledger_active=%s broker_live=%s "
+                "effective_open=%s max_open_positions=%s "
+                "device_id=%s",
                 uid,
+                prop_profile_id,
                 tid,
                 sym,
                 side,
+                _ledger_active_count,
                 _live_pos_count,
+                _effective_open_count,
                 _max_open_positions,
                 device_id,
             )
 
             try:
                 pos["entry_blocked"] = True
-                pos["entry_block_reason"] = "MAX_OPEN_POSITIONS_REACHED"
+                pos["entry_block_reason"] = (
+                    "MAX_OPEN_POSITIONS_REACHED"
+                )
                 pos["trade_state"] = "ENTRY_BLOCKED"
                 pos["status"] = "blocked"
-                pos["blocked_at_ms"] = int(time.time() * 1000)
-                pos["broker_live_positions"] = int(_live_pos_count)
-                pos["max_open_positions"] = int(_max_open_positions)
+                pos["blocked_at_ms"] = int(
+                    time.time() * 1000
+                )
+                pos["broker_live_positions"] = int(
+                    _live_pos_count
+                )
+                pos["ledger_active_positions"] = int(
+                    _ledger_active_count
+                )
+                pos["effective_open_positions"] = int(
+                    _effective_open_count
+                )
+                pos["max_open_positions"] = int(
+                    _max_open_positions
+                )
             except Exception:
                 pass
 
             try:
-                R.delete(ENTRY_CLAIM_KEY.format(alert_id=alert_id))
+                R.delete(
+                    ENTRY_CLAIM_KEY.format(
+                        alert_id=alert_id,
+                    )
+                )
             except Exception:
                 pass
 
@@ -5739,8 +7529,12 @@ def tick_user(uid: str) -> None:
             except Exception:
                 pass
 
-            _clear_watchlist_entry_block(ev, "MAX_OPEN_POSITIONS_REACHED")
-            continue
+            _clear_watchlist_entry_block(
+                ev,
+                "MAX_OPEN_POSITIONS_REACHED",
+            )
+            continue        
+
         # -------------------------------------------------
         # P0: Same-symbol cooldown after broker close.
         # Prevent immediate re-entry on the same symbol.
@@ -5771,7 +7565,12 @@ def tick_user(uid: str) -> None:
         try:
             _wk_late = str(ev.get("watch_key") or "").strip()
             if not _wk_late and sym and side:
-                _wk_late = f"xtl:zone:watch:{sym}:{side}:H1"
+                _wk_late = _zone_watch_key(
+                    uid,
+                    sym,
+                    side,
+                    "H1",
+                )
 
             _w_late = {}
             if _wk_late:
@@ -5795,8 +7594,22 @@ def tick_user(uid: str) -> None:
                         try:
                             if _wk_late:
                                 R.delete(_wk_late)
-                            R.delete(f"xtl:watch:break_state:{sym}:{side}:H1")
-                            for _ck in R.scan_iter(f"xtl:watch:entry_claim:{sym}:{side}:H1:*"):
+                            R.delete(
+                                break_state_key(
+                                    uid,
+                                    sym,
+                                    side,
+                                    "H1",
+                                )
+                            )
+                            for _ck in R.scan_iter(
+                                entry_claim_pattern(
+                                    uid,
+                                    sym,
+                                    side,
+                                    "H1",
+                                )
+                            ):
                                 R.delete(_ck)
                         except Exception:
                             pass
@@ -5892,7 +7705,14 @@ def tick_user(uid: str) -> None:
                 # release watchlist claim so it can retry next cycle
                 try:
                     if is_watchlist_event:
-                        for k in R.scan_iter(f"xtl:watch:entry_claim:{sym}:{side}:H1:*"):
+                        for k in R.scan_iter(
+                            entry_claim_pattern(
+                                uid,
+                                sym,
+                                side,
+                                "H1",
+                            )
+                        ):
                             R.delete(k)
                 except Exception:
                     pass
@@ -5919,6 +7739,7 @@ def tick_user(uid: str) -> None:
                 "execution_mode": "mt5",
                 "mt5_job_id": enq.get("job_id"),
                 "device_id": enq.get("device_id"),
+                "mt5_account": mt5_account,
                 "status": "sent",
                 "trade_state": (
                     "ORDER_PENDING"
@@ -5981,7 +7802,19 @@ def tick_user(uid: str) -> None:
             # If Redis open ledger misses this write, gate can create
             # opposite-side REV_OK while broker position is active.
             # -------------------------------------------------
+            
             _open_trade(uid, pos)
+
+            # Refresh in-memory state immediately so the next
+            # event in this same executor cycle sees this
+            # ORDER_PENDING trade.
+            open_trades = _list_open_trades(uid)
+            open_by_id = {
+                t.get("trade_id"): t
+                for t in open_trades
+                if isinstance(t, dict)
+                and t.get("trade_id")
+            }
 
             try:
                 _saved_raw = R.hget(OPEN_KEY.format(uid=uid), tid)
@@ -6020,8 +7853,22 @@ def tick_user(uid: str) -> None:
             try:
                 opp_side = "SELL" if side == "BUY" else "BUY"
                 R.delete(_zone_watch_key(uid,sym, opp_side, "H1"))
-                R.delete(f"xtl:watch:break_state:{sym}:{opp_side}:H1")
-                for k in R.scan_iter(f"xtl:watch:entry_claim:{sym}:{opp_side}:H1:*"):
+                R.delete(
+                    break_state_key(
+                        uid,
+                        sym,
+                        opp_side,
+                        "H1",
+                    )
+                )
+                for k in R.scan_iter(
+                    entry_claim_pattern(
+                        uid,
+                        sym,
+                        opp_side,
+                        "H1",
+                    )
+                ):
                     R.delete(k)
 
                 log.warning(
@@ -6039,6 +7886,7 @@ def tick_user(uid: str) -> None:
             try:
                 if prop_check and bool(prop_cfg.get("enabled")):
                     _reserve_prop_open_risk(
+                        uid,
                         tid,
                         {
                             "trade_id": tid,
@@ -6074,7 +7922,15 @@ def tick_user(uid: str) -> None:
                 )
             if is_watchlist_event:
                 try:
-                    watch_key = ev.get("watch_key") or f"xtl:zone:watch:{sym}:{side}:H1"
+                    watch_key = (
+                        ev.get("watch_key")
+                        or _zone_watch_key(
+                            uid,
+                            sym,
+                            side,
+                            "H1",
+                        )
+                    )
                     raw_w = R.get(str(watch_key))
                     w = _sj(raw_w, {}) if raw_w else {}
                     if isinstance(w, dict):

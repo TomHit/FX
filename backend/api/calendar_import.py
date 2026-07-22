@@ -72,14 +72,18 @@ def _validate_event(row: dict) -> Optional[dict]:
             log.warning("[IMPORT] Skipping — bad datetime: %s", row)
             return None
 
-        # Skip events in the past (more than 2 hours ago)
-        now_ms = _now_ms()
-        # To this (keep today's events all day):
+        # Keep today's events all day (do not drop ones that already fired).
         today_start_ms = int(datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp() * 1000)
         if time_ms < today_start_ms:
             return None
+
+        # The scraper flags events whose clock time is genuinely unpublished
+        # ("All Day", "Tentative"). Dropping this flag here is what turned a
+        # timeless row into a hard 00:00 UTC event with a real block window.
+        raw_tk     = str(row.get("time_known", "")).strip().lower()
+        time_known = raw_tk in ("true", "1", "yes") if raw_tk else True
 
         pre_min  = int(row.get("pre_block_min") or 15)
         post_min = int(row.get("post_block_min") or 15)
@@ -90,6 +94,7 @@ def _validate_event(row: dict) -> Optional[dict]:
             "currency":          currency,
             "impact":            impact,
             "time_ms":           time_ms,
+            "time_known":        time_known,
             "pre_block_min":     pre_min,
             "post_block_min":    post_min,
             "stabilization_min": stab_min,
@@ -150,6 +155,20 @@ def import_calendar(
     if R is None:
         log.error("[IMPORT] Redis not connected")
         return {"ok": False, "reason": "redis_unavailable"}
+
+    # Fail CLOSED: never let an empty import wipe a populated calendar.
+    if not events:
+        try:
+            existing = json.loads(R.get(REDIS_CALENDAR_KEY) or "{}")
+        except Exception:
+            existing = {}
+        if existing.get("events"):
+            msg = (
+                f"Refusing zero-row import — {len(existing['events'])} events "
+                f"already in Redis would be wiped. Calendar left untouched."
+            )
+            log.error("[IMPORT] %s", msg)
+            return {"ok": False, "reason": msg}
 
     now_ms = _now_ms()
     payload = {

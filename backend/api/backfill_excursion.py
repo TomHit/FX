@@ -1,230 +1,318 @@
 #!/usr/bin/env python3
 """
-backfill_excursion.py
+XTL — excursion + derived-field backfill.
 
-One-time backfill of mfe_r / mae_r on historical CLOSED trades in trades.jsonl.
+Fixes, for every row in trades.jsonl:
 
-Why this exists:
-  Older rows were written before the seconds-vs-milliseconds timestamp fix in
-  _excursion_r, so their excursion loop skipped every fetched H1 bar and left
-  mfe_r = 0.0 (and mae_r truncated). This recomputes those rows from the H1
-  snapshot bars in Redis, using the SAME _excursion_r the live path now uses.
+  1. MFE/MAE window. `_excursion_r` compares `enqueue_timestamp` (server UTC)
+     against H1 bar timestamps (broker wall, UTC+offset). The window therefore
+     opened `offset` minutes early — 3h of pre-trade bars counted as excursion.
+     And at finalize the exit bar had not closed yet, so it was absent from the
+     OHLC snapshot entirely and the stop wick was never seen.
 
-Correctness guards (learned the hard way):
-  1. COVERAGE  - only touch a row if the H1 snapshot actually spans
-                 [entry_enqueue -> broker_close]. Otherwise skip + flag; never
-                 overwrite with a value computed from bars that don't cover the
-                 trade.
-  2. WINDOW    - clip bars by INTERVAL OVERLAP ([open, open+1H] vs [entry,close]),
-                 not by open-time falling inside the window. This keeps the entry
-                 bar and the close bar, which a naive `start <= t <= end` drops.
-  3. INTRABAR  - H1 bars are blind to intrabar exits (manual close / moved TP/SL
-                 that fills mid-bar at a level no H1 high/low reached). When the
-                 broker-realized R exceeds what H1 extremes captured, FLOOR the
-                 excursion to the realized value (broker truth) and flag it
-                 `intrabar_unresolvable` rather than writing a misleading H1 number.
-  4. SINGLE-BAR- sub-hour trades span one H1 bar; excursion is not meaningful.
-                 Flag `single_bar`.
+  2. Derived fields that were never populated: realized_r_net, planned_rr,
+     efficiency.
 
-Every changed row gets:
-  excursion_precision   : 'h1_bar' | 'intrabar_unresolvable' | 'single_bar'
-  excursion_source      : 'h1_bar_approx_backfill'
-  excursion_backfilled  : True
-  excursion_backfill_note (optional)
+  3. capture_status.exit_snapshot_complete, which was set to a bare True.
 
-Usage:
-  python3 backfill_excursion.py            # DRY RUN, writes nothing
-  python3 backfill_excursion.py --apply    # backs up original, writes .backfilled
+Everything is computed in TRUE UTC. Bars are normalized on read.
 
-After --apply: review the .backfilled file, then `mv` it over the original.
+Idempotent: rows already at EXCURSION_VERSION are skipped unless --force.
+Dry run by default. Writes atomically, backs up first.
+
+    python3 backfill_excursion.py                 # report only
+    python3 backfill_excursion.py --apply         # write
+    python3 backfill_excursion.py --apply --ticket 5620700
 """
 
-import sys
+from __future__ import annotations
+
+import argparse
 import json
+import os
 import shutil
-import datetime
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
 
-sys.path.insert(0, '/opt/xauapi/api')
-import xtl_analytics as X          # noqa: E402  (uses the live, fixed _excursion_r)
-import redis                       # noqa: E402
+JSONL_PATH = "/opt/xauapi/api/trend/out/trades.jsonl"
+REDIS_URL = os.getenv("REDIS_URL", "redis://default:xau12345@10.0.0.132:6379/0")
+OHLC_KEY = "xtl:ohlc:snap:{dev}:{sym}:H1"
 
-# ---- config -----------------------------------------------------------------
-REDIS_HOST = 'localhost'
-REDIS_PORT = 6379
-REDIS_PW   = 'xau12345'
-SRC        = '/opt/xauapi/api/trend/out/trades.jsonl'
-HOUR       = 3600_000              # one H1 bar, in ms
-MFE_VERIFY_THRESHOLD = 4.0         # flag (don't block) MFE above this for eyeball
-
-DRY = '--apply' not in sys.argv
-R = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PW,
-                decode_responses=True)
+EXCURSION_VERSION = 2
+DEFAULT_OFFSET_MIN = 180          # EEST. Valid for the whole 2026-06-29..07-22 range.
+BAR_MS = 3_600_000
 
 
-# ---- helpers ----------------------------------------------------------------
-def norm_ms(v):
-    """Bars store 't' in seconds (10-digit); trade timestamps are ms (13-digit)."""
-    v = int(v or 0)
-    return v * 1000 if 0 < v < 10_000_000_000 else v
+def _f(ms):
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
 
 
-def bar_t(b):
-    return norm_ms(b.get('t_close_ms') or b.get('t_open_ms') or b.get('t') or 0)
+def _safe_float(x, d=None):
+    try:
+        return float(x)
+    except Exception:
+        return d
 
 
-def overlaps(b, start, end):
-    """Bar interval [open, open+1H] overlaps trade interval [entry, close]."""
-    o = bar_t(b)
-    c = o + HOUR
-    return o < end and c > start
+def _pip(symbol):
+    s = (symbol or "").upper()
+    return 0.01 if (s == "XAUUSD" or s.endswith("JPY")) else 0.0001
 
 
-def load_bars(dev, sym):
-    if not dev or not sym:
-        return []
-    raw = R.get(f"xtl:ohlc:snap:{dev}:{sym.upper()}:H1")
-    if not raw:
-        return []
-    d = json.loads(raw)
-    return d.get('bars') or (d if isinstance(d, list) else [])
+# ---------------------------------------------------------------------------
+# Bars
+# ---------------------------------------------------------------------------
+
+def load_bars_utc(R, symbol, device, offset_min, cache):
+    """Closed H1 bars with timestamps normalized to true UTC.
+
+    Raw `t` is seconds in broker wall time. Returns bar OPEN in UTC; a bar
+    covers [t_open_utc, t_open_utc + 1h).
+    """
+    ck = (device, symbol)
+    if ck in cache:
+        return cache[ck]
+
+    out = []
+    try:
+        raw = R.get(OHLC_KEY.format(dev=device, sym=(symbol or "").upper()))
+        js = json.loads(raw) if raw else None
+        if isinstance(js, str):
+            js = json.loads(js)
+        for b in (js or {}).get("bars") or (js or {}).get("ohlc") or []:
+            if not isinstance(b, dict) or b.get("complete") is False:
+                continue
+            t = b.get("t")
+            h, l = _safe_float(b.get("h")), _safe_float(b.get("l"))
+            if t is None or h is None or l is None:
+                continue
+            t = float(t)
+            t_ms = int(t * 1000) if t < 10_000_000_000 else int(t)
+            out.append({"t": t_ms - offset_min * 60_000, "h": h, "l": l})
+        out.sort(key=lambda x: x["t"])
+    except Exception as e:
+        print(f"    ! bar load failed {symbol}/{device}: {e}")
+
+    cache[ck] = out
+    return out
 
 
-def span_ok(bars, s, e):
-    if not bars:
-        return False
-    ts = [bar_t(b) for b in bars]
-    return min(ts) <= s and max(ts) >= e
+# ---------------------------------------------------------------------------
+# Window resolution — close_timestamp is written in three different domains
+# ---------------------------------------------------------------------------
+
+def resolve_window_utc(row, offset_min):
+    """(start_utc_ms, end_utc_ms, provenance) — or (None, None, reason)."""
+    start = int(row.get("enqueue_timestamp") or 0)   # always server UTC
+    if start <= 0:
+        return None, None, "no_enqueue_timestamp"
+
+    # 1. Explicitly normalized — trust it.
+    utc = row.get("broker_close_time_utc_ms")
+    if utc:
+        return start, int(utc), "broker_close_time_utc_ms"
+
+    ct = int(row.get("close_timestamp") or 0)
+    if ct <= 0:
+        return None, None, "no_close_timestamp"
+
+    src = str(row.get("exit_source") or "")
+    reason = str(row.get("exit_reason") or "")
+
+    # 2. approximate_exit with a level hit stamps a BAR timestamp (broker domain);
+    #    with no hit it stamps _now_ms() (already UTC).
+    if src == "h1_bar_approx":
+        if reason in ("sl", "tp"):
+            return start, ct - offset_min * 60_000, "approx_hit_ts_shifted"
+        return start, ct, "approx_now_ms_utc"
+
+    # 3. Every broker path writes raw broker wall time.
+    return start, ct - offset_min * 60_000, "close_timestamp_shifted"
 
 
-# ---- main -------------------------------------------------------------------
-def main():
-    rows = []
-    changed = skipped_cov = skipped_ok = errors = 0
-    n_h1 = n_intrabar = n_single = 0
+# ---------------------------------------------------------------------------
+# Excursion
+# ---------------------------------------------------------------------------
 
-    for line in open(SRC):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            r = json.loads(line)
-        except Exception:
-            errors += 1
-            continue
+def excursion(row, bars, start_utc, end_utc):
+    entry = _safe_float(row.get("entry_price"))
+    sl = _safe_float(row.get("sl_price"))
+    if entry is None or sl is None:
+        return {}, "no_entry_or_sl"
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return {}, "zero_risk"
 
-        if r.get('_status') != 'closed':
-            rows.append(r)
-            continue
+    side = (row.get("side") or "").upper()
 
-        mfe = r.get('mfe_r')
-        rr = r.get('realized_r')
-        needs = (mfe in (None, 0.0)) or (r.get('mae_r') is None)
-        winner_zeroed = (mfe in (None, 0.0)) and (rr is not None and rr > 0.05)
-        if not (needs or winner_zeroed):
-            skipped_ok += 1
-            rows.append(r)
-            continue
+    # A bar is in-window if its span intersects the trade's lifetime. The bar
+    # holding the exit is included — its wick carries the stop fill. Sub-hour
+    # resolution cannot separate pre- from post-exit movement inside that bar,
+    # which is why precision is capped at h1 granularity.
+    win = [b for b in bars if b["t"] + BAR_MS > start_utc and b["t"] <= end_utc]
+    if not win:
+        return {}, "no_bars_in_window"
 
-        entry = r.get('entry_price')
-        sl = r.get('sl_price')
-        start = norm_ms(r.get('enqueue_timestamp'))
-        end = norm_ms(r.get('broker_close_time_utc_ms') or r.get('close_timestamp'))
-        if not (entry and sl and start and end and end > start):
-            skipped_cov += 1
-            rows.append(r)
-            continue
-
-        bars = load_bars(r.get('device_id'), r.get('symbol'))
-        if not span_ok(bars, start, end):
-            r['excursion_backfill_note'] = 'SKIPPED_NO_COVERAGE'
-            skipped_cov += 1
-            rows.append(r)
-            continue
-
-        win = [b for b in bars if overlaps(b, start, end)]
-        if not win:
-            r['excursion_backfill_note'] = 'SKIPPED_EMPTY_WINDOW'
-            skipped_cov += 1
-            rows.append(r)
-            continue
-
-        try:
-            exc = X._excursion_r(r, win, float(entry), float(sl))
-        except Exception:
-            errors += 1
-            rows.append(r)
-            continue
-        if not (exc and exc.get('mfe_r') is not None):
-            rows.append(r)
-            continue
-
-        new_mfe = exc['mfe_r']
-        new_mae = exc['mae_r']
-        precision = 'h1_bar'
-        note = None
-
-        if len(win) <= 1:
-            precision = 'single_bar'
-            note = 'sub_hour_one_bar'
-            n_single += 1
+    best = worst = 0.0
+    bp = wp = bt = wt = bi = wi = None
+    for i, b in enumerate(win):
+        if side == "BUY":
+            fav, adv = (b["h"] - entry) / risk, (b["l"] - entry) / risk
+            fp, ap = b["h"], b["l"]
         else:
-            # intrabar exit: broker realized exceeds what H1 extremes captured
-            if rr is not None and rr > 0 and new_mfe < rr - 0.02:
-                precision = 'intrabar_unresolvable'
-                note = 'mfe_floored_to_realized'
-                new_mfe = round(rr, 2)
-                n_intrabar += 1
-            elif rr is not None and rr < 0 and new_mae > rr + 0.02:
-                precision = 'intrabar_unresolvable'
-                note = 'mae_floored_to_realized'
-                new_mae = round(rr, 2)
-                n_intrabar += 1
-            else:
-                n_h1 += 1
-            if new_mfe > MFE_VERIFY_THRESHOLD:
-                note = (note + '|' if note else '') + 'mfe_high_verified'
+            fav, adv = (entry - b["l"]) / risk, (entry - b["h"]) / risk
+            fp, ap = b["l"], b["h"]
+        if fav > best:
+            best, bp, bt, bi = fav, fp, b["t"], i
+        if adv < worst:
+            worst, wp, wt, wi = adv, ap, b["t"], i
 
-        span_h = round((end - start) / HOUR, 1)
-        print(f"{r.get('mt5_ticket'):>12} {r.get('side'):4} rr={rr}  "
-              f"mfe {mfe}->{new_mfe}  mae {r.get('mae_r')}->{new_mae}  "
-              f"bars={len(win)} span={span_h}h  [{precision}]"
-              f"{'  ' + note if note else ''}")
+    pipf = _pip(row.get("symbol"))
+    out = {
+        "mfe_r": round(best, 2),
+        "mae_r": round(worst, 2),
+        "excursion_source": "h1_bar",
+        "excursion_precision": "low" if len(win) <= 3 else "medium",
+        "excursion_bars_used": len(win),
+        "excursion_version": EXCURSION_VERSION,
+        "excursion_window_start_utc_ms": start_utc,
+        "excursion_window_end_utc_ms": end_utc,
+    }
+    if bp is not None:
+        out |= {"mfe_price": round(bp, 5),
+                "mfe_pips": round(abs(bp - entry) / pipf, 1),
+                "mfe_bar_ts_ms": bt, "mfe_bars_after_entry": bi}
+    if wp is not None:
+        out |= {"mae_price": round(wp, 5),
+                "mae_pips": round(abs(wp - entry) / pipf, 1),
+                "mae_bar_ts_ms": wt, "mae_bars_after_entry": wi}
+    return out, "ok"
 
-        r['mfe_r'] = new_mfe
-        r['mae_r'] = new_mae
-        r['excursion_precision'] = precision
-        if note:
-            r['excursion_backfill_note'] = note
-        r['excursion_backfilled'] = True
-        r['excursion_source'] = 'h1_bar_approx_backfill'
+
+def derived(row, exc):
+    """Pure-arithmetic fields. No bars, no broker."""
+    out = {}
+    np_, ru = _safe_float(row.get("net_profit")), _safe_float(row.get("risk_usd"))
+    if np_ is not None and ru:
+        out["realized_r_net"] = round(np_ / ru, 3)
+
+    e, sl, tp = (_safe_float(row.get("entry_price")),
+                 _safe_float(row.get("sl_price")),
+                 _safe_float(row.get("tp_price")))
+    if e and sl and tp and abs(e - sl) > 0:
+        side = (row.get("side") or "").upper()
+        out["planned_rr"] = round(((tp - e) if side == "BUY" else (e - tp)) / abs(e - sl), 3)
+
+    rr = _safe_float(row.get("realized_r"))
+    mfe = exc.get("mfe_r", row.get("mfe_r"))
+    if rr is not None and mfe and mfe > 0:
+        out["efficiency"] = round(rr / mfe, 3)
+
+    cs = dict(row.get("capture_status") or {})
+    cs["exit_snapshot_complete"] = bool(
+        row.get("exit_price") is not None
+        and row.get("outcome") not in (None, "UNKNOWN")
+        and row.get("realized_r") is not None
+    )
+    out["capture_status"] = cs
+    return out
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true", help="write (default: dry run)")
+    ap.add_argument("--force", action="store_true", help="redo rows already at v%d" % EXCURSION_VERSION)
+    ap.add_argument("--ticket", help="single ticket only")
+    ap.add_argument("--offset", type=int, default=DEFAULT_OFFSET_MIN)
+    ap.add_argument("--file", default=JSONL_PATH)
+    a = ap.parse_args()
+
+    import redis
+    R = redis.from_url(REDIS_URL, decode_responses=True)
+
+    rows = [json.loads(l) for l in open(a.file) if l.strip()]
+    print(f"{len(rows)} rows | offset {a.offset}m | {'APPLY' if a.apply else 'DRY RUN'}\n")
+
+    cache, stats, changed = {}, {}, 0
+    print(f"{'ticket':<12} {'sym':<8} {'window (UTC)':<26} {'mae_r':>14} {'mfe_r':>14}")
+    print("-" * 82)
+
+    for row in rows:
+        tk = str(row.get("mt5_ticket") or "")
+        if a.ticket and tk != a.ticket:
+            continue
+        if row.get("excursion_version") == EXCURSION_VERSION and not a.force:
+            stats["skip_current"] = stats.get("skip_current", 0) + 1
+            continue
+
+        off = row.get("broker_tz_offset_minutes")
+        off = int(off) if off is not None else a.offset
+
+        start, end, prov = resolve_window_utc(row, off)
+        if start is None or not end or end <= start:
+            stats[f"skip_{prov}"] = stats.get(f"skip_{prov}", 0) + 1
+            print(f"{tk:<12} {str(row.get('symbol')):<8} SKIP: {prov}")
+            continue
+
+        bars = load_bars_utc(R, row.get("symbol"), row.get("device_id"), off, cache)
+        exc, why = excursion(row, bars, start, end)
+        if why != "ok":
+            stats[f"skip_{why}"] = stats.get(f"skip_{why}", 0) + 1
+            print(f"{tk:<12} {str(row.get('symbol')):<8} SKIP: {why}")
+            continue
+
+        exc["excursion_window_source"] = prov
+        upd = exc | derived(row, exc)
+
+        print(f"{tk:<12} {str(row.get('symbol')):<8} "
+              f"{_f(start)}->{_f(end)} ({(end-start)/60000:>5.0f}m) "
+              f"{str(row.get('mae_r')):>6}->{exc['mae_r']:>6} "
+              f"{str(row.get('mfe_r')):>6}->{exc['mfe_r']:>6}")
+
+        row.update(upd)
         changed += 1
-        rows.append(r)
+        stats["updated"] = stats.get("updated", 0) + 1
 
-    print("\n--- summary ---")
-    print(f"changed              : {changed}")
-    print(f"  trustworthy H1     : {n_h1}")
-    print(f"  intrabar (floored) : {n_intrabar}")
-    print(f"  single-bar (flag)  : {n_single}")
-    print(f"skipped (already ok) : {skipped_ok}")
-    print(f"skipped (no coverage): {skipped_cov}")
-    print(f"errors               : {errors}")
-    print(f"total rows           : {len(rows)}")
+    print("-" * 82)
+    for k, v in sorted(stats.items()):
+        print(f"  {k}: {v}")
 
-    if DRY:
-        print("\nDRY RUN - nothing written. Re-run with --apply to commit.")
-        return
+    if not a.apply:
+        print(f"\nDRY RUN — {changed} rows would change. Re-run with --apply.")
+        return 0
+    if not changed:
+        print("\nnothing to write")
+        return 0
 
-    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup = f"{SRC}.bak_{stamp}"
-    out = SRC + '.backfilled'
-    shutil.copy(SRC, backup)
-    with open(out, 'w') as f:
-        for r in rows:
-            f.write(json.dumps(r) + '\n')
-    print(f"\nBackup:  {backup}")
-    print(f"Written: {out}")
-    print(f"Review, then commit with: mv {out} {SRC}")
+    bak = f"{a.file}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    shutil.copy2(a.file, bak)
+    st = os.stat(a.file)
+    d = os.path.dirname(a.file)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".backfill-", suffix=".jsonl")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, st.st_mode)
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except PermissionError:
+            pass
+        os.replace(tmp, a.file)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+    print(f"\nwrote {changed} rows | backup: {bak}")
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

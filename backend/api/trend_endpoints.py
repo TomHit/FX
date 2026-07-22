@@ -9,6 +9,9 @@ import json as _oppt_json
 from fastapi import HTTPException
 from time import perf_counter as _oppt_perf_counter
 _oppt_log = _oppt_logging.getLogger("xtl.oppt")
+from api.security import require_auth_and_mfa
+from types import SimpleNamespace
+
 
 class _OpptTimer:
     """One OPPT_TIMING line per /trend/opportunities call.
@@ -74,6 +77,19 @@ class _OpptTimer:
             pass
         return payload
 # === end OPPT profiling ===
+
+
+from api.tenant_keys import (
+    zone_watch_key,
+    zone_watch_pattern,
+    break_state_key,
+    prop_profile_key,
+    prop_profiles_set_key,
+    prop_active_profile_key,
+    prop_stats_key,
+    prop_daily_key,
+    prop_open_risk_key,
+)
 
 
 # --- Zone-only entry gate (new module; single source of truth) ---
@@ -283,6 +299,7 @@ except Exception:
 # If not set, Discord notifications are simply skipped.
 DISCORD_WEBHOOK_URL = (os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("XTL_DISCORD_WEBHOOK_URL") or "").strip()
 
+
 def _fmt_price(x: Any) -> str:
     try:
         v = float(x)
@@ -305,24 +322,58 @@ def is_h4_enabled() -> bool:
 ENABLE_H4_MODEL = is_h4_enabled()
 log.info(f"[TREND] ENABLE_H4_MODEL={ENABLE_H4_MODEL}")
 
-def _discord_post(content: str) -> bool:
-    """Best-effort Discord webhook post. Never raises."""
+
+def _discord_post(
+    content: str,
+    embeds: list[dict] | None = None,
+) -> bool:
+    """
+    Post to Discord and return the actual delivery result.
+    """
     if not DISCORD_WEBHOOK_URL:
-        return False
-    try:
-        import urllib.request
-        data = json.dumps({"content": content}).encode("utf-8")
-        req = urllib.request.Request(
-            DISCORD_WEBHOOK_URL,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        log.warning(
+            "[DISCORD] WEBHOOK_MISSING"
         )
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            _ = resp.read()
-        return True
-    except Exception:
         return False
+
+    payload = {
+        "content": (content or "").strip()[:1900],
+    }
+
+    if embeds:
+        payload["embeds"] = embeds
+
+    response = None
+
+    try:
+        response = httpx.post(
+            DISCORD_WEBHOOK_URL,
+            json=payload,
+            timeout=5.0,
+        )
+
+        response.raise_for_status()
+
+        log.warning(
+            "[DISCORD] POST_OK status=%s",
+            response.status_code,
+        )
+
+        return True
+
+    except Exception as exc:
+        log.warning(
+            "[DISCORD] POST_FAILED status=%s err=%r",
+            (
+                response.status_code
+                if response is not None
+                else None
+            ),
+            exc,
+        )
+
+        return False
+
 
 def _discord_entry_msg(sym: str, sig: str, entry_price: Any, tp_price: Any, sl_price: Any, ts_ms: int, reason: str | None = None) -> str:
     ts_s = ""
@@ -447,6 +498,270 @@ PROP_PROFILE_ACTIVE_KEY = "xtl:prop:profile:active"
 PROP_PROFILE_SET_KEY = "xtl:prop:profiles"
 DEFAULT_PROP_PROFILE_ID = "ftmo-main"
 
+def _resolve_user_execution_context(
+    uid: str,
+    profile_id: str | None = None,
+) -> dict:
+    """
+    Resolve one user's execution profile and its strictly bound MT5 device.
+
+    Generic for all firms:
+      FTMO
+      FundingPips
+      FundedNext
+      future firms
+
+    No global-device fallback.
+    No leader-device fallback.
+    No latest-device fallback.
+    """
+    uid_u = _require_prop_runtime_uid(uid)
+
+    pid = _resolve_user_prop_profile_id(
+        uid_u,
+        profile_id,
+    )
+
+    cfg = _get_user_prop_config(
+        uid_u,
+        pid,
+    )
+
+    if not isinstance(cfg, dict):
+        return {
+            "ok": False,
+            "uid": uid_u,
+            "profile_id": pid,
+            "device_id": "",
+            "config": None,
+            "reason": "PROP_PROFILE_CONFIG_INVALID",
+        }
+
+    if not bool(cfg.get("enabled")):
+        return {
+            "ok": False,
+            "uid": uid_u,
+            "profile_id": pid,
+            "device_id": "",
+            "config": cfg,
+            "reason": "PROP_PROFILE_DISABLED",
+        }
+
+    resolved = _resolve_prop_profile_device(
+        pid,
+        uid_u,
+    )
+
+    if (
+        not isinstance(resolved, dict)
+        or not resolved.get("ok")
+    ):
+        return {
+            "ok": False,
+            "uid": uid_u,
+            "profile_id": pid,
+            "device_id": "",
+            "config": cfg,
+            "reason": (
+                resolved.get("reason")
+                if isinstance(resolved, dict)
+                else "BAD_PROFILE_RESOLVE_PAYLOAD"
+            ),
+            "required": (
+                resolved.get("required")
+                if isinstance(resolved, dict)
+                else None
+            ),
+        }
+
+    device_id = str(
+        resolved.get("device_id")
+        or ""
+    ).strip()
+
+    if not device_id:
+        return {
+            "ok": False,
+            "uid": uid_u,
+            "profile_id": pid,
+            "device_id": "",
+            "config": cfg,
+            "reason": "PROP_PROFILE_DEVICE_MISSING",
+        }
+
+    return {
+        "ok": True,
+        "uid": uid_u,
+        "profile_id": pid,
+        "device_id": device_id,
+        "config": cfg,
+        "account": resolved.get("account") or {},
+        "reason": "STRICT_PROFILE_DEVICE",
+    }
+
+def _require_prop_uid(user) -> str:
+    uid = str(_uid_from_user(user) or "").strip()
+
+    if not uid:
+        raise HTTPException(
+            status_code=401,
+            detail="AUTH_REQUIRED",
+        )
+
+    return uid
+
+
+def _user_prop_profile_ids(uid: str) -> set[str]:
+    uid_u = str(uid or "").strip()
+
+    if not uid_u:
+        return set()
+
+    try:
+        raw_ids = (
+            R.smembers(
+                prop_profiles_set_key(uid_u)
+            )
+            or set()
+        )
+    except Exception:
+        return set()
+
+    out = set()
+
+    for value in raw_ids:
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", "ignore")
+
+        pid = str(value or "").strip().lower()
+
+        if pid:
+            out.add(pid)
+
+    return out
+
+
+def _user_active_prop_profile_id(
+    uid: str,
+) -> str:
+    uid_u = str(uid or "").strip()
+
+    if not uid_u:
+        return ""
+
+    try:
+        raw = R.get(
+            prop_active_profile_key(uid_u)
+        )
+
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+
+        pid = str(raw or "").strip().lower()
+    except Exception:
+        pid = ""
+
+    if (
+        pid
+        and pid in _user_prop_profile_ids(uid_u)
+    ):
+        return pid
+
+    return ""
+
+
+def _resolve_user_prop_profile_id(
+    uid: str,
+    profile_id: str | None = None,
+) -> str:
+    uid_u = str(uid or "").strip()
+
+    requested = str(
+        profile_id or ""
+    ).strip().lower()
+
+    pid = (
+        requested
+        or _user_active_prop_profile_id(uid_u)
+    )
+
+    if not pid:
+        raise HTTPException(
+            status_code=404,
+            detail="NO_PROP_PROFILE_CONFIGURED",
+        )
+
+    if pid not in _user_prop_profile_ids(uid_u):
+        raise HTTPException(
+            status_code=404,
+            detail="PROP_PROFILE_NOT_FOUND",
+        )
+
+    return pid
+
+
+def _get_user_prop_config(
+    uid: str,
+    profile_id: str,
+) -> dict:
+    uid_u = str(uid or "").strip()
+    pid = str(profile_id or "").strip().lower()
+
+    raw = R.get(
+        prop_profile_key(
+            uid_u,
+            pid,
+        )
+    )
+
+    if not raw:
+        raise HTTPException(
+            status_code=404,
+            detail="PROP_PROFILE_NOT_FOUND",
+        )
+
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+
+    try:
+        stored = json.loads(raw)
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="PROP_PROFILE_CONFIG_INVALID",
+        )
+
+    if not isinstance(stored, dict):
+        raise HTTPException(
+            status_code=500,
+            detail="PROP_PROFILE_CONFIG_INVALID",
+        )
+
+    owner_uid = str(
+        stored.get("owner_uid") or ""
+    ).strip()
+
+    stored_pid = str(
+        stored.get("profile_id") or ""
+    ).strip().lower()
+
+    if owner_uid != uid_u:
+        raise HTTPException(
+            status_code=403,
+            detail="PROP_PROFILE_OWNER_MISMATCH",
+        )
+
+    if stored_pid != pid:
+        raise HTTPException(
+            status_code=500,
+            detail="PROP_PROFILE_ID_MISMATCH",
+        )
+
+    out = dict(DEFAULT_PROP_CFG)
+    out.update(stored)
+    out["profile_id"] = pid
+
+    return out
 
 def _norm_prop_profile_id(profile_id: str | None = None) -> str:
     pid = str(profile_id or "").strip().lower()
@@ -460,30 +775,93 @@ def _norm_prop_profile_id(profile_id: str | None = None) -> str:
             pid = ""
     return pid or DEFAULT_PROP_PROFILE_ID
 
+def _require_prop_runtime_uid(
+    uid: str | None,
+) -> str:
+    """
+    Require an explicit owner UID for mutable prop runtime state.
 
-def _prop_profile_cfg_key(profile_id: str | None = None) -> str:
-    return f"xtl:prop:profile:{_norm_prop_profile_id(profile_id)}"
+    Permanent multi-tenant rule:
+      - no default user;
+      - no active-profile UID inference;
+      - no legacy/global runtime-key fallback.
+    """
+    uid_u = str(uid or "").strip()
+
+    if not uid_u:
+        raise ValueError("PROP_RUNTIME_UID_REQUIRED")
+
+    return uid_u
 
 
-def _prop_profile_open_risk_key(profile_id: str | None = None) -> str:
-    return f"{PROP_OPEN_RISK_KEY}:{_norm_prop_profile_id(profile_id)}"
+def _prop_uid_profile_cfg_key(
+    uid: str,
+    profile_id: str | None = None,
+) -> str:
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+
+    return prop_profile_key(
+        uid_u,
+        pid,
+    )
 
 
-def _prop_profile_stats_key(profile_id: str | None = None) -> str:
-    return f"{PROP_STATS_KEY}:{_norm_prop_profile_id(profile_id)}"
+def _prop_uid_open_risk_key(
+    uid: str,
+    profile_id: str | None = None,
+) -> str:
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+
+    return prop_open_risk_key(
+        uid_u,
+        pid,
+    )
 
 
-def _prop_profile_daily_key(
+def _prop_uid_stats_key(
+    uid: str,
+    profile_id: str | None = None,
+) -> str:
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+
+    return prop_stats_key(
+        uid_u,
+        pid,
+    )
+
+
+def _prop_uid_daily_key(
+    uid: str,
     day: str | None = None,
     profile_id: str | None = None,
 ) -> str:
+    uid_u = _require_prop_runtime_uid(uid)
     pid = _norm_prop_profile_id(profile_id)
 
-    return (
-        f"{PROP_DAILY_KEY_PREFIX}:"
-        f"{pid}:"
-        f"{day or _prop_today(pid)}"
+    resolved_day = (
+        str(day).strip()
+        if day
+        else _prop_today(uid_u,pid)
     )
+
+    if not resolved_day:
+        raise ValueError("PROP_DAY_REQUIRED")
+
+    return prop_daily_key(
+        uid_u,
+        pid,
+        resolved_day,
+    )
+
+
+
+
+ 
+
+
 
 DEFAULT_PROP_CFG = {
     "enabled": False,
@@ -500,24 +878,31 @@ DEFAULT_PROP_CFG = {
 
 
 
-def _get_prop_config_safe(profile_id: str | None = None, r=None):
+def _get_prop_config_safe(
+    uid: str,
+    profile_id: str | None = None,
+    r=None,
+):
     """
     Fail-closed prop config reader.
 
     Executor must BLOCK when ok=False.
     UI may still call _get_prop_config(), but executor should use this safe version.
     """
+    uid_u = _require_prop_runtime_uid(uid)
     pid = _norm_prop_profile_id(profile_id)
 
     try:
         rr = r or R
 
-        keys = [_prop_profile_cfg_key(pid)]
+        keys = [
+            _prop_uid_profile_cfg_key(
+                uid_u,
+                pid,
+            )
+        ]
 
-        # legacy fallback for active/default profile
-        if pid == _norm_prop_profile_id():
-            keys.append(PROP_CFG_KEY)
-
+        
         last_err = ""
 
         for key in keys:
@@ -541,8 +926,12 @@ def _get_prop_config_safe(profile_id: str | None = None, r=None):
             out.update(cfg)
             out["profile_id"] = pid
 
-            log.warning(
-                "[PROP] PROP_CFG_READ_OK profile=%s key=%s enabled=%s firm=%s phase=%s account_size=%s risk_pct=%s",
+            log.debug(
+                "[PROP] PROP_CFG_READ_OK "
+                "uid=%s profile=%s key=%s "
+                "enabled=%s firm=%s phase=%s "
+                "account_size=%s risk_pct=%s",
+                uid_u,
                 pid,
                 key,
                 out.get("enabled"),
@@ -557,11 +946,16 @@ def _get_prop_config_safe(profile_id: str | None = None, r=None):
         return None, False, last_err or "PROP_CFG_MISSING"
 
     except Exception as e:
-        log.exception("[PROP] PROP_CFG_READ_EXCEPTION profile=%s", pid)
+        log.exception(
+            "[PROP] PROP_CFG_READ_EXCEPTION "
+            "uid=%s profile=%s",
+            uid_u,
+            pid,
+        )
         return None, False, f"PROP_CFG_READ_EXCEPTION:{type(e).__name__}:{e}"
 
 
-def _get_prop_config(profile_id: str | None = None) -> dict:
+def _get_prop_config(uid: str,profile_id: str | None = None) -> dict:
     """
     UI/backward-compatible config getter.
 
@@ -569,13 +963,24 @@ def _get_prop_config(profile_id: str | None = None) -> dict:
     Executor must NOT treat this default as trade permission.
     Executor must call _get_prop_config_safe().
     """
-    cfg, ok, err = _get_prop_config_safe(profile_id)
+    cfg, ok, err = _get_prop_config_safe(uid, profile_id)
 
     if ok and isinstance(cfg, dict):
         try:
             if int(cfg.get("max_open_positions") or 0) < 3:
                 cfg["max_open_positions"] = 3
-                R.set(_prop_profile_cfg_key(cfg.get("profile_id") or profile_id), json.dumps(cfg))
+                R.set(
+                    _prop_uid_profile_cfg_key(
+                        uid,
+                        cfg.get("profile_id")
+                        or profile_id,
+                    ),
+                    json.dumps(
+                        cfg,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                )
         except Exception:
             pass
         return cfg
@@ -593,51 +998,116 @@ def _get_prop_config(profile_id: str | None = None) -> dict:
 
     return out
 
-def _save_prop_config(cfg: dict, profile_id: str | None = None) -> dict:
+def _save_prop_config(
+    uid: str,
+    cfg: dict,
+    profile_id: str | None = None,
+) -> dict:
+    uid_u = _require_prop_runtime_uid(uid)
+
     out = dict(DEFAULT_PROP_CFG)
     out.update(cfg or {})
 
     raw_pid = str(
-        profile_id or out.get("profile_id") or ""
+        profile_id
+        or out.get("profile_id")
+        or ""
     ).strip().lower()
 
     if not raw_pid:
         raise ValueError("PROFILE_ID_REQUIRED")
 
     pid = raw_pid
+
     out["profile_id"] = pid
+    out["owner_uid"] = uid_u
+    out["tenant_scope"] = "UID"
 
-    out["firm"] = str(out.get("firm") or "ftmo").lower()
-    out["phase"] = str(out.get("phase") or "challenge").lower()
-    out["enabled"] = bool(out.get("enabled"))
+    out["firm"] = str(
+        out.get("firm") or "ftmo"
+    ).lower()
 
-    out["account_size"] = float(out.get("account_size") or 25000)
-    out["risk_pct"] = float(out.get("risk_pct") or 1.0)
-    out["target_rr"] = float(out.get("target_rr") or 2.0)
-    out["max_open_risk_pct"] = float(out.get("max_open_risk_pct") or 3.0)
-    out["max_open_positions"] = int(out.get("max_open_positions") or 3)
+    out["phase"] = str(
+        out.get("phase") or "challenge"
+    ).lower()
+
+    out["enabled"] = bool(
+        out.get("enabled")
+    )
+
+    out["account_size"] = float(
+        out.get("account_size") or 25000
+    )
+
+    out["risk_pct"] = float(
+        out.get("risk_pct") or 1.0
+    )
+
+    out["target_rr"] = float(
+        out.get("target_rr") or 2.0
+    )
+
+    out["max_open_risk_pct"] = float(
+        out.get("max_open_risk_pct") or 3.0
+    )
+
+    out["max_open_positions"] = int(
+        out.get("max_open_positions") or 3
+    )
+
     try:
-        if int(out.get("max_open_positions") or 0) < 3:
+        if int(
+            out.get("max_open_positions") or 0
+        ) < 3:
             out["max_open_positions"] = 3
     except Exception:
         out["max_open_positions"] = 3
 
     if out["firm"] not in PROP_FIRM_RULES:
-        raise ValueError(f"Unknown firm: {out['firm']}")
+        raise ValueError(
+            f"Unknown firm: {out['firm']}"
+        )
 
-    if out["phase"] not in PROP_FIRM_RULES[out["firm"]]["phases"]:
-        raise ValueError(f"Unknown phase {out['phase']} for firm {out['firm']}")
+    if (
+        out["phase"]
+        not in PROP_FIRM_RULES[
+            out["firm"]
+        ]["phases"]
+    ):
+        raise ValueError(
+            f"Unknown phase "
+            f"{out['phase']} "
+            f"for firm {out['firm']}"
+        )
 
-    R.set(_prop_profile_cfg_key(pid), json.dumps(out))
-    R.sadd(PROP_PROFILE_SET_KEY, pid)
+    encoded = json.dumps(
+        out,
+        separators=(",", ":"),
+        default=str,
+    )
 
-    # Keep legacy global config synced for active/default profile compatibility.
-    if pid == _norm_prop_profile_id():
-        R.set(PROP_CFG_KEY, json.dumps(out))
+    pipe = R.pipeline(
+        transaction=True,
+    )
+
+    pipe.set(
+        _prop_uid_profile_cfg_key(
+            uid_u,
+            pid,
+        ),
+        encoded,
+    )
+
+    pipe.sadd(
+        prop_profiles_set_key(
+            uid_u,
+        ),
+        pid,
+    )
+
+    pipe.execute()
 
     return out
-
-
 
 def _safe_int(value: object, default: int = 0) -> int:
     try:
@@ -707,6 +1177,7 @@ def _fixed_offset_label(offset_minutes: int) -> str:
 
 
 def _profile_live_broker_account(
+    uid: str,
     profile_id: str | None = None,
 ) -> dict:
     """
@@ -714,10 +1185,15 @@ def _profile_live_broker_account(
 
     No latest-device fallback.
     """
-    pid = _norm_prop_profile_id(profile_id)
+    uid_u = _require_prop_runtime_uid(uid)
+
+    pid = _resolve_user_prop_profile_id(
+        uid_u,
+        profile_id,
+    )
 
     try:
-        resolved = _resolve_prop_profile_device(pid)
+        resolved = _resolve_prop_profile_device(pid,uid_u,)
     except Exception:
         resolved = {}
 
@@ -732,6 +1208,7 @@ def _profile_live_broker_account(
 
 
 def _prop_day_context(
+    uid: str,
     profile_id: str | None = None,
     broker_account: dict | None = None,
 ) -> dict:
@@ -760,9 +1237,16 @@ def _prop_day_context(
         reset_offset_minutes = 180
     """
     from datetime import datetime, timezone, timedelta
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _resolve_user_prop_profile_id(
+        uid_u,
+        profile_id,
+    )
 
-    pid = _norm_prop_profile_id(profile_id)
-    cfg = _get_prop_config(pid)
+    cfg = _get_user_prop_config(
+        uid_u,
+        pid,
+    )
 
     firm = str(
         cfg.get("firm") or ""
@@ -776,7 +1260,7 @@ def _prop_day_context(
     broker = (
         dict(broker_account)
         if isinstance(broker_account, dict)
-        else _profile_live_broker_account(pid)
+        else _profile_live_broker_account(uid_u,pid)
     )
 
     configured_tz = str(
@@ -978,11 +1462,14 @@ def _prop_day_context(
 
 
 def _prop_today(
+    uid: str,
     profile_id: str | None = None,
     broker_account: dict | None = None,
 ) -> str:
+    uid_u = _require_prop_runtime_uid(uid)
     return str(
         _prop_day_context(
+            uid_u,
             profile_id,
             broker_account,
         ).get("day")
@@ -1023,51 +1510,57 @@ def _effective_risk_pct(
     except Exception:
         return base
 
-def _prop_daily_key(
-    day: str | None = None,
-    profile_id: str | None = None,
-) -> str:
-    pid = _norm_prop_profile_id(profile_id)
-
-    resolved_day = (
-        str(day)
-        if day
-        else _prop_today(pid)
-    )
-
-    return (
-        f"{PROP_DAILY_KEY_PREFIX}:"
-        f"{pid}:"
-        f"{resolved_day}"
-    )
 
 
 
 def _prop_clear_expired_daily_halt(
+    uid,
     profile_id: str,
     current_day: str,
 ) -> bool:
     """
-    Clear only halts whose protection window belongs to an older prop day.
+    Clear only a previous-day halt for this exact prop profile.
 
-    Manual and multi-day safety halts remain untouched.
+    Never clears:
+      - another profile's state
+      - manual halts
+      - account-wide/max-loss halts
+      - a halt belonging to the current prop day
     """
     pid = _norm_prop_profile_id(profile_id)
-    stats_key = _prop_profile_stats_key(pid)
+    day_u = str(current_day or "").strip()
+
+    if not pid or not day_u:
+        return False
+
+    # Profile-scoped key: funding-main, ftmo-main, etc. remain isolated.
+    uid_u = _require_prop_runtime_uid(uid)
+
+    stats_key = _prop_uid_stats_key(
+        uid_u,
+        pid,
+    )
 
     try:
         stats = R.hgetall(stats_key) or {}
-    except Exception:
+    except Exception as exc:
+        log.warning(
+            "[PROP] DAILY_HALT_READ_FAILED "
+            "profile=%s current_day=%s err=%r",
+            pid,
+            day_u,
+            exc,
+        )
         return False
 
     halted = str(
         stats.get("trading_halted") or ""
-    ).strip().lower() in (
+    ).strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
-    )
+    }
 
     if not halted:
         return False
@@ -1076,14 +1569,49 @@ def _prop_clear_expired_daily_halt(
         stats.get("halt_reason") or ""
     ).strip().upper()
 
+    halt_scope = str(
+        stats.get("halt_scope") or ""
+    ).strip().upper()
+
+    manual_reset = str(
+        stats.get("halt_until_manual_reset") or ""
+    ).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
     halt_day = str(
         stats.get("halt_meta_day")
         or stats.get("halt_day")
         or ""
     ).strip()
 
+    halt_profile_id = str(
+        stats.get("halt_meta_profile_id")
+        or pid
+    ).strip()
+
+    # Defensive ownership guard. Never mutate another profile's halt.
+    if halt_profile_id and halt_profile_id != pid:
+        log.error(
+            "[PROP] DAILY_HALT_PROFILE_MISMATCH "
+            "requested_profile=%s stored_profile=%s "
+            "reason=%s halt_day=%s current_day=%s",
+            pid,
+            halt_profile_id,
+            reason,
+            halt_day,
+            day_u,
+        )
+        return False
+
     daily_resettable_reasons = {
+        "DAILY_R_LE_-2",
+        "DAILY_R_LIMIT_REACHED",
         "DAILY_REALIZED_LOSS_3PCT",
+        "REALIZED_DAILY_LOSS_LIMIT",
         "PROP_OPEN_RISK_LIMIT_EXCEEDED",
         "FTMO_DAILY_LOSS_80_EMERGENCY",
         "FUNDEDNEXT_DAILY_LOSS_80_EMERGENCY",
@@ -1091,11 +1619,8 @@ def _prop_clear_expired_daily_halt(
         "FTMO_DAILY_LOSS_EXCEEDED",
         "FUNDEDNEXT_DAILY_LOSS_EXCEEDED",
         "FUNDINGPIPS_DAILY_LOSS_EXCEEDED",
-        "DAILY_R_LIMIT_REACHED",
-        "REALIZED_DAILY_LOSS_LIMIT",
     }
 
-    # Never auto-clear these.
     manual_only_reasons = {
         "CONSECUTIVE_LOSING_DAYS",
         "OVERALL_MAX_LOSS",
@@ -1107,49 +1632,84 @@ def _prop_clear_expired_daily_halt(
     if reason in manual_only_reasons:
         return False
 
-    if reason not in daily_resettable_reasons:
+    reason_is_daily = (
+        reason in daily_resettable_reasons
+        or reason.endswith("_DAILY_LOSS_80_EMERGENCY")
+        or reason.endswith("_DAILY_LOSS_EXCEEDED")
+    )
+
+    if not reason_is_daily:
+        return False
+
+    # New records should say DAILY. Legacy daily-R records may have no scope,
+    # so the known reason list is also accepted.
+    if halt_scope not in ("", "DAILY"):
+        return False
+
+    # A true manual halt must never be reset automatically.
+    if manual_reset and halt_scope == "MANUAL":
         return False
 
     if not halt_day:
-        # Do not guess whether an old halt belongs to yesterday.
         log.warning(
             "[PROP] DAILY_HALT_NOT_CLEARED_NO_DAY "
             "profile=%s reason=%s current_day=%s",
             pid,
             reason,
-            current_day,
+            day_u,
         )
         return False
 
-    if halt_day == current_day:
+    # Still the same profile day: keep the protection active.
+    if halt_day == day_u:
         return False
 
-    R.hdel(
-        stats_key,
+    fields_to_delete = [
         "trading_halted",
         "halt_reason",
         "halt_ts",
-        "halt_until_manual_reset",
         "halt_scope",
         "halt_day",
+        "halt_until_manual_reset",
+    ]
+
+    fields_to_delete.extend(
+        str(key)
+        for key in stats.keys()
+        if str(key).startswith("halt_meta_")
     )
 
-    for key in list(stats.keys()):
-        if str(key).startswith("halt_meta_"):
-            R.hdel(stats_key, key)
+    try:
+        R.hdel(
+            stats_key,
+            *sorted(set(fields_to_delete)),
+        )
+    except Exception as exc:
+        log.exception(
+            "[PROP] DAILY_HALT_AUTO_CLEAR_FAILED "
+            "profile=%s old_day=%s new_day=%s "
+            "reason=%s err=%r",
+            pid,
+            halt_day,
+            day_u,
+            reason,
+            exc,
+        )
+        return False
 
     log.warning(
         "[PROP] DAILY_HALT_AUTO_CLEARED "
         "profile=%s old_day=%s new_day=%s reason=%s",
         pid,
         halt_day,
-        current_day,
+        day_u,
         reason,
     )
 
     return True
 
 def _ensure_prop_day_initialized(
+    uid: str,
     profile_id: str | None = None,
     broker_balance: float = 0.0,
     broker_account: dict | None = None,
@@ -1162,13 +1722,22 @@ def _ensure_prop_day_initialized(
     """
     pid = _norm_prop_profile_id(profile_id)
 
+    uid_u = _require_prop_runtime_uid(uid)
+
     ctx = _prop_day_context(
+        uid_u,
         pid,
         broker_account,
     )
 
     day = str(ctx["day"])
-    daily_key = _prop_daily_key(day, pid)
+    uid_u = _require_prop_runtime_uid(uid)
+
+    daily_key = _prop_uid_daily_key(
+        uid_u,
+        day,
+        pid,
+    )
 
     # -------------------------------------------------
     # Daily halt lifecycle repair.
@@ -1182,6 +1751,7 @@ def _ensure_prop_day_initialized(
     # -------------------------------------------------
     try:
         _prop_clear_expired_daily_halt(
+            uid=uid_u,
             profile_id=pid,
             current_day=day,
         )
@@ -1265,10 +1835,7 @@ def _ensure_prop_day_initialized(
             daily_key,
         )
 
-        _prop_clear_expired_daily_halt(
-            pid,
-            day,
-        )
+        
 
     except Exception as exc:
         log.exception(
@@ -1279,13 +1846,56 @@ def _ensure_prop_day_initialized(
             exc,
         )
 
+def require_prop_auth(request: Request):
+    """
+    Resolve the authenticated dashboard user from the existing web session.
+
+    This is intentionally fail-closed:
+      - valid session -> returns an object carrying user_id
+      - no valid session -> HTTP 401
+    """
+    try:
+        session = getattr(request, "session", None) or {}
+
+        uid = str(
+            session.get("user_id")
+            or session.get("uid")
+            or session.get("sub")
+            or ""
+        ).strip()
+
+        if uid:
+            return SimpleNamespace(
+                user_id=uid,
+            )
+    except Exception:
+        pass
+
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required.",
+    )
+
+
 @router.get("/prop/dashboard")
-def prop_dashboard(profile_id: str | None = None):
-    cfg = _get_prop_config(profile_id)
-    pid = str(cfg.get("profile_id") or _norm_prop_profile_id(profile_id))
+def prop_dashboard(
+    profile_id: str | None = None,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
+
+    pid = _resolve_user_prop_profile_id(
+        uid,
+        profile_id,
+    )
+
+    cfg = _get_user_prop_config(
+        uid,
+        pid,
+    )
 
 
-    risk = _get_prop_risk_state(pid)
+    risk = _get_prop_risk_state(uid,pid)
     
 
     account = {
@@ -1321,7 +1931,7 @@ def prop_dashboard(profile_id: str | None = None):
     if int(risk.get("open_positions_count") or 0) >= int(cfg.get("max_open_positions") or 1):
         trading_allowed = False
         reasons.append("MAX_OPEN_POSITIONS_REACHED")
-    active_pid = _norm_prop_profile_id()
+    active_pid = _user_active_prop_profile_id(uid)
 
     is_active_execution_profile = bool(
        pid == active_pid
@@ -1330,7 +1940,7 @@ def prop_dashboard(profile_id: str | None = None):
 
     if is_active_execution_profile:
         try:
-            _prop_eval_alerts(pid, risk)
+            _prop_eval_alerts(uid,pid,risk)
         except Exception:
             log.exception(
                 "[PROP] ALERT_EVAL_CALL_EXC profile=%s",
@@ -1433,64 +2043,158 @@ def _broker_identity_matches(
     )
 
 
-def _resolve_prop_profile_device(profile_id: str | None = None) -> dict:
+def _resolve_prop_profile_device(
+    profile_id: str | None = None,
+    uid: str | None = None,
+) -> dict:
     """
-    Strict prop-account resolver.
+    Strict user-owned prop-account resolver.
 
-    Prop profile must match MT5 account by:
+    The profile must belong to the supplied UID, and its configured
+    MT5 identity must match an account snapshot from one of that
+    user's bound devices.
+
+    Required match:
       - account_login
       - account_server
       - broker_company
 
+    No global device scan.
     No fallback to latest device.
     No fallback to last_resolved_device_id.
     """
-    pid = _norm_prop_profile_id(profile_id)
-    cfg = _get_prop_config(pid)
-
-    want_login = str(cfg.get("account_login") or "").strip()
-    want_server = str(cfg.get("account_server") or "").strip().lower()
-    want_company = str(cfg.get("broker_company") or "").strip().lower()
-
-    if not want_login or not want_server or not want_company:
-        return {
-            "ok": False,
-            "profile_id": pid,
-            "device_id": "",
-            "account": None,
-            "reason": "STRICT_PROP_ACCOUNT_BINDING_MISSING",
-            "required": {
-                "account_login": want_login,
-                "account_server": want_server,
-                "broker_company": want_company,
-            },
-        }
-
     try:
-        for k in R.scan_iter("xtl:mt5:account:last_user:*"):
-            key = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
+        uid_u = _require_prop_runtime_uid(uid)
 
-            raw = R.get(key)
-            acct = json.loads(raw) if raw else {}
+        pid = _resolve_user_prop_profile_id(
+            uid_u,
+            profile_id,
+        )
+
+        cfg = _get_user_prop_config(
+            uid_u,
+            pid,
+        )
+
+        want_login = str(
+            cfg.get("account_login") or ""
+        ).strip()
+
+        want_server = str(
+            cfg.get("account_server") or ""
+        ).strip().lower()
+
+        want_company = str(
+            cfg.get("broker_company") or ""
+        ).strip().lower()
+
+        if (
+            not want_login
+            or not want_server
+            or not want_company
+        ):
+            return {
+                "ok": False,
+                "profile_id": pid,
+                "device_id": "",
+                "account": None,
+                "reason": (
+                    "STRICT_PROP_ACCOUNT_BINDING_MISSING"
+                ),
+                "required": {
+                    "account_login": want_login,
+                    "account_server": want_server,
+                    "broker_company": want_company,
+                },
+            }
+
+        try:
+            raw_devices = (
+                R.smembers(
+                    f"xtl:user:{uid_u}:devices"
+                )
+                or set()
+            )
+        except Exception:
+            raw_devices = set()
+
+        device_ids = []
+
+        for value in raw_devices:
+            if isinstance(
+                value,
+                (bytes, bytearray),
+            ):
+                value = value.decode(
+                    "utf-8",
+                    "ignore",
+                )
+
+            dev = str(value or "").strip()
+
+            if dev:
+                device_ids.append(dev)
+
+        device_ids = sorted(set(device_ids))
+
+        if not device_ids:
+            return {
+                "ok": False,
+                "profile_id": pid,
+                "device_id": "",
+                "account": None,
+                "reason": "NO_DEVICE_BOUND_FOR_USER",
+                "uid": uid_u,
+            }
+
+        checked_devices = []
+
+        for dev in device_ids:
+            key = (
+                f"xtl:mt5:account:"
+                f"last_user:{dev}"
+            )
+
+            checked_devices.append(dev)
+
+            try:
+                raw = R.get(key)
+            except Exception:
+                raw = None
+
+            try:
+                acct = (
+                    json.loads(raw)
+                    if raw
+                    else {}
+                )
+            except Exception:
+                acct = {}
+
             if not isinstance(acct, dict):
                 continue
 
-            dev = _extract_device_id_from_account_key(key)
-
             login = str(
-                acct.get("login") or ""
+                acct.get("login")
+                or acct.get("account_login")
+                or ""
             ).strip()
 
             server = str(
-                acct.get("server") or ""
+                acct.get("server")
+                or acct.get("account_server")
+                or ""
             ).strip()
 
             company = str(
-                acct.get("company") or ""
+                acct.get("company")
+                or acct.get("broker_company")
+                or ""
             ).strip()
 
             login_ok = bool(
-                login and login == want_login
+                login
+                and login == want_login
             )
 
             server_ok = _broker_identity_matches(
@@ -1503,52 +2207,128 @@ def _resolve_prop_profile_device(profile_id: str | None = None) -> dict:
                 company,
             )
 
-            if login_ok and server_ok and company_ok:
-                try:
-                    cfg["last_resolved_device_id"] = dev
-                    cfg["last_resolved_account_login"] = login
-                    cfg["last_resolved_account_server"] = acct.get("server")
-                    cfg["last_resolved_broker_company"] = acct.get("company")
-                    cfg["last_resolved_ts_ms"] = int(time.time() * 1000)
-                    R.set(_prop_profile_cfg_key(pid), json.dumps(cfg, separators=(",", ":"), default=str))
-                except Exception:
-                    pass
+            if not (
+                login_ok
+                and server_ok
+                and company_ok
+            ):
+                continue
 
-                return {
-                    "ok": True,
-                    "profile_id": pid,
-                    "device_id": dev,
-                    "account": acct,
-                    "account_key": key,
-                    "reason": "STRICT_MATCH_ACCOUNT",
-                }
+            try:
+                updated_cfg = dict(cfg)
 
+                updated_cfg[
+                    "last_resolved_device_id"
+                ] = dev
+
+                updated_cfg[
+                    "last_resolved_account_login"
+                ] = login
+
+                updated_cfg[
+                    "last_resolved_account_server"
+                ] = (
+                    acct.get("server")
+                    or acct.get("account_server")
+                )
+
+                updated_cfg[
+                    "last_resolved_broker_company"
+                ] = (
+                    acct.get("company")
+                    or acct.get("broker_company")
+                )
+
+                updated_cfg[
+                    "last_resolved_ts_ms"
+                ] = int(time.time() * 1000)
+
+                R.set(
+                    prop_profile_key(
+                        uid_u,
+                        pid,
+                    ),
+                    json.dumps(
+                        updated_cfg,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                )
+
+            except Exception:
+                log.exception(
+                    "[PROP] PROFILE_RESOLVE_META_SAVE_FAILED "
+                    "uid=%s profile=%s device=%s",
+                    uid_u,
+                    pid,
+                    dev,
+                )
+
+            return {
+                "ok": True,
+                "profile_id": pid,
+                "device_id": dev,
+                "account": acct,
+                "account_key": key,
+                "reason": "STRICT_MATCH_ACCOUNT",
+            }
+
+        # All user-owned devices were checked and none matched.
         return {
             "ok": False,
             "profile_id": pid,
             "device_id": "",
             "account": None,
-            "reason": "STRICT_PROP_ACCOUNT_NOT_CONNECTED",
+            "reason": (
+                "STRICT_PROP_ACCOUNT_NOT_CONNECTED"
+            ),
             "required": {
                 "account_login": want_login,
                 "account_server": want_server,
                 "broker_company": want_company,
             },
+            "checked_devices": checked_devices,
         }
 
-    except Exception as e:
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        log.exception(
+            "[PROP] STRICT_PROP_ACCOUNT_RESOLVE_EXC "
+            "uid=%s profile=%s err=%r",
+            uid,
+            profile_id,
+            exc,
+        )
+
         return {
             "ok": False,
-            "profile_id": pid,
+            "profile_id": str(
+                profile_id or ""
+            ).strip().lower(),
             "device_id": "",
             "account": None,
-            "reason": f"STRICT_PROP_ACCOUNT_RESOLVE_EXC:{type(e).__name__}:{e}",
+            "reason": (
+                "STRICT_PROP_ACCOUNT_RESOLVE_EXC:"
+                f"{type(exc).__name__}:{exc}"
+            ),
         }
-
 @router.get("/prop/profile/resolve")
-def prop_profile_resolve(profile_id: str | None = None):
-    return _resolve_prop_profile_device(profile_id)
+def prop_profile_resolve(
+    profile_id: str | None = None,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
 
+    pid = _resolve_user_prop_profile_id(
+        uid,
+        profile_id,
+    )
+
+    return _resolve_prop_profile_device(
+        pid,uid,
+    )
 
 def _reservation_ticket(j: dict) -> str:
     ticket = (
@@ -1560,20 +2340,48 @@ def _reservation_ticket(j: dict) -> str:
     return str(ticket) if ticket not in (None, "", 0) else ""
 
 
-def _load_zone_watch_rows(symbols: list[str] | None = None, tf: str = "H1") -> list[dict]:
+def _load_zone_watch_rows(uid: str,symbols: list[str] | None = None, tf: str = "H1") -> list[dict]:
     out = []
-    sym_filter = {str(x or "").upper().strip() for x in (symbols or []) if str(x or "").strip()}
+    uid_u = str(uid or "").strip()
+
+    if not uid_u:
+        log.warning(
+            "[WATCHLIST] WEEKEND_WATCH_FALLBACK_SKIP "
+            "reason=missing_uid tf=%s",
+            tf,
+        )
+        return []
+    sym_filter = {
+        str(x or "").upper().strip()
+        for x in (symbols or [])
+        if str(x or "").strip()
+    }
+
     tf_u = str(tf or "H1").upper().strip()
 
     try:
-        for k in R.scan_iter(f"xtl:zone:watch:*:*:{tf_u}", count=200):
+        for k in R.scan_iter(
+            zone_watch_pattern(uid_u, tf_u,),
+            count=200,
+        ):
             key = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
             parts = key.split(":")
-            if len(parts) < 6:
+            if len(parts) < 7:
                 continue
 
-            sym = parts[3].upper()
-            side = parts[4].upper()
+            key_uid = str(parts[3] or "").strip()
+            sym = str(parts[4] or "").upper().strip()
+            side = str(parts[5] or "").upper().strip()
+            key_tf = str(parts[6] or "").upper().strip()
+
+            if key_uid != uid_u:
+                continue
+
+            if key_tf != tf_u:
+                continue
+
+            if side not in ("BUY", "SELL"):
+                continue
 
             if sym_filter and sym not in sym_filter:
                 continue
@@ -1651,42 +2459,114 @@ def _load_zone_watch_rows(symbols: list[str] | None = None, tf: str = "H1") -> l
     return out
 
 
-def _live_broker_tickets_for_prop() -> set[str]:
-    tickets = set()
+def _live_broker_tickets_for_prop(
+    uid: str,
+    profile_id: str,
+    account_type: str = "demo",
+) -> set[str]:
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+
+    tickets: set[str] = set()
+
     try:
-        for k in R.scan_iter("xtl:mt5:pos:*"):
-            raw = R.get(k)
-            js = json.loads(raw) if raw else None
+        resolved = _resolve_prop_profile_device(
+            pid,
+            uid_u,
+        )
 
-            if isinstance(js, dict):
-                positions = js.get("positions") or js.get("items") or js.get("data") or []
-                if not positions and any(x in js for x in ("ticket", "mt5_ticket", "position_id")):
-                    positions = [js]
-            elif isinstance(js, list):
-                positions = js
-            else:
-                positions = []
+        if (
+            not isinstance(resolved, dict)
+            or not resolved.get("ok")
+        ):
+            return tickets
 
-            for p in positions:
-                if not isinstance(p, dict):
-                    continue
-                ticket = p.get("ticket") or p.get("mt5_ticket") or p.get("position_id")
-                if ticket not in (None, "", 0):
-                    tickets.add(str(ticket))
+        dev_id = str(
+            resolved.get("device_id")
+            or ""
+        ).strip()
+
+        if not dev_id:
+            return tickets
+
+        acct = str(
+            account_type or "demo"
+        ).strip().lower()
+
+        raw = R.get(
+            f"xtl:mt5:pos:{dev_id}:{acct}"
+        )
+
+        js = json.loads(raw) if raw else []
+
+        if isinstance(js, dict):
+            positions = (
+                js.get("positions")
+                or js.get("items")
+                or js.get("data")
+                or []
+            )
+
+            if (
+                not positions
+                and any(
+                    name in js
+                    for name in (
+                        "ticket",
+                        "mt5_ticket",
+                        "position_id",
+                    )
+                )
+            ):
+                positions = [js]
+
+        elif isinstance(js, list):
+            positions = js
+        else:
+            positions = []
+
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+
+            ticket = (
+                pos.get("ticket")
+                or pos.get("mt5_ticket")
+                or pos.get("position_id")
+            )
+
+            if ticket not in (None, "", 0):
+                tickets.add(str(ticket))
+
     except Exception:
-        pass
+        log.exception(
+            "[PROP] LIVE_BROKER_TICKETS_LOAD_EXC "
+            "uid=%s profile=%s",
+            uid_u,
+            pid,
+        )
+
     return tickets
 
-def _prop_update_losing_day_streak(profile_id: str | None = None) -> None:
+
+def _prop_update_losing_day_streak(uid: str,profile_id: str | None = None) -> None:
     """
     Evaluate the previous CE(S)T prop day once, then update consecutive losing days.
 
     Runs when current CE(S)T day changes. If previous day's closed result was negative,
     increment streak. Otherwise reset streak to 0.
     """
+    uid_u = _require_prop_runtime_uid(uid)
     pid = _norm_prop_profile_id(profile_id)
-    stats_key = _prop_profile_stats_key(pid)
-    ctx = _prop_day_context(pid)
+
+    stats_key = _prop_uid_stats_key(
+        uid_u,
+        pid,
+    )
+    ctx = _prop_day_context(
+        uid_u,
+        pid,
+    )
 
     today = str(ctx["day"])
     try:
@@ -1733,7 +2613,11 @@ def _prop_update_losing_day_streak(profile_id: str | None = None) -> None:
             - timedelta(days=1)
         ).strftime("%Y%m%d")
 
-    prev_key = _prop_daily_key(prev_day, pid)
+    prev_key = _prop_uid_daily_key(
+        uid_u,
+        prev_day,
+        pid,
+    )
     prev_daily = {}
 
     try:
@@ -1784,6 +2668,7 @@ def _prop_update_losing_day_streak(profile_id: str | None = None) -> None:
 
     if streak >= 3:
         _prop_set_halt(
+            uid_u,
             pid,
             "CONSECUTIVE_LOSING_DAYS",
             {
@@ -1796,12 +2681,16 @@ def _prop_update_losing_day_streak(profile_id: str | None = None) -> None:
         )
 
 def _prop_alert_once(
+    uid: str,
     profile_id: str,
     alert_key: str,
     message: str,
 ) -> bool:
     pid = _norm_prop_profile_id(profile_id)
-    stats_key = _prop_profile_stats_key(pid)
+    stats_key = _prop_uid_stats_key(
+        uid,
+        pid,
+    )
     today = _prop_today(pid)
     field = f"alert_sent:{today}:{alert_key}"
 
@@ -1857,13 +2746,19 @@ def _prop_alert_once(
         )
         return False
 
-def _prop_eval_alerts(profile_id: str | None, risk: dict) -> None:
+def _prop_eval_alerts(
+    uid: str,
+    profile_id: str | None,
+    risk: dict,
+) -> None:
+    uid_u = _require_prop_runtime_uid(uid)
     pid = _norm_prop_profile_id(profile_id)
+    
     if not isinstance(risk, dict):
         return
 
     try:
-        cfg = _get_prop_config(pid)
+        cfg = _get_user_prop_config(uid_u,pid)
 
         firm = str(
             cfg.get("firm")
@@ -1935,13 +2830,14 @@ def _prop_eval_alerts(profile_id: str | None, risk: dict) -> None:
 
         used_pct = (daily_used / daily_limit * 100.0) if daily_limit > 0 else 0.0
 
-        stats_key = _prop_profile_stats_key(pid)
+        stats_key = _prop_uid_stats_key(uid, pid)
         last_band = str(R.hget(stats_key, "last_drawdown_band") or "")
 
         if last_band != band:
             R.hset(stats_key, "last_drawdown_band", band)
             if last_band:
                 _prop_alert_once(
+                    uid_u,
                     pid,
                     f"DRAWDOWN_BAND_{band}",
                     "**🟡 XTL Drawdown Band Changed**\n"
@@ -1955,6 +2851,7 @@ def _prop_eval_alerts(profile_id: str | None, risk: dict) -> None:
 
         if daily_limit > 0 and used_pct >= 70.0 and daily_remaining > 0:
             _prop_alert_once(
+                uid_u,
                 pid,
                 "DAILY_LOSS_WARNING_70",
                 f"**🟠 {firm_label} Daily Loss Warning**\n"
@@ -1966,6 +2863,7 @@ def _prop_eval_alerts(profile_id: str | None, risk: dict) -> None:
 
         if daily_limit > 0 and used_pct >= 80.0:
             _prop_set_halt(
+                uid_u,
                 pid,
                 emergency_reason,
                 {
@@ -1978,6 +2876,7 @@ def _prop_eval_alerts(profile_id: str | None, risk: dict) -> None:
             )
 
             _prop_alert_once(
+                uid_u,
                 pid,
                 emergency_reason,
                 f"**🚨 {firm_label} Emergency Protection Activated**\n"
@@ -1990,6 +2889,7 @@ def _prop_eval_alerts(profile_id: str | None, risk: dict) -> None:
 
         if daily_limit > 0 and daily_remaining <= 0:
             _prop_alert_once(
+                uid_u,
                 pid,
                 "DAILY_LOSS_BLOCK",
                 f"**🔴 {firm_label} Daily Loss Limit Reached**\n"
@@ -2019,6 +2919,7 @@ def _prop_eval_alerts(profile_id: str | None, risk: dict) -> None:
 
         if margin_utilization >= 40.0:
             _prop_alert_once(
+                uid_u,
                 pid,
                 "MARGIN_WARNING_UTIL_40",
                 "**🟠 Margin Warning**\n"
@@ -2035,12 +2936,17 @@ def _prop_eval_alerts(profile_id: str | None, risk: dict) -> None:
         except Exception:
             pass
 def _prop_set_halt(
+    uid: str,
     profile_id: str,
     reason: str,
     meta: dict | None = None,
 ) -> None:
     pid = _norm_prop_profile_id(profile_id)
-    stats_key = _prop_profile_stats_key(pid)
+    uid_u = _require_prop_runtime_uid(uid)
+    stats_key = _prop_uid_stats_key(
+        uid_u,
+        pid,
+    )
     # Capture the existing halt state before updating it.
     # Discord must fire only on a real state transition, not on every
     # watchdog evaluation while the same halt remains active.
@@ -2088,14 +2994,24 @@ def _prop_set_halt(
         and previous_day == day
     )
 
+    daily_resettable_reasons = {
+        "DAILY_R_LE_-2",
+        "DAILY_R_LIMIT_REACHED",
+        "DAILY_REALIZED_LOSS_3PCT",
+        "REALIZED_DAILY_LOSS_LIMIT",
+        "PROP_OPEN_RISK_LIMIT_EXCEEDED",
+        "FTMO_DAILY_LOSS_80_EMERGENCY",
+        "FUNDEDNEXT_DAILY_LOSS_80_EMERGENCY",
+        "FUNDINGPIPS_DAILY_LOSS_80_EMERGENCY",
+        "FTMO_DAILY_LOSS_EXCEEDED",
+        "FUNDEDNEXT_DAILY_LOSS_EXCEEDED",
+        "FUNDINGPIPS_DAILY_LOSS_EXCEEDED",
+    }
+
     daily_resettable = (
-        "DAILY_LOSS" in reason_u
-        or reason_u in {
-            "DAILY_REALIZED_LOSS_3PCT",
-            "PROP_OPEN_RISK_LIMIT_EXCEEDED",
-            "DAILY_R_LIMIT_REACHED",
-            "REALIZED_DAILY_LOSS_LIMIT",
-        }
+        reason_u in daily_resettable_reasons
+        or reason_u.endswith("_DAILY_LOSS_80_EMERGENCY")
+        or reason_u.endswith("_DAILY_LOSS_EXCEEDED")
     )
 
     halt_scope = (
@@ -2108,20 +3024,36 @@ def _prop_set_halt(
         "trading_halted": "1",
         "halt_reason": reason_u,
         "halt_ts": now_ms,
-        "halt_scope": halt_scope,
+        "halt_scope": (
+            "DAILY"
+            if daily_resettable
+            else "MANUAL"
+        ),
         "halt_day": day,
         "halt_until_manual_reset": (
             "0"
             if daily_resettable
             else "1"
         ),
+        "halt_meta_uid": uid_u,
+        "halt_meta_profile_id": pid,
+        "halt_meta_day": day,
     }
 
     for key, value in supplied_meta.items():
-        rec[f"halt_meta_{key}"] = str(value)
+        key_u = str(key or "").strip()
+
+        if key_u in (
+            "uid",
+            "profile_id",
+            "day",
+        ):
+            continue
+
+        rec[f"halt_meta_{key_u}"] = str(value)
 
     # Always preserve the actual prop day for reset evaluation.
-    rec["halt_meta_day"] = day
+    
 
     R.hset(
         stats_key,
@@ -2130,7 +3062,9 @@ def _prop_set_halt(
 
     log.warning(
         "[PROP] TRADING_HALTED "
-        "profile=%s reason=%s scope=%s day=%s meta=%s",
+        "uid=%s profile=%s reason=%s "
+        "scope=%s day=%s meta=%s",
+        uid_u,
         pid,
         reason_u,
         halt_scope,
@@ -2148,6 +3082,7 @@ def _prop_set_halt(
 
             _discord_post(
                 "**🚨 XTL Trading Halted**\n"
+                f"User: `{uid_u}`\n"
                 f"Profile: `{pid}`\n"
                 f"Reason: `{reason_u}`\n"
                 f"Scope: `{halt_scope}`\n"
@@ -2159,37 +3094,46 @@ def _prop_set_halt(
     else:
         log.debug(
             "[PROP] HALT_NOTIFY_SUPPRESSED "
-            "profile=%s reason=%s day=%s",
+            "uid=%s profile=%s reason=%s day=%s",
+            uid_u,
             pid,
             reason_u,
             day,
         )
 
-def _prop_clear_halt(profile_id: str | None = None) -> None:
+def _prop_clear_halt(
+    profile_id: str | None = None,
+) -> None:
     pid = _norm_prop_profile_id(profile_id)
     stats_key = _prop_profile_stats_key(pid)
 
-    R.hdel(
-        stats_key,
+    stats = R.hgetall(stats_key) or {}
+
+    fields = [
         "trading_halted",
         "halt_reason",
         "halt_ts",
+        "halt_scope",
+        "halt_day",
         "halt_until_manual_reset",
-        "halt_meta_daily_r",
-        "halt_meta_count",
-        "halt_meta_day",
+    ]
+
+    fields.extend(
+        str(key)
+        for key in stats.keys()
+        if str(key).startswith("halt_meta_")
     )
 
-    log.warning("[PROP] TRADING_RESUMED profile=%s", pid)
-
-    try:
-        _discord_post(
-            "**✅ XTL Trading Resumed**\n"
-            f"Profile: `{pid}`\n"
-            "Manual resume completed."
+    if fields:
+        R.hdel(
+            stats_key,
+            *sorted(set(fields)),
         )
-    except Exception:
-        pass
+
+    log.warning(
+        "[PROP] TRADING_RESUMED profile=%s",
+        pid,
+    )
 
 @router.post("/prop/resume")
 def prop_resume(payload: dict | None = None):
@@ -2281,10 +3225,11 @@ def _load_open_xtl_trades_by_ticket() -> dict[int, dict]:
 
     return out
 
-def _load_live_broker_positions_for_profile(profile_id: str | None = None, mt5_account: str = "demo") -> list[dict]:
+def _load_live_broker_positions_for_profile(uid: str,profile_id: str | None = None, mt5_account: str = "demo") -> list[dict]:
+    uid_u = _require_prop_runtime_uid(uid)
     pid = _norm_prop_profile_id(profile_id)
     try:
-        resolved = _resolve_prop_profile_device(pid)
+        resolved = _resolve_prop_profile_device(pid,uid_u,)
     except Exception:
         resolved = {}
 
@@ -2396,15 +3341,22 @@ def _overlay_open_trade_state_for_ui(
         uid_s,
         sorted(open_trades.keys()),
     )
-    if not open_trades:
-        return result
+    
 
     try:
         broker_positions = _load_live_broker_positions_for_profile(
+            uid_s,
             profile_id,
             mt5_account,
         )
     except Exception:
+        log.exception(
+            "[WATCHLIST] OPEN_TRADE_UI_BROKER_LOAD_FAILED "
+            "uid=%s profile=%s account=%s",
+            uid_s,
+            profile_id,
+            mt5_account,
+        )
         broker_positions = []
 
     broker_by_ticket: dict[int, dict] = {}
@@ -2424,6 +3376,74 @@ def _overlay_open_trade_state_for_ui(
 
         if ticket > 0:
             broker_by_ticket[ticket] = bp
+    # Broker truth fallback:
+    # If the UID open ledger is missing or delayed, create temporary
+    # overlay records from the strictly resolved profile/device snapshot.
+    for ticket, bp in broker_by_ticket.items():
+        if ticket in open_trades:
+            continue
+
+        symbol = str(
+            bp.get("symbol") or ""
+        ).upper().strip()
+
+        if not symbol:
+            continue
+
+        broker_side = str(
+            bp.get("side") or ""
+        ).upper().strip()
+
+        if broker_side not in ("BUY", "SELL"):
+            try:
+                broker_side = (
+                    "BUY"
+                    if int(bp.get("type") or -1) == 0
+                    else "SELL"
+                )
+            except Exception:
+                broker_side = ""
+
+        if broker_side not in ("BUY", "SELL"):
+            continue
+
+        open_trades[ticket] = {
+            "_open_trade_id": (
+                f"BROKER_ACTIVE:{symbol}:"
+                f"{broker_side}:{ticket}"
+            ),
+            "symbol": symbol,
+            "side": broker_side,
+            "direction": broker_side,
+            "mt5_ticket": ticket,
+            "broker_ticket": ticket,
+            "status": "filled",
+            "trade_state": "TRADE_ACTIVE",
+            "entry_price": bp.get("price_open"),
+            "opened_at_ms": (
+                int(bp.get("time_msc") or 0)
+                or int(bp.get("time") or 0) * 1000
+            ),
+            "broker_current_price": bp.get(
+                "price_current"
+            ),
+            "broker_current_sl": bp.get("sl"),
+            "broker_current_tp": bp.get("tp"),
+            "broker_floating_pnl": bp.get("profit"),
+            "profile_id": profile_id,
+            "device_id": bp.get("device_id"),
+            "overlay_source": "BROKER_PROFILE_SNAPSHOT",
+        }
+
+        log.warning(
+            "[WATCHLIST] OPEN_TRADE_UI_BROKER_FALLBACK "
+            "uid=%s profile=%s sym=%s side=%s ticket=%s",
+            uid_s,
+            profile_id,
+            symbol,
+            broker_side,
+            ticket,
+        )    
 
     for ticket, trade in open_trades.items():
         symbol = str(trade.get("symbol") or "").upper().strip()
@@ -2518,25 +3538,66 @@ def _overlay_open_trade_state_for_ui(
 
             matched = True
             row.update(overlay)
-            log.warning(
-                "[WATCHLIST] OPEN_TRADE_UI_MATCH "
-                "uid=%s sym=%s ticket=%s state=%s "
-                "broker_open=%s deal=%s",
-                uid_s,
-                symbol,
-                ticket,
-                display_trade_state,
-                broker_position_present,
-                broker_deal_present,
+
+            # An active/open trade is the source of truth for this symbol.
+            # Never preserve an opposite synthetic watch direction.
+            if trade_side in ("BUY", "SELL"):
+                row["direction"] = trade_side
+                row["decision"] = trade_side
+                row["opp_direction"] = (
+                    "UP"
+                    if trade_side == "BUY"
+                    else "DOWN"
+                )
+
+            row["status"] = display_status
+            row["watch_status"] = "trade_active"
+            row["signal"] = "WAIT"
+            row["signal_text"] = display_trade_state
+            row["reason"] = display_trade_state
+            row["opp_reason"] = display_trade_state
+
+            entry_gate = row.get("entry_gate")
+
+            if not isinstance(entry_gate, dict):
+                entry_gate = {}
+
+            entry_gate.update(
+                {
+                    "blocked": True,
+                    "reason": block_reason,
+                    "stage": display_trade_state,
+                    "state": display_trade_state,
+                    "trade_state": display_trade_state,
+                    "trade_active": (
+                        display_trade_state
+                        == "TRADE_ACTIVE"
+                    ),
+                    "active_trade_side": trade_side,
+                    "mt5_ticket": ticket,
+                }
             )
 
-            # Preserve the current watch row's direction, zone, reason
-            # and entry_gate. Add a separate lifecycle description.
+            row["entry_gate"] = entry_gate
+
             row["trade_state_reason"] = (
                 f"{display_trade_state} | "
                 f"ticket={ticket} | "
                 f"broker_open={broker_position_present} | "
                 f"deal={broker_deal_present}"
+            )
+
+            log.warning(
+                "[WATCHLIST] OPEN_TRADE_UI_MATCH "
+                "uid=%s sym=%s side=%s ticket=%s state=%s "
+                "broker_open=%s deal=%s",
+                uid_s,
+                symbol,
+                trade_side,
+                ticket,
+                display_trade_state,
+                broker_position_present,
+                broker_deal_present,
             )
 
         if not matched:
@@ -2564,6 +3625,7 @@ def _overlay_open_trade_state_for_ui(
     return result
 
 
+
 def _apply_user_open_trade_overlay_to_payload(
     payload: dict,
     uid: str | None,
@@ -2571,57 +3633,132 @@ def _apply_user_open_trade_overlay_to_payload(
     """
     Return a response copy with user-specific open-trade state applied.
 
-    Never write the returned payload into the shared opportunity cache.
+    Never write the returned payload into the opportunity cache.
     """
     if not isinstance(payload, dict):
         return payload
+
+    uid_s = str(uid or "").strip()
+
+    if not uid_s:
+        return payload
+
+    active_profile_id = str(
+        _user_active_prop_profile_id(uid_s)
+        or ""
+    ).strip().lower()
+
+    if not active_profile_id:
+        log.warning(
+            "[WATCHLIST] OPEN_TRADE_UI_PROFILE_MISSING "
+            "uid=%s",
+            uid_s,
+        )
+        return payload
+
     log.warning(
-        "[WATCHLIST] OPEN_TRADE_UI_APPLY uid=%r rows=%s",
-        uid,
+        "[WATCHLIST] OPEN_TRADE_UI_APPLY "
+        "uid=%s profile=%s rows=%s",
+        uid_s,
+        active_profile_id,
         len(payload.get("rows") or []),
     )
- 
 
     out = dict(payload)
 
     try:
         out["rows"] = _overlay_open_trade_state_for_ui(
             rows=out.get("rows") or [],
-            uid=str(uid or ""),
-            profile_id=None,
+            uid=uid_s,
+            profile_id=active_profile_id,
             mt5_account="demo",
         )
+
     except Exception:
         log.exception(
-            "[WATCHLIST] OPEN_TRADE_UI_OVERLAY_FAILED uid=%s",
-            uid,
+            "[WATCHLIST] OPEN_TRADE_UI_OVERLAY_FAILED "
+            "uid=%s profile=%s",
+            uid_s,
+            active_profile_id,
         )
 
     return out
 
-def _get_prop_risk_state(profile_id: str | None = None) -> dict:
+def _get_prop_risk_state(
+    uid: str | None = None,
+    profile_id: str | None = None,
+) -> dict:
+    uid_u = _require_prop_runtime_uid(uid)
     pid = _norm_prop_profile_id(profile_id)
+    day = _prop_today(
+        uid_u,
+        pid,
+    )
+
+    daily_key = _prop_uid_daily_key(
+        uid_u,
+        day,
+        pid,
+    )
+
+    stats_key = _prop_uid_stats_key(
+        uid_u,
+        pid,
+    )
+
+    open_risk_key = _prop_uid_open_risk_key(
+        uid_u,
+        pid,
+    )
 
     # Resolve profile configuration once for this risk evaluation.
-    cfg = _get_prop_config(pid)
+    cfg = _get_user_prop_config(
+        uid_u,
+        pid,
+    )
 
     # Only the active and enabled execution profile may mutate
     # daily reset state, losing-day streak, or reset notifications.
-    active_pid = _norm_prop_profile_id()
+    active_pid = _user_active_prop_profile_id(
+        uid_u,
+    )
 
     is_active_execution_profile = bool(
         pid == active_pid
         and cfg.get("enabled")
     )
 
-    day = _prop_today(pid)
-    daily_key = _prop_daily_key(day, pid)
-    open_risk_key = _prop_profile_open_risk_key(pid)
-    stats_key = _prop_profile_stats_key(pid)
+    
+    
+    # -------------------------------------------------
+    # Daily halt lifecycle cleanup.
+    #
+    # This must not depend on MT5 snapshot freshness.
+    # A stale/offline broker snapshot must not preserve
+    # yesterday's profile-specific daily halt.
+    #
+    # Only the active execution profile may mutate its
+    # own halt state. _prop_clear_expired_daily_halt()
+    # itself is also strictly profile-scoped.
+    # -------------------------------------------------
+    if is_active_execution_profile:
+        try:
+            _prop_clear_expired_daily_halt(
+                uid=uid_u,
+                profile_id=pid,
+                current_day=day,
+            )
+        except Exception:
+            log.exception(
+                "[PROP] DAILY_HALT_RISK_STATE_CLEAR_EXC "
+                "profile=%s current_day=%s",
+                pid,
+                day,
+            )
 
     if is_active_execution_profile:
         try:
-            _prop_update_losing_day_streak(pid)
+            _prop_update_losing_day_streak(uid_u,pid)
         except Exception:
             log.exception(
                 "[PROP] LOSING_DAY_STREAK_EXC profile=%s",
@@ -2635,13 +3772,10 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
         daily = R.hgetall(daily_key) or {}
         open_risk = R.hgetall(open_risk_key) or {}
 
-        # Legacy fallback for ftmo-main during migration.
-        if not open_risk and pid == DEFAULT_PROP_PROFILE_ID:
-            open_risk = R.hgetall(PROP_OPEN_RISK_KEY) or {}
+        
 
         stats = R.hgetall(stats_key) or {}
-        if not stats and pid == DEFAULT_PROP_PROFILE_ID:
-            stats = R.hgetall(PROP_STATS_KEY) or {}
+        
     except Exception:
         pass
 
@@ -2667,7 +3801,11 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
 
     total_open_risk = 0.0
     open_items = []
-    live_tickets = _live_broker_tickets_for_prop()
+    live_tickets = _live_broker_tickets_for_prop(
+        uid_u,
+        pid,
+        "demo",
+    )
 
     for k, v in open_risk.items():
         try:
@@ -2687,8 +3825,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
             ):
                 try:
                     R.hdel(open_risk_key, k)
-                    if pid == DEFAULT_PROP_PROFILE_ID:
-                        R.hdel(PROP_OPEN_RISK_KEY, k)
+                    
                     log.warning(
                         "[PROP_RISK] DROP_ORPHAN_RESERVATION profile=%s key=%s ticket=%s symbol=%s side=%s risk=%s",
                         pid, k, ticket, j.get("symbol"), j.get("side"), risk
@@ -2728,7 +3865,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
     resolved = {}
 
     try:
-        resolved = _resolve_prop_profile_device(pid)
+        resolved = _resolve_prop_profile_device(pid,uid_u,)
     except Exception:
         resolved = {}
 
@@ -2746,6 +3883,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
         )
         broker = {}
     reset_ctx = _prop_day_context(
+        uid=uid_u,
         profile_id=pid,
         broker_account=broker,
     )
@@ -2777,10 +3915,11 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
 
     snapshot_ts_ms = 0
     for _k in (
+        "server_received_ms",
         "updated_ts_ms",
+        "last_seen_ms",
         "ts_ms",
         "timestamp_ms",
-        "last_seen_ms",
         "account_ts_ms",
         "created_at_ms",
     ):
@@ -2801,29 +3940,28 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
         and broker_equity > 0
     )
 
-    snapshot_fresh = bool(
-        broker_values_valid
-        and snapshot_ts_ms > 0
-        and snapshot_age_ms <= 60000
-    )
-
-    snapshot_valid = snapshot_fresh
+    # Account snapshots are lower-frequency than price/position pushes.
+    # Allow up to 120 seconds while still failing closed on stale data.
+    broker_snapshot_max_age_ms = 120_000
 
     snapshot_valid = bool(
-        broker_balance > 0
-        and broker_equity > 0
-        and snapshot_age_ms <= 60000
+        broker_values_valid
+        and snapshot_ts_ms > 0
+        and 0 <= snapshot_age_ms <= broker_snapshot_max_age_ms
     )
-    
+    snapshot_fresh = snapshot_valid
 
     if not snapshot_valid:
         log.error(
-            "[PROP] INVALID_BROKER_SNAPSHOT profile=%s balance=%s equity=%s snapshot_ts_ms=%s age_ms=%s",
+            "[PROP] INVALID_BROKER_SNAPSHOT "
+            "profile=%s balance=%s equity=%s "
+            "snapshot_ts_ms=%s age_ms=%s max_age_ms=%s",
             pid,
             broker_balance,
             broker_equity,
             snapshot_ts_ms,
             snapshot_age_ms,
+            broker_snapshot_max_age_ms,
         )
 
     try:
@@ -2832,6 +3970,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
             and is_active_execution_profile
         ):
             _ensure_prop_day_initialized(
+                uid=uid_u,
                 profile_id=pid,
                 broker_balance=broker_balance,
                 broker_account=broker,
@@ -2934,8 +4073,11 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
             )
             and broker_balance > 0
         ):
-            notice_key = f"xtl:prop:reset_notice:{firm_u}:{pid}:{day}"
-            stats_key = _prop_profile_stats_key(pid)
+            notice_key = (
+                f"xtl:prop:reset_notice:"
+                f"{uid_u}:{firm_u}:{pid}:{day}"
+            )
+            
 
             last_notify_day = ""
             try:
@@ -2962,8 +4104,9 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
 
             if notice_claimed:
                 reset_ctx = _prop_day_context(
-                    pid,
-                    broker,
+                    uid=uid_u,
+                    profile_id=pid,
+                    broker_account=broker,
                 )
 
                 reset_local_time = str(
@@ -3089,7 +4232,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
     daily_loss_pct = 0.0
 
     try:
-        cfg = _get_prop_config(pid)
+        cfg = _get_prop_config(uid_u,pid)
 
         firm_u = str(cfg.get("firm") or "").lower().strip()
         phase_u = str(cfg.get("phase") or "").lower().strip()
@@ -3222,6 +4365,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
             and str(stats.get("trading_halted") or "") != "1"
         ):
             _prop_set_halt(
+                uid_u,
                 pid,
                 "DAILY_REALIZED_LOSS_3PCT",
                 {
@@ -3232,6 +4376,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
             )
 
             _prop_alert_once(
+                uid_u,
                 pid,
                 "DAILY_REALIZED_LOSS_3PCT",
                 "**🛑 XTL Daily Trading Stop**\n"
@@ -3247,7 +4392,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
     # Dynamic risk bands / drawdown
     # -------------------------------------------------
     try:
-        cfg = _get_prop_config(pid)
+        cfg = _get_prop_config(uid_u,pid)
         effective_risk_pct = _effective_risk_pct(cfg, broker_equity)
 
         acct_size = float(cfg.get("account_size") or 0)
@@ -3352,7 +4497,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
     live_open_risk_usd = 0.0
 
     try:
-        broker_positions = _load_live_broker_positions_for_profile(pid, "demo")
+        broker_positions = _load_live_broker_positions_for_profile(uid,pid, "demo")
         xtl_by_ticket = _load_open_xtl_trades_by_ticket()
 
         for bp in broker_positions:
@@ -3496,7 +4641,7 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
         "margin_utilization_pct": round(float(margin_utilization), 2),
         "snapshot_valid": snapshot_valid,
         "snapshot_age_ms": snapshot_age_ms,
-        "snapshot_fresh": snapshot_fresh,
+        "snapshot_fresh": snapshot_valid,
         "broker_values_valid": broker_values_valid,
         "snapshot_ts_ms": int(snapshot_ts_ms),
         "reset_timezone": reset_ctx.get("timezone"),
@@ -3518,13 +4663,13 @@ def _get_prop_risk_state(profile_id: str | None = None) -> dict:
         ),
     }
 
-def _reserve_prop_open_risk(trade_id: str, rec: dict, profile_id: str | None = None) -> None:
+def _reserve_prop_open_risk(uid: str,trade_id: str, rec: dict, profile_id: str | None = None) -> None:
     if not trade_id:
         return
-
+    uid_u = _require_prop_runtime_uid(uid)
     pid = _norm_prop_profile_id(profile_id or (rec or {}).get("profile_id"))
-    daily_key = _prop_daily_key(profile_id=pid)
-    open_risk_key = _prop_profile_open_risk_key(pid)
+    daily_key = _prop_uid_daily_key(uid_u, None, pid)
+    open_risk_key = _prop_uid_open_risk_key(uid_u, pid)
 
     try:
         if isinstance(rec, dict):
@@ -3535,11 +4680,7 @@ def _reserve_prop_open_risk(trade_id: str, rec: dict, profile_id: str | None = N
     # If same trade_id already exists, subtract old risk first
     old_raw = R.hget(open_risk_key, trade_id)
 
-    # Backward compatibility: if default profile and not found, check legacy hash
-    legacy_old_raw = None
-    if not old_raw and pid == DEFAULT_PROP_PROFILE_ID:
-        legacy_old_raw = R.hget(PROP_OPEN_RISK_KEY, trade_id)
-        old_raw = legacy_old_raw
+    
 
     old = _json_load_twice(old_raw)
     if isinstance(old, dict):
@@ -3552,9 +4693,7 @@ def _reserve_prop_open_risk(trade_id: str, rec: dict, profile_id: str | None = N
 
     R.hset(open_risk_key, trade_id, json.dumps(rec, default=str))
 
-    # Keep legacy global mirrored only for default profile during transition.
-    if pid == DEFAULT_PROP_PROFILE_ID:
-        R.hset(PROP_OPEN_RISK_KEY, trade_id, json.dumps(rec, default=str))
+   
 
     try:
         risk = float(rec.get("risk_usd") or 0)
@@ -3570,7 +4709,7 @@ def _reserve_prop_open_risk(trade_id: str, rec: dict, profile_id: str | None = N
     )
 
 
-def _release_prop_open_risk(
+def _release_prop_open_risk(uid: str,
     trade_id: str,
     result: str | None = None,
     pnl_usd: float | None = None,
@@ -3579,16 +4718,17 @@ def _release_prop_open_risk(
     if not trade_id:
         return
 
+    uid_u = _require_prop_runtime_uid(uid)
     pid = _norm_prop_profile_id(profile_id)
-    open_risk_key = _prop_profile_open_risk_key(pid)
+
+    open_risk_key = _prop_uid_open_risk_key(
+        uid_u,
+        pid,
+    )
 
     raw = R.hget(open_risk_key, trade_id)
 
-    # Backward compatibility: if default profile and not found, check legacy hash.
-    legacy_raw = None
-    if not raw and pid == DEFAULT_PROP_PROFILE_ID:
-        legacy_raw = R.hget(PROP_OPEN_RISK_KEY, trade_id)
-        raw = legacy_raw
+    
 
     log.warning(
         "[PROP] RELEASE_ATTEMPT profile=%s trade_id=%s found=%s result=%s pnl_usd=%s open_risk_key=%s",
@@ -3598,8 +4738,7 @@ def _release_prop_open_risk(
     rec = _json_load_twice(raw)
     if not isinstance(rec, dict):
         R.hdel(open_risk_key, trade_id)
-        if pid == DEFAULT_PROP_PROFILE_ID:
-            R.hdel(PROP_OPEN_RISK_KEY, trade_id)
+        
         return
 
     try:
@@ -3616,12 +4755,19 @@ def _release_prop_open_risk(
         pid, trade_id, risk, result, pnl_usd
     )
 
-    daily_key = _prop_daily_key(profile_id=pid)
+    daily_key = _prop_uid_daily_key(
+        uid_u,
+        None,
+        pid,
+    )
     R.hincrbyfloat(daily_key, "daily_risk_reserved", -risk)
 
     if pnl_usd is not None:
         try:
-            acct_claim_key = f"xtl:prop:daily_release_claim:{pid}:{trade_id}"
+            acct_claim_key = (
+                f"xtl:prop:daily_release_claim:"
+                f"{uid_u}:{pid}:{trade_id}"
+            )
 
             if not R.set(acct_claim_key, "1", nx=True, ex=7 * 24 * 3600):
                 log.warning(
@@ -3660,11 +4806,12 @@ def _release_prop_open_risk(
                 })
 
                 _prop_set_halt(
+                    uid_u,
                     pid,
                     "DAILY_R_LE_-2",
                     {
                         "daily_r": round(float(new_daily_r), 4),
-                        "day": _prop_today(),
+                        "day": _prop_today(uid_u,pid,),
                         "trade_id": trade_id,
                     },
                 )
@@ -3681,31 +4828,47 @@ def _release_prop_open_risk(
 
 
 @router.get("/prop/profiles")
-def prop_profiles():
-    try:
-        raw_ids = R.smembers(PROP_PROFILE_SET_KEY) or []
-        ids = []
-        for x in raw_ids:
-            if isinstance(x, (bytes, bytearray)):
-                x = x.decode("utf-8", "ignore")
-            ids.append(str(x))
+def prop_profiles(
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
 
-        active = _norm_prop_profile_id()
-        profiles = []
-        for pid in sorted(set(ids)):
-            profiles.append(_get_prop_config(pid))
+    profile_ids = sorted(
+        _user_prop_profile_ids(uid)
+    )
 
-        return {
-            "ok": True,
-            "active_profile_id": active,
-            "profiles": profiles,
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    active = _user_active_prop_profile_id(uid)
 
+    profiles = []
+
+    for pid in profile_ids:
+        try:
+            profiles.append(
+                _get_user_prop_config(
+                    uid,
+                    pid,
+                )
+            )
+        except HTTPException:
+            log.exception(
+                "[PROP] USER_PROFILE_READ_FAILED "
+                "uid=%s profile=%s",
+                uid,
+                pid,
+            )
+
+    return {
+        "ok": True,
+        "active_profile_id": active or None,
+        "profiles": profiles,
+    }
 
 @router.post("/prop/profile/enable-and-activate")
-def prop_enable_and_activate_profile(payload: dict):
+def prop_enable_and_activate_profile(
+    payload: dict,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
     """
     Enable one existing prop profile and make it the active
     XTL execution profile.
@@ -3731,29 +4894,9 @@ def prop_enable_and_activate_profile(payload: dict):
         }
 
     try:
-        raw_ids = (
-            R.smembers(PROP_PROFILE_SET_KEY)
-            or set()
+        known_ids = _user_prop_profile_ids(
+            uid,
         )
-
-        known_ids = set()
-
-        for value in raw_ids:
-            if isinstance(
-                value,
-                (bytes, bytearray),
-            ):
-                value = value.decode(
-                    "utf-8",
-                    "ignore",
-                )
-
-            value_s = str(
-                value or ""
-            ).strip().lower()
-
-            if value_s:
-                known_ids.add(value_s)
 
         if requested_profile_id not in known_ids:
             return {
@@ -3762,8 +4905,9 @@ def prop_enable_and_activate_profile(payload: dict):
                 "profile_id": requested_profile_id,
             }
 
-        current_cfg = _get_prop_config(
-            requested_profile_id
+        current_cfg = _get_user_prop_config(
+            uid,
+            requested_profile_id,
         )
 
         if not isinstance(current_cfg, dict):
@@ -3790,7 +4934,7 @@ def prop_enable_and_activate_profile(payload: dict):
          
           
         resolved = _resolve_prop_profile_device(
-            requested_profile_id
+            requested_profile_id,uid,
         )
 
         if (
@@ -3896,8 +5040,9 @@ def prop_enable_and_activate_profile(payload: dict):
                 "phase": normalized_cfg["phase"],
             }
 
-        profile_key = _prop_profile_cfg_key(
-            requested_profile_id
+        profile_key = _prop_uid_profile_cfg_key(
+            uid,
+            requested_profile_id,
         )
 
         encoded_cfg = json.dumps(
@@ -3915,21 +5060,17 @@ def prop_enable_and_activate_profile(payload: dict):
         )
 
         pipe.sadd(
-            PROP_PROFILE_SET_KEY,
+            prop_profiles_set_key(uid),
             requested_profile_id,
         )
 
         # Switch active execution pointer.
         pipe.set(
-            PROP_PROFILE_ACTIVE_KEY,
+            prop_active_profile_key(uid),
             requested_profile_id,
         )
 
-        # Keep legacy readers/executor compatibility.
-        pipe.set(
-            PROP_CFG_KEY,
-            encoded_cfg,
-        )
+        
 
         pipe.execute()
 
@@ -3977,8 +5118,14 @@ def prop_enable_and_activate_profile(payload: dict):
         }
 
 @router.post("/prop/profile/active")
-def prop_set_active_profile(payload: dict):
+def prop_set_active_profile(
+    payload: dict,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
+
     payload = payload or {}
+    
 
     requested_profile_id = str(
         payload.get("profile_id") or ""
@@ -3991,15 +5138,9 @@ def prop_set_active_profile(payload: dict):
         }
 
     try:
-        raw_ids = R.smembers(PROP_PROFILE_SET_KEY) or set()
-
-        known_ids = set()
-        for value in raw_ids:
-            if isinstance(value, (bytes, bytearray)):
-                value = value.decode("utf-8", "ignore")
-            value_s = str(value or "").strip()
-            if value_s:
-                known_ids.add(value_s)
+        known_ids = _user_prop_profile_ids(
+            uid,
+        )
 
         if requested_profile_id not in known_ids:
             return {
@@ -4008,7 +5149,10 @@ def prop_set_active_profile(payload: dict):
                 "profile_id": requested_profile_id,
             }
 
-        cfg = _get_prop_config(requested_profile_id)
+        cfg = _get_user_prop_config(
+            uid,
+            requested_profile_id,
+        )
 
         if not isinstance(cfg, dict):
             return {
@@ -4036,7 +5180,7 @@ def prop_set_active_profile(payload: dict):
             }
 
         resolved = _resolve_prop_profile_device(
-            requested_profile_id
+            requested_profile_id,uid,
         )
 
         if not isinstance(resolved, dict) or not resolved.get("ok"):
@@ -4059,19 +5203,11 @@ def prop_set_active_profile(payload: dict):
         pipe = R.pipeline(transaction=True)
 
         pipe.set(
-            PROP_PROFILE_ACTIVE_KEY,
+            prop_active_profile_key(uid),
             requested_profile_id,
         )
 
-        # Keep old readers compatible.
-        pipe.set(
-            PROP_CFG_KEY,
-            json.dumps(
-                cfg,
-                separators=(",", ":"),
-                default=str,
-            ),
-        )
+        
 
         pipe.execute()
 
@@ -4101,10 +5237,24 @@ def prop_set_active_profile(payload: dict):
         }
 
 @router.get("/prop/config")
-def prop_get_config():
+def prop_get_config(
+    profile_id: str | None = None,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
+
+    pid = _resolve_user_prop_profile_id(
+        uid,
+        profile_id,
+    )
+
     return {
         "ok": True,
-        "config": _get_prop_config(),
+        "profile_id": pid,
+        "config": _get_prop_config(
+            uid,
+            pid,
+        ),
         "firms": PROP_FIRM_RULES,
     }
 
@@ -4112,7 +5262,13 @@ def prop_get_config():
 
 
 @router.post("/prop/config")
-def prop_set_config(payload: dict):
+def prop_set_config(
+    payload: dict,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
+
+    payload = payload or {}
     """
     Create or update one explicit prop profile.
 
@@ -4123,7 +5279,7 @@ def prop_set_config(payload: dict):
     - Existing profile identity cannot be accidentally replaced by another
       firm's account.
     """
-    payload = payload or {}
+    
 
     requested_profile_id = str(
         payload.get("profile_id") or ""
@@ -4171,8 +5327,14 @@ def prop_set_config(payload: dict):
         }
 
     try:
-        profile_key = _prop_profile_cfg_key(
-            requested_profile_id
+        pid = _resolve_user_prop_profile_id(
+            uid,
+            requested_profile_id,
+        )
+
+        profile_key = _prop_uid_profile_cfg_key(
+            uid,
+            pid,
         )
 
         existing_raw = R.get(profile_key)
@@ -4211,17 +5373,20 @@ def prop_set_config(payload: dict):
         # Merge only within the explicitly requested profile.
         merged = dict(existing)
         merged.update(payload)
-        merged["profile_id"] = requested_profile_id
+        merged["profile_id"] = pid
 
         cfg = _save_prop_config(
+            uid,
             merged,
-            profile_id=requested_profile_id,
+            profile_id=pid,
         )
 
         log.warning(
             "[PROP] PROFILE_CONFIG_SAVED "
-            "profile=%s firm=%s login=%s server=%s company=%s",
-            requested_profile_id,
+            "uid=%s profile=%s firm=%s "
+            "login=%s server=%s company=%s",
+            uid,
+            pid,
             cfg.get("firm"),
             cfg.get("account_login"),
             cfg.get("account_server"),
@@ -4230,14 +5395,16 @@ def prop_set_config(payload: dict):
 
         return {
             "ok": True,
-            "profile_id": requested_profile_id,
+            "profile_id": pid,
             "config": cfg,
         }
 
     except Exception as e:
         log.exception(
-            "[PROP] PROFILE_CONFIG_SAVE_EXC profile=%s",
-            requested_profile_id,
+            "[PROP] PROFILE_CONFIG_SAVE_EXC "
+            "uid=%s profile=%s",
+            uid,
+            pid,
         )
 
         return {
@@ -4259,7 +5426,10 @@ def _get_latest_mt5_account() -> dict:
 
 
 
-def _get_profile_account(profile_id: str | None) -> dict:
+def _get_profile_account(
+    uid: str,
+    profile_id: str | None,
+) -> dict:
     """
     Return only the broker account strictly bound to this prop profile.
 
@@ -4271,7 +5441,12 @@ def _get_profile_account(profile_id: str | None) -> dict:
     pid = _norm_prop_profile_id(profile_id)
 
     try:
-        resolved = _resolve_prop_profile_device(pid)
+        uid_u = _require_prop_runtime_uid(uid)
+
+        resolved = _resolve_prop_profile_device(
+            pid,
+            uid_u,
+        )
 
         if isinstance(resolved, dict) and resolved.get("ok"):
             account = resolved.get("account") or {}
@@ -4290,20 +5465,31 @@ def _get_profile_account(profile_id: str | None) -> dict:
     return {}
 
 @router.get("/prop/status")
-def prop_status(profile_id: str | None = None):
-    cfg = _get_prop_config(profile_id)
-    pid = str(cfg.get("profile_id") or _norm_prop_profile_id(profile_id))
+def prop_status(
+    profile_id: str | None = None,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
 
+    pid = _resolve_user_prop_profile_id(
+        uid,
+        profile_id,
+    )
+
+    cfg = _get_user_prop_config(
+        uid,
+        pid,
+    )
     firm = cfg["firm"]
     phase = cfg["phase"]
 
     resolved = {}
     try:
-        resolved = _resolve_prop_profile_device(pid)
+        resolved = _resolve_prop_profile_device(pid,uid,)
     except Exception:
         resolved = {}
 
-    acct = _get_profile_account(pid)
+    acct = _get_profile_account(pid,uid,)
 
     broker_balance = float(
         acct.get("balance")
@@ -4436,29 +5622,51 @@ def prop_status(profile_id: str | None = None):
 
 
 @router.get("/prop/risk")
-def prop_risk(profile_id: str | None = None):
-    pid = _norm_prop_profile_id(profile_id)
+def prop_risk(
+    profile_id: str | None = None,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
+
+    pid = _resolve_user_prop_profile_id(
+        uid,
+        profile_id,
+    )
 
     return {
         "ok": True,
-        "config": _get_prop_config(pid),
-        "risk": _get_prop_risk_state(pid),
+        "config": _get_user_prop_config(
+            uid,
+            pid,
+        ),
+        "risk": _get_prop_risk_state(uid,pid),
     }
 
 @router.post("/prop/check")
-def prop_check(payload: dict):
+def prop_check(
+    payload: dict,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
     try:
         payload = payload or {}
         profile_id = str(payload.get("profile_id") or "").strip() or None
 
-        cfg = _get_prop_config(profile_id)
-        pid = str(cfg.get("profile_id") or _norm_prop_profile_id(profile_id))
+        pid = _resolve_user_prop_profile_id(
+            uid,
+            profile_id,
+        )
 
-        risk_state = _get_prop_risk_state(pid)
+        cfg = _get_user_prop_config(
+            uid,
+            pid,
+        )
+
+        risk_state = _get_prop_risk_state(uid,pid)
 
         resolved = {}
         try:
-            resolved = _resolve_prop_profile_device(pid)
+            resolved = _resolve_prop_profile_device(pid,uid,)
         except Exception as e:
             resolved = {
                 "ok": False,
@@ -4471,7 +5679,7 @@ def prop_check(payload: dict):
                 ),
             }
 
-        acct = _get_profile_account(pid)
+        acct = _get_profile_account(pid,uid,)
 
         # -------------------------------------------------
         # Fail closed: never size or approve a trade using
@@ -4600,92 +5808,225 @@ def prop_check(payload: dict):
 
 
 @router.post("/prop/risk/reset")
-def prop_risk_reset(payload: dict | None = None):
+def prop_risk_reset(
+    payload: dict | None = None,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
+
     payload = payload or {}
-    scope = str(payload.get("scope") or "daily").lower()
+
+    scope = str(
+        payload.get("scope") or "daily"
+    ).lower()
+
+    profile_id = (
+        str(payload.get("profile_id") or "").strip()
+        or None
+    )
+
+    pid = _resolve_user_prop_profile_id(
+        uid,
+        profile_id,
+    )
 
     try:
         if scope in ("daily", "all"):
-            R.delete(_prop_daily_key())
+            R.delete(
+                _prop_uid_daily_key(
+                    uid,
+                    None,
+                    pid,
+                )
+            )
 
         if scope in ("open", "all"):
-            R.delete(PROP_OPEN_RISK_KEY)
+            R.delete(
+                _prop_uid_open_risk_key(
+                    uid,
+                    pid,
+                )
+            )
 
         if scope in ("stats", "all"):
-            R.delete(PROP_STATS_KEY)
+            R.delete(
+                _prop_uid_stats_key(
+                    uid,
+                    pid,
+                )
+            )
 
         return {
             "ok": True,
             "scope": scope,
-            "risk": _get_prop_risk_state(),
+            "profile_id": pid,
+            "risk": _get_prop_risk_state(
+                uid,
+                pid,
+            ),
         }
+
     except Exception as e:
         return {
             "ok": False,
             "error": str(e),
         }
 
+
 @router.post("/prop/risk/reserve")
-def prop_risk_reserve(payload: dict):
+def prop_risk_reserve(
+    payload: dict,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
+
     try:
-        trade_id = str(payload.get("trade_id") or f"manual-{int(time.time() * 1000)}")
+        profile_id = (
+            str(payload.get("profile_id") or "").strip()
+            or None
+        )
+
+        pid = _resolve_user_prop_profile_id(
+            uid,
+            profile_id,
+        )
+
+        trade_id = str(
+            payload.get("trade_id")
+            or f"manual-{int(time.time() * 1000)}"
+        )
 
         rec = {
             "trade_id": trade_id,
-            "symbol": str(payload.get("symbol") or "").upper(),
-            "side": str(payload.get("side") or "").upper(),
-            "risk_usd": float(payload.get("risk_usd") or 0),
-            "lots": float(payload.get("lots") or 0),
-            "entry": float(payload.get("entry") or 0),
-            "sl": float(payload.get("sl") or 0),
-            "tp": float(payload.get("tp") or 0),
-            "reserved_ts_ms": int(time.time() * 1000),
+            "profile_id": pid,
+            "symbol": str(
+                payload.get("symbol") or ""
+            ).upper(),
+            "side": str(
+                payload.get("side") or ""
+            ).upper(),
+            "risk_usd": float(
+                payload.get("risk_usd") or 0
+            ),
+            "lots": float(
+                payload.get("lots") or 0
+            ),
+            "entry": float(
+                payload.get("entry") or 0
+            ),
+            "sl": float(
+                payload.get("sl") or 0
+            ),
+            "tp": float(
+                payload.get("tp") or 0
+            ),
+            "reserved_ts_ms": int(
+                time.time() * 1000
+            ),
             "source": "manual_test",
         }
 
         if rec["risk_usd"] <= 0:
-            return {"ok": False, "error": "risk_usd must be > 0"}
+            return {
+                "ok": False,
+                "error": "risk_usd must be > 0",
+            }
 
-        _reserve_prop_open_risk(trade_id, rec)
-
-        return {
-            "ok": True,
-            "trade_id": trade_id,
-            "reserved": rec,
-            "risk": _get_prop_risk_state(),
-        }
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@router.post("/prop/risk/release")
-def prop_risk_release(payload: dict):
-    try:
-        trade_id = str(payload.get("trade_id") or "").strip()
-        if not trade_id:
-            return {"ok": False, "error": "trade_id required"}
-
-        result = str(payload.get("result") or "").lower() or None
-        pnl_usd_raw = payload.get("pnl_usd", None)
-        pnl_usd = float(pnl_usd_raw) if pnl_usd_raw is not None else None
-
-        _release_prop_open_risk(
-            trade_id=trade_id,
-            result=result,
-            pnl_usd=pnl_usd,
+        _reserve_prop_open_risk(
+            uid,
+            trade_id,
+            rec,
+            pid,
         )
 
         return {
             "ok": True,
             "trade_id": trade_id,
-            "result": result,
-            "pnl_usd": pnl_usd,
-            "risk": _get_prop_risk_state(),
+            "profile_id": pid,
+            "reserved": rec,
+            "risk": _get_prop_risk_state(
+                uid,
+                pid,
+            ),
         }
 
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "error": str(e),
+        }
 
+
+@router.post("/prop/risk/release")
+def prop_risk_release(
+    payload: dict,
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
+
+    try:
+        profile_id = (
+            str(payload.get("profile_id") or "").strip()
+            or None
+        )
+
+        pid = _resolve_user_prop_profile_id(
+            uid,
+            profile_id,
+        )
+
+        trade_id = str(
+            payload.get("trade_id") or ""
+        ).strip()
+
+        if not trade_id:
+            return {
+                "ok": False,
+                "error": "trade_id required",
+            }
+
+        result = (
+            str(payload.get("result") or "")
+            .lower()
+            or None
+        )
+
+        pnl_usd_raw = payload.get(
+            "pnl_usd",
+            None,
+        )
+
+        pnl_usd = (
+            float(pnl_usd_raw)
+            if pnl_usd_raw is not None
+            else None
+        )
+
+        _release_prop_open_risk(
+            uid=uid,
+            trade_id=trade_id,
+            result=result,
+            pnl_usd=pnl_usd,
+            profile_id=pid,
+        )
+
+        return {
+            "ok": True,
+            "trade_id": trade_id,
+            "profile_id": pid,
+            "result": result,
+            "pnl_usd": pnl_usd,
+            "risk": _get_prop_risk_state(
+                uid,
+                pid,
+            ),
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
 def _json_load_maybe(x):
     if x is None:
         return None
@@ -5426,7 +6767,12 @@ def _get_sr_bundle(sym: str, prefer_dev=None, return_src: bool = False, display_
         try:
             for _d in ("BUY", "SELL"):
                 for _tf in ("H1", "H4"):
-                    _wk = f"xtl:zone:watch:{sym_u}:{_d}:{_tf}"
+                    _wk = zone_watch_key(
+                        uid_for_entry,
+                        sym_u,
+                        _d,
+                        _tf,
+                    ) 
                     _raw_w = R.get(_wk)
                     if not _raw_w:
                         continue
@@ -7539,7 +8885,12 @@ log.info(f"[TREND] REDIS_URL={REDIS_URL}")
 # --------------------------
 # Put this in /etc/xauapi.env (recommended):
 #   DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/...."
-DISCORD_WEBHOOK_URL = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
+DISCORD_WEBHOOK_URL = (
+    os.getenv("DISCORD_WEBHOOK_URL")
+    or os.getenv("XTL_DISCORD_WEBHOOK_URL")
+    or os.getenv("DISCORD_TRADE_WEBHOOK_URL")
+    or ""
+).strip()
 DISCORD_MENTION_EVERYONE = (os.getenv("XTL_DISCORD_MENTION_EVERYONE") or "1").strip().lower() in ("1","true","yes","on")
 
 def _discord_dedupe_key(event: str, k: str) -> str:
@@ -7563,19 +8914,30 @@ def _discord_should_send(event: str, k: str, ttl_sec: int = 24 * 3600) -> bool:
         # If Redis fails, default to NOT sending (avoid spam)
         return False
 
-def _discord_post(content: str, embeds: list[dict] | None = None) -> None:
+def _discord_release_dedupe(
+    event: str,
+    k: str,
+) -> None:
     """
-    Fire-and-forget Discord webhook post.
+    Release a Discord dedupe claim after delivery failure so a later
+    executor cycle may retry.
     """
-    if not DISCORD_WEBHOOK_URL:
-        return
-    payload = {"content": (content or "").strip()[:1900]}
-    if embeds:
-        payload["embeds"] = embeds
     try:
-        httpx.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5.0)
-    except Exception as e:
-        log.warning("[DISCORD] post failed err=%r", e)
+        R.delete(
+            _discord_dedupe_key(
+                event,
+                k,
+            )
+        )
+    except Exception as exc:
+        log.warning(
+            "[DISCORD] DEDUPE_RELEASE_FAILED "
+            "event=%s key=%s err=%r",
+            event,
+            k,
+            exc,
+        )
+
 
 def _fmt_px(x) -> str:
     try:
@@ -7639,6 +9001,200 @@ def _discord_notify_entry(row: dict) -> None:
 
     _discord_post(msg)
 
+
+def _discord_notify_rc_trigger(
+    *,
+    watch: dict,
+    live_price: float,
+    now_ms: int,
+) -> bool:
+    """
+    Notify exactly once when the RC trigger is crossed.
+
+    A failed Discord request releases its dedupe claim so the next
+    executor cycle can retry. Discord failure never blocks execution.
+    """
+
+    event_name = "rc_trigger"
+    trade_id = ""
+
+    try:
+        sym = str(
+            watch.get("symbol")
+            or ""
+        ).upper().strip()
+
+        side = str(
+            watch.get("direction")
+            or watch.get("side")
+            or ""
+        ).upper().strip()
+
+        trade_id = str(
+            watch.get("trade_id")
+            or watch.get("watch_id")
+            or watch.get("watch_key")
+            or (
+                f"{sym}:{side}:"
+                f"{watch.get('rev_ok_ms')}"
+            )
+        ).strip()
+
+        if (
+            not sym
+            or side not in ("BUY", "SELL")
+            or not trade_id
+        ):
+            watch["discord_rc_trigger_sent"] = False
+            watch["discord_rc_trigger_error"] = (
+                "INVALID_RC_TRIGGER_IDENTITY"
+            )
+
+            log.warning(
+                "[DISCORD] RC_TRIGGER_INVALID "
+                "sym=%r side=%r trade_id=%r",
+                sym,
+                side,
+                trade_id,
+            )
+            return False
+
+        if not _discord_should_send(
+            event_name,
+            trade_id,
+            ttl_sec=48 * 3600,
+        ):
+            log.warning(
+                "[DISCORD] RC_TRIGGER_DEDUPE_SKIP "
+                "sym=%s side=%s trade_id=%s",
+                sym,
+                side,
+                trade_id,
+            )
+            return False
+
+        trigger = (
+            watch.get("rc_trigger_cross_level")
+            if watch.get("rc_trigger_cross_level")
+            is not None
+            else watch.get("trigger_level")
+        )
+
+        zone = (
+            watch.get("zone_used")
+            if isinstance(
+                watch.get("zone_used"),
+                dict,
+            )
+            else {}
+        )
+
+        zone_low = (
+            watch.get("frozen_zone_low")
+            if watch.get("frozen_zone_low")
+            is not None
+            else zone.get("low")
+        )
+
+        zone_high = (
+            watch.get("frozen_zone_high")
+            if watch.get("frozen_zone_high")
+            is not None
+            else zone.get("high")
+        )
+
+        msg = (
+            f"🚨 **RC TRIGGER CROSSED**\n\n"
+            f"Symbol : `{sym}`\n"
+            f"Direction : `{side}`\n"
+            f"TF : `H1`\n\n"
+            f"RC Trigger : `{_fmt_px(trigger)}`\n"
+            f"Cross Price : `{_fmt_px(live_price)}`\n\n"
+            f"Zone : `{_fmt_px(zone_low)} - "
+            f"{_fmt_px(zone_high)}`\n\n"
+            f"Trade : `{trade_id}`"
+        )
+
+        sent = _discord_post(msg)
+
+        watch["discord_rc_trigger_sent"] = bool(
+            sent
+        )
+        watch["discord_rc_trigger_sent_ms"] = (
+            int(now_ms)
+            if sent
+            else None
+        )
+        watch["discord_rc_trigger_price"] = float(
+            live_price
+        )
+
+        if sent:
+            watch.pop(
+                "discord_rc_trigger_error",
+                None,
+            )
+
+            log.warning(
+                "[DISCORD] RC_TRIGGER_SENT "
+                "sym=%s side=%s trigger=%s "
+                "live=%s trade_id=%s",
+                sym,
+                side,
+                trigger,
+                live_price,
+                trade_id,
+            )
+
+            return True
+
+        watch["discord_rc_trigger_error"] = (
+            "DISCORD_POST_FAILED"
+        )
+
+        # Delivery failed. Permit a later executor cycle to retry.
+        _discord_release_dedupe(
+            event_name,
+            trade_id,
+        )
+
+        log.warning(
+            "[DISCORD] RC_TRIGGER_SEND_FAILED "
+            "sym=%s side=%s trigger=%s "
+            "live=%s trade_id=%s",
+            sym,
+            side,
+            trigger,
+            live_price,
+            trade_id,
+        )
+
+        return False
+
+    except Exception as exc:
+        try:
+            watch["discord_rc_trigger_sent"] = False
+            watch["discord_rc_trigger_sent_ms"] = None
+            watch["discord_rc_trigger_error"] = repr(
+                exc
+            )
+        except Exception:
+            pass
+
+        if trade_id:
+            _discord_release_dedupe(
+                event_name,
+                trade_id,
+            )
+
+        log.warning(
+            "[DISCORD] RC_TRIGGER_FAILED "
+            "trade_id=%s err=%r",
+            trade_id,
+            exc,
+        )
+
+        return False
 def _discord_notify_outcome(event: str, payload: dict) -> None:
     """
     event: 'hit' | 'expired' | 'sl_hit'
@@ -7911,7 +9467,14 @@ def _invalidate_active_opportunity(sym: str, opp_dir: str, reason: str = "ZONE_I
     try:
         for _side in ("BUY", "SELL"):
             for _tf in ("H1", "H4"):
-                R.delete(f"xtl:zone:watch:{sym_u}:{_side}:{_tf}")
+                R.delete(
+                    zone_watch_key(
+                        uid_for_entry,
+                        sym_u,
+                        _side,
+                        _tf,
+                    )
+                )
     except Exception:
         pass
 
@@ -9320,7 +10883,6 @@ def _policy_decision(sym: str, p_up: float, atr_val: float | None = None):
 
 # ---- Optional auth (session/relaxed) shim for /trend/* routes ----------------
 
-from types import SimpleNamespace
 
 # Try to import session + uid helpers from routes_devices (your project already has them)
 try:
@@ -11600,7 +13162,17 @@ def trend_opportunities(
         except Exception:
            return None
 
-    uid_for_entry = _uid_from_user(user)
+    uid_for_entry = str(
+        _uid_from_user(user) or ""
+    ).strip()
+
+    if not uid_for_entry:
+        raise HTTPException(
+            status_code=401,
+            detail="UID_REQUIRED_FOR_OPPORTUNITIES",
+        )
+
+    
     def _same_symbol_cooldown_for_row(row: dict) -> dict | None:
         try:
             if not isinstance(row, dict):
@@ -11610,15 +13182,12 @@ def trend_opportunities(
             if not sym_cd:
                 return None
 
-            keys = []
-
-            if uid_for_entry:
-                keys.append(f"xtl:cooldown:symbol:{uid_for_entry}:{sym_cd}")
-            else:
-                try:
-                    keys.extend(list(R.scan_iter(f"xtl:cooldown:symbol:*:{sym_cd}")))
-                except Exception:
-                    keys = []
+            keys = [
+                (
+                    f"xtl:cooldown:symbol:"
+                    f"{uid_for_entry}:{sym_cd}"
+                )
+            ]
 
             best = None
 
@@ -11709,82 +13278,337 @@ def trend_opportunities(
     #     (predict_all, snapshot reads, zone gate).
     # ------------------------------------------------------------
     pinned_device = ""
+
     try:
-        pinned_device = (getattr(user, "pinned_device", None) or getattr(user, "pinnedDevice", None) or "").strip()
+        pinned_device = str(
+            getattr(user, "pinned_device", None)
+            or getattr(user, "pinnedDevice", None)
+            or ""
+        ).strip()
     except Exception:
         pinned_device = ""
-    pinned_device = (pinned_device or "").strip()
-    device = (device or "").strip()
 
-    # Prefer FastAPI-parsed header param, but fallback to raw headers too
+    device = str(
+        device or ""
+    ).strip()
+
+    # Header/query device is informational only for authenticated
+    # execution. It must never override the active prop profile's
+    # strictly bound MT5 device.
     try:
-        _hdr_raw = request.headers.get("x-device-id") or request.headers.get("X-Device-Id")
+        _hdr_raw = (
+            request.headers.get("x-device-id")
+            or request.headers.get("X-Device-Id")
+        )
     except Exception:
         _hdr_raw = None
-    x_device_id_hdr = (x_device_id or _hdr_raw or "").strip()
 
+    x_device_id_hdr = str(
+        x_device_id
+        or _hdr_raw
+        or ""
+    ).strip()
 
-    resolved_device = (x_device_id_hdr or pinned_device or device).strip()
-    effective_device = resolved_device
-    dev_for_gate = resolved_device
-    
-    if effective_device:
-        x_device_id = x_device_id_hdr or effective_device
-        device = device or effective_device
-        pinned_device = pinned_device or effective_device
+    resolved_device = ""
+    execution_profile_id = ""
 
-    # --- HARD FALLBACK: auto-select an online device if none is pinned ---
-    # Step 2: HARD fallback only if still none
-    if not resolved_device and R is not None:
+    # ------------------------------------------------------------
+    # AUTHENTICATED EXECUTION
+    #
+    # uid -> active prop profile -> strictly bound MT5 device
+    #
+    # Generic for FTMO, FundingPips, FundedNext and future firms.
+    # No newest-device fallback is allowed for authenticated users.
+    # ------------------------------------------------------------
+    if uid_for_entry:
         try:
-            _pt = _oppt_t.now()
-            best_dev = None
-            best_hb = -1
-            for key in R.scan_iter("device:dev_*"):
-                try:
-                    h = R.hgetall(key) or {}
-                except Exception:
-                    h = {}
-                if not h:
-                    continue
+            execution_profile_id = str(
+                _resolve_user_prop_profile_id(
+                    uid_for_entry,
+                    None,
+                )
+                or ""
+            ).strip().lower()
 
-                status = h.get(b"status") or h.get("status")
-                if isinstance(status, (bytes, bytearray)):
-                    status = status.decode("utf-8", "ignore")
-                if (status or "").strip().lower() != "online":
-                    continue
+            exec_ctx = _resolve_user_execution_context(
+                uid_for_entry,
+                execution_profile_id,
+            )
 
-                hb = h.get(b"last_heartbeat_ms") or h.get("last_heartbeat_ms")
-                if isinstance(hb, (bytes, bytearray)):
-                    hb = hb.decode("utf-8", "ignore").strip()
-                try:
-                    hb_i = int(hb) if hb not in (None, "") else -1
-                except Exception:
-                    hb_i = -1
+            if (
+                not isinstance(exec_ctx, dict)
+                or not exec_ctx.get("ok")
+            ):
+                _ctx_reason = (
+                    exec_ctx.get("reason")
+                    if isinstance(exec_ctx, dict)
+                    else "BAD_EXECUTION_CONTEXT"
+                )
 
-                key_s = key.decode("utf-8", "ignore") if isinstance(key, (bytes, bytearray)) else str(key)
-                dev_id = key_s.replace("device:", "").strip()
+                log.error(
+                    "[WATCHLIST] EXECUTION_CONTEXT_FAILED "
+                    "uid=%s profile=%s reason=%s",
+                    uid_for_entry,
+                    execution_profile_id,
+                    _ctx_reason,
+                )
 
-                if hb_i > best_hb:
-                    best_hb = hb_i
-                    best_dev = dev_id
+                return {
+                    "ok": False,
+                    "rows": [],
+                    "profile_id": execution_profile_id,
+                    "device_id": "",
+                    "reason": _ctx_reason,
+                }
 
-            _oppt_t.add("dev_scan", _oppt_t.now() - _pt)
-            if best_dev:
-                resolved_device = best_dev
-        except Exception:
-            pass
+            execution_profile_id = str(
+                exec_ctx.get("profile_id")
+                or execution_profile_id
+                or ""
+            ).strip().lower()
 
-    # Step 3: propagate resolved device consistently everywhere downstream
-    effective_device = resolved_device
-    dev_for_gate = resolved_device
+            resolved_device = str(
+                exec_ctx.get("device_id")
+                or ""
+            ).strip()
+
+            if not resolved_device:
+                log.error(
+                    "[WATCHLIST] EXECUTION_DEVICE_MISSING "
+                    "uid=%s profile=%s",
+                    uid_for_entry,
+                    execution_profile_id,
+                )
+
+                return {
+                    "ok": False,
+                    "rows": [],
+                    "profile_id": execution_profile_id,
+                    "device_id": "",
+                    "reason": "EXECUTION_DEVICE_MISSING",
+                }
+
+            request_device = str(
+                x_device_id_hdr
+                or pinned_device
+                or device
+                or ""
+            ).strip()
+
+            if (
+                request_device
+                and request_device != resolved_device
+            ):
+                log.warning(
+                    "[WATCHLIST] REQUEST_DEVICE_OVERRIDDEN "
+                    "uid=%s profile=%s "
+                    "request_device=%s execution_device=%s",
+                    uid_for_entry,
+                    execution_profile_id,
+                    request_device,
+                    resolved_device,
+                )
+
+        except HTTPException as exc:
+            detail = str(
+                getattr(exc, "detail", "")
+                or ""
+            ).strip()
+
+            # A logged-in user without a configured prop profile may
+            # still use the opportunities page in display/debug mode.
+            # Do not produce a traceback and do not assign another
+            # user's prop execution device.
+            if (
+                int(getattr(exc, "status_code", 0) or 0) == 404
+                and detail == "NO_PROP_PROFILE_CONFIGURED"
+            ):
+                execution_profile_id = ""
+
+                resolved_device = str(
+                    x_device_id_hdr
+                    or pinned_device
+                    or device
+                    or ""
+                ).strip()
+
+                log.info(
+                    "[WATCHLIST] NO_PROP_PROFILE_DISPLAY_ONLY "
+                    "uid=%s device=%s",
+                    uid_for_entry,
+                    resolved_device,
+                )
+
+            else:
+                log.error(
+                    "[WATCHLIST] EXECUTION_CONTEXT_HTTP_ERROR "
+                    "uid=%s profile=%s status=%s detail=%s",
+                    uid_for_entry,
+                    execution_profile_id,
+                    getattr(exc, "status_code", None),
+                    detail,
+                )
+
+                return {
+                    "ok": False,
+                    "rows": [],
+                    "profile_id": (
+                        execution_profile_id
+                        or None
+                    ),
+                    "device_id": "",
+                    "reason": detail or "EXECUTION_CONTEXT_HTTP_ERROR",
+                }
+
+        except Exception as exc:
+            log.exception(
+                "[WATCHLIST] EXECUTION_CONTEXT_EXC "
+                "uid=%s profile=%s err=%r",
+                uid_for_entry,
+                execution_profile_id,
+                exc,
+            )
+
+            return {
+                "ok": False,
+                "rows": [],
+                "profile_id": (
+                    execution_profile_id
+                    or None
+                ),
+                "device_id": "",
+                "reason": "EXECUTION_CONTEXT_EXCEPTION",
+            }
+
+    # ------------------------------------------------------------
+    # UNAUTHENTICATED DEBUG/DISPLAY MODE ONLY
+    #
+    # This path may use an explicitly supplied device to inspect the
+    # gate. It cannot execute orders because uid_for_entry is absent.
+    # ------------------------------------------------------------
+    else:
+        resolved_device = str(
+            x_device_id_hdr
+            or pinned_device
+            or device
+            or ""
+        ).strip()
+
+        # Keep the online-device scan only for anonymous debug/display.
+        if (
+            not resolved_device
+            and R is not None
+            and (debug_gate or debug_force)
+        ):
+            try:
+                _pt = _oppt_t.now()
+                best_dev = None
+                best_hb = -1
+
+                for key in R.scan_iter(
+                    "device:dev_*"
+                ):
+                    try:
+                        h = R.hgetall(key) or {}
+                    except Exception:
+                        h = {}
+
+                    if not h:
+                        continue
+
+                    status = (
+                        h.get(b"status")
+                        or h.get("status")
+                    )
+
+                    if isinstance(
+                        status,
+                        (bytes, bytearray),
+                    ):
+                        status = status.decode(
+                            "utf-8",
+                            "ignore",
+                        )
+
+                    if (
+                        str(status or "")
+                        .strip()
+                        .lower()
+                        != "online"
+                    ):
+                        continue
+
+                    hb = (
+                        h.get(b"last_heartbeat_ms")
+                        or h.get("last_heartbeat_ms")
+                    )
+
+                    if isinstance(
+                        hb,
+                        (bytes, bytearray),
+                    ):
+                        hb = hb.decode(
+                            "utf-8",
+                            "ignore",
+                        ).strip()
+
+                    try:
+                        hb_i = int(
+                            hb
+                            if hb not in (None, "")
+                            else -1
+                        )
+                    except Exception:
+                        hb_i = -1
+
+                    key_s = (
+                        key.decode(
+                            "utf-8",
+                            "ignore",
+                        )
+                        if isinstance(
+                            key,
+                            (bytes, bytearray),
+                        )
+                        else str(key)
+                    )
+
+                    dev_id = key_s.replace(
+                        "device:",
+                        "",
+                    ).strip()
+
+                    if hb_i > best_hb:
+                        best_hb = hb_i
+                        best_dev = dev_id
+
+                _oppt_t.add(
+                    "dev_scan",
+                    _oppt_t.now() - _pt,
+                )
+
+                if best_dev:
+                    resolved_device = best_dev
+
+            except Exception:
+                log.exception(
+                    "[WATCHLIST] DEBUG_DEVICE_SCAN_EXC"
+                )
+
+    # ------------------------------------------------------------
+    # One authoritative device for every downstream operation.
+    # Do not preserve a previous pinned/header device here.
+    # ------------------------------------------------------------
+    effective_device = str(
+        resolved_device or ""
+    ).strip()
+
+    dev_for_gate = effective_device
 
     if effective_device:
-        # Ensure downstream calls all see the same resolved value
         x_device_id = effective_device
         device = effective_device
-        pinned_device = pinned_device or effective_device
-
+        pinned_device = effective_device
     auth_ok = bool(uid_for_entry) or bool(effective_device)
     # --- DEBUG BYPASS: allow zone-gate evaluation using X-Device-Id even without login ---
     # This does NOT place orders; it only computes and returns entry_gate metadata.
@@ -11830,7 +13654,24 @@ def trend_opportunities(
     if _is_slim_cacheable:
         _dev_for_key = ((effective_device or dev_for_gate or "").strip() or "nodev")
         _sym_for_key = ",".join(_sym_list(symbols))
-        cache_key = f"xtl:oppt:cache:slim:{_dev_for_key}:{tfu}:{_sym_for_key}"
+        _uid_for_key = str(
+            uid_for_entry
+            or "nouid"
+        ).strip()
+
+        _profile_for_key = str(
+            execution_profile_id
+            or "noprofile"
+        ).strip().lower()
+
+        cache_key = (
+            f"xtl:oppt:cache:slim:"
+            f"{_uid_for_key}:"
+            f"{_profile_for_key}:"
+            f"{_dev_for_key}:"
+            f"{tfu}:"
+            f"{_sym_for_key}"
+        )
         cache_ttl_s = 10   # H1 gate/zone display tolerates ~10s staleness; price pushed separately
     else:
         cache_key = None
@@ -12530,7 +14371,12 @@ def trend_opportunities(
                 _sym0 = str(sym_u or "").upper().strip()
 
             _side0 = "BUY" if _dir == "BUY" else "SELL"
-            _break_key = f"xtl:watch:break_state:{_sym0}:{_side0}:H1"
+            _break_key = break_state_key(
+                uid_for_entry,
+                _sym0,
+                _side0,
+                "H1",
+            )
 
             _prev_px = 0.0
             _prev_ts = 0
@@ -12588,7 +14434,12 @@ def trend_opportunities(
             # Reset only same symbol + same side, not all symbols.
             if _already_beyond:
                 try:
-                    _watch_key = f"xtl:zone:watch:{_sym0}:{_side0}:H1"
+                    _watch_key = zone_watch_key(
+                        uid_for_entry,
+                        _sym0,
+                        _side0,
+                        "H1",
+                    )
                     R.delete(_watch_key)
 
                     _opp_dir = "UP" if _side0 == "BUY" else "DOWN"
@@ -12605,7 +14456,15 @@ def trend_opportunities(
                         _rev_ms = 0
 
                     if _rev_ms > 0:
-                        R.delete(f"xtl:watch:entry_claim:{_sym0}:{_side0}:H1:{_rev_ms}")
+                        R.delete(
+                            entry_claim_key(
+                                uid_for_entry,
+                                _sym0,
+                                _side0,
+                                _rev_ms,
+                                "H1",
+                            )
+                        )
 
                     # remove this break state too, so next discovery starts fresh
                     R.delete(_break_key)
@@ -13204,7 +15063,11 @@ def trend_opportunities(
         # If lifecycle cleanup removed old opportunity snapshots but zone watches
         # still exist, show the watchlist from xtl:zone:watch:* on weekends.
         if not rows:
-            rows = _load_zone_watch_rows(None, tfu)
+            rows = _load_zone_watch_rows(
+                uid_for_entry,
+                None,
+                tfu,
+            )
             try:
                 log.warning("[WATCHLIST] WEEKEND_WATCH_FALLBACK rows=%s tf=%s", len(rows), tfu)
             except Exception:
@@ -15669,8 +17532,15 @@ def trend_opportunities(
         out["gate_meta"] = gm  # keep a stable copy for _run_entry_only_if_armed + UI/debug
 
         if gm:
-            out["zone"] = gm.get("zone") or gm.get("planned_zone")
-            out["planned_zone"] = gm.get("planned_zone")
+            z = (
+                gm.get("zone")
+                or gm.get("planned_zone")
+                or gm.get("zone_used")
+            )
+
+            out["zone"] = z
+            out["planned_zone"] = gm.get("planned_zone") or z
+            out["zone_used"] = gm.get("zone_used")
             out["opp_confidence"] = gm.get("confidence", opp_conf)
             out["opp_reason"] = gm.get("reason", out.get("opp_reason"))
         else:

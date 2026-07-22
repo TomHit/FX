@@ -91,8 +91,116 @@ def start_oppt_executor_manager() -> None:
                     pass
 
             # If nobody enabled -> do nothing, sleep longer
+            # ---------------------------------------------------------
+            # Global, device-aligned DXY state tracking.
+            #
+            # This must run before the enabled-user early exit because
+            # DXY direction changes are market events, not trade events.
+            # ---------------------------------------------------------
+            try:
+                from api.dxy_tracker import (
+                    update_global_dxy_state,
+                )
+
+                _dxy_stats = update_global_dxy_state(
+                    R=R,
+                    now_ms=int(now_ms),
+                )
+
+                if (
+                    _dxy_stats
+                    and (
+                        int(
+                            _dxy_stats.get(
+                                "initialized"
+                            )
+                            or 0
+                        ) > 0
+                        or int(
+                            _dxy_stats.get(
+                                "changed"
+                            )
+                            or 0
+                        ) > 0
+                        or int(
+                            _dxy_stats.get(
+                                "errors"
+                            )
+                            or 0
+                        ) > 0
+                    )
+                ):
+                    log.info(
+                        "[DXY_TRACKER] tick "
+                        "devices=%s real=%s synthetic=%s "
+                        "initialized=%s changed=%s errors=%s",
+                        _dxy_stats.get("devices"),
+                        _dxy_stats.get(
+                            "real_available"
+                        ),
+                        _dxy_stats.get(
+                            "synthetic_available"
+                        ),
+                        _dxy_stats.get(
+                            "initialized"
+                        ),
+                        _dxy_stats.get("changed"),
+                        _dxy_stats.get("errors"),
+                    )
+
+            except Exception:
+                log.exception(
+                    "[DXY_TRACKER] manager update failed "
+                    "pid=%s",
+                    pid,
+                )
+
+            # ---------------------------------------------------------
+            # M15 DXY turn detector (shadow analytics only).
+            # Independent lock/state/history; never affects trade execution.
+            # ---------------------------------------------------------
+            try:
+                from api.dxy_m15_tracker import (
+                    update_global_dxy_m15_state,
+                )
+
+                _dxy_m15_stats = update_global_dxy_m15_state(
+                    R=R,
+                    now_ms=int(now_ms),
+                )
+
+                if (
+                    _dxy_m15_stats
+                    and (
+                        int(_dxy_m15_stats.get("bootstrapped") or 0) > 0
+                        or int(_dxy_m15_stats.get("evaluated") or 0) > 0
+                        or int(_dxy_m15_stats.get("candidate_events") or 0) > 0
+                        or int(_dxy_m15_stats.get("errors") or 0) > 0
+                    )
+                ):
+                    log.info(
+                        "[DXY_M15] tick devices=%s real=%s synthetic=%s "
+                        "series=%s bootstrapped=%s evaluated=%s "
+                        "candidate_events=%s errors=%s",
+                        _dxy_m15_stats.get("devices"),
+                        _dxy_m15_stats.get("real_available"),
+                        _dxy_m15_stats.get("synthetic_available"),
+                        _dxy_m15_stats.get("series_built"),
+                        _dxy_m15_stats.get("bootstrapped"),
+                        _dxy_m15_stats.get("evaluated"),
+                        _dxy_m15_stats.get("candidate_events"),
+                        _dxy_m15_stats.get("errors"),
+                    )
+
+            except Exception:
+                log.exception(
+                    "[DXY_M15] manager update failed pid=%s",
+                    pid,
+                )
+
+            # Strategy execution can sleep longer when nobody is enabled.
+            # Global DXY tracking above has already run.
             if enabled_n <= 0:
-                # hard backoff to avoid log spam + CPU
                 time.sleep(10)
                 continue
 

@@ -37,7 +37,100 @@ def _bar_f(b: dict, *keys: str) -> Optional[float]:
                 return None
     return None
 
+def _find_xtl_broker_position(
+    R,
+    device_id: str,
+    symbol: str,
+    account_type: str = "demo",
+    ticket: int | None = None,
+) -> dict | None:
+    """
+    Read one explicitly selected MT5 device snapshot.
 
+    Never scan all connected MT5 devices.
+    """
+    dev = str(device_id or "").strip()
+    sym = str(symbol or "").upper().strip()
+    acct = str(account_type or "demo").lower().strip()
+
+    if not dev or not sym:
+        return None
+
+    try:
+        raw = R.get(
+            f"xtl:mt5:pos:{dev}:{acct}"
+        )
+
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode(
+                "utf-8",
+                "ignore",
+            )
+
+        positions = (
+            json.loads(raw)
+            if raw
+            else []
+        )
+
+        if not isinstance(positions, list):
+            return None
+
+        wanted_ticket = int(ticket or 0)
+
+        for bp in positions:
+            if not isinstance(bp, dict):
+                continue
+
+            if (
+                str(
+                    bp.get("symbol") or ""
+                ).upper().strip()
+                != sym
+            ):
+                continue
+
+            try:
+                broker_ticket = int(
+                    bp.get("ticket") or 0
+                )
+            except Exception:
+                broker_ticket = 0
+
+            if (
+                wanted_ticket > 0
+                and broker_ticket != wanted_ticket
+            ):
+                continue
+
+            try:
+                magic = int(
+                    bp.get("magic") or 0
+                )
+            except Exception:
+                magic = 0
+
+            comment = str(
+                bp.get("comment") or ""
+            ).upper().strip()
+
+            if (
+                magic == 20251227
+                or comment.startswith("XTL")
+            ):
+                return dict(bp)
+
+    except Exception:
+        log.exception(
+            "[ZONE_GATE] BROKER_POSITION_READ_FAILED "
+            "device=%s account=%s symbol=%s ticket=%s",
+            dev,
+            acct,
+            sym,
+            ticket,
+        )
+
+    return None
 
 def _level_to_zone(lvl: float, tf: str, sym_u: str, atr: float | None) -> dict:
     # pip_factor: XAU/JPY wider than FX majors
@@ -666,8 +759,10 @@ def _pick_display_zones_from_sr(sr_all: dict, price: float, atr: float, tf_tag: 
 
     return out
 
-from api.tenant_keys import zone_watch_key
-
+from api.tenant_keys import (
+    zone_watch_key,
+    break_state_key,
+)
 def _watch_key(
     uid: str,
     sym: str,
@@ -1455,126 +1550,356 @@ def zone_reversal_gate(
                 watch.get("trade_state") or ""
             ).upper().strip()
 
+            # -------------------------------------------------
+            # A broker close was already confirmed previously.
+            # Do not allow the normal gate logic below to turn
+            # this watch into WATCH / REV_OK again.
+            # -------------------------------------------------
+            if (
+                _watch_state == "BROKER_CLOSE_PENDING"
+                or _watch_trade_state
+                == "BROKER_CLOSE_PENDING"
+            ):
+                return False, {
+                    "blocked": True,
+                    "stage": "BROKER_CLOSE_PENDING",
+                    "reason": (
+                        "BROKER_DEAL_PENDING_"
+                        "EXECUTOR_RECONCILIATION"
+                    ),
+                    "trade_state": "BROKER_CLOSE_PENDING",
+                    "broker_position_present": False,
+                    "broker_deal_present": True,
+                    "broker_reconciliation_pending": True,
+                    "broker_close_reason": watch.get(
+                        "broker_close_reason"
+                    ),
+                    "broker_closed_at_ms": watch.get(
+                        "broker_closed_at_ms"
+                    ),
+                    "mt5_ticket": (
+                        watch.get("mt5_ticket")
+                        or watch.get("broker_ticket")
+                        or watch.get("position_ticket")
+                    ),
+                    "device_id": watch.get("device_id"),
+                    "rev_ok": False,
+                    "zone": watch.get("zone"),
+                    "planned_zone": watch.get(
+                        "planned_zone"
+                    ),
+                    "zone_used": watch.get("zone_used"),
+                    "rev_state": watch,
+                }
+
             if (
                 _watch_state == "TRADE_ACTIVE"
                 or _watch_trade_state == "TRADE_ACTIVE"
             ):
-                _broker_active = False
+                _watch_device_id = str(
+                    dev
+                    or watch.get("device_id")
+                    or watch.get("broker_device_id")
+                    or ""
+                ).strip()
 
-                for _pk in R.scan_iter("xtl:mt5:pos:*:demo"):
-                    _rawp = R.get(_pk)
+                if _watch_device_id:
+                    watch["device_id"] = _watch_device_id
 
+                try:
+                    _watch_ticket = int(
+                        watch.get("mt5_ticket")
+                        or watch.get("broker_ticket")
+                        or watch.get("position_ticket")
+                        or 0
+                    )
+                except Exception:
+                    _watch_ticket = 0
+
+                # Use the account namespace stored on the watch.
+                # Demo/challenge accounts normally publish under
+                # Use the broker snapshot namespace stored on the watch.
+                # The namespace follows actual MT5 trade mode:
+                # demo/contest -> "demo", real -> "live".
+                _watch_account_type = str(
+                    watch.get("mt5_account")
+                    or watch.get("account_type")
+                    or watch.get("broker_account_type")
+                    or ""
+                ).lower().strip()
+
+                if _watch_account_type not in (
+                    "demo",
+                    "live",
+                ):
+                    log.error(
+                        "[WATCHLIST] ACTIVE_TRADE_ACCOUNT_TYPE_MISSING "
+                        "sym=%s side=%s key=%s ticket=%s",
+                        sym_u,
+                        str(resolved_dir).upper(),
+                        wkey,
+                        _watch_ticket,
+                    )
+
+                    return False, {
+                        "blocked": True,
+                        "stage": "TRADE_ACTIVE_RECON_ERROR",
+                        "reason": "MT5_ACCOUNT_TYPE_MISSING",
+                        "trade_state": "TRADE_ACTIVE",
+                        "mt5_ticket": _watch_ticket,
+                        "device_id": _watch_device_id,
+                        "rev_ok": False,
+                        "zone": watch.get("zone"),
+                        "planned_zone": watch.get(
+                            "planned_zone"
+                        ),
+                        "zone_used": watch.get("zone_used"),
+                        "rev_state": watch,
+                    }
+                _active_bp = _find_xtl_broker_position(
+                    R=R,
+                    device_id=_watch_device_id,
+                    symbol=sym_u,
+                    account_type=_watch_account_type,
+                    ticket=(
+                        _watch_ticket
+                        if _watch_ticket > 0
+                        else None
+                    ),
+                )
+
+                _broker_active = bool(_active_bp)
+
+                # ---------------------------------------------
+                # Broker position still exists.
+                # Keep the watch blocked as TRADE_ACTIVE and
+                # do not allow normal zone/RC logic to continue.
+                # ---------------------------------------------
+                if _broker_active:
+                    watch["state"] = "TRADE_ACTIVE"
+                    watch["trade_state"] = "TRADE_ACTIVE"
+                    watch["broker_position_present"] = True
+                    watch["broker_deal_present"] = False
+                    watch[
+                        "broker_reconciliation_pending"
+                    ] = False
+                    watch["broker_active_seen_ms"] = int(
+                        time.time() * 1000
+                    )
+
+                    return False, {
+                        "blocked": True,
+                        "stage": "TRADE_ACTIVE",
+                        "reason": "SAME_SYMBOL_ACTIVE",
+                        "trade_state": "TRADE_ACTIVE",
+                        "broker_position_present": True,
+                        "broker_deal_present": False,
+                        "broker_reconciliation_pending": False,
+                        "mt5_ticket": _watch_ticket,
+                        "device_id": _watch_device_id,
+                        "rev_ok": False,
+                        "zone": watch.get("zone"),
+                        "planned_zone": watch.get(
+                            "planned_zone"
+                        ),
+                        "zone_used": watch.get("zone_used"),
+                        "rev_state": watch,
+                    }
+
+                # ---------------------------------------------
+                # Broker position is absent. Look for the MT5
+                # deal record before deciding what to display.
+                # ---------------------------------------------
+                _ticket = _watch_ticket
+                _deal_exists = False
+                _deal_obj = {}
+
+                if _ticket > 0:
                     try:
+                        _deal_raw = R.get(
+                            f"xtl:mt5:deal:{_ticket}"
+                        )
+
                         if isinstance(
-                            _rawp,
+                            _deal_raw,
                             (bytes, bytearray),
                         ):
-                            _rawp = _rawp.decode(
+                            _deal_raw = _deal_raw.decode(
                                 "utf-8",
                                 "ignore",
                             )
 
-                        _arrp = (
-                            json.loads(_rawp)
-                            if _rawp
-                            else []
+                        _deal_obj = (
+                            json.loads(_deal_raw)
+                            if _deal_raw
+                            else {}
                         )
+
+                        _deal_exists = bool(
+                            isinstance(_deal_obj, dict)
+                            and _deal_obj.get("ok")
+                        )
+
                     except Exception:
-                        _arrp = []
+                        _deal_exists = False
+                        _deal_obj = {}
 
-                    if not isinstance(_arrp, list):
-                        continue
-
-                    for _bp in _arrp:
-                        if not isinstance(_bp, dict):
-                            continue
-
-                        if (
-                            str(
-                                _bp.get("symbol") or ""
-                            ).upper().strip()
-                            != sym_u
-                        ):
-                            continue
-
-                        try:
-                            _magic = int(
-                                _bp.get("magic") or 0
-                            )
-                        except Exception:
-                            _magic = 0
-
-                        _comment = str(
-                            _bp.get("comment") or ""
-                        ).upper().strip()
-
-                        if (
-                            _magic == 20251227
-                            or _comment.startswith("XTL")
-                        ):
-                            _broker_active = True
-                            break
-
-                    if _broker_active:
-                        break
-
-                if not _broker_active:
-                    _ticket = 0
+                # ---------------------------------------------
+                # Deal confirms broker close.
+                # Mark reconciliation pending and stop here.
+                # Executor remains responsible for:
+                # closed ledger, PnL, risk release and cooldown.
+                # ---------------------------------------------
+                if _deal_exists:
+                    _deal_reason = str(
+                        _deal_obj.get("broker_reason")
+                        or _deal_obj.get("exit_reason")
+                        or "BROKER_CLOSED"
+                    ).upper().strip()
 
                     try:
-                        _ticket = int(
-                            watch.get("mt5_ticket")
-                            or watch.get("broker_ticket")
-                            or watch.get("position_ticket")
-                            or 0
+                        _deal_closed_at_ms = int(
+                            _deal_obj.get("close_time_ms")
+                            or _deal_obj.get("closed_at_ms")
+                            or int(time.time() * 1000)
                         )
                     except Exception:
-                        _ticket = 0
+                        _deal_closed_at_ms = int(
+                            time.time() * 1000
+                        )
 
-                    _deal_exists = False
+                    watch["state"] = (
+                        "BROKER_CLOSE_PENDING"
+                    )
+                    watch["trade_state"] = (
+                        "BROKER_CLOSE_PENDING"
+                    )
+                    watch["entry_triggered"] = False
+                    watch[
+                        "broker_position_present"
+                    ] = False
+                    watch["broker_deal_present"] = True
+                    watch[
+                        "broker_reconciliation_pending"
+                    ] = True
+                    watch[
+                        "broker_close_reason"
+                    ] = _deal_reason
+                    watch[
+                        "broker_closed_at_ms"
+                    ] = _deal_closed_at_ms
+                    watch["last_updated_ms"] = int(
+                        time.time() * 1000
+                    )
 
-                    if _ticket > 0:
-                        try:
-                            _deal_raw = R.get(
-                                f"xtl:mt5:deal:{_ticket}"
-                            )
-
-                            if isinstance(
-                                _deal_raw,
-                                (bytes, bytearray),
-                            ):
-                                _deal_raw = _deal_raw.decode(
-                                    "utf-8",
-                                    "ignore",
-                                )
-
-                            _deal_obj = (
-                                json.loads(_deal_raw)
-                                if _deal_raw
-                                else {}
-                            )
-
-                            _deal_exists = bool(
-                                isinstance(_deal_obj, dict)
-                                and _deal_obj.get("ok")
-                            )
-                        except Exception:
-                            _deal_exists = False
+                    try:
+                        R.set(
+                            wkey,
+                            json.dumps(
+                                watch,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                        )
+                    except Exception:
+                        log.exception(
+                            "[WATCHLIST] "
+                            "BROKER_CLOSE_PENDING_SAVE_FAILED "
+                            "sym=%s side=%s key=%s "
+                            "ticket=%s",
+                            sym_u,
+                            str(resolved_dir).upper(),
+                            wkey,
+                            _ticket,
+                        )
 
                     log.warning(
-                        "[WATCHLIST] TRADE_ACTIVE_PRESERVED "
-                        "sym=%s side=%s key=%s ticket=%s "
-                        "broker_position=False deal_exists=%s "
-                        "reason=WAIT_EXECUTOR_RECON",
+                        "[WATCHLIST] "
+                        "TRADE_ACTIVE_TO_"
+                        "BROKER_CLOSE_PENDING "
+                        "sym=%s side=%s key=%s "
+                        "ticket=%s deal_reason=%s "
+                        "closed_at_ms=%s device_id=%s "
+                        "account_type=%s",
                         sym_u,
                         str(resolved_dir).upper(),
                         wkey,
                         _ticket,
-                        _deal_exists,
+                        _deal_reason,
+                        _deal_closed_at_ms,
+                        _watch_device_id,
+                        _watch_account_type,
                     )
 
+                    return False, {
+                        "blocked": True,
+                        "stage": "BROKER_CLOSE_PENDING",
+                        "reason": (
+                            "BROKER_DEAL_PENDING_"
+                            "EXECUTOR_RECONCILIATION"
+                        ),
+                        "trade_state": (
+                            "BROKER_CLOSE_PENDING"
+                        ),
+                        "broker_position_present": False,
+                        "broker_deal_present": True,
+                        "broker_reconciliation_pending": True,
+                        "broker_close_reason": _deal_reason,
+                        "broker_closed_at_ms": (
+                            _deal_closed_at_ms
+                        ),
+                        "mt5_ticket": _ticket,
+                        "device_id": _watch_device_id,
+                        "rev_ok": False,
+                        "zone": watch.get("zone"),
+                        "planned_zone": watch.get(
+                            "planned_zone"
+                        ),
+                        "zone_used": watch.get("zone_used"),
+                        "rev_state": watch,
+                    }
+
+                # ---------------------------------------------
+                # Broker position absent, but deal has not
+                # arrived yet. Preserve the active lifecycle
+                # temporarily and block all new RC processing.
+                # ---------------------------------------------
+                log.warning(
+                    "[WATCHLIST] TRADE_ACTIVE_PRESERVED "
+                    "sym=%s side=%s key=%s ticket=%s "
+                    "broker_position=False "
+                    "deal_exists=False device_id=%s "
+                    "account_type=%s "
+                    "reason=WAIT_EXECUTOR_RECON",
+                    sym_u,
+                    str(resolved_dir).upper(),
+                    wkey,
+                    _ticket,
+                    _watch_device_id,
+                    _watch_account_type,
+                )
+
+                return False, {
+                    "blocked": True,
+                    "stage": "TRADE_ACTIVE",
+                    "reason": "WAIT_EXECUTOR_RECON",
+                    "trade_state": "TRADE_ACTIVE",
+                    "broker_position_present": False,
+                    "broker_deal_present": False,
+                    "broker_reconciliation_pending": True,
+                    "mt5_ticket": _ticket,
+                    "device_id": _watch_device_id,
+                    "rev_ok": False,
+                    "zone": watch.get("zone"),
+                    "planned_zone": watch.get(
+                        "planned_zone"
+                    ),
+                    "zone_used": watch.get("zone_used"),
+                    "rev_state": watch,
+                }
+
     except Exception as _e:
-        log.warning(
+        log.exception(
             "[WATCHLIST] TRADE_ACTIVE_PRESERVE_EXC "
             "sym=%s side=%s key=%s err=%r",
             sym_u,
@@ -1582,6 +1907,33 @@ def zone_reversal_gate(
             wkey,
             _e,
         )
+
+        return False, {
+            "blocked": True,
+            "stage": "TRADE_ACTIVE_RECON_ERROR",
+            "reason": "TRADE_ACTIVE_RECON_ERROR",
+            "rev_ok": False,
+            "zone": (
+                watch.get("zone")
+                if isinstance(watch, dict)
+                else None
+            ),
+            "planned_zone": (
+                watch.get("planned_zone")
+                if isinstance(watch, dict)
+                else None
+            ),
+            "zone_used": (
+                watch.get("zone_used")
+                if isinstance(watch, dict)
+                else None
+            ),
+            "rev_state": (
+                watch
+                if isinstance(watch, dict)
+                else None
+            ),
+        }
     
     # ------------------------------------------------------------
     # WATCH INTEGRITY REPAIR
@@ -2755,6 +3107,11 @@ def zone_reversal_gate(
                     _cur_closed_ms
                 )
                 watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
+                # New/refreshed RC must be allowed to send one new trigger alert.
+                watch["discord_rc_trigger_sent"] = False
+                watch.pop("discord_rc_trigger_sent_ms", None)
+                watch.pop("discord_rc_trigger_price", None)
+                watch.pop("discord_rc_trigger_error", None)
                 watch["frozen_at_ms"] = int(now_ms_pick)
                 watch["last_price"] = float((live_px if "live_px" in locals() else 0) or cl)
                 watch["updated_at_ms"] = int(now_ms_pick)
@@ -2782,8 +3139,23 @@ def zone_reversal_gate(
                 # New RC must require a fresh break of the new trigger.
                 try:
                     _rc_side = str(watch.get("direction") or resolved_dir).upper()
-                    R.delete(f"xtl:watch:break_state:{sym_u}:{_rc_side}:H1")
-                    for _ck in R.scan_iter(f"xtl:watch:entry_claim:{sym_u}:{_rc_side}:H1:*", count=50):
+                    R.delete(
+                        break_state_key(
+                            uid_u,
+                            sym_u,
+                            _rc_side,
+                            "H1",
+                        )
+                    )
+                    for _ck in R.scan_iter(
+                        entry_claim_pattern(
+                            uid_u,
+                            sym_u,
+                            _rc_side,
+                            "H1",
+                        ),
+                        count=50,
+                    ):
                         R.delete(_ck)
                     watch["entry_triggered"] = False
                     watch["entry_ready"] = False
@@ -3351,6 +3723,11 @@ def zone_reversal_gate(
             watch["rc_low"] = float(lo)
             watch["rc_close"] = float(cl)
             watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
+            # New RC must be allowed to send one new trigger alert.
+            watch["discord_rc_trigger_sent"] = False
+            watch.pop("discord_rc_trigger_sent_ms", None)
+            watch.pop("discord_rc_trigger_price", None)
+            watch.pop("discord_rc_trigger_error", None)
             watch["frozen_at_ms"] = int(now_ms_pick)
             watch["last_price"] = float((live_px if "live_px" in locals() else 0) or cl)
             watch["updated_at_ms"] = int(now_ms_pick)
@@ -3360,38 +3737,80 @@ def zone_reversal_gate(
             # active XTL position for this symbol.
             # -------------------------------------------------
             try:
-                _active_bp = None
-                for _pk in R.scan_iter("xtl:mt5:pos:*:demo"):
-                    _rawp = R.get(_pk)
+                _gate_device_id = str(
+                    dev
+                    or watch.get("device_id")
+                    or watch.get("broker_device_id")
+                    or ""
+                ).strip()
+
+                if _gate_device_id:
+                    watch["device_id"] = _gate_device_id
+
+                # Resolve the broker snapshot namespace for this device.
+                # MT5 trade mode:
+                #   0 = demo
+                #   1 = contest
+                #   2 = real
+                _gate_account_type = str(
+                    watch.get("mt5_account")
+                    or watch.get("account_type")
+                    or watch.get("broker_account_type")
+                    or ""
+                ).lower().strip()
+
+                if _gate_account_type not in (
+                    "demo",
+                    "live",
+                ):
                     try:
-                        if isinstance(_rawp, (bytes, bytearray)):
-                            _rawp = _rawp.decode("utf-8", "ignore")
-                        _arrp = json.loads(_rawp) if _rawp else []
+                        _trade_mode_raw = R.hget(
+                            f"device:{_gate_device_id}",
+                            "mt5_account_trade_mode",
+                        )
+
+                        _trade_mode = int(
+                            _trade_mode_raw
+                        )
+
+                        if _trade_mode == 2:
+                            _gate_account_type = "live"
+                        elif _trade_mode in (0, 1):
+                            _gate_account_type = "demo"
+                        else:
+                            _gate_account_type = ""
+
                     except Exception:
-                        _arrp = []
-                    if not isinstance(_arrp, list):
-                        continue
+                        _gate_account_type = ""
 
-                    for _bp in _arrp:
-                        if not isinstance(_bp, dict):
-                            continue
-                        if str(_bp.get("symbol") or "").upper().strip() != sym_u:
-                            continue
+                if _gate_account_type not in (
+                    "demo",
+                    "live",
+                ):
+                    log.error(
+                        "[WATCHLIST] REV_OK_ACCOUNT_TYPE_MISSING "
+                        "sym=%s side=%s device_id=%s key=%s",
+                        sym_u,
+                        dir_u,
+                        _gate_device_id,
+                        wkey,
+                    )
 
-                        try:
-                            _magic = int(_bp.get("magic") or 0)
-                        except Exception:
-                            _magic = 0
+                    gate["blocked"] = True
+                    gate["stage"] = "BROKER_ACTIVE_GUARD"
+                    gate["reason"] = "MT5_ACCOUNT_TYPE_MISSING"
+                    gate["rev_ok"] = False
+                    gate["rev_state"] = watch
+                    return False, gate
 
-                        _comment = str(_bp.get("comment") or "").upper().strip()
+                watch["mt5_account"] = _gate_account_type
 
-                        if _magic == 20251227 or _comment.startswith("XTL"):
-                            _active_bp = _bp
-                            break
-
-                    if _active_bp:
-                        break
-
+                _active_bp = _find_xtl_broker_position(
+                    R=R,
+                    device_id=_gate_device_id,
+                    symbol=sym_u,
+                    account_type=_gate_account_type,
+                )
                 if _active_bp:
                     _active_side = str(_active_bp.get("side") or "").upper().strip()
                     if _active_side not in ("BUY", "SELL"):
@@ -3411,31 +3830,70 @@ def zone_reversal_gate(
                             "H1",
                         )
                     )
-                        R.delete(f"xtl:watch:break_state:{sym_u}:{_clear_side}:H1")
+                        R.delete(
+                            break_state_key(
+                                uid_u,
+                                sym_u,
+                                _clear_side,
+                                "H1",
+                            )
+                        )
                     except Exception:
                         pass
 
+                    try:
+                        _active_ticket = int(
+                            _active_bp.get("ticket") or 0
+                        )
+                    except Exception:
+                        _active_ticket = 0
+
                     log.warning(
-                        "[WATCHLIST] SKIP_REV_OK_ACTIVE_POSITION sym=%s side=%s active_side=%s ticket=%s cleared_side=%s",
+                        "[WATCHLIST] SKIP_REV_OK_ACTIVE_POSITION "
+                        "sym=%s side=%s active_side=%s ticket=%s "
+                        "cleared_side=%s device_id=%s "
+                        "account_type=%s",
                         sym_u,
-                        _dir_for_trigger,
+                        dir_u,
                         _active_side,
-                        _active_bp.get("ticket"),
+                        _active_ticket,
                         _clear_side,
+                        _gate_device_id,
+                        _gate_account_type,
                     )
-                    return gate
+
+                    gate["blocked"] = True
+                    gate["stage"] = "BROKER_ACTIVE_GUARD"
+                    gate["reason"] = "BROKER_POSITION_ACTIVE"
+                    gate["trade_state"] = "TRADE_ACTIVE"
+                    gate["active_trade_side"] = _active_side
+                    gate["mt5_ticket"] = _active_ticket
+                    gate["rev_ok"] = False
+                    gate["rev_state"] = watch
+                    return False, gate
 
             except Exception as _e:
                 log.warning(
-                    "[WATCHLIST] ACTIVE_POSITION_REV_OK_GUARD_EXC sym=%s side=%s err=%r",
+                    "[WATCHLIST] ACTIVE_POSITION_REV_OK_GUARD_EXC "
+                    "sym=%s side=%s device_id=%s err=%r",
                     sym_u,
                     _dir_for_trigger,
+                    (
+                        _gate_device_id
+                        if "_gate_device_id" in locals()
+                        else ""
+                    ),
                     _e,
                 )
 
             _set_ok = R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
             try:
-                _bs_key = f"xtl:watch:break_state:{sym_u}:{_dir_for_trigger}:H1"
+                _bs_key = break_state_key(
+                    uid_u,
+                    sym_u,
+                    _dir_for_trigger,
+                    "H1",
+                )
                 _prev_px = float(watch.get("rev_ok_bar_close") or watch.get("last_checked_close") or cl)
 
                 R.set(

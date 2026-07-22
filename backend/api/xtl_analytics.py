@@ -42,12 +42,21 @@ JSONL_PATH     = "/opt/xauapi/api/trend/out/trades.jsonl"
 JSONL_LOCK_PATH = JSONL_PATH + ".lock"
 PENDING_TRUTH_KEY = "xtl:analytics:pending_truth"
 ORPHAN_AGE_MS  = 10 * 60 * 1000
-SCHEMA_VERSION = "1.5"
+SCHEMA_VERSION = "1.6"
 
 # Live entry timestamps (now_ms) are TRUE UTC, so offset 0. (The historical parquet
 # needed +3 because it was broker-encoded; the live clock is not.) VERIFY once against
 # a known entry before trusting session analysis, then adjust here if needed.
 LIVE_TZ_OFFSET_H = 0.0
+
+# DXY M15 shadow analytics wiring. These keys are produced by the unified
+# REAL_DXY / SYNTHETIC_DXY detector. Analytics reads them only; it never
+# changes the detector or blocks/modifies a trade.
+DXY_M15_SOURCES = ("REAL_DXY", "SYNTHETIC_DXY")
+DXY_M15_STATE_PREFIX = "xtl:dxy:turn:state:M15"
+DXY_M15_HISTORY_PREFIX = "xtl:dxy:turn:history:M15"
+DXY_M15_MAX_TRACKED_EVENTS = 200
+DXY_M15_STATE_FRESH_MS = 90 * 60 * 1000
 
 # Static drift table from the 18-month profiler. Only |reliab|>=2 combos are reliable;
 # everything else is noise and never flags against_drift. Regenerate monthly.
@@ -443,14 +452,40 @@ def from_app_R():
     return R
 
 
-def _open_tickets() -> set:
+def _open_tickets(
+    uid: str,
+    profile_id: str,
+    account_type: str = "demo",
+) -> set:
     try:
-        from api.trend_endpoints import _live_broker_tickets_for_prop
-        return _live_broker_tickets_for_prop() or set()
-    except Exception as e:
-        log.error("analytics: cannot read open tickets: %s", e)
-        return set()
+        from api.trend_endpoints import (
+            _live_broker_tickets_for_prop,
+        )
 
+        uid_u = str(uid or "").strip()
+        pid = str(profile_id or "").strip().lower()
+
+        if not uid_u or not pid:
+            return set()
+
+        return (
+            _live_broker_tickets_for_prop(
+                uid_u,
+                pid,
+                account_type,
+            )
+            or set()
+        )
+
+    except Exception as e:
+        log.error(
+            "analytics: cannot read open tickets "
+            "uid=%s profile=%s err=%s",
+            uid,
+            profile_id,
+            e,
+        )
+        return set()
 
 def _resolve_bar_device(
     symbol: str,
@@ -1400,7 +1435,20 @@ def _h1_window_direction(bars_h1, atr, n=20, r2_gate=0.20):
 
         # raw label: pure net-sign; gated label: also requires a real trend (r2)
         raw = "UP" if net_atr >= 1.0 else ("DOWN" if net_atr <= -1.0 else "SIDEWAYS")
-        gated = raw if (raw in ("UP", "DOWN") and r2 >= r2_gate) else "SIDEWAYS"
+
+        # A strong net move (>=2 ATR over the window) is directional even if the
+        # path was choppy (low r2). The r2 gate only arbitrates the marginal
+        # 1-2 ATR zone, where "closed higher by a little" might just be noise.
+        strong = abs(net_atr) >= 2.0
+
+        gated = (
+            raw
+            if (
+                raw in ("UP", "DOWN")
+                and (strong or r2 >= r2_gate)
+            )
+            else "SIDEWAYS"
+        )
         # -------------------------------------------------
         # Trend tilt (analytics only)
         #
@@ -2371,6 +2419,437 @@ def capture_usd_reference_snapshot(
 
         return out
 
+
+# ── DXY M15 SHADOW ANALYTICS ─────────────────────────────────────────────────
+def _dxy_m15_state_key(source: str, device_id: str) -> str:
+    return f"{DXY_M15_STATE_PREFIX}:{str(source).upper()}:{str(device_id).strip()}"
+
+
+def _dxy_m15_history_key(source: str, device_id: str) -> str:
+    return f"{DXY_M15_HISTORY_PREFIX}:{str(source).upper()}:{str(device_id).strip()}"
+
+
+def _dxy_m15_direction(value) -> str:
+    direction = str(value or "").upper().strip()
+    if direction in ("BULLISH", "UP"):
+        return "BULLISH"
+    if direction in ("BEARISH", "DOWN"):
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _dxy_m15_trade_alignment(symbol: str, side: str, dxy_direction: str) -> str:
+    """Return ALIGNED / AGAINST / NEUTRAL for USD direction vs trade side."""
+    try:
+        sym = str(symbol or "").upper().strip()
+        trade_side = str(side or "").upper().strip()
+        direction = _dxy_m15_direction(dxy_direction)
+        if trade_side not in ("BUY", "SELL") or direction == "NEUTRAL":
+            return "NEUTRAL"
+
+        usd_base = sym in {"USDJPY", "USDCHF", "USDCAD"}
+        usd_quote_or_gold = sym in {"EURUSD", "GBPUSD", "XAUUSD"}
+        if not (usd_base or usd_quote_or_gold):
+            return "UNKNOWN"
+
+        usd_strength_trade = (
+            (usd_base and trade_side == "BUY")
+            or (usd_quote_or_gold and trade_side == "SELL")
+        )
+        aligned = usd_strength_trade if direction == "BULLISH" else not usd_strength_trade
+        return "ALIGNED" if aligned else "AGAINST"
+    except Exception:
+        return "UNKNOWN"
+
+
+def _dxy_m15_decode(raw, default=None):
+    if default is None:
+        default = {}
+    try:
+        if raw is None:
+            return default
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(value, str):
+            value = json.loads(value)
+        return value
+    except Exception:
+        return default
+
+
+def _dxy_m15_compact_features(features: dict) -> dict:
+    """Keep explainable evidence while avoiding duplicating the full 300-bar series."""
+    f = features if isinstance(features, dict) else {}
+    sr = f.get("sr_audit") if isinstance(f.get("sr_audit"), dict) else {}
+    context = sr.get("structure_context") if isinstance(sr.get("structure_context"), dict) else {}
+    pin_current = f.get("pin_current") if isinstance(f.get("pin_current"), dict) else {}
+    pin_previous = f.get("pin_previous") if isinstance(f.get("pin_previous"), dict) else {}
+    return {
+        "model": f.get("model"),
+        "bar_close_ms": _safe_int(f.get("bar_close_ms"), 0),
+        "detected_at_ms": _safe_int(f.get("detected_at_ms"), 0),
+        "recent_net_atr": _safe_float(f.get("recent_net_atr")),
+        "prior_net_atr": _safe_float(f.get("prior_net_atr")),
+        "slope_5_atr": _safe_float(f.get("slope_5_atr")),
+        "slope_12_atr": _safe_float(f.get("slope_12_atr")),
+        "prior_slope_5_atr": _safe_float(f.get("prior_slope_5_atr")),
+        "acceleration_atr": _safe_float(f.get("acceleration_atr")),
+        "bullish_structure_break": bool(f.get("bullish_structure_break")),
+        "bearish_structure_break": bool(f.get("bearish_structure_break")),
+        "compression_ratio": _safe_float(f.get("compression_ratio")),
+        "expansion_ratio": _safe_float(f.get("expansion_ratio")),
+        "body_ratio": _safe_float(f.get("body_ratio")),
+        "bullish_pin_score": _safe_int(f.get("bullish_pin_score"), 0),
+        "bearish_pin_score": _safe_int(f.get("bearish_pin_score"), 0),
+        "pin_current": pin_current,
+        "pin_previous": pin_previous,
+        "bull_evidence_score": _safe_int(f.get("bull_evidence_score"), 0),
+        "bear_evidence_score": _safe_int(f.get("bear_evidence_score"), 0),
+        "evidence_direction": f.get("evidence_direction"),
+        "evidence_margin": _safe_float(f.get("evidence_margin")),
+        "evidence_detail": f.get("evidence_detail") if isinstance(f.get("evidence_detail"), dict) else {},
+        "candidate_qualification_reason": f.get("candidate_qualification_reason"),
+        "candidate_qualified": bool(f.get("candidate_qualified")),
+        "synthetic_pair_count": _safe_int(f.get("synthetic_pair_count"), 0),
+        "synthetic_pairs": f.get("synthetic_pairs") if isinstance(f.get("synthetic_pairs"), list) else [],
+        "sr_score_enabled": bool(f.get("sr_score_enabled")),
+        "sr_score_applied": _safe_float(f.get("sr_score_applied"), 0.0),
+        "sr": {
+            "structure_context": context,
+            "near_support_tfs": sr.get("near_support_tfs") if isinstance(sr.get("near_support_tfs"), list) else [],
+            "near_resistance_tfs": sr.get("near_resistance_tfs") if isinstance(sr.get("near_resistance_tfs"), list) else [],
+            "bullish_h1_sweep_reclaim": bool(sr.get("bullish_h1_sweep_reclaim")),
+            "bearish_h1_sweep_reject": bool(sr.get("bearish_h1_sweep_reject")),
+            "sweep_conflict": bool(sr.get("sweep_conflict")),
+            "bullish_confluence_count": _safe_int(sr.get("bullish_confluence_count"), 0),
+            "bearish_confluence_count": _safe_int(sr.get("bearish_confluence_count"), 0),
+            "h1": sr.get("h1") if isinstance(sr.get("h1"), dict) else {},
+            "h4": sr.get("h4") if isinstance(sr.get("h4"), dict) else {},
+            "m15": sr.get("m15") if isinstance(sr.get("m15"), dict) else {},
+        },
+    }
+
+
+def _dxy_m15_state_snapshot(R, source: str, device_id: str, symbol: str, side: str, now_ms: int) -> dict:
+    out = {
+        "source": str(source).upper(),
+        "device_id": str(device_id or ""),
+        "available": False,
+        "fresh": False,
+        "status": "UNAVAILABLE",
+        "direction": "NEUTRAL",
+        "trade_alignment": "NEUTRAL",
+        "unavailable_reason": None,
+    }
+    try:
+        if not device_id:
+            out["unavailable_reason"] = "DEVICE_ID_MISSING"
+            return out
+        raw = R.get(_dxy_m15_state_key(source, device_id))
+        state = _dxy_m15_decode(raw, {})
+        if not isinstance(state, dict) or not state:
+            out["unavailable_reason"] = "STATE_NOT_FOUND"
+            return out
+
+        direction = _dxy_m15_direction(state.get("direction") or state.get("candidate_direction"))
+        status = str(state.get("status") or "IDLE").upper().strip()
+        detected_ms = _safe_int(state.get("detected_at_ms"), 0) or 0
+        bar_close_ms = _safe_int(state.get("last_evaluated_bar_close_ms"), 0) or 0
+        freshness_anchor = max(detected_ms, bar_close_ms)
+        age_ms = max(0, int(now_ms) - freshness_anchor) if freshness_anchor else None
+        fresh = bool(age_ms is not None and age_ms <= DXY_M15_STATE_FRESH_MS)
+
+        out.update({
+            "available": True,
+            "fresh": fresh,
+            "stale": not fresh,
+            "state_age_ms": age_ms,
+            "schema_version": state.get("schema_version"),
+            "model": state.get("model"),
+            "status": status,
+            "direction": direction,
+            "trade_alignment": _dxy_m15_trade_alignment(symbol, side, direction),
+            "candidate_started_ms": state.get("candidate_started_ms"),
+            "candidate_age_bars": state.get("candidate_age_bars"),
+            "candidate_start_price": state.get("candidate_start_price"),
+            "candidate_start_atr": state.get("candidate_start_atr"),
+            "confirmed_ms": state.get("confirmed_ms"),
+            "support_bars": state.get("support_bars"),
+            "confidence": state.get("confidence"),
+            "bull_score": state.get("bull_score"),
+            "bear_score": state.get("bear_score"),
+            "accumulated_score": state.get("accumulated_score"),
+            "directional_move_atr": state.get("directional_move_atr"),
+            "max_favorable_atr": state.get("max_favorable_atr"),
+            "max_adverse_atr": state.get("max_adverse_atr"),
+            "revoke_score": state.get("revoke_score"),
+            "revoke_reasons": state.get("revoke_reasons") or [],
+            "last_event_status": state.get("last_event_status"),
+            "last_event_reason": state.get("last_event_reason"),
+            "last_event_ms": state.get("last_event_ms"),
+            "last_evaluated_bar_close_ms": bar_close_ms or None,
+            "broker_bar_close_ms": state.get("broker_bar_close_ms"),
+            "broker_offset_minutes": state.get("broker_offset_minutes"),
+            "detected_at_ms": detected_ms or None,
+            "features": _dxy_m15_compact_features(state.get("features") or {}),
+            "shadow_only": True,
+            "unavailable_reason": None,
+        })
+        return out
+    except Exception as exc:
+        out["unavailable_reason"] = f"STATE_READ_EXCEPTION:{type(exc).__name__}"
+        return out
+
+
+def read_dxy_m15_at_entry(device_id: str, symbol: str, side: str, entry_ms: int) -> dict:
+    """Freeze both REAL and SYNTHETIC states; choose a preferred source for summaries."""
+    result = {
+        "schema_version": 1,
+        "captured_at_ms": int(entry_ms or _now_ms()),
+        "device_id": str(device_id or ""),
+        "sources": {},
+        "selected_source": None,
+        "selected": None,
+        "shadow_only": True,
+    }
+    try:
+        R = from_app_R()
+        for source in DXY_M15_SOURCES:
+            result["sources"][source] = _dxy_m15_state_snapshot(
+                R, source, device_id, symbol, side, int(entry_ms or _now_ms())
+            )
+
+        real = result["sources"].get("REAL_DXY") or {}
+        synthetic = result["sources"].get("SYNTHETIC_DXY") or {}
+        if real.get("available") and real.get("fresh"):
+            selected_source = "REAL_DXY"
+        elif synthetic.get("available") and synthetic.get("fresh"):
+            selected_source = "SYNTHETIC_DXY"
+        elif real.get("available"):
+            selected_source = "REAL_DXY"
+        elif synthetic.get("available"):
+            selected_source = "SYNTHETIC_DXY"
+        else:
+            selected_source = None
+
+        result["selected_source"] = selected_source
+        result["selected"] = result["sources"].get(selected_source) if selected_source else None
+        return result
+    except Exception as exc:
+        result["capture_error"] = f"{type(exc).__name__}:{exc}"
+        return result
+
+
+def _dxy_m15_event_id(event: dict) -> str:
+    return "|".join((
+        str(event.get("source") or ""),
+        str(event.get("change_ms") or event.get("bar_close_ms") or 0),
+        str(event.get("status") or ""),
+        str(event.get("direction") or ""),
+    ))
+
+
+def _dxy_m15_compact_event(event: dict, symbol: str, side: str) -> dict:
+    direction = _dxy_m15_direction(event.get("direction"))
+    return {
+        "event_id": _dxy_m15_event_id(event),
+        "source": event.get("source"),
+        "status": str(event.get("status") or "").upper(),
+        "direction": direction,
+        "trade_alignment": _dxy_m15_trade_alignment(symbol, side, direction),
+        "reason": event.get("reason"),
+        "outcome": event.get("outcome"),
+        "change_ms": event.get("change_ms") or event.get("bar_close_ms"),
+        "detected_at_ms": event.get("detected_at_ms"),
+        "candidate_started_ms": event.get("candidate_started_ms"),
+        "confirmed_ms": event.get("confirmed_ms"),
+        "candidate_age_bars": event.get("candidate_age_bars"),
+        "bars_alive": event.get("bars_alive"),
+        "confidence": event.get("confidence"),
+        "bull_score": event.get("bull_score"),
+        "bear_score": event.get("bear_score"),
+        "accumulated_score": event.get("accumulated_score"),
+        "directional_move_atr": event.get("directional_move_atr"),
+        "max_favorable_atr": event.get("max_favorable_atr"),
+        "max_adverse_atr": event.get("max_adverse_atr"),
+        "peak_favorable_ms": event.get("peak_favorable_ms"),
+        "bars_to_peak": event.get("bars_to_peak"),
+        "end_move_atr": event.get("end_move_atr"),
+        "revoke_score": event.get("revoke_score"),
+        "revoke_reasons": event.get("revoke_reasons") or [],
+        "historical_backfill": bool(event.get("historical_backfill")),
+        "features": _dxy_m15_compact_features(event.get("features") or {}),
+    }
+
+
+def update_dxy_m15_trade_tracking(snap: dict, until_ms: int | None = None) -> bool:
+    """Append post-entry DXY lifecycle events to one in-flight analytics snapshot."""
+    try:
+        if not isinstance(snap, dict):
+            return False
+        R = from_app_R()
+        device_id = str(snap.get("device_id") or _resolve_device(snap) or "").strip()
+        symbol = str(snap.get("symbol") or "").upper().strip()
+        side = str(snap.get("side") or "").upper().strip()
+        entry_ms = _safe_int(
+            snap.get("broker_open_time_utc_ms")
+            or snap.get("enqueue_timestamp")
+            or snap.get("ts_ms"),
+            0,
+        ) or 0
+        end_ms = int(until_ms or _now_ms())
+        if not device_id or entry_ms <= 0:
+            return False
+
+        tracking = snap.get("dxy_m15_tracking") if isinstance(snap.get("dxy_m15_tracking"), dict) else {}
+        tracking.setdefault("schema_version", 1)
+        tracking.setdefault("entry_ms", entry_ms)
+        tracking.setdefault("device_id", device_id)
+        tracking.setdefault("sources", {})
+        changed = False
+
+        for source in DXY_M15_SOURCES:
+            source_rec = tracking["sources"].get(source) if isinstance(tracking["sources"].get(source), dict) else {}
+            source_rec.setdefault("source", source)
+            source_rec.setdefault("events", [])
+            existing_ids = {
+                str(e.get("event_id") or "")
+                for e in source_rec["events"]
+                if isinstance(e, dict)
+            }
+
+            raw_events = R.lrange(_dxy_m15_history_key(source, device_id), 0, -1) or []
+            for raw_event in raw_events:
+                event = _dxy_m15_decode(raw_event, {})
+                if not isinstance(event, dict):
+                    continue
+                event_ms = _safe_int(event.get("change_ms") or event.get("bar_close_ms"), 0) or 0
+                if event_ms <= entry_ms or event_ms > end_ms:
+                    continue
+                # Bootstrap history represents genuine historical events, but events before
+                # entry are filtered above. Keeping the flag allows later segmentation.
+                compact = _dxy_m15_compact_event(event, symbol, side)
+                event_id = compact["event_id"]
+                if event_id and event_id not in existing_ids:
+                    source_rec["events"].append(compact)
+                    existing_ids.add(event_id)
+                    changed = True
+
+            source_rec["events"] = sorted(
+                source_rec["events"],
+                key=lambda e: int(e.get("change_ms") or 0),
+            )[-DXY_M15_MAX_TRACKED_EVENTS:]
+            current = _dxy_m15_state_snapshot(R, source, device_id, symbol, side, end_ms)
+            if source_rec.get("current_state") != current:
+                source_rec["current_state"] = current
+                changed = True
+            source_rec["last_updated_ms"] = end_ms
+            tracking["sources"][source] = source_rec
+
+        tracking["last_updated_ms"] = end_ms
+        snap["dxy_m15_tracking"] = tracking
+        return changed
+    except Exception as exc:
+        log.warning(
+            "analytics: DXY M15 tracking update failed ticket=%s err=%r",
+            snap.get("mt5_ticket") if isinstance(snap, dict) else None,
+            exc,
+        )
+        return False
+
+
+def _dxy_m15_source_summary(source: str, source_entry: dict, source_tracking: dict, symbol: str, side: str) -> dict:
+    events = source_tracking.get("events") if isinstance(source_tracking, dict) else []
+    events = [e for e in (events or []) if isinstance(e, dict)]
+    confirmed = [e for e in events if e.get("status") == "CONFIRMED"]
+    completed = [e for e in events if e.get("status") == "COMPLETED"]
+    weak = [e for e in events if e.get("status") == "WEAK_COMPLETION"]
+    failed = [e for e in events if e.get("status") == "INVALIDATED"]
+    entry_direction = _dxy_m15_direction((source_entry or {}).get("direction"))
+    entry_alignment = (source_entry or {}).get("trade_alignment") or _dxy_m15_trade_alignment(symbol, side, entry_direction)
+    against_events = [e for e in confirmed if e.get("trade_alignment") == "AGAINST"]
+    aligned_events = [e for e in confirmed if e.get("trade_alignment") == "ALIGNED"]
+    strongest = max(
+        events,
+        key=lambda e: abs(float(e.get("max_favorable_atr") or e.get("directional_move_atr") or 0.0)),
+        default=None,
+    )
+    return {
+        "source": source,
+        "entry_available": bool((source_entry or {}).get("available")),
+        "entry_fresh": bool((source_entry or {}).get("fresh")),
+        "entry_status": (source_entry or {}).get("status"),
+        "entry_direction": entry_direction,
+        "entry_alignment": entry_alignment,
+        "entry_confidence": (source_entry or {}).get("confidence"),
+        "events_during_trade": len(events),
+        "confirmed_turns_during_trade": len(confirmed),
+        "completed_turns_during_trade": len(completed),
+        "weak_turns_during_trade": len(weak),
+        "failed_turns_during_trade": len(failed),
+        "aligned_confirmations_during_trade": len(aligned_events),
+        "against_confirmations_during_trade": len(against_events),
+        "first_confirmed_ms": confirmed[0].get("change_ms") if confirmed else None,
+        "first_against_confirmed_ms": against_events[0].get("change_ms") if against_events else None,
+        "first_aligned_confirmed_ms": aligned_events[0].get("change_ms") if aligned_events else None,
+        "direction_changed_during_trade": len({_dxy_m15_direction(e.get("direction")) for e in confirmed}) > 1,
+        "strongest_event": strongest,
+        "current_state": source_tracking.get("current_state") if isinstance(source_tracking, dict) else None,
+    }
+
+
+def finalize_dxy_m15_trade_summary(snap: dict) -> None:
+    """Freeze selected-source and per-source DXY summaries into the closed row."""
+    try:
+        if not isinstance(snap, dict):
+            return
+        close_ms = _safe_int(
+            snap.get("broker_close_time_utc_ms")
+            or snap.get("close_timestamp")
+            or _now_ms(),
+            _now_ms(),
+        ) or _now_ms()
+        update_dxy_m15_trade_tracking(snap, until_ms=close_ms)
+        entry = snap.get("dxy_m15_entry") if isinstance(snap.get("dxy_m15_entry"), dict) else {}
+        tracking = snap.get("dxy_m15_tracking") if isinstance(snap.get("dxy_m15_tracking"), dict) else {}
+        symbol = str(snap.get("symbol") or "").upper().strip()
+        side = str(snap.get("side") or "").upper().strip()
+        summaries = {}
+        for source in DXY_M15_SOURCES:
+            source_entry = (entry.get("sources") or {}).get(source) if isinstance(entry.get("sources"), dict) else {}
+            source_tracking = (tracking.get("sources") or {}).get(source) if isinstance(tracking.get("sources"), dict) else {}
+            summaries[source] = _dxy_m15_source_summary(source, source_entry or {}, source_tracking or {}, symbol, side)
+
+        selected_source = entry.get("selected_source")
+        selected = summaries.get(selected_source) if selected_source else None
+        warning = bool(
+            selected
+            and (
+                (selected.get("entry_status") == "CONFIRMED" and selected.get("entry_alignment") == "AGAINST")
+                or int(selected.get("against_confirmations_during_trade") or 0) > 0
+            )
+        )
+        snap["dxy_m15_trade_summary"] = {
+            "schema_version": 1,
+            "selected_source": selected_source,
+            "selected": selected,
+            "sources": summaries,
+            "possible_dxy_warning": warning,
+            "warning_reason": (
+                "ENTRY_OR_DURING_TRADE_CONFIRMED_USD_MOVE_AGAINST_TRADE"
+                if warning else None
+            ),
+            "finalized_at_ms": _now_ms(),
+            "shadow_only": True,
+        }
+    except Exception as exc:
+        log.warning(
+            "analytics: DXY M15 summary failed ticket=%s err=%r",
+            snap.get("mt5_ticket") if isinstance(snap, dict) else None,
+            exc,
+        )
+
 # ── ENTRY: build snapshot from a pos/repaired record ─────────────────────────
 def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
     """Map a pos (clean) or repaired record -> frozen entry snapshot.
@@ -2381,7 +2860,12 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
         sym  = str(p.get("symbol") or "").upper()
         side = str(p.get("side") or "").upper()
         ticket = _extract_ticket(p)
-
+        uid = str(
+            p.get("uid")
+            or p.get("user_id")
+            or p.get("owner_uid")
+            or ""
+        ).strip()
         entry = _safe_float(p.get("entry_price")) or _safe_float(p.get("mt5_fill_price"))
         sl = _safe_float(p.get("sl_price"))
         tp = _safe_float(p.get("tp_price"))
@@ -2413,7 +2897,12 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                           or str(p.get("trade_id") or "").startswith("BROKER_REPAIR:")) else "clean")
         is_repair = (provenance == "broker_repair")
 
-        ets = int(p.get("opened_at_ms") or _now_ms())
+        ets = int(
+            p.get("broker_open_time_ms")
+            or p.get("opened_at_ms")
+            or p.get("enqueue_timestamp")
+            or _now_ms()
+        )
         session = _session_for_ts_ms(ets, LIVE_TZ_OFFSET_H)
 
         dist_pips = None
@@ -2495,9 +2984,16 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
 
         snap = {
             "schema_version":   SCHEMA_VERSION,
+            # Ownership (multi-user / multi-profile safe)
+            "uid": uid,
+            "user_id": uid,
+            "owner_uid": uid,
             "trade_id":         p.get("trade_id"),
             "mt5_ticket":       str(ticket) if ticket else None,
-            "profile_id":       p.get("profile_id"),
+            "profile_id": str(
+                p.get("profile_id")
+                or ""
+            ).strip().lower(),
             "symbol":           sym,
             "side":             side,
             "entry_provenance": provenance,
@@ -2723,7 +3219,11 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "prop_phase":       pc.get("phase") or p.get("prop_phase"),
 
             # ── provenance detail ──
-            "device_id":        p.get("device_id"),
+            "mt5_account": str(
+                p.get("mt5_account")
+                or p.get("account_type")
+                or "demo"
+            ).lower().strip(),
             "source":           p.get("source"),
         }
         
@@ -2826,6 +3326,31 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                 "usd_reference_alignment_at_entry",
                 "UNKNOWN",
             )
+
+        # ── Unified M15 DXY evidence snapshot (REAL + SYNTHETIC) ──
+        # Frozen at entry and strictly shadow-only. No execution effect.
+        try:
+            snap["dxy_m15_entry"] = read_dxy_m15_at_entry(
+                device_id=p.get("device_id"),
+                symbol=sym,
+                side=side,
+                entry_ms=ets,
+            )
+        except Exception as _dxy_m15_exc:
+            log.warning(
+                "analytics: DXY M15 entry capture failed ticket=%s err=%r",
+                ticket,
+                _dxy_m15_exc,
+            )
+            snap["dxy_m15_entry"] = {
+                "schema_version": 1,
+                "captured_at_ms": ets,
+                "sources": {},
+                "selected_source": None,
+                "selected": None,
+                "capture_error": f"{type(_dxy_m15_exc).__name__}:{_dxy_m15_exc}",
+                "shadow_only": True,
+            }
         return snap
         
     except Exception as e:
@@ -2844,24 +3369,124 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
 
 
 def write_entry_snapshot(snap: dict) -> bool:
-    """Persist the frozen entry snapshot. Idempotent caller should check R.exists.
-    Returns True on success; never raises."""
+    """Persist the frozen entry snapshot.
+
+    Repairs missing ownership from UID-scoped strategy records before writing.
+    Analytics failure never blocks trading.
+    """
     try:
-        ticket = str(snap.get("mt5_ticket") or "").strip()
-        if not ticket:
-            log.warning("analytics: snapshot missing mt5_ticket; skipped")
+        if not isinstance(snap, dict):
+            log.error(
+                "analytics: invalid entry snapshot type=%s",
+                type(snap).__name__,
+            )
             return False
+
+        ticket = str(
+            snap.get("mt5_ticket")
+            or ""
+        ).strip()
+
+        if not ticket:
+            log.warning(
+                "analytics: snapshot missing mt5_ticket; skipped"
+            )
+            return False
+
+        R = from_app_R()
+
+        uid = str(
+            snap.get("uid")
+            or snap.get("user_id")
+            or snap.get("owner_uid")
+            or ""
+        ).strip()
+
+        # ---------------------------------------------------------
+        # P0: prevent creation of another ownerless snapshot.
+        # Try authoritative Redis ownership recovery at write time.
+        # ---------------------------------------------------------
+        if not uid:
+            recovered_uid, recovery_source = _recover_analytics_uid(
+                R,
+                ticket,
+                snap,
+            )
+
+            if recovered_uid:
+                uid = recovered_uid
+
+                snap["ownership_recovered"] = True
+                snap["ownership_recovery_source"] = (
+                    f"ENTRY_WRITE:{recovery_source}"
+                )
+                snap["ownership_recovered_at_ms"] = _now_ms()
+
+                log.warning(
+                    "analytics: entry ownership recovered "
+                    "ticket=%s trade_id=%s uid=%s source=%s",
+                    ticket,
+                    snap.get("trade_id"),
+                    uid,
+                    recovery_source,
+                )
+
+        if uid:
+            snap["uid"] = uid
+            snap["user_id"] = uid
+            snap["owner_uid"] = uid
+        else:
+            # Do not silently create corrupt analytics.
+            log.error(
+                "analytics: REFUSE_OWNERLESS_ENTRY "
+                "ticket=%s trade_id=%s profile=%s symbol=%s",
+                ticket,
+                snap.get("trade_id"),
+                snap.get("profile_id"),
+                snap.get("symbol"),
+            )
+            return False
+
+        profile_id = str(
+            snap.get("profile_id")
+            or snap.get("prop_profile_id")
+            or ""
+        ).strip().lower()
+
+        if not profile_id:
+            log.error(
+                "analytics: REFUSE_PROFILELESS_ENTRY "
+                "ticket=%s trade_id=%s uid=%s symbol=%s",
+                ticket,
+                snap.get("trade_id"),
+                uid,
+                snap.get("symbol"),
+            )
+            return False
+
+        snap["profile_id"] = profile_id
         snap.setdefault("schema_version", SCHEMA_VERSION)
         snap.setdefault("enqueue_timestamp", _now_ms())
         snap["_status"] = "open"
-        from_app_R().set(SNAP_PREFIX + ticket,
-                         json.dumps(snap, separators=(",", ":")),
-                         ex=SNAP_TTL_SEC)
-        return True
-    except Exception as e:
-        log.error("analytics: write_entry_snapshot failed: %s", e)
-        return False
 
+        R.set(
+            SNAP_PREFIX + ticket,
+            json.dumps(
+                snap,
+                default=str,
+                separators=(",", ":"),
+            ),
+            ex=SNAP_TTL_SEC,
+        )
+
+        return True
+
+    except Exception as exc:
+        log.error(
+            "analytics: write_entry_snapshot failed: %s",
+            exc,
+        )
+        return False
 
 def capture_entry(pos: dict, capture_source: str = "normal") -> bool:
     """One-call entry capture for the hooks: build + write, idempotent.
@@ -3283,6 +3908,19 @@ def _norm_ms(v) -> int:
         return 0
     return v * 1000 if 0 < v < 10_000_000_000 else v
 
+def _resolve_device(snap) -> str:
+    """device_id can be dropped from a finalized snapshot; bar_device_id (inside
+    the shadow_bias_snapshot) is the stable fallback. Resolve from the chain."""
+    if not isinstance(snap, dict):
+        return None
+    return (snap.get("device_id")
+            or snap.get("bar_device_id")
+            or (snap.get("shadow_bias_snapshot") or {}).get("bar_device_id")
+            or snap.get("usd_strength_device_id")
+            or None)
+
+
+
 def _excursion_r(snap, bars_h1, entry, sl) -> dict:
     try:
         side = (snap.get("side") or "").upper()
@@ -3334,16 +3972,89 @@ def _excursion_r(snap, bars_h1, entry, sl) -> dict:
         return {}
 
 # ── FINALIZE + APPEND ────────────────────────────────────────────────────────
-def _append_jsonl(record: dict) -> bool:
+def _jsonl_has_ticket_unlocked(ticket: str) -> bool:
+    """Return True when the permanent JSONL already contains this MT5 ticket.
+
+    Caller must hold _trades_jsonl_lock().
+    """
+    ticket_s = str(ticket or "").strip()
+    if not ticket_s or not os.path.exists(JSONL_PATH):
+        return False
+
     try:
+        with open(JSONL_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+
+                if not isinstance(row, dict):
+                    continue
+
+                if str(row.get("mt5_ticket") or "").strip() == ticket_s:
+                    return True
+
+    except FileNotFoundError:
+        return False
+
+    return False
+
+
+def _append_jsonl(record: dict) -> bool:
+    """Durably append one analytics row, idempotent by MT5 ticket."""
+    try:
+        if not isinstance(record, dict):
+            log.error(
+                "analytics: JSONL append rejected non-dict type=%s",
+                type(record).__name__,
+            )
+            return False
+
+        ticket = str(record.get("mt5_ticket") or "").strip()
+
         with _trades_jsonl_lock():
-            with open(JSONL_PATH, "a", encoding="utf-8") as f:   
-                f.write(json.dumps(record, default=str) + "\n")   
+            # P0: a retry after append-but-before-Redis-delete must not create
+            # a duplicate permanent row.
+            if ticket and _jsonl_has_ticket_unlocked(ticket):
+                log.warning(
+                    "analytics: JSONL ticket already present; treating append "
+                    "as success ticket=%s",
+                    ticket,
+                )
+                return True
+
+            os.makedirs(
+                os.path.dirname(JSONL_PATH),
+                exist_ok=True,
+            )
+
+            with open(JSONL_PATH, "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        record,
+                        default=str,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
                 f.flush()
                 os.fsync(f.fileno())
+
         return True
+
     except Exception as exc:
-        log.error("analytics: JSONL append failed: %s", exc)      
+        log.error(
+            "analytics: JSONL append failed ticket=%s err=%s",
+            (record or {}).get("mt5_ticket")
+            if isinstance(record, dict)
+            else None,
+            exc,
+        )
         return False
 
 
@@ -3475,9 +4186,48 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
         raw = R.get(SNAP_PREFIX + ticket)
         if not raw:
             return False
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+
         snap = json.loads(raw)
-        if snap.get("_status") == "closed":
+
+        if not isinstance(snap, dict):
+            log.error(
+                "analytics: finalize invalid snapshot "
+                "ticket=%s type=%s",
+                ticket,
+                type(snap).__name__,
+            )
             return False
+        # device_id sometimes drops between entry snapshot and finalize; restore
+        # from the stable fallback so the record keeps a usable device and
+        # excursion/bar re-fetch works.
+        if not snap.get("device_id"):
+            _dev = _resolve_device(snap)
+            if _dev:
+                snap["device_id"] = _dev
+
+        # P0 idempotent cleanup:
+        # A process can crash after the durable JSONL append but before Redis
+        # deletion. On the next sweep, _status is already closed. Re-run the
+        # idempotent append check and then remove the stale in-flight snapshot.
+        if snap.get("_status") == "closed":
+            if _append_jsonl(snap):
+                R.delete(SNAP_PREFIX + ticket)
+                try:
+                    R.srem(PENDING_TRUTH_KEY, ticket)
+                except Exception:
+                    pass
+
+                log.warning(
+                    "analytics: stale closed snapshot cleaned "
+                    "ticket=%s",
+                    ticket,
+                )
+                return True
+
+            return False
+
         broker_exit = _exit_from_broker_deal(
             ticket,
             snap,
@@ -3501,10 +4251,26 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
             _first = snap.get("_first_closed_seen_ms")
             if not _first:
                 snap["_first_closed_seen_ms"] = _now
-                R.set(SNAP_PREFIX + ticket, json.dumps(snap, default=str))
+                R.set(
+                    SNAP_PREFIX + ticket,
+                    json.dumps(
+                        snap,
+                        default=str,
+                        separators=(",", ":"),
+                    ),
+                    ex=SNAP_TTL_SEC,
+                )
                 return False   # keep snapshot OPEN, retry next sweep
             elif (_now - int(_first)) < DEAL_WAIT_MS:
-                R.set(SNAP_PREFIX + ticket, json.dumps(snap, default=str))
+                R.set(
+                    SNAP_PREFIX + ticket,
+                    json.dumps(
+                        snap,
+                        default=str,
+                        separators=(",", ":"),
+                    ),
+                    ex=SNAP_TTL_SEC,
+                )
                 return False   # still within grace window, retry next sweep
             else:
                 snap.update(
@@ -3532,9 +4298,17 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
         # which is where excursion used to run. Compute it here for every trade,
         # time-bounded to the real close so post-exit bars can't inflate it.
         try:
+            
             _entry = _safe_float(snap.get("entry_price"))
             _sl    = _safe_float(snap.get("sl_price"))
             _end   = _norm_ms(snap.get("close_timestamp") or 0)
+            if not bars_h1:
+                _dev = _resolve_device(snap)
+                if _dev:
+                    try:
+                        bars_h1 = _get_closed_h1_bars(snap.get("symbol"), _dev) or []
+                    except Exception:
+                        pass
             if _entry and _sl and bars_h1:
                 if _end:
                     _win = [b for b in bars_h1
@@ -3562,6 +4336,9 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
                 ticket,
                 exc,
             )
+
+        # Freeze DXY lifecycle through the actual close time before durable append.
+        finalize_dxy_m15_trade_summary(snap)
 
         snap["_status"] = "closed"
        
@@ -3690,6 +4467,15 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
         
         if _append_jsonl(snap):
             R.delete(SNAP_PREFIX + ticket)
+
+            try:
+                R.srem(
+                    PENDING_TRUTH_KEY,
+                    ticket,
+                )
+            except Exception:
+                pass
+
             return True
         return False
     except Exception as e:
@@ -3936,7 +4722,7 @@ def reconcile_pending_broker_truth(fetch_h1_bars=None) -> dict:
                                         bars = fetch_h1_bars(
                                             r.get("symbol"),
                                             int(r.get("enqueue_timestamp") or 0),
-                                            _end, r.get("device_id")) or []
+                                            _end, _resolve_device(r)) or []
                                     except TypeError:
                                         bars = fetch_h1_bars(
                                             r.get("symbol"),
@@ -4008,6 +4794,186 @@ def reconcile_pending_broker_truth(fetch_h1_bars=None) -> dict:
             "analytics: reconcile_pending_broker_truth failed: %s", exc)
         return out
 
+def _decode_json_value(raw):
+    """Safely decode Redis JSON bytes/strings."""
+    if raw is None:
+        return None
+
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+        if isinstance(raw, str):
+            return json.loads(raw)
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        return None
+
+    return None
+
+
+def _ticket_matches(record: dict, ticket: str) -> bool:
+    if not isinstance(record, dict):
+        return False
+
+    wanted = str(ticket or "").strip()
+    if not wanted:
+        return False
+
+    candidates = (
+        record.get("mt5_ticket"),
+        record.get("ticket"),
+        record.get("position_ticket"),
+        record.get("position_id"),
+        record.get("broker_ticket"),
+    )
+
+    return any(
+        str(value or "").strip() == wanted
+        for value in candidates
+    )
+
+
+def _uid_from_ledger_key(key) -> str:
+    """
+    Extract UID from:
+      xtl:strategy:oppt:open:{uid}
+      xtl:strategy:oppt:closed:{uid}
+    """
+    try:
+        if isinstance(key, (bytes, bytearray)):
+            key = key.decode("utf-8", "ignore")
+
+        key_s = str(key or "")
+        return key_s.rsplit(":", 1)[-1].strip()
+    except Exception:
+        return ""
+
+
+def _recover_analytics_uid(
+    R,
+    ticket: str,
+    snap: dict | None = None,
+) -> tuple[str, str]:
+    """
+    Recover analytics ownership only from authoritative UID-scoped records.
+
+    Returns:
+        (uid, recovery_source)
+    """
+    snap = snap if isinstance(snap, dict) else {}
+    ticket_s = str(ticket or "").strip()
+
+    if not ticket_s:
+        return "", "NO_TICKET"
+
+    # ---------------------------------------------------------
+    # 1. Open strategy ledger — strongest ownership source
+    # ---------------------------------------------------------
+    try:
+        for ledger_key in R.scan_iter("xtl:strategy:oppt:open:*"):
+            owner_uid = _uid_from_ledger_key(ledger_key)
+            if not owner_uid:
+                continue
+
+            try:
+                rows = R.hvals(ledger_key) or []
+            except Exception:
+                rows = []
+
+            for raw_row in rows:
+                row = _decode_json_value(raw_row)
+                if _ticket_matches(row, ticket_s):
+                    return owner_uid, "OPEN_LEDGER"
+    except Exception as exc:
+        log.warning(
+            "analytics: UID recovery open-ledger failed "
+            "ticket=%s err=%s",
+            ticket_s,
+            exc,
+        )
+
+    # ---------------------------------------------------------
+    # 2. Closed strategy ledger
+    # ---------------------------------------------------------
+    try:
+        for ledger_key in R.scan_iter("xtl:strategy:oppt:closed:*"):
+            owner_uid = _uid_from_ledger_key(ledger_key)
+            if not owner_uid:
+                continue
+
+            try:
+                rows = R.lrange(ledger_key, 0, -1) or []
+            except Exception:
+                rows = []
+
+            for raw_row in rows:
+                row = _decode_json_value(raw_row)
+                if _ticket_matches(row, ticket_s):
+                    return owner_uid, "CLOSED_LEDGER"
+    except Exception as exc:
+        log.warning(
+            "analytics: UID recovery closed-ledger failed "
+            "ticket=%s err=%s",
+            ticket_s,
+            exc,
+        )
+
+    # ---------------------------------------------------------
+    # 3. UID-scoped watch records
+    #
+    # New key shape:
+    # xtl:zone:watch:{uid}:{symbol}:{side}:H1
+    # ---------------------------------------------------------
+    try:
+        trade_id = str(snap.get("trade_id") or "").strip()
+
+        for watch_key in R.scan_iter("xtl:zone:watch:*"):
+            try:
+                if isinstance(watch_key, (bytes, bytearray)):
+                    watch_key_s = watch_key.decode("utf-8", "ignore")
+                else:
+                    watch_key_s = str(watch_key)
+
+                parts = watch_key_s.split(":")
+
+                # Require UID-scoped format:
+                # xtl zone watch UID SYMBOL SIDE TF
+                if len(parts) < 7:
+                    continue
+
+                owner_uid = str(parts[3] or "").strip()
+                if not owner_uid:
+                    continue
+
+                watch = _decode_json_value(R.get(watch_key))
+                if not isinstance(watch, dict):
+                    continue
+
+                if _ticket_matches(watch, ticket_s):
+                    return owner_uid, "WATCH_TICKET"
+
+                watch_trade_id = str(
+                    watch.get("trade_id")
+                    or watch.get("open_trade_id")
+                    or watch.get("entry_trade_id")
+                    or ""
+                ).strip()
+
+                if trade_id and watch_trade_id == trade_id:
+                    return owner_uid, "WATCH_TRADE_ID"
+
+            except Exception:
+                continue
+    except Exception as exc:
+        log.warning(
+            "analytics: UID recovery watch scan failed "
+            "ticket=%s err=%s",
+            ticket_s,
+            exc,
+        )
+
+    return "", "NOT_FOUND"
 
 # ── CLOSE DETECTION + ORPHAN SWEEP ───────────────────────────────────────────
 def sweep_closed_trades(fetch_h1_bars=None) -> dict:
@@ -4017,8 +4983,15 @@ def sweep_closed_trades(fetch_h1_bars=None) -> dict:
     stats = {"checked": 0, "finalized": 0, "errors": 0}
     try:
         R = from_app_R()
-        open_tickets = _open_tickets()
         now = _now_ms()
+
+        # Cache broker-open tickets separately for each
+        # UID-owned prop profile during this sweep.
+        open_tickets_cache: dict[
+            tuple[str, str],
+            set,
+        ] = {}
+
         for key in R.scan_iter(SNAP_PREFIX + "*"):
             stats["checked"] += 1
             try:
@@ -4026,8 +4999,144 @@ def sweep_closed_trades(fetch_h1_bars=None) -> dict:
                 if not raw:
                     continue
                 snap = json.loads(raw)
-                ticket = str(snap.get("mt5_ticket") or str(key).split(":")[-1])
+                uid = str(
+                    snap.get("uid")
+                    or snap.get("user_id")
+                    or snap.get("owner_uid")
+                    or ""
+                ).strip()
+
+                profile_id = str(
+                    snap.get("profile_id")
+                    or snap.get("prop_profile_id")
+                    or ""
+                ).strip().lower()
+
+                ticket = str(
+                    snap.get("mt5_ticket")
+                    or str(key).split(":")[-1]
+                    or ""
+                ).strip()
+
+                # ---------------------------------------------------------
+                # P0: self-heal ownerless analytics snapshots.
+                # Recovery is attempted only when UID is absent.
+                # ---------------------------------------------------------
+                if not uid:
+                    recovered_uid, recovery_source = _recover_analytics_uid(
+                        R,
+                        ticket,
+                        snap,
+                    )
+
+                    if recovered_uid:
+                        uid = recovered_uid
+
+                        snap["uid"] = uid
+                        snap["user_id"] = uid
+                        snap["owner_uid"] = uid
+                        snap["ownership_recovered"] = True
+                        snap["ownership_recovery_source"] = recovery_source
+                        snap["ownership_recovered_at_ms"] = now
+
+                        # Preserve the existing TTL when possible.
+                        try:
+                            ttl = int(R.ttl(key))
+                        except Exception:
+                            ttl = -1
+
+                        try:
+                            payload = json.dumps(
+                                snap,
+                                default=str,
+                                separators=(",", ":"),
+                            )
+
+                            if ttl > 0:
+                                R.set(key, payload, ex=ttl)
+                            else:
+                                R.set(key, payload)
+
+                            log.warning(
+                                "analytics: close sweep ownership recovered "
+                                "key=%s ticket=%s uid=%s profile=%s source=%s",
+                                key,
+                                ticket,
+                                uid,
+                                profile_id,
+                                recovery_source,
+                            )
+                        except Exception as exc:
+                            log.error(
+                                "analytics: ownership recovered but persistence failed "
+                                "key=%s ticket=%s uid=%s err=%s",
+                                key,
+                                ticket,
+                                uid,
+                                exc,
+                            )
+                    else:
+                        log.error(
+                            "analytics: close sweep ownership missing "
+                            "key=%s ticket=%s uid=%r profile=%r recovery=%s",
+                            key,
+                            ticket,
+                            uid,
+                            profile_id,
+                            recovery_source,
+                        )
+                        stats["errors"] += 1
+                        continue
+
+                # Profile ownership is still mandatory.
+                if not profile_id:
+                    log.error(
+                        "analytics: close sweep profile missing "
+                        "key=%s ticket=%s uid=%r profile=%r",
+                        key,
+                        ticket,
+                        uid,
+                        profile_id,
+                    )
+                    stats["errors"] += 1
+                    continue
+
+                owner_key = (
+                    uid,
+                    profile_id,
+                )
+
+                if owner_key not in open_tickets_cache:
+                    open_tickets_cache[owner_key] = (
+                        _open_tickets(
+                            uid,
+                            profile_id,
+                        )
+                    )
+
+                open_tickets = open_tickets_cache[
+                    owner_key
+                ]
+                
                 if ticket in open_tickets:
+                    try:
+                        if update_dxy_m15_trade_tracking(snap, until_ms=now):
+                            ttl = int(R.ttl(key))
+                            payload = json.dumps(
+                                snap,
+                                default=str,
+                                separators=(",", ":"),
+                            )
+                            if ttl > 0:
+                                R.set(key, payload, ex=ttl)
+                            else:
+                                R.set(key, payload, ex=SNAP_TTL_SEC)
+                    except Exception as _dxy_track_exc:
+                        log.warning(
+                            "analytics: DXY M15 open tracking failed ticket=%s err=%r",
+                            ticket,
+                            _dxy_track_exc,
+                        )
                     continue
                 age = now - int(snap.get("enqueue_timestamp") or now)
                 if age < ORPHAN_AGE_MS:
@@ -4036,7 +5145,7 @@ def sweep_closed_trades(fetch_h1_bars=None) -> dict:
                 try:
                     bars = fetch_h1_bars(snap.get("symbol"),
                                          int(snap.get("enqueue_timestamp") or 0),
-                                         now, snap.get("device_id")) or []
+                                         now, _resolve_device(snap)) or []
                 except TypeError:
                     bars = fetch_h1_bars(snap.get("symbol"),
                                          int(snap.get("enqueue_timestamp") or 0), now) or []
@@ -4122,6 +5231,431 @@ def capture_rejection(candidate: dict, reason: str, gate: str = None, enrich: bo
         log.warning("analytics: capture_rejection failed: %s", e)
         return False
 
+
+def load_real_dxy_bars(
+    device_id: str,
+    tf: str = "H1",
+    max_bars: int = 300,
+) -> list:
+    """
+    Load completed real broker DXY bars from one exact device/timeframe.
+    Never scans another device and never falls back to synthetic DXY.
+    """
+    dev = str(device_id or "").strip()
+    tf_u = str(tf or "H1").upper().strip()
+
+    if not dev or tf_u not in ("M15", "H1"):
+        return []
+
+    try:
+        R = from_app_R()
+
+        raw = R.get(
+            f"xtl:ohlc:snap:{dev}:DXY:{tf_u}"
+        )
+
+        if not raw:
+            return []
+
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode(
+                "utf-8",
+                "ignore",
+            )
+
+        payload = json.loads(raw)
+
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        bars = (
+            payload.get("bars")
+            if isinstance(payload, dict)
+            else []
+        )
+
+        if not isinstance(bars, list):
+            return []
+
+        limit = max(
+            1,
+            int(max_bars or 300),
+        )
+
+        out = []
+        seen = set()
+
+        for bar in bars[-limit:]:
+            if (
+                not isinstance(bar, dict)
+                or not bool(
+                    bar.get("complete", True)
+                )
+            ):
+                continue
+
+            ts_ms = _norm_ms(
+                bar.get("t_open_ms")
+                or bar.get("t")
+                or bar.get("time")
+                or 0
+            )
+
+            if not ts_ms or ts_ms in seen:
+                continue
+
+            o = _safe_float(bar.get("o"))
+            h = _safe_float(bar.get("h"))
+            l = _safe_float(bar.get("l"))
+            c = _safe_float(bar.get("c"))
+
+            if (
+                None in (o, h, l, c)
+                or min(o, h, l, c) <= 0
+            ):
+                continue
+
+            row = dict(bar)
+            row["t"] = int(ts_ms // 1000)
+            row["t_open_ms"] = int(ts_ms)
+            row["complete"] = True
+
+            out.append(row)
+            seen.add(ts_ms)
+
+        out.sort(
+            key=lambda b: int(
+                b.get("t_open_ms") or 0
+            )
+        )
+
+        return out
+
+    except Exception as exc:
+        log.warning(
+            "analytics: real DXY bars load failed "
+            "device=%s tf=%s err=%r",
+            device_id,
+            tf_u,
+            exc,
+        )
+        return []
+
+
+def build_synthetic_dxy_bars(
+    device_id: str,
+    tf: str = "H1",
+    max_bars: int = 300,
+    min_pairs: int = 3,
+) -> list:
+    """
+    Build broker-aligned synthetic DXY OHLC bars for H1 or M15.
+
+    Components:
+      EURUSD, GBPUSD             inverted
+      USDJPY, USDCHF, USDCAD     direct
+
+    Candles are combined only when the component bars have the exact
+    same broker candle-open timestamp.
+    """
+    dev = str(device_id or "").strip()
+    tf_u = str(tf or "H1").upper().strip()
+
+    tf_ms_map = {
+        "M15": 15 * 60 * 1000,
+        "H1": 60 * 60 * 1000,
+    }
+
+    tf_ms = tf_ms_map.get(tf_u)
+
+    if not dev or not tf_ms:
+        return []
+
+    pair_signs = {
+        "EURUSD": -1,
+        "GBPUSD": -1,
+        "USDJPY": 1,
+        "USDCHF": 1,
+        "USDCAD": 1,
+    }
+
+    required = max(
+        3,
+        min(
+            5,
+            int(min_pairs or 3),
+        ),
+    )
+
+    try:
+        R = from_app_R()
+
+        pair_maps = {}
+        pair_bases = {}
+
+        limit = max(
+            1,
+            int(max_bars or 300),
+        )
+
+        for symbol, sign in pair_signs.items():
+            raw = R.get(
+                f"xtl:ohlc:snap:{dev}:{symbol}:{tf_u}"
+            )
+
+            if not raw:
+                continue
+
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode(
+                    "utf-8",
+                    "ignore",
+                )
+
+            payload = json.loads(raw)
+
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+
+            bars = (
+                payload.get("bars")
+                if isinstance(payload, dict)
+                else []
+            )
+
+            if not isinstance(bars, list):
+                continue
+
+            bar_map = {}
+
+            for bar in bars[-limit:]:
+                if (
+                    not isinstance(bar, dict)
+                    or not bool(
+                        bar.get("complete", True)
+                    )
+                ):
+                    continue
+
+                ts_ms = _norm_ms(
+                    bar.get("t_open_ms")
+                    or bar.get("t")
+                    or bar.get("time")
+                    or 0
+                )
+
+                o = _safe_float(bar.get("o"))
+                h = _safe_float(bar.get("h"))
+                l = _safe_float(bar.get("l"))
+                c = _safe_float(bar.get("c"))
+
+                if (
+                    not ts_ms
+                    or None in (o, h, l, c)
+                    or min(o, h, l, c) <= 0
+                ):
+                    continue
+
+                bar_map[int(ts_ms)] = {
+                    "o": o,
+                    "h": h,
+                    "l": l,
+                    "c": c,
+                }
+
+            if not bar_map:
+                continue
+
+            first_ts = min(bar_map)
+
+            first_close = _safe_float(
+                bar_map[first_ts].get("c")
+            )
+
+            if (
+                first_close is None
+                or first_close <= 0
+            ):
+                continue
+
+            pair_maps[symbol] = {
+                "sign": sign,
+                "bars": bar_map,
+            }
+
+            pair_bases[symbol] = first_close
+
+        if len(pair_maps) < required:
+            return []
+
+        all_timestamps = sorted(
+            {
+                ts
+                for rec in pair_maps.values()
+                for ts in rec["bars"].keys()
+            }
+        )
+
+        synthetic = []
+
+        for ts_ms in all_timestamps:
+            opens = []
+            highs = []
+            lows = []
+            closes = []
+            contributors = []
+
+            for symbol, rec in pair_maps.items():
+                bar = rec["bars"].get(ts_ms)
+
+                if not bar:
+                    continue
+
+                base = pair_bases.get(symbol)
+                sign = int(
+                    rec.get("sign") or 0
+                )
+
+                if (
+                    not base
+                    or sign not in (-1, 1)
+                ):
+                    continue
+
+                o = _safe_float(bar.get("o"))
+                h = _safe_float(bar.get("h"))
+                l = _safe_float(bar.get("l"))
+                c = _safe_float(bar.get("c"))
+
+                if (
+                    None in (o, h, l, c)
+                    or min(o, h, l, c) <= 0
+                ):
+                    continue
+
+                if sign == 1:
+                    so = 100.0 * o / base
+                    sh = 100.0 * h / base
+                    sl = 100.0 * l / base
+                    sc = 100.0 * c / base
+
+                else:
+                    so = 100.0 * base / o
+                    sh = 100.0 * base / l
+                    sl = 100.0 * base / h
+                    sc = 100.0 * base / c
+
+                opens.append(so)
+                highs.append(sh)
+                lows.append(sl)
+                closes.append(sc)
+                contributors.append(symbol)
+
+            if len(closes) < required:
+                continue
+
+            synth_open = (
+                sum(opens) / len(opens)
+            )
+            synth_high = (
+                sum(highs) / len(highs)
+            )
+            synth_low = (
+                sum(lows) / len(lows)
+            )
+            synth_close = (
+                sum(closes) / len(closes)
+            )
+
+            synth_high = max(
+                synth_high,
+                synth_open,
+                synth_close,
+            )
+
+            synth_low = min(
+                synth_low,
+                synth_open,
+                synth_close,
+            )
+
+            synthetic.append(
+                {
+                    "t": int(ts_ms // 1000),
+                    "t_open_ms": int(ts_ms),
+                    "t_close_ms": int(
+                        ts_ms + tf_ms
+                    ),
+                    "o": round(
+                        synth_open,
+                        6,
+                    ),
+                    "h": round(
+                        synth_high,
+                        6,
+                    ),
+                    "l": round(
+                        synth_low,
+                        6,
+                    ),
+                    "c": round(
+                        synth_close,
+                        6,
+                    ),
+                    "complete": True,
+                    "synthetic": True,
+                    "synthetic_tf": tf_u,
+                    "synthetic_pair_count": len(
+                        contributors
+                    ),
+                    "synthetic_pairs": contributors,
+                }
+            )
+
+        synthetic.sort(
+            key=lambda bar: int(
+                bar.get("t_open_ms") or 0
+            )
+        )
+
+        return synthetic[-limit:]
+
+    except Exception as exc:
+        log.warning(
+            "analytics: synthetic DXY build failed "
+            "device=%s tf=%s err=%r",
+            device_id,
+            tf_u,
+            exc,
+        )
+        return []
+
+
+def build_synthetic_dxy_h1_bars_generic(
+    device_id: str,
+    max_bars: int = 300,
+) -> list:
+    """
+    Generic H1 builder retained only for regression comparison.
+
+    Production dxy_tracker.py must continue importing the original
+    build_synthetic_dxy_h1_bars implementation defined earlier.
+    """
+    return build_synthetic_dxy_bars(
+        device_id=device_id,
+        tf="H1",
+        max_bars=max_bars,
+    )
+
+def build_synthetic_dxy_m15_bars(
+    device_id: str,
+    max_bars: int = 300,
+) -> list:
+    return build_synthetic_dxy_bars(
+        device_id=device_id,
+        tf="M15",
+        max_bars=max_bars,
+    )
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

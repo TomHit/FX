@@ -269,6 +269,37 @@ def _wait_response(reason: str, window: str, shadow: bool) -> dict:
 # ForexFactory Scraper (Primary)
 # ---------------------------------------------------------------------------
 
+def _parse_ff_clock(text: str):
+    """Parse a FF time cell. None for placeholders ("All Day", "Tentative")."""
+    s = str(text or "").strip().lower().replace(" ", "")
+    if not s or ":" not in s:
+        return None
+    for fmt in ("%I:%M%p", "%H:%M"):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_ff_date(day_text: str, ref: datetime):
+    """Parse a FF date cell ("Wed Jul 22"). FF omits the year; roll forward
+    across New Year instead of stamping the reference year blindly."""
+    day_text = str(day_text or "").strip()
+    if not day_text:
+        return None
+    try:
+        d = datetime.strptime(f"{day_text} {ref.year}", "%a %b %d %Y").date()
+    except ValueError:
+        return None
+    if (ref.date() - d).days > 180:
+        try:
+            d = d.replace(year=ref.year + 1)
+        except ValueError:
+            return None
+    return d
+
+
 def _scrape_forexfactory(lookahead_hours: int = 48) -> List[dict]:
     events: List[dict] = []
     try:
@@ -292,9 +323,18 @@ def _scrape_forexfactory(lookahead_hours: int = 48) -> List[dict]:
             "Connection": "keep-alive",
         }
 
+        # Force FF to render in GMT (offset 0) so page times are already UTC.
+        # Without these cookies FF picks its own default timezone and the
+        # America/New_York conversion below stacked a second offset on top,
+        # producing the ~10.5h shift (GBP CPI showing 16:30 instead of 06:00).
         resp = requests.get(
             "https://www.forexfactory.com/calendar",
-            headers=headers, timeout=15
+            headers=headers, timeout=15,
+            cookies={
+                "fftimezone": "Atlantic%2FAzores",
+                "fftimezoneoffset": "0",
+                "fftimeformat": "0",
+            },
         )
         if resp.status_code != 200:
             log.warning("[NEWS] ForexFactory status %s", resp.status_code)
@@ -306,18 +346,35 @@ def _scrape_forexfactory(lookahead_hours: int = 48) -> List[dict]:
         now_utc      = datetime.now(timezone.utc)
         cutoff       = now_utc + timedelta(hours=lookahead_hours)
         current_date = now_utc.date()
+        current_time = None      # carried across grouped rows, reset each day
 
         for row in rows:
             try:
-                # Date cell
+                # Date + time tracking on EVERY row, BEFORE filters. The head of a
+                # grouped time block is often filtered out ("Federal Funds Rate",
+                # "Official Bank Rate"), and filtering first discards the time the
+                # rows below it must inherit.
                 date_cell = row.select_one("td.calendar__date span")
                 if date_cell and date_cell.text.strip():
-                    try:
-                        current_date = datetime.strptime(
-                            f"{date_cell.text.strip()} {now_utc.year}", "%a %b %d %Y"
-                        ).date()
-                    except Exception:
-                        pass
+                    new_date = _parse_ff_date(date_cell.text, now_utc)
+                    if new_date and new_date != current_date:
+                        current_date = new_date
+                        current_time = None
+
+                time_cell = row.select_one("td.calendar__time")
+                time_text = time_cell.text.strip() if time_cell else ""
+
+                if not time_text:
+                    t_obj      = current_time
+                    time_known = current_time is not None
+                else:
+                    t_obj = _parse_ff_clock(time_text)
+                    if t_obj is not None:
+                        current_time = t_obj
+                        time_known   = True
+                    else:
+                        current_time = None
+                        time_known   = False
 
                 # Impact — HIGH only
                 impact_cell = row.select_one("td.calendar__impact span")
@@ -339,26 +396,13 @@ def _scrape_forexfactory(lookahead_hours: int = 48) -> List[dict]:
                 if not event_name:
                     continue
 
-                
-                # Time — ForexFactory publishes in US Eastern; convert to UTC
-                # with real DST handling (EST -5 / EDT -4) via zoneinfo.
-                time_cell = row.select_one("td.calendar__time")
-                time_text = time_cell.text.strip() if time_cell else ""
-                event_dt   = None
-                time_known = False
-                if time_text and ":" in time_text:
-                    try:
-                        t = datetime.strptime(time_text.lower(), "%I:%M%p")
-                        _et = datetime.combine(current_date, t.time()).replace(
-                            tzinfo=ZoneInfo("America/New_York")
-                        )
-                        event_dt   = _et.astimezone(timezone.utc)
-                        time_known = True
-                    except Exception:
-                        pass
-
-                # Timeless event: keep the date at UTC midnight, do NOT fabricate 13:30.
-                if event_dt is None:
+                # Page is forced to GMT by the request cookies — stamp directly as
+                # UTC, no America/New_York conversion.
+                if t_obj is not None:
+                    event_dt = datetime.combine(current_date, t_obj).replace(
+                        tzinfo=timezone.utc
+                    )
+                else:
                     event_dt = datetime.combine(
                         current_date, datetime.min.time(), tzinfo=timezone.utc
                     )
@@ -637,6 +681,18 @@ def check_news_block(
             if event_time_ms <= 0:
                 continue
             if not _is_relevant(event_name, currency, sym_u):
+                continue
+
+            # An event with no published clock time was stamped at UTC midnight
+            # as a placeholder. Deriving a window from it blocks the wrong hours
+            # AND leaves the real release unguarded. Surface it in the digest,
+            # never in the gate.
+            if not ev.get("time_known", True):
+                log.warning(
+                    "[NEWS] Skipping gate for time-unknown event: %s (%s) — "
+                    "no published time, manual check required",
+                    ev.get("event"), ev.get("currency"),
+                )
                 continue
 
             pre_ms  = pre_min  * 60_000
@@ -928,18 +984,48 @@ def morning_rate_check(R, events: Optional[List[dict]] = None) -> None:
     if events is None:
         events = _load_calendar_events(R)
 
-    today      = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    now_ms     = _now_ms()
-    day_end_ms = now_ms + 24 * 60 * 60 * 1000
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.strftime("%Y-%m-%d")
+
+    # Exact UTC calendar-day boundaries.
+    day_start_utc = now_utc.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    next_day_start_utc = (
+        day_start_utc
+        + timedelta(days=1)
+    )
+
+    day_start_ms = int(
+        day_start_utc.timestamp() * 1000
+    )
+
+    day_end_ms = int(
+        next_day_start_utc.timestamp() * 1000
+    )
 
     rate_events = [
-        e for e in events
-        if e.get("is_rate_decision", _is_rate_decision(e.get("event", "")))
-        and now_ms <= int(e.get("time_ms") or 0) <= day_end_ms
+        e
+        for e in events
+        if (
+            e.get(
+                "is_rate_decision",
+                _is_rate_decision(
+                    e.get("event", "")
+                ),
+            )
+            and day_start_ms
+            <= int(e.get("time_ms") or 0)
+            < day_end_ms
+        )
     ]
 
     if not rate_events:
-        log.info("[RATE_CHECK] No rate decisions in next 24h")
+        log.info("[RATE_CHECK] No rate decisions on UTC day=%s",)
         _discord_post(
             f"✅ **XTL News Check** — No rate decisions today ({today}). "
             "Normal trading windows apply."
