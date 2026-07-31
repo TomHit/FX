@@ -115,8 +115,28 @@ def _startup_oppt_executor():
         start_oppt_executor_manager()
     except Exception as e:
         log.warning("[OPPT] executor manager failed to start: %s", e)
+@app.middleware("http")
+async def request_timer(request, call_next):
+    start = time.perf_counter()
+
+    response = await call_next(request)
+
+    elapsed = (time.perf_counter() - start) * 1000
+
+    _reqlog.warning(
+        "REQ %s %s %.1fms",
+        request.method,
+        request.url.path,
+        elapsed,
+    )
+
+    return response
 
 from starlette.middleware.base import BaseHTTPMiddleware
+import time
+import logging
+
+_reqlog = logging.getLogger("xauapi.req")
 
 class _StripApiPrefix(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):

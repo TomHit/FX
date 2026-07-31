@@ -139,36 +139,45 @@ except Exception:
 try:
     # Running as package / PyInstaller
     from xtl.mt5_client import (
+        MT5_API_LOCK,
+        mt5_locked,
         mt5_init,
         mt5_fetch_rates,
         get_mt5_tick_price_and_ts,
         mt5_get_open_positions,
         mt5_get_deal_summary,
         mt5_calc_order_margin,
+        _resolve_broker_symbol,
         _broker_offset_min,
     )
 except ImportError:
     try:
         # Running as package-relative source
         from .mt5_client import (
+            MT5_API_LOCK,
+            mt5_locked,
             mt5_init,
             mt5_fetch_rates,
             get_mt5_tick_price_and_ts,
             mt5_get_open_positions,
             mt5_get_deal_summary,
             mt5_calc_order_margin,
+            _resolve_broker_symbol,
             _broker_offset_min,
         )
     except Exception:
         # Running directly from source folder
         sys.path.append(os.path.dirname(__file__))
         from mt5_client import (
+            MT5_API_LOCK,
+            mt5_locked,
             mt5_init,
             mt5_fetch_rates,
             get_mt5_tick_price_and_ts,
             mt5_get_open_positions,
             mt5_get_deal_summary,
             mt5_calc_order_margin,
+            _resolve_broker_symbol,
             _broker_offset_min,
         )
 
@@ -292,7 +301,15 @@ def push_mt5_positions_once(
             )
 
         positions = mt5_get_open_positions()
-
+        if positions is None:
+            log.warning(
+                "MT5_POS_PUSH_SKIP_INVALID_SNAPSHOT "
+                "dev=%s acct=%s reason=MT5_POSITIONS_READ_FAILED",
+                dev_id,
+                mt5_account,
+            )
+            return False
+        
         current_positions = {}
         for p in positions or []:
             try:
@@ -365,7 +382,7 @@ def push_mt5_positions_once(
             f"/devices/{dev_id}/mt5/positions",
             payload,
             token=token,
-            timeout=10,
+            timeout=6,
         )
 
         ok = bool(getattr(r, "status_code", 0) == 200)
@@ -410,7 +427,7 @@ def push_mt5_account_once(
             f"/devices/{dev_id}/mt5/account",
             payload,
             token=token,
-            timeout=10,
+            timeout=4,
         )
 
         log.warning(
@@ -438,7 +455,7 @@ def push_mt5_account_once(
             pass
         return False
 
-
+@mt5_locked
 def _mt5_account_meta() -> dict:
     """
     MT5 account identity so backend can validate demo/live before trading.
@@ -728,8 +745,14 @@ def api_post(api_base: str, path: str, payload: dict, token: str, timeout: int =
 
     url = api_base.rstrip("/") + "/" + path.lstrip("/")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    # If API is currently marked offline (recent timeouts), skip sending for now.
-    if not _api_allowed():
+    critical_broker_snapshot = (
+        path.rstrip("/").endswith("/mt5/account")
+        or path.rstrip("/").endswith("/mt5/positions")
+    )
+
+    # Non-critical traffic may use the shared backoff.
+    # Account and position truth must still attempt delivery every cycle.
+    if not critical_broker_snapshot and not _api_allowed():
 
         class _R:
             status_code = 0
@@ -1276,12 +1299,31 @@ def push_rates_batch(
 
         # Decide if this bar is forming
         explicit_complete = b.get("complete")
-        if explicit_complete is not None:
-            # If MT5 (or the fetch wrapper) told us explicitly, trust it.
-            is_forming = explicit_complete is False
+        close_tolerance_ms = 10_000
+
+        time_says_closed = (
+            t_close_ms <= now_ms + close_tolerance_ms
+        )
+
+        if explicit_complete is False:
+            is_forming = True
         else:
-            # Fallback: use broker-grid boundary only when 'complete' not provided
-            is_forming = t_close_ms > slot_ms
+            # complete=True is a hint, not authority.
+            is_forming = not time_says_closed
+
+        if explicit_complete is True and not time_says_closed:
+            log.error(
+                "P0_FUTURE_COMPLETE_REJECT "
+                "symbol=%s tf=%s "
+                "open_ms=%s close_ms=%s "
+                "server_now_ms=%s ahead_ms=%s",
+                symbol,
+                tf_s,
+                t_open_ms,
+                t_close_ms,
+                now_ms,
+                t_close_ms - now_ms,
+            )
 
         # If forming ,and it's the tail and include_latest=True, capture as latest_bar (NOT in history)
         if is_forming and include_latest and (i == n - 1):
@@ -1337,21 +1379,14 @@ def push_rates_batch(
     # Compute serverNow as max of system clock and last bar close time
     # This prevents gate from treating recent closed bars as "future" candles
     _server_now = int(now_ms)
+    _last_closed_ms = 0
     try:
         if arr_closed:
-            _lb = arr_closed[-1]
-            _lb_open = int(
-                _lb.get("t_open_ms") or _lb.get("t", 0) * 1000
-                if _lb.get("t_open_ms") or _lb.get("t")
-                else 0
+            _last_closed_ms = int(
+                arr_closed[-1].get("t_close_ms") or 0
             )
-            _lb_close = int(
-                _lb.get("t_close_ms") or (_lb_open + tf_ms) if _lb_open else 0
-            )
-            if _lb_close > _server_now:
-                _server_now = _lb_close
     except Exception:
-        pass
+        _last_closed_ms = 0
 
     payload = {
         "symbol": (symbol or "").upper(),
@@ -1359,13 +1394,13 @@ def push_rates_batch(
         "bars": arr_closed,
         "count": len(arr_closed),
         "written_at": now_ms,
-        "serverNow": _server_now,  # ? ADD: used by gate bar picker
-        "lastClosedTs": _server_now,  # ? ADD: reference for gate diagnostics
         "device_id": str(device_id),
         "source": "broker",
         "broker": _broker_tz_meta(),
         "account": acct,
         "extra": extras or {},
+        "serverNow": _server_now,
+        "lastClosedTs": _last_closed_ms,
     }
     # terminal info is optional; only add if present
     term = {}
@@ -1441,36 +1476,56 @@ def _assert_mt5_account(expected: str = "demo") -> tuple[bool, str, dict]:
     return True, "", meta
 
 
-def _run_with_timeout(fn, args=(), kwargs=None, timeout_sec=10):
-    import threading
 
-    out = {"done": False, "ret": None, "err": None}
-    if kwargs is None:
-        kwargs = {}
 
-    def _t():
-        try:
-            out["ret"] = fn(*args, **kwargs)
-        except Exception as e:
-            out["err"] = e
-        out["done"] = True
+def _resolve_market_filling_mode(mt5, symbol_info):
+    """
+    Resolve the broker-supported filling policy for a market order.
 
-    th = threading.Thread(target=_t, daemon=True)
-    th.start()
-    th.join(timeout_sec)
-    if not out["done"]:
-        return {"ok": False, "error": f"timeout_after_{timeout_sec}s"}
-    if out["err"] is not None:
-        return {
-            "ok": False,
-            "error": f"exception:{type(out['err']).__name__}:{out['err']}",
-        }
-    return out["ret"]
+    symbol_info.filling_mode is a bitmask:
+      1 = FOK supported
+      2 = IOC supported
 
+    mt5.ORDER_FILLING_* are order-request enum values:
+      FOK    = 0
+      IOC    = 1
+      RETURN = 2
+    """
+    if symbol_info is None:
+        raise RuntimeError("symbol_info_missing")
+
+    filling_flags = int(
+        getattr(symbol_info, "filling_mode", 0) or 0
+    )
+
+    execution_mode = int(
+        getattr(symbol_info, "trade_exemode", -1)
+    )
+
+    # Prefer IOC where supported.
+    # CTI XAUUSDC reports filling_flags=2, so this returns ORDER_FILLING_IOC.
+    if filling_flags & 2:
+        return mt5.ORDER_FILLING_IOC
+
+    if filling_flags & 1:
+        return mt5.ORDER_FILLING_FOK
+
+    # RETURN is not valid for Market Execution.
+    if execution_mode != mt5.SYMBOL_TRADE_EXECUTION_MARKET:
+        return mt5.ORDER_FILLING_RETURN
+
+    raise RuntimeError(
+        "no_supported_market_filling_mode:"
+        f"symbol={getattr(symbol_info, 'name', '')}:"
+        f"filling_flags={filling_flags}:"
+        f"execution_mode={execution_mode}"
+    )
 
 import threading, traceback
 
 
+
+@mt5_locked
 def _mt5_send_market_order(cmd: dict) -> dict:
     """
     Execute MT5 market order.
@@ -1531,29 +1586,134 @@ def _mt5_send_market_order(cmd: dict) -> dict:
         pass
     # -------------------- END NEW BLOCK --------------------
 
-    symbol = cmd.get("symbol")
-    side = cmd.get("side")
+    canonical_symbol = str(
+        cmd.get("symbol") or ""
+    ).upper().strip()
+
+    side = str(
+        cmd.get("side") or ""
+    ).upper().strip()
+
     volume = float(cmd.get("volume") or 0)
     sl = cmd.get("sl")
     tp = cmd.get("tp")
     comment = cmd.get("comment") or "XTL"
 
-    if not symbol or volume <= 0:
-        return {"ok": False, "error": "invalid_symbol_or_volume"}
+    if not canonical_symbol or volume <= 0:
+        return {
+            "ok": False,
+            "error": "invalid_symbol_or_volume",
+            "symbol": canonical_symbol,
+            "volume": volume,
+        }
 
-    if not mt5.symbol_select(symbol, True):
-        return {"ok": False, "error": f"symbol_select_failed:{symbol}"}
+    # Resolve XTL canonical symbol to the symbol exposed by this broker.
+    # CTI examples:
+    # EURUSD -> EURUSDC
+    # XAUUSD -> XAUUSDC
+    broker_symbol = str(
+        _resolve_broker_symbol(canonical_symbol)
+        or ""
+    ).strip()
 
-    tick = mt5.symbol_info_tick(symbol)
+    if not broker_symbol:
+        return {
+            "ok": False,
+            "error": f"broker_symbol_not_found:{canonical_symbol}",
+            "symbol": canonical_symbol,
+        }
+
+    if not mt5.symbol_select(broker_symbol, True):
+        return {
+            "ok": False,
+            "error": f"symbol_select_failed:{broker_symbol}",
+            "symbol": canonical_symbol,
+            "broker_symbol": broker_symbol,
+            "mt5_last_error": mt5.last_error(),
+        }
+
+    symbol_info = mt5.symbol_info(broker_symbol)
+
+    if symbol_info is None:
+        return {
+            "ok": False,
+            "error": f"symbol_info_failed:{broker_symbol}",
+            "symbol": canonical_symbol,
+            "broker_symbol": broker_symbol,
+            "mt5_last_error": mt5.last_error(),
+        }
+
+    try:
+        type_filling = _resolve_market_filling_mode(
+            mt5,
+            symbol_info,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "symbol": canonical_symbol,
+            "broker_symbol": broker_symbol,
+            "filling_flags": int(
+                getattr(symbol_info, "filling_mode", 0) or 0
+            ),
+            "execution_mode": int(
+                getattr(symbol_info, "trade_exemode", -1)
+            ),
+            "mt5_last_error": mt5.last_error(),
+        }
+
+    tick = mt5.symbol_info_tick(broker_symbol)
+
     if not tick:
-        return {"ok": False, "error": "no_tick"}
+        return {
+            "ok": False,
+            "error": f"no_tick:{broker_symbol}",
+            "symbol": canonical_symbol,
+            "broker_symbol": broker_symbol,
+            "mt5_last_error": mt5.last_error(),
+        }
+
+    try:
+        log.warning(
+            "[AGENT] SYMBOL_RESOLVED "
+            "job_id=%s requested=%s broker=%s",
+            cmd.get("job_id"),
+            canonical_symbol,
+            broker_symbol,
+        )
+
+        log.warning(
+            "[AGENT] FILLING_MODE_RESOLVED "
+            "job_id=%s requested=%s broker=%s "
+            "filling_flags=%s execution_mode=%s "
+            "request_filling=%s",
+            cmd.get("job_id"),
+            canonical_symbol,
+            broker_symbol,
+            getattr(symbol_info, "filling_mode", None),
+            getattr(symbol_info, "trade_exemode", None),
+            type_filling,
+        )
+    except Exception:
+        pass
+
+    # All MT5 operations below must use the broker-native symbol.
+    symbol = broker_symbol
 
     if side == "BUY":
         order_type = mt5.ORDER_TYPE_BUY
         price = tick.ask
-    else:
+    elif side == "SELL":
         order_type = mt5.ORDER_TYPE_SELL
         price = tick.bid
+    else:
+        return {
+            "ok": False,
+            "error": f"invalid_side:{side}",
+            "symbol": canonical_symbol,
+            "broker_symbol": broker_symbol,
+        }
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -1567,18 +1727,21 @@ def _mt5_send_market_order(cmd: dict) -> dict:
         "magic": 20251227,
         "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_FOK,
+        "type_filling": type_filling,
     }
     # ------------------------------------------------------------
     # Broker-native margin pre-check before order_send.
     # ------------------------------------------------------------
     try:
         log.warning(
-            "[AGENT] ORDER_MARGIN_START job_id=%s trade_id=%s profile=%s symbol=%s side=%s volume=%s price=%s",
+            "[AGENT] ORDER_MARGIN_START "
+            "job_id=%s trade_id=%s profile=%s "
+            "symbol=%s broker_symbol=%s side=%s volume=%s price=%s",
             cmd.get("job_id"),
             cmd.get("trade_id"),
             cmd.get("profile_id"),
-            symbol,
+            canonical_symbol,
+            broker_symbol,
             side,
             volume,
             price,
@@ -1612,6 +1775,8 @@ def _mt5_send_market_order(cmd: dict) -> dict:
         return {
             "ok": False,
             "error": "MARGIN_CALC_FAILED",
+            "symbol": canonical_symbol,
+            "broker_symbol": broker_symbol,
             "margin": margin,
         }
 
@@ -1638,6 +1803,8 @@ def _mt5_send_market_order(cmd: dict) -> dict:
         return {
             "ok": False,
             "error": "INSUFFICIENT_FREE_MARGIN",
+            "symbol": canonical_symbol,
+            "broker_symbol": broker_symbol,
             "margin": margin,
         }
 
@@ -1661,27 +1828,59 @@ def _mt5_send_market_order(cmd: dict) -> dict:
     except Exception:
         pass
     result = mt5.order_send(request)
-    if not result:
-        return {"ok": False, "error": "order_send_none"}
 
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
+    if not result:
+        return {
+            "ok": False,
+            "error": "order_send_none",
+            "symbol": canonical_symbol,
+            "broker_symbol": broker_symbol,
+            "mt5_last_error": mt5.last_error(),
+            "request": request,
+        }
+
+    success_retcodes = {
+        mt5.TRADE_RETCODE_DONE,
+        mt5.TRADE_RETCODE_PLACED,
+    }
+
+    if result.retcode not in success_retcodes:
         return {
             "ok": False,
             "error": f"retcode:{result.retcode}",
+            "symbol": canonical_symbol,
+            "broker_symbol": broker_symbol,
             "comment": getattr(result, "comment", ""),
+            "retcode": getattr(result, "retcode", None),
+            "deal": getattr(result, "deal", None),
+            "order": getattr(result, "order", None),
+            "price": getattr(result, "price", None),
+            "volume": getattr(result, "volume", None),
+            "request_id": getattr(result, "request_id", None),
+            "mt5_last_error": mt5.last_error(),
         }
 
     return {
         "ok": True,
-        "ticket": result.order,
-        "retcode": result.retcode,
-        "deal": result.deal,
-        "price": result.price,
-        "volume": result.volume,
+        "ticket": int(
+            getattr(result, "order", 0)
+            or getattr(result, "deal", 0)
+            or 0
+        ),
+        "order": int(getattr(result, "order", 0) or 0),
+        "deal": int(getattr(result, "deal", 0) or 0),
+        "retcode": int(getattr(result, "retcode", 0) or 0),
+        "price": float(getattr(result, "price", 0.0) or 0.0),
+        "volume": float(getattr(result, "volume", 0.0) or 0.0),
+
+        # Keep XTL and broker identities separately.
+        "symbol": canonical_symbol,
+        "broker_symbol": broker_symbol,
+
         "margin": margin,
     }
 
-
+@mt5_locked
 def _mt5_close_position(cmd: dict) -> dict:
     """
     Close an open MT5 position by *ticket* (works for hedging AND netting).
@@ -1741,6 +1940,27 @@ def _mt5_close_position(cmd: dict) -> dict:
         return {"ok": False, "error": "no_tick", "ticket": ticket, "symbol": symbol}
 
     price = float(tick.bid) if order_type == mt5.ORDER_TYPE_SELL else float(tick.ask)
+    symbol_info = mt5.symbol_info(symbol)
+
+    if symbol_info is None:
+        return {
+            "ok": False,
+            "error": f"symbol_info_failed:{symbol}",
+            "ticket": ticket,
+        }
+
+    try:
+        type_filling = _resolve_market_filling_mode(
+            mt5,
+            symbol_info,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "ticket": ticket,
+            "symbol": symbol,
+        }
 
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -1752,7 +1972,7 @@ def _mt5_close_position(cmd: dict) -> dict:
         "deviation": deviation,
         "comment": "XTL close_position",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_FOK,
+        "type_filling": type_filling,
     }
 
     try:
@@ -1798,7 +2018,10 @@ def start_ohlc_worker(
         f"OHLC: starting worker symbols={symbols} tfs={tfs} bars={bars} every {period_sec}s"
     )
 
-    # Dedicated account heartbeat
+    # ---------------------------------------------------------
+    # Critical broker account snapshot.
+    # Runs independently of OHLC processing.
+    # ---------------------------------------------------------
     th_acc = threading.Thread(
         target=_mt5_account_heartbeat_loop,
         args=(api_base, device_id, token, "demo", 5),
@@ -1807,10 +2030,32 @@ def start_ohlc_worker(
     )
     th_acc.start()
 
-    # Existing OHLC worker
+    # ---------------------------------------------------------
+    # Critical broker positions snapshot.
+    # Runs independently of OHLC processing.
+    # ---------------------------------------------------------
+    th_pos = threading.Thread(
+        target=_mt5_positions_heartbeat_loop,
+        args=(api_base, device_id, token, "demo", 10),
+        name="mt5-positions-heartbeat",
+        daemon=True,
+    )
+    th_pos.start()
+
+    # ---------------------------------------------------------
+    # OHLC publisher.
+    # ---------------------------------------------------------
     th = threading.Thread(
         target=_ohlc_loop,
-        args=(api_base, device_id, token, symbols, tfs, bars, period_sec),
+        args=(
+            api_base,
+            device_id,
+            token,
+            symbols,
+            tfs,
+            bars,
+            period_sec,
+        ),
         name="ohlc-worker",
         daemon=True,
     )
@@ -1829,14 +2074,137 @@ def start_mt5_cmd_worker(api_base, device_id, token, poll_sec=2):
     th.start()
     return th
 
-def _mt5_account_heartbeat_loop(api_base, device_id, token, mt5_account="demo", period_sec=5):
-    while True:
-        try:
-            push_mt5_account_once(api_base, device_id, token, mt5_account=mt5_account)
-        except Exception as e:
-            log.warning("MT5 account heartbeat failed: %s", e)
+def _mt5_account_heartbeat_loop(
+    api_base,
+    device_id,
+    token,
+    mt5_account="demo",
+    period_sec=5,
+):
+    period = max(5.0, min(float(period_sec or 5), 15.0))
+    next_run = time.monotonic()
+    consecutive_failures = 0
 
-        time.sleep(float(period_sec or 5))
+    while True:
+        started = time.monotonic()
+
+        try:
+            ok = push_mt5_account_once(
+                api_base,
+                device_id,
+                token,
+                mt5_account=mt5_account,
+            )
+
+            if ok:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                log.warning(
+                    "MT5_ACCOUNT_HEARTBEAT_FAILED dev=%s acct=%s "
+                    "consecutive=%s",
+                    device_id,
+                    mt5_account,
+                    consecutive_failures,
+                )
+
+        except Exception:
+            consecutive_failures += 1
+            log.exception(
+                "MT5_ACCOUNT_HEARTBEAT_EXC dev=%s acct=%s "
+                "consecutive=%s",
+                device_id,
+                mt5_account,
+                consecutive_failures,
+            )
+
+        took_ms = int((time.monotonic() - started) * 1000)
+
+        log.info(
+            "MT5_ACCOUNT_HEARTBEAT_DONE dev=%s acct=%s "
+            "ok=%s took_ms=%s",
+            device_id,
+            mt5_account,
+            consecutive_failures == 0,
+            took_ms,
+        )
+
+        next_run += period
+        delay = next_run - time.monotonic()
+
+        if delay <= 0:
+            next_run = time.monotonic() + period
+            delay = period
+
+        time.sleep(delay)
+        
+def _mt5_positions_heartbeat_loop(
+    api_base,
+    device_id,
+    token,
+    mt5_account="demo",
+    period_sec=10,
+):
+    """
+    Publish broker positions independently of OHLC, price, DXY,
+    command polling and deal-history workloads.
+    """
+    period = max(5.0, min(float(period_sec or 10), 15.0))
+    next_run = time.monotonic()
+    consecutive_failures = 0
+
+    while True:
+        started = time.monotonic()
+
+        try:
+            ok = push_mt5_positions_once(
+                api_base,
+                device_id,
+                token,
+                mt5_account=mt5_account,
+            )
+
+            if ok:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                log.warning(
+                    "MT5_POS_HEARTBEAT_FAILED dev=%s acct=%s "
+                    "consecutive=%s",
+                    device_id,
+                    mt5_account,
+                    consecutive_failures,
+                )
+
+        except Exception:
+            consecutive_failures += 1
+            log.exception(
+                "MT5_POS_HEARTBEAT_EXC dev=%s acct=%s "
+                "consecutive=%s",
+                device_id,
+                mt5_account,
+                consecutive_failures,
+            )
+
+        took_ms = int((time.monotonic() - started) * 1000)
+
+        log.info(
+            "MT5_POS_HEARTBEAT_DONE dev=%s acct=%s "
+            "ok=%s took_ms=%s",
+            device_id,
+            mt5_account,
+            consecutive_failures == 0,
+            took_ms,
+        )
+
+        next_run += period
+        delay = next_run - time.monotonic()
+
+        if delay <= 0:
+            next_run = time.monotonic() + period
+            delay = period
+
+        time.sleep(delay)
         
 def _ohlc_loop(api_base, device_id, token, symbols, tfs, bars, period_sec):
     next_run = time.time()
@@ -1849,10 +2217,7 @@ def _ohlc_loop(api_base, device_id, token, symbols, tfs, bars, period_sec):
 
             
 
-            try:
-                push_mt5_positions_once(api_base, device_id, token, mt5_account="demo")
-            except Exception as e:
-                log.warning("MT5 positions push failed: %s", e)
+            
 
             took = time.time() - tick_start
             log.info(f"OHLC: tick done in {took:.2f}s")
@@ -1890,17 +2255,44 @@ def _mt5_cmd_loop(api_base, device_id, token, poll_sec):
             cmd_type = str(cmd.get("type") or "").strip().lower()
 
             if cmd_type == "market_order":
-                result = _run_with_timeout(
-                    _mt5_send_market_order, args=(cmd,), timeout_sec=15
-                )
+                try:
+                    result = _mt5_send_market_order(cmd)
+                except Exception as e:
+                    log.exception(
+                        "MT5 CMD: market_order exception job=%s err=%s",
+                        job_id,
+                        e,
+                    )
+                    result = {
+                        "ok": False,
+                        "error": (
+                            f"market_order_exception:"
+                            f"{type(e).__name__}:{e}"
+                        ),
+                    }
 
             elif cmd_type == "close_position":
-                result = _run_with_timeout(
-                    _mt5_close_position, args=(cmd,), timeout_sec=15
-                )
+                try:
+                    result = _mt5_close_position(cmd)
+                except Exception as e:
+                    log.exception(
+                        "MT5 CMD: close_position exception job=%s err=%s",
+                        job_id,
+                        e,
+                    )
+                    result = {
+                        "ok": False,
+                        "error": (
+                            f"close_position_exception:"
+                            f"{type(e).__name__}:{e}"
+                        ),
+                    }
 
             else:
-                result = {"ok": False, "error": f"unknown_cmd_type:{cmd_type}"}
+                result = {
+                    "ok": False,
+                    "error": f"unknown_cmd_type:{cmd_type}",
+                }
 
             if not isinstance(result, dict):
                 result = {

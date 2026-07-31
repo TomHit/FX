@@ -88,6 +88,32 @@ PROP_FIRM_RULES = {
             },
         },
     },
+        "cti": {
+        "label": "City Traders Imperium",
+        "phases": {
+            "two_step_phase_1": {
+                "target_pct": 10,
+                "daily_loss_pct": 5,
+                "max_loss_pct": 10,
+                "min_days": None,
+                "risk_per_idea_pct": None,
+            },
+            "two_step_phase_2": {
+                "target_pct": 5,
+                "daily_loss_pct": 5,
+                "max_loss_pct": 10,
+                "min_days": None,
+                "risk_per_idea_pct": None,
+            },
+            "funded": {
+                "target_pct": None,
+                "daily_loss_pct": 5,
+                "max_loss_pct": 10,
+                "min_days": None,
+                "risk_per_idea_pct": None,
+            },
+        },
+    },
 }
 
 SYMBOL_SPECS = {

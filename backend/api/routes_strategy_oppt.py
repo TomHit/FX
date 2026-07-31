@@ -398,14 +398,42 @@ def _get_state(uid: str) -> Dict[str, Any]:
 
 def _save_state(uid: str, st: Dict[str, Any]) -> Dict[str, Any]:
     key = STATE_KEY.format(uid=uid)
-    try:
-        R.set(key, json.dumps(st), ex=STATE_TTL_SEC)
-    except (AuthenticationError, ConnectionError, TimeoutError) as e:
-        raise HTTPException(status_code=503, detail=f"Redis unavailable: {type(e).__name__}") from e
-    except Exception as e:
-        raise HTTPException(status_code=503, detail="Redis unavailable") from e
-    return st
+    enabled_users_key = "xtl:strategy:oppt:enabled_users"
 
+    try:
+        pipe = R.pipeline(transaction=True)
+
+        pipe.set(
+            key,
+            json.dumps(st),
+            ex=STATE_TTL_SEC,
+        )
+
+        if bool(st.get("enabled")):
+            pipe.sadd(
+                enabled_users_key,
+                uid,
+            )
+        else:
+            pipe.srem(
+                enabled_users_key,
+                uid,
+            )
+
+        pipe.execute()
+
+    except (AuthenticationError, ConnectionError, TimeoutError) as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Redis unavailable: {type(e).__name__}",
+        ) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis unavailable",
+        ) from e
+
+    return st
 
 def _require_uid(user) -> str:
     # require_auth_optional guarantees .user_id

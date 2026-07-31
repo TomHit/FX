@@ -15,8 +15,9 @@ from pathlib import Path
 import shutil, tempfile, subprocess
 from pydantic import BaseModel, Field, ConfigDict
 import httpx, math
-
-
+import hashlib
+import hmac
+import threading
 
 
 import logging
@@ -64,6 +65,104 @@ if get_current_user_relaxed is None:
 # ---- Redis ------------------------------------------------------------------
 REDIS_URL = "redis://default:xau12345@10.0.0.132:6379/0"
 R = redis.from_url(REDIS_URL, decode_responses=True)
+
+
+# -------------------------------------------------
+# Atomic price-ingestion Redis operation.
+#
+# One Redis round trip:
+# - compare timestamps for device/global prices
+# - update only when incoming tick is newer
+# - publish accepted tick
+# - maintain user-device membership
+# - update auth breadcrumb
+# -------------------------------------------------
+_PRICE_INGEST_LUA = """
+local device_key = KEYS[1]
+local global_key = KEYS[2]
+local pub_channel = KEYS[3]
+local devices_key = KEYS[4]
+local auth_debug_key = KEYS[5]
+
+local incoming_json = ARGV[1]
+local incoming_ts = tonumber(ARGV[2]) or 0
+local price_ttl = tonumber(ARGV[3]) or 604800
+local event_json = ARGV[4]
+local device_id = ARGV[5]
+local auth_debug_ttl = tonumber(ARGV[6]) or 120
+
+local function existing_ts(key)
+    local raw = redis.call("GET", key)
+
+    if not raw then
+        return 0
+    end
+
+    local ok, decoded = pcall(
+        cjson.decode,
+        raw
+    )
+
+    if not ok or type(decoded) ~= "table" then
+        return 0
+    end
+
+    return tonumber(decoded["ts_ms"]) or 0
+end
+
+local device_written = 0
+local global_written = 0
+
+if existing_ts(device_key) < incoming_ts then
+    redis.call(
+        "SETEX",
+        device_key,
+        price_ttl,
+        incoming_json
+    )
+
+    device_written = 1
+end
+
+if existing_ts(global_key) < incoming_ts then
+    redis.call(
+        "SETEX",
+        global_key,
+        price_ttl,
+        incoming_json
+    )
+
+    global_written = 1
+end
+
+redis.call(
+    "PUBLISH",
+    pub_channel,
+    event_json
+)
+
+redis.call(
+    "SADD",
+    devices_key,
+    device_id
+)
+
+redis.call(
+    "SETEX",
+    auth_debug_key,
+    auth_debug_ttl,
+    "ok"
+)
+
+return {
+    device_written,
+    global_written
+}
+"""
+
+_PRICE_INGEST_SCRIPT = R.register_script(
+    _PRICE_INGEST_LUA
+)
 # import-time smoke test: which Redis is this process using?
 try:
     import time as _t
@@ -123,6 +222,8 @@ def _decode(b):
     return b
 def _hkey(dev_id: str) -> str:
     return f"{DEVICE_PREFIX}{dev_id}"
+
+
 
 # ---- MT5 command queue (device pulls) -----------------------------------------
 
@@ -330,6 +431,426 @@ def _assert_device_token(device_id: str, token: str):
         row = cur.fetchone()
         if not row or (row[0] or "") != token:
             raise HTTPException(status_code=401, detail="Bad device token")
+
+# -------------------------------------------------
+# Device-auth L1 cache.
+#
+# Hot price ticks authenticate from process memory.
+# Redis remains the shared L2 cache.
+# PostgreSQL remains authoritative on cache miss.
+# -------------------------------------------------
+DEVICE_AUTH_L1_TTL_S = max(
+    5,
+    int(
+        os.getenv(
+            "XTL_DEVICE_AUTH_L1_TTL_S",
+            "30",
+        )
+    ),
+)
+
+DEVICE_AUTH_L1_MAX_ENTRIES = max(
+    100,
+    int(
+        os.getenv(
+            "XTL_DEVICE_AUTH_L1_MAX_ENTRIES",
+            "10000",
+        )
+    ),
+)
+
+_device_auth_l1: dict[
+    str,
+    tuple[str, str, float],
+] = {}
+
+_device_auth_l1_lock = threading.Lock()
+
+_device_auth_refresh_locks: dict[
+    str,
+    threading.Lock,
+] = {}
+
+_device_auth_refresh_locks_guard = (
+    threading.Lock()
+)
+
+DEVICE_AUTH_CACHE_TTL_S = int(
+    os.getenv(
+        "XTL_DEVICE_AUTH_CACHE_TTL_S",
+        "600",
+    )
+)
+
+
+def _device_auth_cache_key(
+    device_id: str,
+) -> str:
+    return (
+        f"xtl:device_auth_cache:"
+        f"{str(device_id or '').strip()}"
+    )
+
+
+def _device_token_hash(
+    token: str,
+) -> str:
+    return hashlib.sha256(
+        str(token or "").encode("utf-8")
+    ).hexdigest()
+
+def _device_auth_l1_get(
+    device_id: str,
+    expected_hash: str,
+) -> Optional[str]:
+    dev = str(
+        device_id or ""
+    ).strip()
+
+    if not dev or not expected_hash:
+        return None
+
+    now_mono = time.monotonic()
+
+    try:
+        with _device_auth_l1_lock:
+            entry = _device_auth_l1.get(dev)
+
+            if not entry:
+                return None
+
+            (
+                cached_owner,
+                cached_hash,
+                expires_mono,
+            ) = entry
+
+            if expires_mono <= now_mono:
+                _device_auth_l1.pop(
+                    dev,
+                    None,
+                )
+                return None
+
+            if not hmac.compare_digest(
+                cached_hash,
+                expected_hash,
+            ):
+                return None
+
+            return cached_owner or None
+
+    except Exception:
+        return None
+
+
+def _device_auth_l1_set(
+    device_id: str,
+    owner_id: str,
+    token_hash: str,
+) -> None:
+    dev = str(
+        device_id or ""
+    ).strip()
+
+    owner = str(
+        owner_id or ""
+    ).strip()
+
+    tok_hash = str(
+        token_hash or ""
+    ).strip()
+
+    if not dev or not owner or not tok_hash:
+        return
+
+    now_mono = time.monotonic()
+
+    try:
+        with _device_auth_l1_lock:
+            # Defensive size bound. This is normally tiny:
+            # roughly one entry per connected device.
+            if (
+                len(_device_auth_l1)
+                >= DEVICE_AUTH_L1_MAX_ENTRIES
+                and dev not in _device_auth_l1
+            ):
+                expired_keys = [
+                    key
+                    for key, value
+                    in _device_auth_l1.items()
+                    if value[2] <= now_mono
+                ]
+
+                for key in expired_keys:
+                    _device_auth_l1.pop(
+                        key,
+                        None,
+                    )
+
+                # Still full: remove one oldest-expiring entry.
+                if (
+                    len(_device_auth_l1)
+                    >= DEVICE_AUTH_L1_MAX_ENTRIES
+                ):
+                    oldest_key = min(
+                        _device_auth_l1,
+                        key=lambda key: (
+                            _device_auth_l1[key][2]
+                        ),
+                    )
+
+                    _device_auth_l1.pop(
+                        oldest_key,
+                        None,
+                    )
+
+            _device_auth_l1[dev] = (
+                owner,
+                tok_hash,
+                now_mono
+                + float(
+                    DEVICE_AUTH_L1_TTL_S
+                ),
+            )
+
+    except Exception:
+        pass
+
+def _device_auth_refresh_lock(
+    device_id: str,
+) -> threading.Lock:
+    dev = str(
+        device_id or ""
+    ).strip()
+
+    with _device_auth_refresh_locks_guard:
+        lock = _device_auth_refresh_locks.get(
+            dev
+        )
+
+        if lock is None:
+            lock = threading.Lock()
+
+            _device_auth_refresh_locks[
+                dev
+            ] = lock
+
+        return lock
+
+def _authenticate_device_cached(
+    device_id: str,
+    token: str,
+) -> tuple[str, str]:
+    dev = str(
+        device_id or ""
+    ).strip()
+
+    tok = str(
+        token or ""
+    ).strip()
+
+    if not dev or not tok:
+        raise HTTPException(
+            status_code=401,
+            detail="invalid token",
+        )
+
+    cache_key = _device_auth_cache_key(
+        dev
+    )
+
+    expected_hash = _device_token_hash(
+        tok
+    )
+
+    # -----------------------------------------
+    # L1 fast path: process memory
+    # -----------------------------------------
+    l1_owner = _device_auth_l1_get(
+        dev,
+        expected_hash,
+    )
+
+    if l1_owner:
+        return (
+            l1_owner,
+            "MEMORY",
+        )
+
+    # -----------------------------------------
+    # Single-flight refresh per device
+    # -----------------------------------------
+    refresh_lock = (
+        _device_auth_refresh_lock(
+            dev
+        )
+    )
+
+    with refresh_lock:
+        # Another request may have refreshed L1
+        # while this request waited for the lock.
+        l1_owner = _device_auth_l1_get(
+            dev,
+            expected_hash,
+        )
+
+        if l1_owner:
+            return (
+                l1_owner,
+                "MEMORY_AFTER_WAIT",
+            )
+
+        # -------------------------------------
+        # L2 fast path: Redis auth cache
+        # -------------------------------------
+        try:
+            cached_raw = R.get(
+                cache_key
+            )
+
+            if cached_raw:
+                cached = json.loads(
+                    cached_raw
+                )
+
+                if isinstance(
+                    cached,
+                    dict,
+                ):
+                    cached_owner = str(
+                        cached.get(
+                            "owner_id"
+                        )
+                        or ""
+                    ).strip()
+
+                    cached_hash = str(
+                        cached.get(
+                            "token_hash"
+                        )
+                        or ""
+                    ).strip()
+
+                    if (
+                        cached_owner
+                        and cached_hash
+                        and hmac.compare_digest(
+                            cached_hash,
+                            expected_hash,
+                        )
+                    ):
+                        _device_auth_l1_set(
+                            dev,
+                            cached_owner,
+                            expected_hash,
+                        )
+
+                        return (
+                            cached_owner,
+                            "REDIS",
+                        )
+
+        except Exception:
+            # Cache failure must not fail open.
+            pass
+
+        # -------------------------------------
+        # Authoritative fallback: PostgreSQL
+        # -------------------------------------
+        owner_id: Optional[str] = None
+        stored_token = ""
+
+        try:
+            with db() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        user_id::text,
+                        device_token
+                    FROM devices
+                    WHERE id=%s
+                    LIMIT 1
+                    """,
+                    (dev,),
+                )
+
+                row = cur.fetchone()
+
+                if row:
+                    owner_id = str(
+                        row[0] or ""
+                    ).strip()
+
+                    stored_token = str(
+                        row[1] or ""
+                    ).strip()
+
+        except Exception:
+            log.exception(
+                "[DEVICE_AUTH] "
+                "POSTGRES_LOOKUP_FAILED "
+                "device=%s",
+                dev,
+            )
+
+            raise HTTPException(
+                status_code=503,
+                detail="device auth unavailable",
+            )
+
+        if (
+            not owner_id
+            or not stored_token
+            or not hmac.compare_digest(
+                stored_token,
+                tok,
+            )
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid token",
+            )
+
+        # -------------------------------------
+        # Populate Redis after valid DB auth
+        # -------------------------------------
+        try:
+            R.setex(
+                cache_key,
+                max(
+                    60,
+                    DEVICE_AUTH_CACHE_TTL_S,
+                ),
+                json.dumps(
+                    {
+                        "owner_id": owner_id,
+                        "token_hash": expected_hash,
+                        "cached_at_ms": int(
+                            time.time() * 1000
+                        ),
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+
+        except Exception:
+            # Redis cache failure does not
+            # invalidate successful DB auth.
+            pass
+
+        # Populate process-local cache.
+        _device_auth_l1_set(
+            dev,
+            owner_id,
+            expected_hash,
+        )
+
+        return (
+            owner_id,
+            "POSTGRES",
+        )
+
 
 def _is_fresh(hb_ms: int | None, now_ms: int) -> bool:
     if hb_ms is None:
@@ -645,8 +1166,28 @@ def mt5_account(
     account = payload.account if isinstance(payload.account, dict) else {}
     account = dict(account)
 
-    if payload.ts_ms:
-        account["updated_ts_ms"] = int(payload.ts_ms)
+    server_received_ms = int(time.time() * 1000)
+
+    # Keep Agent/broker timestamp for audit only.
+    try:
+        broker_ts_ms = int(
+            payload.ts_ms
+            or account.get("ts_ms")
+            or account.get("timestamp_ms")
+            or account.get("account_ts_ms")
+            or 0
+        )
+    except Exception:
+        broker_ts_ms = 0
+
+    if 0 < broker_ts_ms < 10_000_000_000:
+        broker_ts_ms *= 1000
+
+    account["broker_ts_ms"] = broker_ts_ms
+
+    # Freshness must use API server receipt time.
+    account["server_received_ms"] = server_received_ms
+    account["updated_ts_ms"] = server_received_ms
 
     key = f"xtl:mt5:account:{dev_id}:{acct_type}"
 
@@ -671,7 +1212,7 @@ def mt5_account(
         R.hset(
             _hkey(dev_id),
             mapping={
-                "last_mt5_account_ms": str(int(time.time() * 1000)),
+                "last_mt5_account_ms": str(server_received_ms),
                 "mt5_balance": str(account.get("balance", "")),
                 "mt5_equity": str(account.get("equity", "")),
                 "mt5_floating_pnl": str(account.get("floating_pnl", "")),
@@ -877,6 +1418,21 @@ def post_ohlc(
         log.exception("POST_OHLC PAYLOAD log failed dev_id=%s", dev_id)
 
     import os, json, time
+    _price_t0 = time.perf_counter()
+    _price_phase_ms: dict[str, float] = {}
+
+    def _price_mark(
+        name: str,
+        started: float,
+    ) -> float:
+        now = time.perf_counter()
+
+        _price_phase_ms[name] = round(
+            (now - started) * 1000.0,
+            1,
+        )
+
+        return now
 
     # --- breadcrumbs: prove route is hit ---
     try:
@@ -1359,10 +1915,29 @@ def post_price(
     device_token_hdr: Optional[str] = Header(default=None, alias="Device-Token"),
     x_device_id: Optional[str] = Header(default=None, alias="X-Device-Id"),
 ):
+    
+
     import os, json, time
 
-    # normalize device id (some agents send X-Device-Id)
+    _price_t0 = time.perf_counter()
+    _price_phase_ms: dict[str, float] = {}
+    def _price_mark(
+        name: str,
+        started: float,
+    ) -> float:
+        now = time.perf_counter()
+
+        _price_phase_ms[name] = round(
+            (now - started) * 1000.0,
+            1,
+        )
+
+        return now
+
+
     dev = (x_device_id or dev_id or "").strip()
+
+    _price_phase_started = _price_t0
 
     # gather token from multiple possible headers
     token = ""
@@ -1373,7 +1948,10 @@ def post_price(
         token = parts[-1].strip() if parts else str(candidate).strip()
         if token:
             break
-
+    _price_phase_started = _price_mark(
+        "token_parse",
+        _price_phase_started,
+    )
     if not token:
         # breadcrumb: missing token (so we know why 401)
         try:
@@ -1382,42 +1960,25 @@ def post_price(
             pass
         raise HTTPException(status_code=401, detail="missing token")
 
-    owner_id: Optional[str] = None
+    _price_phase_started = (
+        time.perf_counter()
+    )
 
-    # ---- (A) Primary auth: Postgres devices table ----
-    try:
-        with db() as conn, conn.cursor() as cur:
-            cur.execute("SELECT user_id::text, device_token FROM devices WHERE id=%s", (dev,))
-            row = cur.fetchone()
-            if row and str(row[1]) == token:
-                owner_id = row[0]
-            else:
-                owner_id = None
-    except Exception:
-        owner_id = None
+    (
+        owner_id,
+        _device_auth_source,
+    ) = _authenticate_device_cached(
+        dev,
+        token,
+    )
 
-    # ---- (B) Fallback auth: Redis device hash (prefix) ----
-    # This matches how some of your agent/device metadata is stored.
-    if owner_id is None:
-        try:
-            prefix = os.getenv("XTL_DEVICE_KEY_PREFIX", "device:")
-            meta = R.hgetall(f"{prefix}{dev}") or {}
-            # meta could contain device_token + owner_id/user_id depending on your implementation
-            meta_token = (meta.get("device_token") or meta.get("token") or "")
-            meta_owner = (meta.get("owner_id") or meta.get("user_id") or None)
-            if meta_token and str(meta_token) == token and meta_owner:
-                owner_id = str(meta_owner)
-        except Exception:
-            pass
-
-    if owner_id is None:
-        # breadcrumb: token mismatch (so we can inspect quickly)
-        try:
-            R.setex(f"xtl:debug:price_auth:{dev}", 120, "bad_token_or_unknown_device")
-        except Exception:
-            pass
-        raise HTTPException(status_code=401, detail="invalid token")
-
+    _price_phase_started = _price_mark(
+        "device_auth",
+        _price_phase_started,
+    )
+    _price_phase_started = (
+        time.perf_counter()
+    )
     sym_u = str(payload.get("symbol") or "").upper().strip()
     try:
         price = float(payload.get("price") or 0.0)
@@ -1454,6 +2015,10 @@ def post_price(
         return int(default_ms)
 
     ts_ms = _coerce_ts_ms(payload if isinstance(payload, dict) else {}, server_now_ms)
+    _price_phase_started = _price_mark(
+        "payload_parse",
+        _price_phase_started,
+    )
 
     if not sym_u or price <= 0:
         return {"ok": True, "ignored": True}
@@ -1462,52 +2027,111 @@ def post_price(
     ttl = 7 * 24 * 3600  # 7 days
 
     val = json.dumps({"price": float(price), "ts_ms": int(ts_ms), "src": "tick"}, separators=(",", ":"), ensure_ascii=False)
+    # -------------------------------------------------
+    # Atomic one-round-trip Redis price ingest.
+    # -------------------------------------------------
+    _price_phase_started = (
+        time.perf_counter()
+    )
 
-    # cache (state) — only overwrite if newer
+    _device_price_key = (
+        f"xtl:price:{dev}:{sym_u}"
+    )
+
+    _global_price_key = (
+        f"xtl:price:{sym_u}"
+    )
+
+    _event = {
+        "type": "price",
+        "symbol": sym_u,
+        "price": float(price),
+        "device_id": dev,
+        "ts_ms": int(ts_ms),
+        "src": "agent_price",
+    }
+
     try:
-        def _set_if_newer(key: str) -> None:
-            old = R.get(key)
-            if old:
-                try:
-                    oldj = json.loads(old)
-                    old_ts = int(oldj.get("ts_ms") or 0)
-                    if old_ts > 0 and old_ts >= ts_ms:
-                        return  # keep newer existing
-                except Exception:
-                    pass
-            R.setex(key, ttl, val)
+        _price_write_result = (
+            _PRICE_INGEST_SCRIPT(
+                keys=[
+                    _device_price_key,
+                    _global_price_key,
+                    (
+                        f"xtl:pub:price:"
+                        f"{owner_id}"
+                    ),
+                    (
+                        f"xtl:user:"
+                        f"{owner_id}:devices"
+                    ),
+                    (
+                        f"xtl:debug:"
+                        f"price_auth:{dev}"
+                    ),
+                ],
+                args=[
+                    val,
+                    int(ts_ms),
+                    int(ttl),
+                    json.dumps(
+                        _event,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                    dev,
+                    120,
+                ],
+            )
+        )
 
-        _set_if_newer(f"xtl:price:{dev}:{sym_u}")
-        _set_if_newer(f"xtl:price:{sym_u}")
     except Exception:
-        pass
+        log.exception(
+            "[PRICE_INGEST] "
+            "REDIS_ATOMIC_FAILED "
+            "dev=%s owner=%s sym=%s",
+            dev,
+            owner_id,
+            sym_u,
+        )
 
+        # Price ingestion must report infrastructure
+        # failure instead of falsely returning success.
+        raise HTTPException(
+            status_code=503,
+            detail="price ingest unavailable",
+        )
 
-    # pubsub (event)
-    try:
-        evt = {
-            "type": "price",
-            "symbol": sym_u,
-            "price": float(price),
-            "device_id": dev,
-            "ts_ms": int(ts_ms),
-            "src": "agent_price",
-        }
-        R.publish(f"xtl:pub:price:{owner_id}", json.dumps(evt, separators=(",", ":"), ensure_ascii=False))
-    except Exception:
-        pass
+    _price_phase_started = _price_mark(
+        "redis_atomic_ingest",
+        _price_phase_started,
+    )
+    _price_total_ms = round(
+        (
+            time.perf_counter()
+            - _price_t0
+        )
+        * 1000.0,
+        1,
+    )
 
-    # membership (optional)
-    try:
-        R.sadd(f"xtl:user:{owner_id}:devices", dev)
-    except Exception:
-        pass
-
-    # breadcrumb: auth OK
-    try:
-        R.setex(f"xtl:debug:price_auth:{dev}", 120, "ok")
-    except Exception:
-        pass
+    if _price_total_ms >= 100.0:
+        log.warning(
+            "[PRICE_TIMING] "
+            "dev=%s owner=%s sym=%s "
+            "auth_source=%s "
+            "total_ms=%s phases=%s",
+            dev,
+            owner_id,
+            sym_u,
+            _device_auth_source,
+            _price_total_ms,
+            json.dumps(
+                _price_phase_ms,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
 
     return {"ok": True}
 

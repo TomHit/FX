@@ -1731,3 +1731,490 @@ def summarize_sr_multi_tf(
         pass
 
     return out
+
+
+def build_market_structure_state(
+    sr_bundle: Dict[str, Any],
+    price: Optional[float] = None,
+    flow_direction: Optional[str] = None,
+    max_levels: int = 3,
+) -> Dict[str, Any]:
+    """
+    Build a compact market-structure view from an SR bundle already produced
+    by summarize_sr_multi_tf().
+
+    This function does not detect pivots, cluster levels, score SR, mark
+    breaks, or change roles. It only packages the existing SR truth.
+    """
+
+    def _f(v, default=None):
+        try:
+            x = float(v)
+            return x if math.isfinite(x) else default
+        except Exception:
+            return default
+
+    def _i(v, default=0):
+        try:
+            return int(v)
+        except Exception:
+            return default
+
+    def _zone_bounds(
+        z: Dict[str, Any],
+    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        if not isinstance(z, dict):
+            return None, None, None
+
+        lv = _f(z.get("level"))
+        lo = _f(z.get("low"), lv)
+        hi = _f(z.get("high"), lv)
+
+        if lo is not None and hi is not None and lo > hi:
+            lo, hi = hi, lo
+
+        if lv is None and lo is not None and hi is not None:
+            lv = (lo + hi) / 2.0
+
+        return lv, lo, hi
+
+    bundle = sr_bundle if isinstance(sr_bundle, dict) else {}
+    px = _f(price, _f(bundle.get("price")))
+    atr = _f(bundle.get("atr"), 0.0) or 0.0
+
+    direction = str(flow_direction or "NEUTRAL").upper().strip()
+    if direction not in ("BULLISH", "BEARISH", "NEUTRAL"):
+        direction = "NEUTRAL"
+
+    try:
+        nmax = max(1, min(10, int(max_levels or 3)))
+    except Exception:
+        nmax = 3
+
+    def _normalized_zone(
+        z: Dict[str, Any],
+        role: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(z, dict):
+            return None
+
+        lv, lo, hi = _zone_bounds(z)
+        if lv is None:
+            return None
+
+        dist = abs(px - lv) if px is not None else _f(z.get("distance"))
+
+        dist_atr = (
+            abs(px - lv) / atr
+            if px is not None and atr > 0
+            else _f(z.get("distance_atr"))
+        )
+
+        inside = bool(
+            px is not None
+            and lo is not None
+            and hi is not None
+            and lo <= px <= hi
+        )
+
+        return {
+            "role": str(role).upper(),
+            "tf": (
+                str(z.get("tf") or z.get("source_tf") or "").upper()
+                or None
+            ),
+            "price": float(lv),
+            "level": float(lv),
+            "low": float(lo) if lo is not None else float(lv),
+            "high": float(hi) if hi is not None else float(lv),
+            "distance": float(dist) if dist is not None else None,
+            "distance_atr": (
+                float(dist_atr) if dist_atr is not None else None
+            ),
+            "inside": inside,
+            "near": (
+                bool(z.get("near"))
+                if z.get("near") is not None
+                else None
+            ),
+            "broken": bool(z.get("broken", False)),
+            "swept": bool(z.get("swept", False)),
+            "reclaimed": bool(z.get("reclaimed", False)),
+            "touches": _i(z.get("touches"), 0),
+            "strength": _f(z.get("strength"), 0.0),
+            "sr_score": _f(
+                z.get("sr_score"),
+                _f(z.get("strength"), 0.0),
+            ),
+            "maturity": z.get("maturity"),
+            "age_bars": (
+                _i(z.get("age_bars"), 0)
+                if z.get("age_bars") is not None
+                else None
+            ),
+            "source_type": (
+                z.get("source_type")
+                or z.get("band_type")
+            ),
+            "source_role": z.get("source_role"),
+            "flip_source": z.get("flip_source"),
+            "htf_confluence": bool(
+                z.get("htf_confluence", False)
+            ),
+            "causal": z.get("causal"),
+        }
+
+    def _collect(role: str) -> List[Dict[str, Any]]:
+        """
+        Return only canonical ACTIVE SR inventory.
+
+        Priority:
+          1. bundle.active_supports / bundle.active_resistances
+          2. no raw H1/H4 fallback here
+
+        Raw per-timeframe SR remains available in the bundle for audit, but
+        must not override the canonical active inventory.
+        """
+        role_l = str(role or "").lower().strip()
+
+        primary_key = (
+            "active_supports"
+            if role_l == "support"
+            else "active_resistances"
+        )
+
+        raw = bundle.get(primary_key) or []
+        if not isinstance(raw, list):
+            raw = []
+
+        out: List[Dict[str, Any]] = []
+        seen: set[Tuple[int, int, int, str]] = set()
+
+        tol = max(
+            0.05 * atr,
+            _f(bundle.get("cross_buf"), 0.0) or 0.0,
+            1e-12,
+        )
+
+        for z in raw:
+            nz = _normalized_zone(z, role_l)
+            if not nz:
+                continue
+
+            # Canonical active inventory should already exclude broken zones,
+            # but preserve this guard.
+            if nz.get("broken"):
+                continue
+
+            lv = float(nz["price"])
+            lo = float(nz["low"])
+            hi = float(nz["high"])
+
+            # Active structure must be on the correct side of price unless
+            # current price is genuinely inside the zone.
+            if px is not None and not nz.get("inside"):
+                if role_l == "support" and hi >= px + tol:
+                    continue
+
+                if role_l == "resistance" and lo <= px - tol:
+                    continue
+
+            key = (
+                int(round(lv / tol)),
+                int(round(lo / tol)),
+                int(round(hi / tol)),
+                str(nz.get("role")),
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            nz["active"] = True
+            nz["source_role"] = (
+                nz.get("source_role")
+                or f"ACTIVE_{role_l.upper()}"
+            )
+            out.append(nz)
+
+        out.sort(
+            key=lambda z: (
+                0 if z.get("inside") else 1,
+                (
+                    float(z.get("distance_atr"))
+                    if isinstance(
+                        z.get("distance_atr"),
+                        (int, float),
+                    )
+                    else 1e18
+                ),
+                -float(z.get("sr_score") or 0.0),
+                -float(z.get("strength") or 0.0),
+            )
+        )
+
+        return out
+    
+
+    supports = _collect("support")
+    resistances = _collect("resistance")
+
+    nearest_support = supports[0] if supports else None
+    nearest_resistance = (
+        resistances[0] if resistances else None
+    )
+
+    next_support = (
+        supports[1] if len(supports) > 1 else None
+    )
+    next_resistance = (
+        resistances[1] if len(resistances) > 1 else None
+    )
+
+    # Top-level nearest values from summarize_sr_multi_tf are retained only
+    # as non-active context when no canonical active level exists.
+    def _context_level(
+        value: Any,
+        role: str,
+    ) -> Optional[Dict[str, Any]]:
+        if isinstance(value, dict):
+            nz = _normalized_zone(value, role)
+        else:
+            level = _f(value)
+            if level is None:
+                return None
+
+            nz = _normalized_zone(
+                {
+                    "level": level,
+                    "low": level,
+                    "high": level,
+                    "source_type": "TOP_LEVEL_NEAREST_SR",
+                    "source_role": "NEAREST_CONTEXT_SR",
+                },
+                role,
+            )
+
+        if not nz:
+            return None
+
+        nz["active"] = False
+        nz["source_role"] = "NEAREST_CONTEXT_SR"
+        nz["context_only"] = True
+        return nz
+
+    context_support = None
+    context_resistance = None
+
+    if nearest_support is None:
+        context_support = _context_level(
+            bundle.get("nearest_support"),
+            "support",
+        )
+
+    if nearest_resistance is None:
+        context_resistance = _context_level(
+            bundle.get("nearest_resistance"),
+            "resistance",
+        )
+
+    def _best(
+        xs: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not xs:
+            return None
+
+        return max(
+            xs,
+            key=lambda z: (
+                float(z.get("sr_score") or 0.0),
+                float(z.get("strength") or 0.0),
+                int(z.get("touches") or 0),
+                (
+                    -float(z.get("distance_atr"))
+                    if isinstance(
+                        z.get("distance_atr"),
+                        (int, float),
+                    )
+                    else -1e18
+                ),
+            ),
+        )
+
+    best_support = _best(supports)
+    best_resistance = _best(resistances)
+
+    inside_support = next(
+        (z for z in supports if z.get("inside")),
+        None,
+    )
+
+    inside_resistance = next(
+        (z for z in resistances if z.get("inside")),
+        None,
+    )
+
+    room_down_atr = (
+        _f(nearest_support.get("distance_atr"))
+        if nearest_support
+        else None
+    )
+
+    room_up_atr = (
+        _f(nearest_resistance.get("distance_atr"))
+        if nearest_resistance
+        else None
+    )
+
+    if inside_support is not None:
+        room_down_atr = 0.0
+
+    if inside_resistance is not None:
+        room_up_atr = 0.0
+
+    if direction == "BULLISH":
+        directional_room_atr = room_up_atr
+        blocking_role = "RESISTANCE"
+        inside_blocking_zone = inside_resistance is not None
+
+    elif direction == "BEARISH":
+        directional_room_atr = room_down_atr
+        blocking_role = "SUPPORT"
+        inside_blocking_zone = inside_support is not None
+
+    else:
+        available = [
+            x
+            for x in (room_up_atr, room_down_atr)
+            if isinstance(x, (int, float))
+        ]
+
+        directional_room_atr = (
+            min(available) if available else None
+        )
+
+        blocking_role = "NEAREST_STRUCTURE"
+
+        inside_blocking_zone = (
+            inside_support is not None
+            or inside_resistance is not None
+        )
+
+    if inside_blocking_zone:
+        pressure = "EXTREME"
+        pressure_reason = f"INSIDE_{blocking_role}"
+
+    elif directional_room_atr is None:
+        pressure = "UNKNOWN"
+        pressure_reason = "NO_DIRECTIONAL_STRUCTURE"
+
+    elif directional_room_atr <= 0.20:
+        pressure = "EXTREME"
+        pressure_reason = "ROOM_LE_0_20_ATR"
+
+    elif directional_room_atr <= 0.50:
+        pressure = "HIGH"
+        pressure_reason = "ROOM_LE_0_50_ATR"
+
+    elif directional_room_atr <= 1.00:
+        pressure = "MEDIUM"
+        pressure_reason = "ROOM_LE_1_00_ATR"
+
+    else:
+        pressure = "LOW"
+        pressure_reason = "ROOM_GT_1_00_ATR"
+
+    ACTIVE_TARGET_MAX_ATR = 5.0
+
+    def _choose_active_target(
+        nearest: Optional[Dict[str, Any]],
+        best: Optional[Dict[str, Any]],
+    ) -> Tuple[
+        Optional[Dict[str, Any]],
+        Optional[str],
+    ]:
+        best_da = (
+            _f(best.get("distance_atr"))
+            if isinstance(best, dict)
+            else None
+        )
+
+        if (
+            isinstance(best, dict)
+            and best_da is not None
+            and best_da <= ACTIVE_TARGET_MAX_ATR
+        ):
+            return best, "BEST_SCORED_SR"
+
+        if isinstance(nearest, dict):
+            return nearest, "NEAREST_ACTIVE_SR"
+
+        if isinstance(best, dict):
+            return best, "BEST_SCORED_SR_FAR_CONTEXT"
+
+        return None, None
+
+    active_target = None
+    active_target_source = None
+
+    if direction == "BULLISH":
+        (
+            active_target,
+            active_target_source,
+        ) = _choose_active_target(
+            nearest_resistance,
+            best_resistance,
+        )
+
+    elif direction == "BEARISH":
+        (
+            active_target,
+            active_target_source,
+        ) = _choose_active_target(
+            nearest_support,
+            best_support,
+        )
+
+    return {
+        "schema_version": 1,
+        "source": "trend_sr.summarize_sr_multi_tf",
+        "symbol": bundle.get("symbol"),
+        "price": px,
+        "atr": float(atr) if atr > 0 else None,
+        "flow_direction": direction,
+
+        "nearest_support": nearest_support,
+        "nearest_resistance": nearest_resistance,
+        "context_support": context_support,
+        "context_resistance": context_resistance,
+        "next_support": next_support,
+        "next_resistance": next_resistance,
+
+        "best_support": best_support,
+        "best_resistance": best_resistance,
+
+        "active_target": active_target,
+        "active_target_source": active_target_source,
+
+        "active_supports": supports[:nmax],
+        "active_resistances": resistances[:nmax],
+        # Ordered structure path (nearest → farther).
+        # Analytics only.
+        "support_path": supports[:5],
+        "resistance_path": resistances[:5],
+
+        "inside_support": inside_support,
+        "inside_resistance": inside_resistance,
+
+        "room_up_atr": room_up_atr,
+        "room_down_atr": room_down_atr,
+        "directional_room_atr": directional_room_atr,
+
+        "structure_pressure": pressure,
+        "structure_pressure_reason": pressure_reason,
+
+        "sr_safety": bundle.get("sr_safety"),
+        "cache_state": bundle.get("_cache"),
+        "computed_at_ms": bundle.get("_computed_at_ms"),
+        
+    }

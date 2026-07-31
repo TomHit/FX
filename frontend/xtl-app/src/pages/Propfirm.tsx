@@ -148,28 +148,53 @@ export default function Propfirm() {
       ) .trim()
         .toLowerCase();
 
-      if (!backendActiveProfileId) {
-        throw new Error(
-          "No active prop profile is configured"
-        );
+      const availableProfiles =
+        Array.isArray(profilesRes.profiles)
+          ? profilesRes.profiles
+          : [];
+
+      if (availableProfiles.length === 0) {
+        setProfilesData({
+          ...profilesRes,
+          active_profile_id: "",
+          profiles: [],
+        });
+
+        setViewedProfileId("");
+        setStatus(null);
+        setRisk(null);
+        setErr("");
+        return;
       }
+
+      const firstProfileId = String(
+        availableProfiles[0]?.profile_id || ""
+      )
+        .trim()
+        .toLowerCase();
 
       const requestedViewProfileId = String(
         profileIdToView ||
         viewedProfileId ||
-        backendActiveProfileId
-      ) .trim()
+        backendActiveProfileId ||
+        firstProfileId
+      )
+        .trim()
         .toLowerCase();
 
-      const profileExists = profilesRes.profiles?.some(
+      const profileExists = availableProfiles.some(
         (profile) =>
-          profile.profile_id === requestedViewProfileId
+          String(profile?.profile_id || "")
+            .trim()
+            .toLowerCase() === requestedViewProfileId
       );
 
       const displayProfileId = profileExists
         ? requestedViewProfileId
-        : backendActiveProfileId;
-
+        : (
+            backendActiveProfileId ||
+            firstProfileId
+          );
       const encodedProfileId =
         encodeURIComponent(displayProfileId);
 
@@ -500,8 +525,29 @@ export default function Propfirm() {
             Loading prop-firm account...
           </div>
         ) : null}
+        {!loading && !profilesData?.profiles?.length ? (
+          <div className="rounded-2xl border border-cyan-900/60 bg-cyan-950/20 p-6">
+            <div className="text-lg font-semibold text-cyan-200">
+              No Prop Firm accounts configured
+            </div>
 
-        {!loading ? (
+            <div className="mt-2 text-sm text-slate-300">
+              No prop-firm execution profiles belong to this user.
+              Pair a device and configure a broker account before
+              enabling XTL execution.
+            </div>
+
+            <a
+              href="/react/devices"
+              className="mt-4 inline-flex rounded-xl border border-cyan-700 bg-cyan-950/40 px-4 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-900/40"
+            >
+              Pair a Device
+            </a>
+          </div>
+        ) : null}
+
+        {!loading &&
+         Boolean(profilesData?.profiles?.length) ? (
           <>
             <div
               className={[

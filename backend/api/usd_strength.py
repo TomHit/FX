@@ -61,34 +61,94 @@ MAX_AGE_H = {"H4": 12.0, "H1": 4.0}
 MIN_PAIRS = 3
 
 
-def _freshest_device(R, symbol: str, tf: str) -> Optional[str]:
-    """Scan all devices for this symbol/tf, return the one with the newest bar.
-    Cached briefly to avoid scanning on every read."""
-    now = time.time() * 1000
-    ck = (symbol, tf)
-    cached = _DEVICE_CACHE.get(ck)
-    if cached and (now - cached[1]) < _DEVICE_CACHE_TTL_MS:
-        return cached[0]
-    best_dev, best_ts = None, -1
-    try:
-        for key in R.scan_iter(match=f"xtl:ohlc:snap:*:{symbol}:{tf}", count=200):
-            k = key.decode() if isinstance(key, (bytes, bytearray)) else key
-            try:
-                raw = R.get(k)
-                if not raw:
-                    continue
-                d = json.loads(raw)
-                ts = float(d.get("lastClosedTs") or 0)
-                if ts > best_ts:
-                    best_ts, best_dev = ts, k.split(":")[3]  # device id segment
-            except Exception:
-                continue
-    except Exception:
-        return cached[0] if cached else None
-    if best_dev:
-        _DEVICE_CACHE[ck] = (best_dev, now)
-    return best_dev
+def _freshest_device(
+    R,
+    symbol: str,
+    tf: str,
+) -> Optional[str]:
+    """
+    Return the latest OHLC device pointer for symbol/tf.
 
+    The OHLC writer maintains:
+
+        xtl:ohlc:latest:<SYMBOL>:<TF>
+
+    This avoids scanning the entire Redis keyspace.
+    """
+
+    symbol_u = str(
+        symbol or ""
+    ).upper().strip()
+
+    tf_u = str(
+        tf or ""
+    ).upper().strip()
+
+    if not symbol_u or not tf_u:
+        return None
+
+    now_ms = time.time() * 1000
+    cache_key = (
+        symbol_u,
+        tf_u,
+    )
+
+    cached = _DEVICE_CACHE.get(
+        cache_key
+    )
+
+    if (
+        cached
+        and (
+            now_ms
+            - cached[1]
+        )
+        < _DEVICE_CACHE_TTL_MS
+    ):
+        return cached[0]
+
+    latest_device = None
+
+    try:
+        latest_device = R.get(
+            f"xtl:ohlc:latest:"
+            f"{symbol_u}:{tf_u}"
+        )
+
+        if isinstance(
+            latest_device,
+            (bytes, bytearray),
+        ):
+            latest_device = (
+                latest_device.decode(
+                    "utf-8",
+                    errors="ignore",
+                )
+            )
+
+        latest_device = str(
+            latest_device or ""
+        ).strip()
+
+    except Exception:
+        latest_device = ""
+
+    if latest_device:
+        _DEVICE_CACHE[
+            cache_key
+        ] = (
+            latest_device,
+            now_ms,
+        )
+
+        return latest_device
+
+    # Preserve an already cached device during a
+    # temporary Redis read failure or missing pointer.
+    if cached:
+        return cached[0]
+
+    return None
 
 def _get_snapshot(
     R,

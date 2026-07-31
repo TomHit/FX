@@ -833,16 +833,35 @@ const tradeStateReason =
       ? String((r as any).signal_reason)
       : null;
 
-  const gateZone = (r as any)?.entry_gate?.zone ?? null;
+  const gateObjPre = (r as any)?.entry_gate ?? {};
+
+  // Accept every zone shape currently emitted by the backend.  Active-trade
+  // rows commonly preserve the frozen band under zone_used, while older or
+  // display-only rows may expose it at the top level or as planned/display zone.
+  const gateZone =
+    gateObjPre?.zone ??
+    gateObjPre?.zone_used ??
+    gateObjPre?.planned_zone ??
+    gateObjPre?.display_zone ??
+    gateObjPre?.rev_state?.zone_used ??
+    gateObjPre?.rev_state?.planned_zone ??
+    (r as any)?.zone ??
+    (r as any)?.zone_used ??
+    (r as any)?.planned_zone ??
+    null;
 
   const gateZoneLevel =
-    gateZone && typeof gateZone.level === "number" ? Number(gateZone.level) : null;
+    gateZone && Number.isFinite(Number(gateZone.level))
+      ? Number(gateZone.level)
+      : null;
 
   const gateZoneTf =
     gateZone && typeof gateZone.tf === "string" ? String(gateZone.tf) : null;
 
   const gateZoneType =
-    gateZone && typeof gateZone.type === "string" ? String(gateZone.type) : null;
+    gateZone && typeof (gateZone.type ?? gateZone.kind) === "string"
+      ? String(gateZone.type ?? gateZone.kind)
+      : null;
 
   const gateZoneStr =
     gateZoneLevel != null
@@ -1102,18 +1121,33 @@ if (!srMajor && !srNearest && srLabel) srMajor = srLabel;
 
   const z =
     gateObj?.zone ??
+    gateObj?.zone_used ??
+    gateObj?.planned_zone ??
     gateObj?.display_zone ??
+    gateObj?.rev_state?.zone_used ??
+    gateObj?.rev_state?.planned_zone ??
+    (r as any)?.zone ??
+    (r as any)?.zone_used ??
+    (r as any)?.planned_zone ??
     null;
-    const zLow = z && Number.isFinite(z.low) ? Number(z.low) : null;
-    const zHigh = z && Number.isFinite(z.high) ? Number(z.high) : null;
-    const zLevel = z && Number.isFinite(z.level) ? Number(z.level) : null;
-    const zTf = z && typeof z.tf === "string" ? String(z.tf) : "";
+
+  const zLow =
+    z && Number.isFinite(Number(z.low)) ? Number(z.low) : null;
+  const zHigh =
+    z && Number.isFinite(Number(z.high)) ? Number(z.high) : null;
+  const zLevel =
+    z && Number.isFinite(Number(z.level)) ? Number(z.level) : null;
+  const zTf = z && typeof z.tf === "string" ? String(z.tf) : "";
 
   const zoneTextFromApi =
     typeof (r as any).zone_text === "string" && (r as any).zone_text.trim()
       ? (r as any).zone_text.trim()
       : null;
 
+  // Build from numeric zone data first so symbol precision is preserved:
+  // XAUUSD = 2 decimals, JPY pairs = 3, other FX pairs = 5.
+  // Use backend zone_text only as a last-resort legacy fallback because it may
+  // already be rounded to two decimals.
   const zoneStr =
     (zLow != null && zHigh != null)
       ? `${fmtPrice(r.symbol, zLow)}–${fmtPrice(r.symbol, zHigh)}${zTf ? ` (${zTf})` : ""}`
@@ -1287,6 +1321,11 @@ type ApiResponse = {
   ok: boolean;
   tf: string;
   rows: ApiRow[];
+  overlay_uid?: string;
+  overlay_profile_id?: string;
+  cached?: boolean;
+  cache_note?: string | null;
+
   history?: ApiHistoryRow[];
   usd_strength?: {
     usd_bias_h4: "up" | "down" | "flat";
@@ -1313,25 +1352,117 @@ function useOpportunities() {
   // before backend returns it in history; backend should normally be the source of truth).
   // Note: we no longer expire client-side; completion should come from backend status/history.
 
-  const CACHE_ROWS_KEY = "xtl_opp_rows_cache_v1";
-  const CACHE_HIST_KEY = "xtl_opp_history_cache_v1";
-  const CACHE_AT_KEY = "xtl_opp_lastAt_cache_v1";
+  const ownershipRef = React.useRef<{
+    uid: string;
+    profileId: string;
+  }>({
+    uid: "",
+    profileId: "",
+  });
+  const LAST_OWNER_KEY =
+    "xtl_opp_last_owner_v2";
 
+  const cacheKeys = React.useCallback(
+    (
+      uid: string,
+      profileId: string,
+    ) => {
+      const uidKey = String(uid || "").trim();
+      const profileKey = String(
+        profileId || "",
+      )
+        .trim()
+        .toLowerCase();
+
+      return {
+        rows:
+          `xtl_opp_rows_cache_v2:` +
+          `${uidKey}:${profileKey}`,
+
+        history:
+          `xtl_opp_history_cache_v2:` +
+          `${uidKey}:${profileKey}`,
+
+        lastAt:
+          `xtl_opp_lastAt_cache_v2:` +
+          `${uidKey}:${profileKey}`,
+      };
+    },
+    [],
+  );
   async function fetchOnce() {
     const now = Date.now();
 
     try {
       setError(null);
 
-      const res = await fetch(`${API_BASE}/trend/opportunities?tf=H1`, {
-        credentials: "include",
-      });
+      const res = await fetch(
+        `${API_BASE}/trend/opportunities?tf=H1&_=${Date.now()}`,
+        {
+         credentials: "include",
+         cache: "no-store",
+        },
+      );
 
       if (!res.ok) {
         throw new Error("HTTP " + res.status);
       }
 
       const js: ApiResponse = await res.json();
+      const responseUid = String(
+        js.overlay_uid || "",
+      ).trim();
+
+      const responseProfileId = String(
+        js.overlay_profile_id || "",
+      )
+        .trim()
+        .toLowerCase();
+      console.log(
+        "[OppDashboard] ownership response",
+        {
+          ok: js.ok,
+          overlay_uid: js.overlay_uid,
+          overlay_profile_id:
+            js.overlay_profile_id,
+          cached: js.cached,
+          cache_note: js.cache_note,
+          rows: Array.isArray(js.rows)
+            ? js.rows.length
+            : null,
+        },
+      );
+
+      if (!responseUid || !responseProfileId) {
+        throw new Error(
+          "OPPORTUNITY_RESPONSE_OWNERSHIP_MISSING "
+          + `uid=${responseUid || "<missing>"} `
+          + `profile=${responseProfileId || "<missing>"} `
+          + `cached=${String(js.cached)} `
+          + `cache_note=${String(js.cache_note || "")}`,
+        );
+      }
+
+      const previousOwner =
+        ownershipRef.current;
+
+      const ownerChanged =
+        previousOwner.uid !== responseUid
+        || previousOwner.profileId
+          !== responseProfileId;
+
+      if (ownerChanged) {
+        frozenRef.current.clear();
+
+        setRows([]);
+        setHistory([]);
+        setUsdStrength(null);
+
+        ownershipRef.current = {
+          uid: responseUid,
+          profileId: responseProfileId,
+        };
+      }
       if (!js.ok) {
         throw new Error(
           (js as any).reason || "Backend reported error in /trend/opportunities"
@@ -1400,9 +1531,13 @@ function useOpportunities() {
               ...prev,
               ...r,
 
-              h1Zone: r.h1Zone ?? null,
-              h4Zone: r.h4Zone ?? null,
-              zoneStr: r.zoneStr ?? null,
+              h1Zone: r.h1Zone ?? prev.h1Zone ?? null,
+              h4Zone: r.h4Zone ?? prev.h4Zone ?? null,
+              zoneStr: r.zoneStr ?? prev.zoneStr ?? null,
+              gateZoneStr: r.gateZoneStr ?? prev.gateZoneStr ?? null,
+              gateZoneLevel: r.gateZoneLevel ?? prev.gateZoneLevel ?? null,
+              gateZoneTf: r.gateZoneTf ?? prev.gateZoneTf ?? null,
+              gateZoneType: r.gateZoneType ?? prev.gateZoneType ?? null,
 
               alertTimeMs,
             }
@@ -1420,11 +1555,19 @@ function useOpportunities() {
         }
       }
 
+      
+
       // 3) Final rows = all frozen snapshots, sorted
-      const frozenRows = Array.from(frozenRef.current.values()).sort((a, b) => {
-        if (b.absMovePct !== a.absMovePct) return b.absMovePct - a.absMovePct;
+      const frozenRows = Array.from(
+        frozenRef.current.values(),
+      ).sort((a, b) => {
+        if (b.absMovePct !== a.absMovePct) {
+          return b.absMovePct - a.absMovePct;
+        }
+
         const sa = a.oppScore ?? 0;
         const sb = b.oppScore ?? 0;
+
         return sb - sa;
       });
 
@@ -1433,12 +1576,38 @@ function useOpportunities() {
       // History = backend truth.
       setHistory(mappedHistory);
       setLastAt(now);
+      const keys = cacheKeys(
+        responseUid,
+        responseProfileId,
+      );
+      try {
+        sessionStorage.setItem(
+          LAST_OWNER_KEY,
+          JSON.stringify({
+            uid: responseUid,
+            profileId: responseProfileId,
+          }),
+        );
+      } catch {
+        // ignore storage failures
+      }
 
       // Persist lightweight cache so navigating away/back doesn't look "blank"
       try {
-        sessionStorage.setItem(CACHE_ROWS_KEY, JSON.stringify(frozenRows));
-        sessionStorage.setItem(CACHE_HIST_KEY, JSON.stringify(mappedHistory));
-        sessionStorage.setItem(CACHE_AT_KEY, String(now));
+        sessionStorage.setItem(
+          keys.rows,
+          JSON.stringify(frozenRows),
+        );
+
+        sessionStorage.setItem(
+          keys.history,
+          JSON.stringify(mappedHistory),
+        );
+
+        sessionStorage.setItem(
+          keys.lastAt,
+          String(now),
+        );
       } catch {
         // ignore storage failures
       }
@@ -1447,36 +1616,103 @@ function useOpportunities() {
       setError(e?.message || String(e));
     }
   }
-  React.useEffect(() => {
-    // Hydrate cached state immediately (helps when navigating away/back)
+    React.useEffect(() => {
+    //
+    // Restore the last successfully rendered UID/profile immediately.
+    // This preserves the existing watchlist while a fresh backend request
+    // is running after navigating away and returning.
+    //
     try {
-      const rawRows = sessionStorage.getItem(CACHE_ROWS_KEY);
-      const rawHist = sessionStorage.getItem(CACHE_HIST_KEY);
-      const rawAt = sessionStorage.getItem(CACHE_AT_KEY);
+      const rawOwner = sessionStorage.getItem(
+        LAST_OWNER_KEY,
+      );
 
-      if (rawRows) {
-        const rr = JSON.parse(rawRows) as OppRow[];
-        if (Array.isArray(rr) && rr.length) {
-          setRows(rr);
-          frozenRef.current = new Map(rr.map((r) => [r.symbol, r]));
+      if (rawOwner) {
+        const owner = JSON.parse(rawOwner);
+
+        const cachedUid = String(
+          owner?.uid || "",
+        ).trim();
+
+        const cachedProfileId = String(
+          owner?.profileId || "",
+        )
+          .trim()
+          .toLowerCase();
+
+        if (cachedUid && cachedProfileId) {
+          const keys = cacheKeys(
+            cachedUid,
+            cachedProfileId,
+          );
+
+          const rawRows =
+            sessionStorage.getItem(keys.rows);
+
+          const rawHistory =
+            sessionStorage.getItem(keys.history);
+
+          const rawLastAt =
+            sessionStorage.getItem(keys.lastAt);
+
+          if (rawRows) {
+            const cachedRows =
+              JSON.parse(rawRows) as OppRow[];
+
+            if (Array.isArray(cachedRows)) {
+              frozenRef.current = new Map(
+                cachedRows.map((row) => [
+                  row.symbol,
+                  row,
+                ]),
+              );
+
+              setRows(cachedRows);
+            }
+          }
+
+          if (rawHistory) {
+            const cachedHistory =
+              JSON.parse(rawHistory) as HistoryRow[];
+
+            if (Array.isArray(cachedHistory)) {
+              setHistory(cachedHistory);
+            }
+          }
+
+          if (rawLastAt) {
+            const cachedLastAt =
+              Number(rawLastAt);
+
+            if (
+              Number.isFinite(cachedLastAt)
+              && cachedLastAt > 0
+            ) {
+              setLastAt(cachedLastAt);
+            }
+          }
+
+          ownershipRef.current = {
+            uid: cachedUid,
+            profileId: cachedProfileId,
+          };
         }
       }
-      if (rawHist) {
-        const hh = JSON.parse(rawHist) as HistoryRow[];
-        if (Array.isArray(hh) && hh.length) setHistory(hh);
-      }
-      if (rawAt) {
-        const n = Number(rawAt);
-        if (Number.isFinite(n) && n > 0) setLastAt(n);
-      }
     } catch {
-      // ignore
+      // Ignore invalid or unavailable session cache.
     }
 
     void fetchOnce();
-    const id = window.setInterval(() => void fetchOnce(), 15_000);
-    return () => window.clearInterval(id);
-  }, []);
+
+    const id = window.setInterval(
+      () => void fetchOnce(),
+      15_000,
+    );
+
+    return () => {
+      window.clearInterval(id);
+    };
+  }, [cacheKeys]);
 
   return { rows, history, lastAt, error, refetch: fetchOnce, usdStrength };
 }
@@ -1799,16 +2035,22 @@ function OpportunitiesDashboard() {
                       <td className="px-3 py-2 text-xs text-slate-200 whitespace-nowrap">{r.srMajor || "-"}</td>
                       <td className="px-3 py-2 text-xs text-slate-200 whitespace-nowrap">
                         <div className="flex flex-col gap-1">
-                          {r.gateZoneLevel ? (
+                          {r.zoneStr ? (
                             <div className="text-amber-300">
                               {r.zoneStr}
                             </div>
+                          ) : r.gateZoneStr ? (
+                            <div className="text-amber-300">
+                              {r.gateZoneStr}
+                            </div>
                           ) : (
                             <>
-                              {false ? (
+                              {r.h1Zone &&
+                              (Number.isFinite(Number(r.h1Zone.low ?? r.h1Zone.level)) ||
+                                Number.isFinite(Number(r.h1Zone.high ?? r.h1Zone.level))) ? (
                                 <div className="text-sky-300">
                                   H1: {fmtPrice(r.symbol, Number(r.h1Zone.low ?? r.h1Zone.level))}
-                                  -
+                                  –
                                   {fmtPrice(r.symbol, Number(r.h1Zone.high ?? r.h1Zone.level))}
                                 </div>
                               ) : (
@@ -1817,10 +2059,12 @@ function OpportunitiesDashboard() {
                                 </div>
                               )}
 
-                              {false ? (
+                              {r.h4Zone &&
+                              (Number.isFinite(Number(r.h4Zone.low ?? r.h4Zone.level)) ||
+                                Number.isFinite(Number(r.h4Zone.high ?? r.h4Zone.level))) ? (
                                 <div className="text-amber-300">
                                   H4: {fmtPrice(r.symbol, Number(r.h4Zone.low ?? r.h4Zone.level))}
-                                  -
+                                  –
                                   {fmtPrice(r.symbol, Number(r.h4Zone.high ?? r.h4Zone.level))}
                                 </div>
                               ) : (

@@ -15,25 +15,79 @@ ENABLED_USERS_KEY = "xtl:strategy:oppt:enabled_users"
 
 
 def _sync_enabled_users_on_startup() -> None:
-    """Scan all user state keys on startup and populate enabled_users set."""	
+    """
+    Rebuild the enabled-users set from persisted strategy states.
+
+    This repairs missing and stale set membership after an API restart.
+    Runtime strategy enable/disable must also update the set immediately.
+    """
     try:
         import json
-        keys = R.keys("xtl:strategy:oppt:state:*") or []
-        for key in keys:
+
+        enabled_uids = set()
+
+        for key in R.scan_iter(
+            match="xtl:strategy:oppt:state:*",
+            count=200,
+        ):
             try:
-                uid = str(key).split(":")[-1]
+                key_s = (
+                    key.decode("utf-8", "ignore")
+                    if isinstance(key, (bytes, bytearray))
+                    else str(key)
+                )
+
+                uid = key_s.rsplit(":", 1)[-1].strip()
+
+                if not uid:
+                    continue
+
                 raw = R.get(key)
+
                 if not raw:
                     continue
-                st = json.loads(raw)
-                if isinstance(st, dict) and st.get("enabled"):
-                    R.sadd(ENABLED_USERS_KEY, uid)
-                    log.info("[OPPT] startup: added uid=%s to enabled_users", uid)
-            except Exception:
-                pass
-    except Exception as e:
-        log.warning("[OPPT] startup sync failed: %r", e)
 
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", "replace")
+
+                state = json.loads(raw)
+
+                if (
+                    isinstance(state, dict)
+                    and bool(state.get("enabled"))
+                ):
+                    enabled_uids.add(uid)
+
+            except Exception:
+                log.exception(
+                    "[OPPT] startup enabled-user read failed "
+                    "key=%r",
+                    key,
+                )
+
+        pipe = R.pipeline(transaction=True)
+
+        pipe.delete(ENABLED_USERS_KEY)
+
+        if enabled_uids:
+            pipe.sadd(
+                ENABLED_USERS_KEY,
+                *sorted(enabled_uids),
+            )
+
+        pipe.execute()
+
+        log.warning(
+            "[OPPT] startup enabled-users rebuilt "
+            "count=%s users=%s",
+            len(enabled_uids),
+            sorted(enabled_uids),
+        )
+
+    except Exception:
+        log.exception(
+            "[OPPT] startup enabled-users rebuild failed"
+        )
 
 def start_oppt_executor_manager() -> None:
     """
@@ -57,6 +111,26 @@ def start_oppt_executor_manager() -> None:
 
     _started = True
     _sync_enabled_users_on_startup()
+
+    # Repair unresolved analytics rows before the first close sweep. This is
+    # safe when the agent was offline: reconciliation uses broker deal truth,
+    # while the later sweep refuses unverified broker snapshots.
+    try:
+        from api.xtl_analytics import (
+            reconcile_pending_broker_truth,
+            reseed_pending_broker_truth,
+        )
+
+        _seed = reseed_pending_broker_truth() or {}
+        _recon = reconcile_pending_broker_truth() or {}
+        log.info(
+            "[ANALYTICS] startup reseed=%s reconcile_upgraded=%s errors=%s",
+            _seed.get("reseeded"),
+            _recon.get("upgraded"),
+            int(_seed.get("errors") or 0) + int(_recon.get("errors") or 0),
+        )
+    except Exception:
+        log.exception("[ANALYTICS] startup reconciliation failed")
 
     def loop() -> None:
         pid = os.getpid()
@@ -198,8 +272,40 @@ def start_oppt_executor_manager() -> None:
                     pid,
                 )
 
+            # Analytics truth maintenance is independent of whether strategy
+            # execution is enabled. Reconcile first, then sweep. The sweep itself
+            # skips owners whose broker-open snapshot is unavailable/unverified.
+            try:
+                from api.xtl_analytics import (
+                    reconcile_pending_broker_truth,
+                    sweep_closed_trades,
+                )
+
+                _recon = reconcile_pending_broker_truth() or {}
+                _sw = sweep_closed_trades() or {}
+
+                if (
+                    int(_recon.get("upgraded") or 0) > 0
+                    or int(_sw.get("finalized") or 0) > 0
+                    or int(_sw.get("skipped_unverified") or 0) > 0
+                    or int(_recon.get("errors") or 0) > 0
+                    or int(_sw.get("errors") or 0) > 0
+                ):
+                    log.info(
+                        "[ANALYTICS] reconcile upgraded=%s checked=%s "
+                        "sweep finalized=%s checked=%s skipped_unverified=%s errors=%s",
+                        _recon.get("upgraded"),
+                        _recon.get("checked"),
+                        _sw.get("finalized"),
+                        _sw.get("checked"),
+                        _sw.get("skipped_unverified"),
+                        int(_recon.get("errors") or 0) + int(_sw.get("errors") or 0),
+                    )
+            except Exception:
+                log.exception("[ANALYTICS] lifecycle maintenance error pid=%s", pid)
+
             # Strategy execution can sleep longer when nobody is enabled.
-            # Global DXY tracking above has already run.
+            # Global DXY and analytics maintenance above have already run.
             if enabled_n <= 0:
                 time.sleep(10)
                 continue
@@ -212,16 +318,6 @@ def start_oppt_executor_manager() -> None:
             except Exception:
                 log.exception("[OPPT] manager loop error pid=%s", pid)
                 last_stats = {"enabled": enabled_n, "ticked": 0}
-            # ── analytics: finalize closed trades once per cycle (never blocks) ──
-            try:
-                from api.xtl_analytics import sweep_closed_trades
-                _sw = sweep_closed_trades()
-                if _sw and _sw.get("finalized"):
-                    log.info("[ANALYTICS] sweep finalized=%s checked=%s",
-                             _sw.get("finalized"), _sw.get("checked"))
-            except Exception:
-                log.exception("[ANALYTICS] sweep error pid=%s", pid)
-
             # Adaptive sleep:
             # - base sleep when enabled users exist
             # - if nothing ticked (locks busy / transient), add a little backoff

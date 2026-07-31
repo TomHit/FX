@@ -6,8 +6,8 @@ import logging
 import time
 from typing import Any
 
-log = logging.getLogger("uvicorn.error")
 
+log = logging.getLogger(__name__)
 
 STATE_PREFIX = "xtl:dxy:state:H1"
 HISTORY_PREFIX = "xtl:dxy:history:H1"

@@ -11,6 +11,7 @@ from time import perf_counter as _oppt_perf_counter
 _oppt_log = _oppt_logging.getLogger("xtl.oppt")
 from api.security import require_auth_and_mfa
 from types import SimpleNamespace
+import secrets
 
 
 class _OpptTimer:
@@ -89,8 +90,88 @@ from api.tenant_keys import (
     prop_stats_key,
     prop_daily_key,
     prop_open_risk_key,
+    zone_watch_delete,
+    delete_latest_entry_claim,
 )
 
+#
+# Opportunity cache infrastructure.
+#
+OPPT_FRESH_CACHE_TTL_S = 10
+
+OPPT_LAST_GOOD_TTL_S = (
+    4 * 60 * 60
+)
+
+OPPT_MAX_LAST_GOOD_AGE_MS = (
+    3 * 60 * 1000
+)
+
+
+def _store_opportunity_snapshot(
+    *,
+    cache_key: str,
+    last_good_cache_key: str | None,
+    payload: dict,
+    fresh_ttl_s: int,
+) -> None:
+    """
+    Store one successful opportunity payload in:
+
+      1. Fresh cache - existing short TTL.
+      2. Last-good cache - retained for recovery/fast serving.
+
+    This helper does not alter opportunity computation or response flow.
+    """
+
+    if (
+        not cache_key
+        or not isinstance(payload, dict)
+    ):
+        return
+
+    try:
+        snapshot = dict(payload)
+
+        snapshot["computed_at_ms"] = int(
+            time.time() * 1000
+        )
+
+        encoded = json.dumps(
+            snapshot,
+            separators=(",", ":"),
+            default=str,
+        )
+
+        pipe = R.pipeline(
+            transaction=False,
+        )
+
+        pipe.setex(
+            cache_key,
+            max(
+                1,
+                int(fresh_ttl_s),
+            ),
+            encoded,
+        )
+
+        if last_good_cache_key:
+            pipe.setex(
+                last_good_cache_key,
+                int(OPPT_LAST_GOOD_TTL_S),
+                encoded,
+            )
+
+        pipe.execute()
+
+    except Exception:
+        log.exception(
+            "[OPPT] SNAPSHOT_STORE_FAILED "
+            "cache_key=%s last_good_key=%s",
+            cache_key,
+            last_good_cache_key,
+        )
 
 # --- Zone-only entry gate (new module; single source of truth) ---
 _ZONE_GATE_IMPORT_ERR = None
@@ -640,6 +721,700 @@ def _user_prop_profile_ids(uid: str) -> set[str]:
 
     return out
 
+
+
+def _discover_missing_prop_profiles(uid: str) -> None:
+    """
+    Discover and maintain prop-profile account bindings from fresh MT5
+    account snapshots belonging to this authenticated user.
+
+    Permanent replacement-account behavior:
+      - create a missing profile from one unambiguous live account;
+      - keep a profile unchanged while its configured account is connected;
+      - rebind a disconnected profile only when exactly one fresh,
+        firm-compatible replacement account exists;
+      - never rebind while that profile has an open XTL trade;
+      - never pick between multiple matching accounts;
+      - never enable or activate a profile automatically.
+    """
+    uid_u = str(uid or "").strip()
+
+    if not uid_u:
+        return
+
+    now_ms = int(time.time() * 1000)
+
+    # Account snapshots arrive every few seconds. A stale snapshot from a
+    # deleted account must not participate in replacement selection.
+    max_snapshot_age_ms = int(
+        float(
+            os.getenv(
+                "XTL_PROP_ACCOUNT_REBIND_MAX_AGE_SEC",
+                "120",
+            )
+        )
+        * 1000
+    )
+
+    try:
+        raw_devices = (
+            R.smembers(f"xtl:user:{uid_u}:devices")
+            or set()
+        )
+    except Exception:
+        log.exception(
+            "[PROP] PROFILE_DISCOVERY_DEVICE_READ_FAILED "
+            "uid=%s",
+            uid_u,
+        )
+        return
+
+    device_ids: list[str] = []
+
+    for raw_dev in raw_devices:
+        if isinstance(raw_dev, (bytes, bytearray)):
+            raw_dev = raw_dev.decode(
+                "utf-8",
+                "ignore",
+            )
+
+        dev = str(raw_dev or "").strip()
+
+        if dev:
+            device_ids.append(dev)
+
+    # pid -> fresh live account candidates
+    candidates: dict[str, list[dict]] = {}
+
+    for dev in sorted(set(device_ids)):
+        # A device can temporarily have several account snapshot keys.
+        # Never select the first existing key because last_user may still
+        # contain the account that was deleted. Select the freshest valid
+        # snapshot by receive/update timestamp.
+        account_keys = (
+            f"xtl:mt5:account:{dev}:demo",
+            f"xtl:mt5:account:{dev}:live",
+            f"xtl:mt5:account:last_user:{dev}",
+            f"xtl:mt5:account:last:{dev}:demo",
+            f"xtl:mt5:account:last:{dev}:live",
+        )
+
+        snapshot_candidates: list[dict] = []
+
+        for account_key in account_keys:
+            try:
+                raw = R.get(account_key)
+            except Exception:
+                log.exception(
+                    "[PROP] PROFILE_DISCOVERY_ACCOUNT_READ_FAILED "
+                    "uid=%s device=%s key=%s",
+                    uid_u,
+                    dev,
+                    account_key,
+                )
+                continue
+
+            if not raw:
+                continue
+
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode(
+                    "utf-8",
+                    "replace",
+                )
+
+            try:
+                loaded = json.loads(raw)
+            except Exception:
+                loaded = {}
+
+            if not isinstance(loaded, dict):
+                continue
+
+            login, server, company = _prop_account_identity(
+                loaded,
+            )
+
+            if not login or not server or not company:
+                log.warning(
+                    "[PROP] PROFILE_DISCOVERY_SKIP_IDENTITY_MISSING "
+                    "uid=%s device=%s key=%s "
+                    "login=%s server=%s company=%s",
+                    uid_u,
+                    dev,
+                    account_key,
+                    login,
+                    server,
+                    company,
+                )
+                continue
+
+            snapshot_ms = _to_ms_any(
+                loaded.get("server_received_ms")
+                or loaded.get("updated_ts_ms")
+                or loaded.get("received_ts_ms")
+                or loaded.get("ts_ms")
+                or loaded.get("broker_ts_ms")
+                or 0
+            )
+
+            if snapshot_ms <= 0:
+                continue
+
+            row = dict(loaded)
+            row["_device_id"] = dev
+            row["_account_key"] = account_key
+            row["_snapshot_ms"] = snapshot_ms
+
+            snapshot_candidates.append(row)
+
+        if not snapshot_candidates:
+            continue
+
+        # Highest receive/update timestamp wins. If timestamps are equal,
+        # prefer the canonical typed account key over last_user.
+        snapshot_candidates.sort(
+            key=lambda row: (
+                int(row.get("_snapshot_ms") or 0),
+                1
+                if str(row.get("_account_key") or "").endswith(
+                    (":demo", ":live")
+                )
+                and ":last:" not in str(
+                    row.get("_account_key") or ""
+                )
+                and ":last_user:" not in str(
+                    row.get("_account_key") or ""
+                )
+                else 0,
+            ),
+            reverse=True,
+        )
+
+        acct = snapshot_candidates[0]
+
+        log.warning(
+            "[PROP] PROFILE_DISCOVERY_ACCOUNT_SELECTED "
+            "uid=%s device=%s login=%s key=%s snapshot_ms=%s "
+            "candidate_count=%s",
+            uid_u,
+            dev,
+            acct.get("login")
+            or acct.get("account_login"),
+            acct.get("_account_key"),
+            acct.get("_snapshot_ms"),
+            len(snapshot_candidates),
+        )
+
+        login, server, company = _prop_account_identity(
+            acct,
+        )
+
+        if not login or not server or not company:
+            continue
+
+        snapshot_ms = _to_ms_any(
+            acct.get("server_received_ms")
+            or acct.get("updated_ts_ms")
+            or acct.get("received_ts_ms")
+            or acct.get("ts_ms")
+            or 0
+        )
+
+        # Unknown or stale snapshots must not cause automatic rebinding.
+        if snapshot_ms <= 0:
+            log.warning(
+                "[PROP] PROFILE_DISCOVERY_SKIP_NO_TIMESTAMP "
+                "uid=%s device=%s login=%s",
+                uid_u,
+                dev,
+                login,
+            )
+            continue
+
+        age_ms = max(0, now_ms - snapshot_ms)
+
+        if age_ms > max_snapshot_age_ms:
+            log.warning(
+                "[PROP] PROFILE_DISCOVERY_SKIP_STALE "
+                "uid=%s device=%s login=%s age_ms=%s",
+                uid_u,
+                dev,
+                login,
+                age_ms,
+            )
+            continue
+
+        company_n = _norm_broker_identity(company)
+        server_n = _norm_broker_identity(server)
+
+        if (
+            "ftmo" in company_n
+            or "ftmo" in server_n
+        ):
+            pid = "ftmo-main"
+            firm = "ftmo"
+
+        elif (
+            "fundingpips" in company_n
+            or "fundingpips" in server_n
+            or "funding pips" in company_n
+            or "funding pips" in server_n
+        ):
+            pid = "funding-main"
+            firm = "fundingpips"
+
+        elif (
+            "fundednext" in company_n
+            or "fundednext" in server_n
+            or "funded next" in company_n
+            or "funded next" in server_n
+        ):
+            pid = "fundednext-main"
+            firm = "fundednext"
+
+        elif (
+            "city traders imperium" in company_n
+            or "city traders imperium" in server_n
+            or "citytradersimperium" in company_n
+            or "citytradersimperium" in server_n
+            or company_n == "cti"
+            or server_n == "cti"
+        ):
+            pid = "cti-main"
+            firm = "cti"
+
+        else:
+            log.warning(
+                "[PROP] PROFILE_DISCOVERY_UNKNOWN_FIRM "
+                "uid=%s device=%s login=%s "
+                "server=%s company=%s",
+                uid_u,
+                dev,
+                login,
+                server,
+                company,
+            )
+            continue
+
+        candidate = {
+            "profile_id": pid,
+            "firm": firm,
+            "device_id": dev,
+            "account_key": acct.get("_account_key"),
+            "account": acct,
+            "login": login,
+            "server": server,
+            "company": company,
+            "account_type": str(
+                acct.get("account_type")
+                or (
+                    "DEMO"
+                    if bool(acct.get("is_demo"))
+                    else ""
+                )
+            ).strip().upper(),
+            "is_demo": bool(
+                acct.get("is_demo")
+                or str(
+                    acct.get("account_type") or ""
+                ).strip().upper() == "DEMO"
+            ),
+            "snapshot_ms": snapshot_ms,
+        }
+
+        candidates.setdefault(pid, []).append(candidate)
+
+    known = _user_prop_profile_ids(uid_u)
+
+    for pid, rows in candidates.items():
+        # Remove duplicate representations of the same account.
+        unique_by_identity: dict[tuple[str, str, str], dict] = {}
+
+        for row in rows:
+            identity = (
+                str(row.get("login") or "").strip(),
+                _norm_broker_identity(row.get("server")),
+                _norm_broker_identity(row.get("company")),
+            )
+
+            previous = unique_by_identity.get(identity)
+
+            if (
+                previous is None
+                or int(row.get("snapshot_ms") or 0)
+                > int(previous.get("snapshot_ms") or 0)
+            ):
+                unique_by_identity[identity] = row
+
+        unique_rows = list(unique_by_identity.values())
+
+        # ---------------------------------------------------------
+        # First-time profile creation.
+        # ---------------------------------------------------------
+        if pid not in known:
+            if len(unique_rows) != 1:
+                log.error(
+                    "[PROP] AUTO_CREATE_PROFILE_AMBIGUOUS "
+                    "uid=%s profile=%s candidates=%s",
+                    uid_u,
+                    pid,
+                    [
+                        {
+                            "login": x.get("login"),
+                            "server": x.get("server"),
+                            "device_id": x.get("device_id"),
+                        }
+                        for x in unique_rows
+                    ],
+                )
+                continue
+
+            selected = unique_rows[0]
+            acct = selected["account"]
+            selected_firm = str(
+                selected.get("firm") or ""
+            ).strip().lower()
+
+            if selected_firm == "cti":
+                default_phase = "two_step_phase_1"
+            elif selected_firm == "fundingpips":
+                default_phase = "phase_1_8"
+            elif selected_firm == "fundednext":
+                default_phase = "phase_1"
+            else:
+                default_phase = "challenge"
+
+            detected_account_size = float(
+                acct.get("balance")
+                or acct.get("account_size")
+                or DEFAULT_PROP_CFG["account_size"]
+            )
+            cfg = dict(DEFAULT_PROP_CFG)
+            cfg.update({
+                "profile_id": pid,
+                "firm": selected_firm,
+                "phase": default_phase,
+                "account_size": detected_account_size,
+                "account_name": (
+                    "CTI 100K Free Trial"
+                    if selected_firm == "cti"
+                    else ""
+                ),
+                "enabled": False,
+                "account_login": selected["login"],
+                "account_server": selected["server"],
+                "broker_company": selected["company"],
+                "account_type": selected["account_type"],
+                "is_demo": selected["is_demo"],
+                "last_resolved_device_id": (
+                    selected["device_id"]
+                ),
+                "last_resolved_account_login": (
+                    selected["login"]
+                ),
+                "last_resolved_account_server": (
+                    selected["server"]
+                ),
+                "last_resolved_broker_company": (
+                    selected["company"]
+                ),
+                "last_resolved_ts_ms": now_ms,
+            })
+
+            try:
+                _save_prop_config(
+                    uid_u,
+                    cfg,
+                    profile_id=pid,
+                )
+
+                known.add(pid)
+
+                log.warning(
+                    "[PROP] AUTO_CREATE_PROFILE_OK "
+                    "uid=%s profile=%s login=%s "
+                    "server=%s device=%s",
+                    uid_u,
+                    pid,
+                    selected["login"],
+                    selected["server"],
+                    selected["device_id"],
+                )
+
+            except Exception:
+                log.exception(
+                    "[PROP] AUTO_CREATE_PROFILE_FAILED "
+                    "uid=%s profile=%s",
+                    uid_u,
+                    pid,
+                )
+
+            continue
+
+        # ---------------------------------------------------------
+        # Existing profile.
+        # ---------------------------------------------------------
+        try:
+            current_cfg = _get_user_prop_config(
+                uid_u,
+                pid,
+            )
+        except Exception:
+            log.exception(
+                "[PROP] AUTO_REBIND_PROFILE_READ_FAILED "
+                "uid=%s profile=%s",
+                uid_u,
+                pid,
+            )
+            continue
+
+        current_login = str(
+            current_cfg.get("account_login") or ""
+        ).strip()
+
+        current_server = str(
+            current_cfg.get("account_server") or ""
+        ).strip()
+
+        current_company = str(
+            current_cfg.get("broker_company") or ""
+        ).strip()
+
+        # Keep the existing binding when that exact account is fresh.
+        current_match = next(
+            (
+                row
+                for row in unique_rows
+                if (
+                    str(row.get("login") or "").strip()
+                    == current_login
+                    and _broker_identity_matches(
+                        current_server,
+                        row.get("server"),
+                    )
+                    and _broker_identity_matches(
+                        current_company,
+                        row.get("company"),
+                    )
+                )
+            ),
+            None,
+        )
+
+        if current_match is not None:
+            continue
+
+        # Never guess between two currently connected accounts belonging
+        # to the same firm.
+        if len(unique_rows) != 1:
+            log.error(
+                "[PROP] AUTO_REBIND_AMBIGUOUS "
+                "uid=%s profile=%s old_login=%s "
+                "candidates=%s",
+                uid_u,
+                pid,
+                current_login,
+                [
+                    {
+                        "login": x.get("login"),
+                        "server": x.get("server"),
+                        "device_id": x.get("device_id"),
+                    }
+                    for x in unique_rows
+                ],
+            )
+            continue
+
+        selected = unique_rows[0]
+
+        # The replacement must remain on the configured broker/server.
+        # Login may change; broker identity may not.
+        if (
+            current_server
+            and not _broker_identity_matches(
+                current_server,
+                selected.get("server"),
+            )
+        ):
+            log.error(
+                "[PROP] AUTO_REBIND_SERVER_MISMATCH "
+                "uid=%s profile=%s old_login=%s "
+                "old_server=%s candidate_login=%s "
+                "candidate_server=%s",
+                uid_u,
+                pid,
+                current_login,
+                current_server,
+                selected.get("login"),
+                selected.get("server"),
+            )
+            continue
+
+        if (
+            current_company
+            and not _broker_identity_matches(
+                current_company,
+                selected.get("company"),
+            )
+        ):
+            log.error(
+                "[PROP] AUTO_REBIND_COMPANY_MISMATCH "
+                "uid=%s profile=%s old_login=%s "
+                "old_company=%s candidate_login=%s "
+                "candidate_company=%s",
+                uid_u,
+                pid,
+                current_login,
+                current_company,
+                selected.get("login"),
+                selected.get("company"),
+            )
+            continue
+
+        # Do not change account routing while an XTL trade for this
+        # profile remains open.
+        profile_has_open_trade = False
+
+        try:
+            open_rows = (
+                R.hvals(
+                    f"xtl:strategy:oppt:open:{uid_u}"
+                )
+                or []
+            )
+
+            for raw_trade in open_rows:
+                if isinstance(
+                    raw_trade,
+                    (bytes, bytearray),
+                ):
+                    raw_trade = raw_trade.decode(
+                        "utf-8",
+                        "replace",
+                    )
+
+                try:
+                    trade = json.loads(raw_trade)
+                except Exception:
+                    trade = {}
+
+                if not isinstance(trade, dict):
+                    continue
+
+                trade_pid = str(
+                    trade.get("profile_id") or ""
+                ).strip().lower()
+
+                trade_state = str(
+                    trade.get("trade_state")
+                    or trade.get("status")
+                    or ""
+                ).strip().upper()
+
+                if (
+                    trade_pid == pid
+                    and trade_state not in {
+                        "CLOSED",
+                        "FAILED",
+                        "ORDER_FAILED",
+                        "EXPIRED",
+                    }
+                ):
+                    profile_has_open_trade = True
+                    break
+
+        except Exception:
+            # A Redis/read failure must fail closed.
+            log.exception(
+                "[PROP] AUTO_REBIND_OPEN_TRADE_CHECK_FAILED "
+                "uid=%s profile=%s",
+                uid_u,
+                pid,
+            )
+            continue
+
+        if profile_has_open_trade:
+            log.error(
+                "[PROP] AUTO_REBIND_BLOCKED_OPEN_TRADE "
+                "uid=%s profile=%s old_login=%s "
+                "candidate_login=%s",
+                uid_u,
+                pid,
+                current_login,
+                selected.get("login"),
+            )
+            continue
+
+        updated_cfg = dict(current_cfg)
+
+        updated_cfg.update({
+            "account_login": str(
+                selected.get("login") or ""
+            ).strip(),
+            "account_server": str(
+                selected.get("server") or ""
+            ).strip(),
+            "broker_company": str(
+                selected.get("company") or ""
+            ).strip(),
+            "account_type": str(
+                selected.get("account_type") or ""
+            ).strip().upper(),
+            "is_demo": bool(
+                selected.get("is_demo")
+            ),
+            "last_resolved_device_id": str(
+                selected.get("device_id") or ""
+            ).strip(),
+            "last_resolved_account_login": str(
+                selected.get("login") or ""
+            ).strip(),
+            "last_resolved_account_server": str(
+                selected.get("server") or ""
+            ).strip(),
+            "last_resolved_broker_company": str(
+                selected.get("company") or ""
+            ).strip(),
+            "last_resolved_ts_ms": now_ms,
+            "rebound_from_account_login": current_login,
+            "rebound_at_ms": now_ms,
+            "rebound_reason": (
+                "UNIQUE_FRESH_SAME_BROKER_REPLACEMENT"
+            ),
+        })
+
+        try:
+            saved = _save_prop_config(
+                uid_u,
+                updated_cfg,
+                profile_id=pid,
+            )
+
+            log.warning(
+                "[PROP] PROFILE_ACCOUNT_AUTO_REBOUND "
+                "uid=%s profile=%s old_login=%s "
+                "new_login=%s server=%s company=%s "
+                "device=%s",
+                uid_u,
+                pid,
+                current_login,
+                saved.get("account_login"),
+                saved.get("account_server"),
+                saved.get("broker_company"),
+                selected.get("device_id"),
+            )
+
+        except Exception:
+            log.exception(
+                "[PROP] PROFILE_ACCOUNT_AUTO_REBIND_FAILED "
+                "uid=%s profile=%s old_login=%s "
+                "new_login=%s",
+                uid_u,
+                pid,
+                current_login,
+                selected.get("login"),
+            )
 
 def _user_active_prop_profile_id(
     uid: str,
@@ -1877,6 +2652,405 @@ def require_prop_auth(request: Request):
     )
 
 
+
+# ================================================================
+# Prop Dashboard unified read model (Phase 1 performance)
+# ================================================================
+PROP_DASHBOARD_SNAPSHOT_VERSION = 1
+PROP_DASHBOARD_SNAPSHOT_TTL_S = max(
+    1,
+    int(os.getenv("XTL_PROP_DASHBOARD_SNAPSHOT_TTL_SEC", "5")),
+)
+PROP_DASHBOARD_LAST_GOOD_TTL_S = max(
+    PROP_DASHBOARD_SNAPSHOT_TTL_S,
+    int(os.getenv("XTL_PROP_DASHBOARD_LAST_GOOD_TTL_SEC", "300")),
+)
+
+
+def _prop_dashboard_snapshot_key(uid: str, profile_id: str) -> str:
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+    return f"xtl:prop:dashboard_snapshot:{uid_u}:{pid}"
+
+
+def _prop_dashboard_last_good_key(uid: str, profile_id: str) -> str:
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+    return f"xtl:prop:dashboard_snapshot:last_good:{uid_u}:{pid}"
+
+
+def _decode_json_dict(raw) -> dict:
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "ignore")
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _build_prop_dashboard_snapshot(uid: str, profile_id: str) -> dict:
+    """Build status, risk and dashboard from one shared set of inputs."""
+    started = time.perf_counter()
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+
+    cfg = _get_user_prop_config(uid_u, pid)
+    firm_u = str(cfg.get("firm") or "").strip().lower()
+    phase_u = str(cfg.get("phase") or "").strip().lower()
+
+    firm_rules = PROP_FIRM_RULES.get(firm_u)
+    if not isinstance(firm_rules, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "INVALID_PROP_FIRM",
+                "profile_id": pid,
+                "firm": firm_u,
+                "valid_firms": sorted(PROP_FIRM_RULES.keys()),
+            },
+        )
+
+    phase_rules = firm_rules.get("phases") or {}
+    if phase_u not in phase_rules:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "INVALID_PROP_PHASE",
+                "profile_id": pid,
+                "firm": firm_u,
+                "phase": phase_u,
+                "valid_phases": sorted(phase_rules.keys()),
+            },
+        )
+    rules = phase_rules[phase_u]
+
+    t0 = time.perf_counter()
+    try:
+        resolved = _resolve_prop_profile_device(pid, uid_u) or {}
+    except Exception:
+        log.exception(
+            "[PROP_DASHBOARD_PERF] DEVICE_RESOLVE_FAILED uid=%s profile=%s",
+            uid_u,
+            pid,
+        )
+        resolved = {}
+    resolve_ms = (time.perf_counter() - t0) * 1000.0
+
+    account_raw = (
+        resolved.get("account")
+        if isinstance(resolved, dict) and resolved.get("ok")
+        else {}
+    ) or {}
+
+    t0 = time.perf_counter()
+    risk = _read_prop_risk_snapshot(
+        uid_u,
+        pid,
+        max_age_ms=PROP_RISK_UI_MAX_AGE_MS,
+        fallback_compute=True,
+    )
+    risk_ms = (time.perf_counter() - t0) * 1000.0
+
+    broker_balance = float(
+        risk.get("broker_balance")
+        or account_raw.get("balance")
+        or cfg.get("account_size")
+        or 0.0
+    )
+    broker_equity = float(
+        risk.get("broker_equity")
+        or account_raw.get("equity")
+        or broker_balance
+        or 0.0
+    )
+    account_size = float(cfg.get("account_size") or broker_balance or 0.0)
+
+    target_pct = rules.get("target_pct")
+    daily_pct = float(rules.get("daily_loss_pct") or 0.0)
+    max_pct = float(rules.get("max_loss_pct") or 0.0)
+    target_usd = account_size * (float(target_pct) / 100.0) if target_pct else None
+    daily_limit_usd = account_size * (daily_pct / 100.0)
+    max_loss_limit_usd = account_size * (max_pct / 100.0)
+
+    max_open_risk_pct = float(cfg.get("max_open_risk_pct") or 0.0)
+    max_open_risk_usd = (
+        broker_equity * (max_open_risk_pct / 100.0)
+        if broker_equity > 0
+        else account_size * (max_open_risk_pct / 100.0)
+    )
+    open_risk_usd = float(risk.get("open_risk_usd") or 0.0)
+
+    trading_allowed = True
+    reasons: list[str] = []
+    if bool(risk.get("trading_halted")):
+        trading_allowed = False
+        reasons.append(str(risk.get("halt_reason") or "TRADING_HALTED"))
+    if bool(risk.get("daily_r_blocked")):
+        trading_allowed = False
+        reasons.append(str(risk.get("daily_r_block_reason") or "DAILY_R_BLOCKED"))
+    if float(risk.get("ftmo_daily_loss_remaining") or 0.0) <= 0:
+        trading_allowed = False
+        reasons.append("DAILY_LOSS_EXCEEDED")
+    if max_open_risk_usd > 0 and open_risk_usd >= max_open_risk_usd:
+        trading_allowed = False
+        reasons.append("MAX_OPEN_RISK_REACHED")
+    if int(risk.get("open_positions_count") or 0) >= int(cfg.get("max_open_positions") or 1):
+        trading_allowed = False
+        reasons.append("MAX_OPEN_POSITIONS_REACHED")
+
+    active_pid = _user_active_prop_profile_id(uid_u)
+    is_active_execution_profile = bool(pid == active_pid and cfg.get("enabled"))
+    if is_active_execution_profile:
+        try:
+            _prop_eval_alerts(uid_u, pid, risk)
+        except Exception:
+            log.exception("[PROP] ALERT_EVAL_CALL_EXC profile=%s", pid)
+
+    account = {
+        "balance": broker_balance,
+        "equity": broker_equity,
+        "margin": account_raw.get("margin"),
+        "used_margin": risk.get("used_margin"),
+        "free_margin": risk.get("free_margin"),
+        "floating_pnl": risk.get("floating_pnl"),
+        "leverage": account_raw.get("leverage"),
+        "login": account_raw.get("login"),
+        "server": account_raw.get("server"),
+        "company": account_raw.get("company"),
+        "currency": account_raw.get("currency"),
+        "account_type": account_raw.get("account_type"),
+        "is_demo": account_raw.get("is_demo"),
+        "margin_level": risk.get("margin_level"),
+    }
+
+    dashboard = {
+        "ok": True,
+        "profile_id": pid,
+        "trading_allowed": trading_allowed,
+        "reasons": reasons,
+        "risk": risk.get("effective_risk_pct"),
+        "config": {
+            "firm": cfg.get("firm"),
+            "phase": cfg.get("phase"),
+            "account_size": account_size,
+            "configured_risk_pct": cfg.get("risk_pct"),
+            "effective_risk_pct": risk.get("effective_risk_pct"),
+            "target_rr": cfg.get("target_rr"),
+            "max_open_positions": cfg.get("max_open_positions"),
+            "max_open_risk_pct": max_open_risk_pct,
+        },
+        "account": {
+            "balance": broker_balance,
+            "equity": broker_equity,
+            "floating_pnl": risk.get("floating_pnl"),
+        },
+        "margin": {
+            "equity": broker_equity,
+            "balance": broker_balance,
+            "free_margin": risk.get("free_margin"),
+            "used_margin": risk.get("used_margin"),
+            "margin_level": risk.get("margin_level"),
+            "margin_utilization_pct": risk.get("margin_utilization_pct"),
+        },
+        "daily": {
+            "day": risk.get("day"),
+            "daily_key": risk.get("daily_key"),
+            "start_balance": risk.get("start_balance"),
+            "today_closed_pnl": risk.get("today_closed_pnl"),
+            "floating_pnl": risk.get("floating_pnl"),
+            "ftmo_current_daily_result": risk.get("ftmo_current_daily_result"),
+            "ftmo_daily_loss_used": risk.get("ftmo_daily_loss_used"),
+            "ftmo_daily_loss_limit": risk.get("ftmo_daily_loss_limit"),
+            "ftmo_daily_loss_remaining": risk.get("ftmo_daily_loss_remaining"),
+            "daily_r": risk.get("daily_r"),
+            "wins_today": risk.get("wins_today"),
+            "losses_today": risk.get("losses_today"),
+        },
+        "drawdown": {
+            "drawdown_pct": risk.get("drawdown_pct"),
+            "drawdown_band": risk.get("drawdown_band"),
+        },
+        "open_risk": {
+            "open_risk_usd": open_risk_usd,
+            "max_open_risk_usd": round(max_open_risk_usd, 2),
+            "daily_risk_reserved": risk.get("daily_risk_reserved"),
+            "projected_daily_loss_if_all_sl": risk.get("projected_daily_loss_if_all_sl"),
+            "open_positions_count": risk.get("open_positions_count"),
+            "open_positions": risk.get("open_positions"),
+        },
+        "halt": {
+            "trading_halted": risk.get("trading_halted"),
+            "halt_reason": risk.get("halt_reason"),
+            "halt_ts": risk.get("halt_ts"),
+            "halt_until_manual_reset": risk.get("halt_until_manual_reset"),
+            "daily_r_blocked": risk.get("daily_r_blocked"),
+            "daily_r_block_reason": risk.get("daily_r_block_reason"),
+            "consecutive_losing_days": risk.get("consecutive_losing_days"),
+        },
+    }
+
+    status = {
+        "ok": True,
+        "profile_id": pid,
+        "profile_device": {
+            "ok": bool(isinstance(resolved, dict) and resolved.get("ok")),
+            "device_id": resolved.get("device_id") if isinstance(resolved, dict) else "",
+            "reason": resolved.get("reason") if isinstance(resolved, dict) else "",
+        },
+        "config": cfg,
+        "rules": rules,
+        "account": account,
+        "limits": {
+            "target_usd": round(target_usd, 2) if target_usd else None,
+            "daily_limit_usd": round(daily_limit_usd, 2),
+            "max_loss_limit_usd": round(max_loss_limit_usd, 2),
+        },
+        "risk": {
+            "drawdown_pct": risk.get("drawdown_pct"),
+            "drawdown_band": risk.get("drawdown_band"),
+            "configured_risk_pct": cfg.get("risk_pct"),
+            "recommended_risk_pct": risk.get("effective_risk_pct"),
+            "execution_risk_pct": float(cfg.get("risk_pct") or 1.0),
+        },
+    }
+
+    total_ms = (time.perf_counter() - started) * 1000.0
+    now_ms = int(time.time() * 1000)
+    return {
+        "ok": True,
+        "snapshot_version": PROP_DASHBOARD_SNAPSHOT_VERSION,
+        "profile_id": pid,
+        "active_profile_id": active_pid,
+        "computed_at_ms": now_ms,
+        "snapshot_source": "COMPUTED",
+        "snapshot_cache_hit": False,
+        "snapshot_stale": False,
+        "status": status,
+        "risk": {"ok": True, "config": cfg, "risk": risk},
+        "dashboard": dashboard,
+        "performance": {
+            "total_ms": round(total_ms, 1),
+            "device_resolve_ms": round(resolve_ms, 1),
+            "risk_read_ms": round(risk_ms, 1),
+            "risk_snapshot_cache_hit": bool(risk.get("risk_snapshot_cache_hit")),
+        },
+    }
+
+
+def _store_prop_dashboard_snapshot(uid: str, profile_id: str, payload: dict) -> None:
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+    encoded = json.dumps(payload, separators=(",", ":"), default=str)
+    pipe = R.pipeline(transaction=False)
+    pipe.setex(
+        _prop_dashboard_snapshot_key(uid_u, pid),
+        PROP_DASHBOARD_SNAPSHOT_TTL_S,
+        encoded,
+    )
+    pipe.setex(
+        _prop_dashboard_last_good_key(uid_u, pid),
+        PROP_DASHBOARD_LAST_GOOD_TTL_S,
+        encoded,
+    )
+    pipe.execute()
+
+
+@router.get("/prop/snapshot")
+def prop_snapshot(
+    profile_id: str | None = None,
+    refresh: bool = False,
+    user=Depends(require_prop_auth),
+):
+    """One fast response for the Prop Dashboard UI."""
+    request_started = time.perf_counter()
+    uid = _require_prop_uid(user)
+    pid = _resolve_user_prop_profile_id(uid, profile_id)
+    cache_key = _prop_dashboard_snapshot_key(uid, pid)
+
+    if not refresh:
+        try:
+            cached = _decode_json_dict(R.get(cache_key))
+            if cached:
+                out = dict(cached)
+                computed_at_ms = int(out.get("computed_at_ms") or 0)
+                out["snapshot_source"] = "FRESH_CACHE"
+                out["snapshot_cache_hit"] = True
+                out["snapshot_stale"] = False
+                out["snapshot_age_ms"] = max(
+                    0,
+                    int(time.time() * 1000) - computed_at_ms,
+                ) if computed_at_ms else None
+                out.setdefault("performance", {})["request_total_ms"] = round(
+                    (time.perf_counter() - request_started) * 1000.0,
+                    1,
+                )
+                log.info(
+                    "[PROP_DASHBOARD_TIMING] uid=%s profile=%s cache_hit=1 total_ms=%.1f",
+                    uid,
+                    pid,
+                    (time.perf_counter() - request_started) * 1000.0,
+                )
+                return out
+        except Exception:
+            log.exception(
+                "[PROP_DASHBOARD] CACHE_READ_FAILED uid=%s profile=%s",
+                uid,
+                pid,
+            )
+
+    try:
+        payload = _build_prop_dashboard_snapshot(uid, pid)
+        _store_prop_dashboard_snapshot(uid, pid, payload)
+        payload.setdefault("performance", {})["request_total_ms"] = round(
+            (time.perf_counter() - request_started) * 1000.0,
+            1,
+        )
+        log.warning(
+            "[PROP_DASHBOARD_TIMING] uid=%s profile=%s cache_hit=0 total_ms=%.1f build_ms=%s risk_cache_hit=%s",
+            uid,
+            pid,
+            (time.perf_counter() - request_started) * 1000.0,
+            payload.get("performance", {}).get("total_ms"),
+            payload.get("performance", {}).get("risk_snapshot_cache_hit"),
+        )
+        return payload
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception(
+            "[PROP_DASHBOARD] BUILD_FAILED uid=%s profile=%s",
+            uid,
+            pid,
+        )
+        try:
+            last_good = _decode_json_dict(
+                R.get(_prop_dashboard_last_good_key(uid, pid))
+            )
+            if last_good:
+                out = dict(last_good)
+                computed_at_ms = int(out.get("computed_at_ms") or 0)
+                out["snapshot_source"] = "LAST_GOOD"
+                out["snapshot_cache_hit"] = False
+                out["snapshot_stale"] = True
+                out["snapshot_age_ms"] = max(
+                    0,
+                    int(time.time() * 1000) - computed_at_ms,
+                ) if computed_at_ms else None
+                out.setdefault("performance", {})["request_total_ms"] = round(
+                    (time.perf_counter() - request_started) * 1000.0,
+                    1,
+                )
+                return out
+        except Exception:
+            log.exception(
+                "[PROP_DASHBOARD] LAST_GOOD_READ_FAILED uid=%s profile=%s",
+                uid,
+                pid,
+            )
+        raise HTTPException(status_code=503, detail="PROP_DASHBOARD_SNAPSHOT_UNAVAILABLE")
+
+
 @router.get("/prop/dashboard")
 def prop_dashboard(
     profile_id: str | None = None,
@@ -1895,7 +3069,12 @@ def prop_dashboard(
     )
 
 
-    risk = _get_prop_risk_state(uid,pid)
+    risk = _read_prop_risk_snapshot(
+        uid,
+        pid,
+        max_age_ms=PROP_RISK_UI_MAX_AGE_MS,
+        fallback_compute=True,
+    )
     
 
     account = {
@@ -2026,6 +3205,49 @@ def _norm_broker_identity(value: object) -> str:
     )
 
 
+def _prop_account_identity(
+    account: dict,
+) -> tuple[str, str, str]:
+    """
+    Return stable login/server/company identity for prop discovery.
+
+    Some MT5 installations report account_info.server as empty/None.
+    In that case, use broker company as the stable server identity.
+
+    This remains strict because:
+      - login is still mandatory;
+      - company is still mandatory;
+      - the same normalization is used during discovery and resolution.
+    """
+    if not isinstance(account, dict):
+        return "", "", ""
+
+    login = str(
+        account.get("login")
+        or account.get("account_login")
+        or ""
+    ).strip()
+
+    company = str(
+        account.get("company")
+        or account.get("broker_company")
+        or account.get("terminal_company")
+        or ""
+    ).strip()
+
+    server = str(
+        account.get("server")
+        or account.get("account_server")
+        or ""
+    ).strip()
+
+    # CTI currently reports server=None through the Python MT5 binding.
+    # Use the broker company as a deterministic identity fallback.
+    if not server and company:
+        server = company
+
+    return login, server, company
+
 def _broker_identity_matches(
     configured: object,
     live: object,
@@ -2150,128 +3372,165 @@ def _resolve_prop_profile_device(
         checked_devices = []
 
         for dev in device_ids:
-            key = (
-                f"xtl:mt5:account:"
-                f"last_user:{dev}"
-            )
-
             checked_devices.append(dev)
 
-            try:
-                raw = R.get(key)
-            except Exception:
-                raw = None
-
-            try:
-                acct = (
-                    json.loads(raw)
-                    if raw
-                    else {}
-                )
-            except Exception:
-                acct = {}
-
-            if not isinstance(acct, dict):
-                continue
-
-            login = str(
-                acct.get("login")
-                or acct.get("account_login")
-                or ""
-            ).strip()
-
-            server = str(
-                acct.get("server")
-                or acct.get("account_server")
-                or ""
-            ).strip()
-
-            company = str(
-                acct.get("company")
-                or acct.get("broker_company")
-                or ""
-            ).strip()
-
-            login_ok = bool(
-                login
-                and login == want_login
+            account_keys = (
+                f"xtl:mt5:account:{dev}:demo",
+                f"xtl:mt5:account:{dev}:live",
+                f"xtl:mt5:account:last_user:{dev}",
+                f"xtl:mt5:account:last:{dev}:demo",
+                f"xtl:mt5:account:last:{dev}:live",
             )
 
-            server_ok = _broker_identity_matches(
-                want_server,
-                server,
-            )
+            account_candidates: list[dict] = []
 
-            company_ok = _broker_identity_matches(
-                want_company,
-                company,
-            )
+            for candidate_key in account_keys:
+                try:
+                    raw = R.get(candidate_key)
+                except Exception:
+                    raw = None
 
-            if not (
-                login_ok
-                and server_ok
-                and company_ok
-            ):
-                continue
+                if not raw:
+                    continue
 
-            try:
-                updated_cfg = dict(cfg)
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode(
+                        "utf-8",
+                        "replace",
+                    )
 
-                updated_cfg[
-                    "last_resolved_device_id"
-                ] = dev
+                try:
+                    loaded = json.loads(raw)
+                except Exception:
+                    loaded = {}
 
-                updated_cfg[
-                    "last_resolved_account_login"
-                ] = login
+                if not isinstance(loaded, dict):
+                    continue
 
-                updated_cfg[
-                    "last_resolved_account_server"
-                ] = (
-                    acct.get("server")
-                    or acct.get("account_server")
+                (
+                    candidate_login,
+                    candidate_server,
+                    candidate_company,
+                ) = _prop_account_identity(
+                    loaded,
                 )
 
-                updated_cfg[
-                    "last_resolved_broker_company"
-                ] = (
-                    acct.get("company")
-                    or acct.get("broker_company")
+                if (
+                    not candidate_login
+                    or not candidate_server
+                    or not candidate_company
+                ):
+                    continue
+
+                candidate_ms = _to_ms_any(
+                    loaded.get("server_received_ms")
+                    or loaded.get("updated_ts_ms")
+                    or loaded.get("received_ts_ms")
+                    or loaded.get("ts_ms")
+                    or loaded.get("broker_ts_ms")
+                    or 0
                 )
 
-                updated_cfg[
-                    "last_resolved_ts_ms"
-                ] = int(time.time() * 1000)
+                candidate = dict(loaded)
+                candidate["_account_key"] = candidate_key
+                candidate["_snapshot_ms"] = candidate_ms
 
-                R.set(
-                    prop_profile_key(
+                account_candidates.append(candidate)
+
+            account_candidates.sort(
+                key=lambda row: int(
+                    row.get("_snapshot_ms") or 0
+                ),
+                reverse=True,
+            )
+
+            # Test all current snapshots. Do not let one stale last_user
+            # snapshot hide the matching typed account snapshot.
+            for acct in account_candidates:
+                login, server, company = _prop_account_identity(
+                    acct,
+                )
+
+                login_ok = bool(
+                    login
+                    and login == want_login
+                )
+
+                server_ok = _broker_identity_matches(
+                    want_server,
+                    server,
+                )
+
+                company_ok = _broker_identity_matches(
+                    want_company,
+                    company,
+                )
+
+                if not (
+                    login_ok
+                    and server_ok
+                    and company_ok
+                ):
+                    continue
+
+                key = str(
+                    acct.get("_account_key") or ""
+                )
+
+                try:
+                    updated_cfg = dict(cfg)
+
+                    updated_cfg[
+                        "last_resolved_device_id"
+                    ] = dev
+
+                    updated_cfg[
+                        "last_resolved_account_login"
+                    ] = login
+
+                    updated_cfg[
+                        "last_resolved_account_server"
+                    ] = server
+
+                    updated_cfg[
+                        "last_resolved_broker_company"
+                    ] = company
+
+                    updated_cfg[
+                        "last_resolved_ts_ms"
+                    ] = int(time.time() * 1000)
+
+                    R.set(
+                        prop_profile_key(
+                            uid_u,
+                            pid,
+                        ),
+                        json.dumps(
+                            updated_cfg,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                    )
+
+                except Exception:
+                    log.exception(
+                        "[PROP] PROFILE_RESOLVE_META_SAVE_FAILED "
+                        "uid=%s profile=%s device=%s",
                         uid_u,
                         pid,
-                    ),
-                    json.dumps(
-                        updated_cfg,
-                        separators=(",", ":"),
-                        default=str,
-                    ),
-                )
+                        dev,
+                    )
 
-            except Exception:
-                log.exception(
-                    "[PROP] PROFILE_RESOLVE_META_SAVE_FAILED "
-                    "uid=%s profile=%s device=%s",
-                    uid_u,
-                    pid,
-                    dev,
-                )
+                return {
+                    "ok": True,
+                    "profile_id": pid,
+                    "device_id": dev,
+                    "account": acct,
+                    "account_key": key,
+                    "reason": "STRICT_MATCH_ACCOUNT",
+                }
 
-            return {
-                "ok": True,
-                "profile_id": pid,
-                "device_id": dev,
-                "account": acct,
-                "account_key": key,
-                "reason": "STRICT_MATCH_ACCOUNT",
-            }
+            
 
         # All user-owned devices were checked and none matched.
         return {
@@ -2497,7 +3756,24 @@ def _live_broker_tickets_for_prop(
             f"xtl:mt5:pos:{dev_id}:{acct}"
         )
 
-        js = json.loads(raw) if raw else []
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode(
+                "utf-8",
+                "replace",
+            )
+
+        try:
+            js = json.loads(raw) if raw else []
+        except Exception:
+            log.exception(
+                "[PROP] LIVE_BROKER_TICKETS_JSON_EXC "
+                "uid=%s profile=%s device=%s account=%s",
+                uid_u,
+                pid,
+                dev_id,
+                acct,
+            )
+            return tickets
 
         if isinstance(js, dict):
             positions = (
@@ -2522,6 +3798,7 @@ def _live_broker_tickets_for_prop(
 
         elif isinstance(js, list):
             positions = js
+
         else:
             positions = []
 
@@ -2536,7 +3813,9 @@ def _live_broker_tickets_for_prop(
             )
 
             if ticket not in (None, "", 0):
-                tickets.add(str(ticket))
+                tickets.add(
+                    str(ticket).strip()
+                )
 
     except Exception:
         log.exception(
@@ -3195,35 +4474,80 @@ def _estimate_position_risk_usd(symbol: str, side: str, entry: float, sl: float,
     return 0.0
 
 
-
-def _load_open_xtl_trades_by_ticket() -> dict[int, dict]:
+def _load_open_xtl_trades_by_ticket(
+    uid: str,
+    profile_id: str,
+) -> dict[int, dict]:
     out = {}
 
+    uid_u = str(uid or "").strip()
+    profile_u = str(profile_id or "").strip().lower()
+
+    if not uid_u:
+        return out
+
     try:
-        for k in R.scan_iter("xtl:strategy:oppt:open:*"):
+        rows = R.hgetall(
+            f"xtl:strategy:oppt:open:{uid_u}"
+        ) or {}
+
+        for _field, raw in (rows or {}).items():
             try:
-                rows = R.hgetall(k) or {}
-            except Exception:
-                rows = {}
-
-            for _field, raw in (rows or {}).items():
-                try:
-                    if not raw:
-                        continue
-
-                    t = json.loads(raw)
-                    if not isinstance(t, dict):
-                        continue
-
-                    ticket = int(t.get("mt5_ticket") or t.get("ticket") or 0)
-                    if ticket > 0:
-                        out[ticket] = t
-                except Exception:
+                if not raw:
                     continue
+
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode(
+                        "utf-8",
+                        "replace",
+                    )
+
+                t = json.loads(raw)
+
+                if not isinstance(t, dict):
+                    continue
+
+                #
+                # Strict profile isolation.
+                #
+                trade_profile = str(
+                    t.get("profile_id") or ""
+                ).strip().lower()
+
+                if trade_profile != profile_u:
+                    continue
+
+                ticket = int(
+                    t.get("mt5_ticket")
+                    or t.get("broker_ticket")
+                    or t.get("position_ticket")
+                    or t.get("ticket")
+                    or 0
+                )
+
+                if ticket <= 0:
+                    continue
+
+                #
+                # Extra ownership metadata.
+                #
+                t["_redis_uid"] = uid_u
+
+                out[ticket] = t
+
+            except Exception:
+                continue
+
     except Exception:
-        pass
+        log.exception(
+            "[PROP] LOAD_OPEN_XTL_BY_TICKET_FAILED "
+            "uid=%s profile=%s",
+            uid_u,
+            profile_u,
+        )
 
     return out
+
 
 def _load_live_broker_positions_for_profile(uid: str,profile_id: str | None = None, mt5_account: str = "demo") -> list[dict]:
     uid_u = _require_prop_runtime_uid(uid)
@@ -3325,30 +4649,231 @@ def _overlay_open_trade_state_for_ui(
       local open + broker ticket absent + no deal
         -> BROKER_RECON_PENDING
     """
-    result = [
-        dict(row)
-        for row in (rows or [])
-        if isinstance(row, dict)
-    ]
+    result: list[dict] = []
+
+    for source_row in (rows or []):
+        if not isinstance(source_row, dict):
+            continue
+
+        row = dict(source_row)
+
+        #
+        # Clear all previously attached trade-lifecycle overlay fields.
+        #
+        # The base opportunity/watch payload may contain stale TRADE_ACTIVE
+        # state from another execution profile or an earlier cached response.
+        # Only the UID/profile-specific overlay below is allowed to restore
+        # these fields.
+        #
+        row.pop("has_local_open_trade", None)
+        row.pop("open_trade_id", None)
+        row.pop("mt5_ticket", None)
+        row.pop("trade_state", None)
+        row.pop("trade_status", None)
+        row.pop("broker_position_present", None)
+        row.pop("broker_deal_present", None)
+        row.pop("broker_reconciliation_pending", None)
+        row.pop("entry_blocked", None)
+        row.pop("entry_block_reason", None)
+        row.pop("active_trade_side", None)
+        row.pop("active_trade_entry_price", None)
+        row.pop("active_trade_opened_at_ms", None)
+        row.pop("active_trade_sl", None)
+        row.pop("active_trade_tp", None)
+        row.pop("active_trade_broker_price", None)
+        row.pop("active_trade_broker_pnl", None)
+        row.pop("trade_state_reason", None)
+
+        #
+        # Remove stale lifecycle state from entry_gate while preserving
+        # genuine zone/reversal gate data.
+        #
+        entry_gate = row.get("entry_gate")
+
+        if isinstance(entry_gate, dict):
+            entry_gate = dict(entry_gate)
+
+            stale_gate_state = str(
+                entry_gate.get("trade_state")
+                or entry_gate.get("state")
+                or entry_gate.get("stage")
+                or ""
+            ).strip().upper()
+
+            if stale_gate_state in {
+                "TRADE_ACTIVE",
+                "BROKER_RECON_PENDING",
+                "BROKER_CLOSE_PENDING",
+            }:
+                entry_gate.pop("trade_state", None)
+                entry_gate.pop("trade_active", None)
+                entry_gate.pop("active_trade_side", None)
+                entry_gate.pop("mt5_ticket", None)
+
+                if str(
+                    entry_gate.get("state") or ""
+                ).strip().upper() in {
+                    "TRADE_ACTIVE",
+                    "BROKER_RECON_PENDING",
+                    "BROKER_CLOSE_PENDING",
+                }:
+                    entry_gate.pop("state", None)
+
+                if str(
+                    entry_gate.get("stage") or ""
+                ).strip().upper() in {
+                    "TRADE_ACTIVE",
+                    "BROKER_RECON_PENDING",
+                    "BROKER_CLOSE_PENDING",
+                }:
+                    entry_gate.pop("stage", None)
+
+                if str(
+                    entry_gate.get("reason") or ""
+                ).strip().upper() in {
+                    "SAME_SYMBOL_ACTIVE",
+                    "TRADE_ACTIVE",
+                    "BROKER_RECON_PENDING",
+                    "BROKER_CLOSE_PENDING",
+                    "BROKER_DEAL_PENDING_RECONCILIATION",
+                    "STALE_OPEN_LEDGER_NO_BROKER_DEAL",
+                }:
+                    entry_gate.pop("reason", None)
+
+                if entry_gate.get("blocked") is True:
+                    entry_gate.pop("blocked", None)
+
+            row["entry_gate"] = entry_gate
+
+        #
+        # Clear top-level display text only when it represents a stale
+        # trade lifecycle. Do not remove genuine gate/watch reasons.
+        #
+        stale_display_values = {
+            "TRADE_ACTIVE",
+            "BROKER_RECON_PENDING",
+            "BROKER_CLOSE_PENDING",
+        }
+
+        if str(
+            row.get("signal_text") or ""
+        ).strip().upper() in stale_display_values:
+            row["signal_text"] = None
+
+        if str(
+            row.get("reason") or ""
+        ).strip().upper() in stale_display_values:
+            row["reason"] = None
+
+        if str(
+            row.get("opp_reason") or ""
+        ).strip().upper() in stale_display_values:
+            row["opp_reason"] = None
+
+        if str(
+            row.get("watch_status") or ""
+        ).strip().lower() == "trade_active":
+            row["watch_status"] = None
+
+        result.append(row)
 
     uid_s = str(uid or "").strip()
     if not uid_s:
         return result
 
-    open_trades = _load_open_xtl_trades_for_uid(uid_s)
-    log.warning(
-        "[WATCHLIST] OPEN_TRADE_UI_STATE uid=%r open_tickets=%s",
+    active_pid = str(
+        profile_id or ""
+    ).strip().lower()
+
+    profile_cfg = _get_user_prop_config(
         uid_s,
+        active_pid,
+    )
+
+    want_login = str(
+        profile_cfg.get("account_login") or ""
+    ).strip()
+
+    want_server = str(
+        profile_cfg.get("account_server") or ""
+    ).strip()
+
+    want_company = str(
+        profile_cfg.get("broker_company") or ""
+    ).strip()
+
+    all_open_trades = _load_open_xtl_trades_for_uid(
+        uid_s,
+    )
+
+    open_trades = {}
+
+    for ticket, trade in all_open_trades.items():
+
+        if not isinstance(trade, dict):
+            continue
+
+        trade_pid = str(
+            trade.get("profile_id") or ""
+        ).strip().lower()
+
+        if trade_pid != active_pid:
+            continue
+
+        trade_login = str(
+            trade.get("account_login") or ""
+        ).strip()
+
+        trade_server = str(
+            trade.get("account_server") or ""
+        ).strip()
+
+        trade_company = str(
+            trade.get("broker_company") or ""
+        ).strip()
+
+        # Enforce account identity whenever the trade contains it.
+        # Legacy/repaired records remain isolated by UID + profile_id.
+        if trade_login and trade_login != want_login:
+            continue
+
+        if (
+            trade_server
+            and not _broker_identity_matches(
+                trade_server,
+                want_server,
+            )
+        ):
+            continue
+
+        if (
+            trade_company
+            and not _broker_identity_matches(
+                trade_company,
+                want_company,
+            )
+        ):
+            continue
+
+        open_trades[ticket] = trade
+
+    log.warning(
+        "[WATCHLIST] OPEN_TRADE_UI_STATE "
+        "uid=%s profile=%s open_tickets=%s",
+        uid_s,
+        active_pid,
         sorted(open_trades.keys()),
     )
     
 
     try:
+        
         broker_positions = _load_live_broker_positions_for_profile(
             uid_s,
             profile_id,
             mt5_account,
         )
+        
     except Exception:
         log.exception(
             "[WATCHLIST] OPEN_TRADE_UI_BROKER_LOAD_FAILED "
@@ -3626,51 +5151,61 @@ def _overlay_open_trade_state_for_ui(
 
 
 
+
+
 def _apply_user_open_trade_overlay_to_payload(
     payload: dict,
     uid: str | None,
+    profile_id: str | None = None,
 ) -> dict:
-    """
-    Return a response copy with user-specific open-trade state applied.
-
-    Never write the returned payload into the opportunity cache.
-    """
     if not isinstance(payload, dict):
         return payload
 
     uid_s = str(uid or "").strip()
 
-    if not uid_s:
-        return payload
-
-    active_profile_id = str(
-        _user_active_prop_profile_id(uid_s)
-        or ""
+    requested_pid = str(
+        profile_id or ""
     ).strip().lower()
 
-    if not active_profile_id:
-        log.warning(
-            "[WATCHLIST] OPEN_TRADE_UI_PROFILE_MISSING "
-            "uid=%s",
-            uid_s,
-        )
-        return payload
-
-    log.warning(
-        "[WATCHLIST] OPEN_TRADE_UI_APPLY "
-        "uid=%s profile=%s rows=%s",
-        uid_s,
-        active_profile_id,
-        len(payload.get("rows") or []),
+    resolved_pid = (
+        requested_pid
+        or str(
+            _user_active_prop_profile_id(uid_s)
+            or ""
+        ).strip().lower()
     )
 
     out = dict(payload)
+
+    #
+    # Always attach ownership fields.
+    #
+    out["overlay_uid"] = uid_s
+    out["overlay_profile_id"] = resolved_pid
+
+    if not uid_s or not resolved_pid:
+        log.error(
+            "[WATCHLIST] OPEN_TRADE_UI_OWNERSHIP_MISSING "
+            "uid=%s profile=%s",
+            uid_s,
+            resolved_pid,
+        )
+        return out
+
+    if resolved_pid not in _user_prop_profile_ids(uid_s):
+        log.error(
+            "[WATCHLIST] OPEN_TRADE_UI_PROFILE_NOT_OWNED "
+            "uid=%s profile=%s",
+            uid_s,
+            resolved_pid,
+        )
+        return out
 
     try:
         out["rows"] = _overlay_open_trade_state_for_ui(
             rows=out.get("rows") or [],
             uid=uid_s,
-            profile_id=active_profile_id,
+            profile_id=resolved_pid,
             mt5_account="demo",
         )
 
@@ -3679,21 +5214,252 @@ def _apply_user_open_trade_overlay_to_payload(
             "[WATCHLIST] OPEN_TRADE_UI_OVERLAY_FAILED "
             "uid=%s profile=%s",
             uid_s,
-            active_profile_id,
+            resolved_pid,
         )
 
     return out
+
+
+PROP_RISK_SNAPSHOT_VERSION = 1
+PROP_RISK_UI_MAX_AGE_MS = 30_000
+
+
+def _prop_risk_snapshot_key(
+    uid: str,
+    profile_id: str,
+) -> str:
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+
+    return (
+        f"xtl:prop:risk_state:"
+        f"{uid_u}:{pid}"
+    )
+
+
+def _store_prop_risk_snapshot(
+    uid: str,
+    profile_id: str,
+    risk_state: dict,
+    *,
+    source: str = "AUTHORITATIVE_COMPUTE",
+) -> dict:
+    """
+    Persist one complete authoritative prop-risk result.
+
+    The snapshot has no Redis TTL. Freshness is controlled using
+    risk_snapshot_generated_at_ms so readers never silently trust
+    an indefinitely stale value.
+    """
+    if not isinstance(risk_state, dict):
+        return risk_state
+
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+
+    now_ms = int(time.time() * 1000)
+
+    payload = dict(risk_state)
+    payload["risk_snapshot_version"] = int(
+        PROP_RISK_SNAPSHOT_VERSION
+    )
+    payload["risk_snapshot_generated_at_ms"] = now_ms
+    payload["risk_snapshot_source"] = str(
+        source or "AUTHORITATIVE_COMPUTE"
+    )
+    payload["risk_snapshot_uid"] = uid_u
+    payload["risk_snapshot_profile_id"] = pid
+
+    key = _prop_risk_snapshot_key(
+        uid_u,
+        pid,
+    )
+
+    try:
+        R.set(
+            key,
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+
+    except Exception:
+        log.exception(
+            "[PROP_RISK_SNAPSHOT] STORE_FAILED "
+            "uid=%s profile=%s key=%s",
+            uid_u,
+            pid,
+            key,
+        )
+
+    return payload
+
+
+def _read_prop_risk_snapshot(
+    uid: str,
+    profile_id: str,
+    *,
+    max_age_ms: int | None = PROP_RISK_UI_MAX_AGE_MS,
+    fallback_compute: bool = True,
+) -> dict:
+    """
+    Read the authoritative risk snapshot.
+
+    UI callers use a 30-second maximum age. If missing, malformed,
+    wrong-profile, or stale, one authoritative computation refreshes it.
+
+    Callers that must never trigger risk maintenance can pass:
+        fallback_compute=False
+    """
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+
+    key = _prop_risk_snapshot_key(
+        uid_u,
+        pid,
+    )
+
+    payload = {}
+
+    try:
+        raw = R.get(key)
+
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode(
+                "utf-8",
+                "ignore",
+            )
+
+        if raw:
+            parsed = (
+                json.loads(raw)
+                if isinstance(raw, str)
+                else raw
+            )
+
+            if isinstance(parsed, dict):
+                payload = parsed
+
+    except Exception:
+        log.exception(
+            "[PROP_RISK_SNAPSHOT] READ_FAILED "
+            "uid=%s profile=%s key=%s",
+            uid_u,
+            pid,
+            key,
+        )
+        payload = {}
+
+    valid_identity = bool(
+        payload
+        and str(
+            payload.get("risk_snapshot_uid") or ""
+        ).strip() == uid_u
+        and str(
+            payload.get("risk_snapshot_profile_id") or ""
+        ).strip().lower() == pid
+    )
+
+    generated_at_ms = 0
+
+    try:
+        generated_at_ms = int(
+            payload.get(
+                "risk_snapshot_generated_at_ms"
+            )
+            or 0
+        )
+    except Exception:
+        generated_at_ms = 0
+
+    now_ms = int(time.time() * 1000)
+
+    age_ms = (
+        now_ms - generated_at_ms
+        if generated_at_ms > 0
+        else None
+    )
+
+    fresh = bool(
+        valid_identity
+        and generated_at_ms > 0
+        and (
+            max_age_ms is None
+            or (
+                age_ms is not None
+                and 0 <= age_ms <= int(max_age_ms)
+            )
+        )
+    )
+
+    if fresh:
+        out = dict(payload)
+        out["risk_snapshot_age_ms"] = int(
+            age_ms or 0
+        )
+        out["risk_snapshot_cache_hit"] = True
+        return out
+
+    if not fallback_compute:
+        return {}
+
+    log.warning(
+        "[PROP_RISK_SNAPSHOT] REFRESH_REQUIRED "
+        "uid=%s profile=%s key=%s "
+        "present=%s valid_identity=%s age_ms=%s max_age_ms=%s",
+        uid_u,
+        pid,
+        key,
+        bool(payload),
+        valid_identity,
+        age_ms,
+        max_age_ms,
+    )
+
+    refreshed = _get_prop_risk_state(
+        uid_u,
+        pid,
+    )
+
+    if not isinstance(refreshed, dict):
+        return {}
+
+    out = dict(refreshed)
+    out["risk_snapshot_cache_hit"] = False
+    return out
+
 
 def _get_prop_risk_state(
     uid: str | None = None,
     profile_id: str | None = None,
 ) -> dict:
+
+    
     uid_u = _require_prop_runtime_uid(uid)
     pid = _norm_prop_profile_id(profile_id)
+    
+    _t_risk_start = time.perf_counter()
+
+    def _risk_stage(name: str, started: float) -> float:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        if elapsed_ms >= 50.0:
+            log.warning(
+                "[PROP_RISK_PERF] profile=%s stage=%s elapsed_ms=%.1f",
+                pid,
+                name,
+                elapsed_ms,
+            )
+
+        return time.perf_counter()
+    _t_stage = time.perf_counter()
     day = _prop_today(
         uid_u,
         pid,
     )
+    _t_stage = _risk_stage("prop_today", _t_stage)
 
     daily_key = _prop_uid_daily_key(
         uid_u,
@@ -3716,9 +5482,11 @@ def _get_prop_risk_state(
         uid_u,
         pid,
     )
+    _t_stage = _risk_stage("get_user_prop_config", _t_stage)
 
     # Only the active and enabled execution profile may mutate
     # daily reset state, losing-day streak, or reset notifications.
+    _t_stage = time.perf_counter()
     active_pid = _user_active_prop_profile_id(
         uid_u,
     )
@@ -3743,11 +5511,13 @@ def _get_prop_risk_state(
     # -------------------------------------------------
     if is_active_execution_profile:
         try:
+            _t_stage = time.perf_counter()
             _prop_clear_expired_daily_halt(
                 uid=uid_u,
                 profile_id=pid,
                 current_day=day,
             )
+            _t_stage = _risk_stage("clear_expired_daily_halt", _t_stage)
         except Exception:
             log.exception(
                 "[PROP] DAILY_HALT_RISK_STATE_CLEAR_EXC "
@@ -3758,7 +5528,9 @@ def _get_prop_risk_state(
 
     if is_active_execution_profile:
         try:
+            _t_stage = time.perf_counter()
             _prop_update_losing_day_streak(uid_u,pid)
+            _t_stage = _risk_stage("update_losing_day_streak", _t_stage)
         except Exception:
             log.exception(
                 "[PROP] LOSING_DAY_STREAK_EXC profile=%s",
@@ -3769,12 +5541,14 @@ def _get_prop_risk_state(
     stats = {}
 
     try:
+        _t_stage = time.perf_counter()
         daily = R.hgetall(daily_key) or {}
         open_risk = R.hgetall(open_risk_key) or {}
 
         
 
         stats = R.hgetall(stats_key) or {}
+        _t_stage = _risk_stage("redis_state_hgetall", _t_stage)
         
     except Exception:
         pass
@@ -3801,11 +5575,13 @@ def _get_prop_risk_state(
 
     total_open_risk = 0.0
     open_items = []
+    _t_stage = time.perf_counter()
     live_tickets = _live_broker_tickets_for_prop(
         uid_u,
         pid,
         "demo",
     )
+    _t_stage = _risk_stage("live_broker_tickets", _t_stage)
 
     for k, v in open_risk.items():
         try:
@@ -4151,9 +5927,9 @@ def _get_prop_risk_state(
                     f"Floating P/L: `${float(floating_pnl):.2f}`\n"
                     f"Daily loss limit: `${daily_loss_limit_notify:.2f}`"
                 )
-
+                _t_stage = time.perf_counter()
                 _discord_post(msg)
-
+                _t_stage = _risk_stage("discord_daily_reset_post", _t_stage)
                 try:
                     R.hset(
                         stats_key,
@@ -4497,9 +6273,12 @@ def _get_prop_risk_state(
     live_open_risk_usd = 0.0
 
     try:
+        _t_stage = time.perf_counter()
         broker_positions = _load_live_broker_positions_for_profile(uid,pid, "demo")
-        xtl_by_ticket = _load_open_xtl_trades_by_ticket()
-
+        _t_stage = _risk_stage("load_live_broker_positions", _t_stage)
+        
+        xtl_by_ticket = _load_open_xtl_trades_by_ticket(uid,pid,)
+        _t_stage = _risk_stage("load_open_xtl_trades", _t_stage)
         for bp in broker_positions:
             if not isinstance(bp, dict):
                 continue
@@ -4574,8 +6353,17 @@ def _get_prop_risk_state(
 
     live_open_positions_count = len(live_positions)
     live_projected_daily_loss_if_all_sl = float(daily_loss_used or 0.0) + float(live_open_risk_usd or 0.0)
+    _total_risk_ms = (
+        time.perf_counter() - _t_risk_start
+    ) * 1000.0
 
-    return {
+    if _total_risk_ms >= 100.0:
+        log.warning(
+            "[PROP_RISK_PERF] profile=%s stage=TOTAL elapsed_ms=%.1f",
+            pid,
+            _total_risk_ms,
+        )
+    result = {
         "profile_id": pid,
         "firm": firm_u,
         "phase": phase_u,
@@ -4662,6 +6450,13 @@ def _get_prop_risk_state(
             effective_risk_pct or 0.0
         ),
     }
+
+    return _store_prop_risk_snapshot(
+        uid_u,
+        pid,
+        result,
+        source="AUTHORITATIVE_COMPUTE",
+    )
 
 def _reserve_prop_open_risk(uid: str,trade_id: str, rec: dict, profile_id: str | None = None) -> None:
     if not trade_id:
@@ -4832,6 +6627,16 @@ def prop_profiles(
     user=Depends(require_prop_auth),
 ):
     uid = _require_prop_uid(user)
+    try:
+        _discover_missing_prop_profiles(
+            uid,
+        )
+    except Exception:
+        log.exception(
+            "[PROP] AUTO_DISCOVER_PROFILES_EXC "
+            "uid=%s",
+            uid,
+        )
 
     profile_ids = sorted(
         _user_prop_profile_ids(uid)
@@ -5327,34 +7132,42 @@ def prop_set_config(
         }
 
     try:
-        pid = _resolve_user_prop_profile_id(
-            uid,
-            requested_profile_id,
-        )
+        # -------------------------------------------------
+        # Allow first-time profile creation.
+        # Existing profiles are updated.
+        # New profiles are created.
+        # -------------------------------------------------
+        pid = requested_profile_id
+
+        known_profiles = _user_prop_profile_ids(uid)
 
         profile_key = _prop_uid_profile_cfg_key(
             uid,
             pid,
         )
 
-        existing_raw = R.get(profile_key)
         existing = {}
 
-        if existing_raw:
-            if isinstance(existing_raw, (bytes, bytearray)):
-                existing_raw = existing_raw.decode(
-                    "utf-8",
-                    "replace",
-                )
+        if pid in known_profiles:
+            existing_raw = R.get(profile_key)
 
-            existing = json.loads(existing_raw)
+            if existing_raw:
+                if isinstance(existing_raw, (bytes, bytearray)):
+                    existing_raw = existing_raw.decode(
+                        "utf-8",
+                        "replace",
+                    )
 
-            if not isinstance(existing, dict):
-                return {
-                    "ok": False,
-                    "error": "EXISTING_PROP_PROFILE_INVALID",
-                    "profile_id": requested_profile_id,
-                }
+                existing = json.loads(existing_raw)
+
+                if not isinstance(existing, dict):
+                    return {
+                        "ok": False,
+                        "error": "EXISTING_PROP_PROFILE_INVALID",
+                        "profile_id": pid,
+                    }
+
+        
 
         # Prevent accidental cross-firm overwrite of an existing profile.
         existing_firm = str(
@@ -5489,7 +7302,7 @@ def prop_status(
     except Exception:
         resolved = {}
 
-    acct = _get_profile_account(pid,uid,)
+    acct = _get_profile_account(uid,pid,)
 
     broker_balance = float(
         acct.get("balance")
@@ -5639,7 +7452,12 @@ def prop_risk(
             uid,
             pid,
         ),
-        "risk": _get_prop_risk_state(uid,pid),
+        "risk": _read_prop_risk_snapshot(
+            uid,
+            pid,
+            max_age_ms=PROP_RISK_UI_MAX_AGE_MS,
+            fallback_compute=True,
+        ),
     }
 
 @router.post("/prop/check")
@@ -5679,7 +7497,7 @@ def prop_check(
                 ),
             }
 
-        acct = _get_profile_account(pid,uid,)
+        acct = _get_profile_account(uid,pid,)
 
         # -------------------------------------------------
         # Fail closed: never size or approve a trade using
@@ -6514,26 +8332,99 @@ def _surface_h1_h4_zones_from_gate(out: dict, gm: dict) -> dict:
 
     return out
 
-def _resolve_live_device(sym_u: str) -> str | None:
-    """Pick a device that has a fresh OHLC snapshot for this symbol.
-    No uid, no hardcode — finds whoever is actually publishing."""
+
+def _resolve_live_device(
+    sym_u: str,
+) -> str | None:
+    """
+    Resolve the latest OHLC publisher for this symbol
+    and confirm that the device is currently online.
+
+    Uses deterministic Redis pointers only.
+    No keyspace SCAN.
+    """
+
+    sym = str(
+        sym_u or ""
+    ).upper().strip()
+
+    if not sym:
+        return None
+
     try:
-        best = None
-        best_t = -1
-        now_ms = int(time.time() * 1000)
-        for key in R.scan_iter(match=f"xtl:ohlc:snap:*:{sym_u}:H1", count=200):
-            k = key.decode() if isinstance(key, (bytes, bytearray)) else key
-            dev = k.split(":")[3]  # xtl:ohlc:snap:{dev}:{sym}:H1
-            # confirm the device is online via its hash
-            st = R.hget(f"device:{dev}", "status")
-            st = st.decode() if isinstance(st, (bytes, bytearray)) else st
-            if st != "online":
-                continue
-            hb = R.hget(f"device:{dev}", "last_heartbeat_ms")
-            hb = int(hb) if hb else 0
-            if hb > best_t:
-                best_t, best = hb, dev
-        return best
+        dev = R.get(
+            f"xtl:ohlc:latest:{sym}:H1"
+        )
+
+        if isinstance(
+            dev,
+            (bytes, bytearray),
+        ):
+            dev = dev.decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+        dev = str(
+            dev or ""
+        ).strip()
+
+        if not dev:
+            return None
+
+        device_key = (
+            f"device:{dev}"
+        )
+
+        status, heartbeat_raw = R.hmget(
+            device_key,
+            "status",
+            "last_heartbeat_ms",
+        )
+
+        if isinstance(
+            status,
+            (bytes, bytearray),
+        ):
+            status = status.decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+        status = str(
+            status or ""
+        ).strip().lower()
+
+        try:
+            heartbeat_ms = int(
+                heartbeat_raw or 0
+            )
+        except Exception:
+            heartbeat_ms = 0
+
+        now_ms = int(
+            time.time() * 1000
+        )
+
+        # Match the current heartbeat-hash lifetime.
+        # Device hash expires after about 600 seconds,
+        # but use a tighter live-device threshold here.
+        max_age_ms = 180_000
+
+        if status != "online":
+            return None
+
+        if heartbeat_ms <= 0:
+            return None
+
+        if (
+            now_ms - heartbeat_ms
+            > max_age_ms
+        ):
+            return None
+
+        return dev
+
     except Exception:
         return None
 
@@ -11113,93 +13004,156 @@ def _pick_last_closed_bar(snap: dict, tf: str, now_ms: int) -> dict | None:
         return c
     except Exception:
         return None
-def _read_freshest_snap_any_device(sym_u: str, tf: str):
+def _read_freshest_snap_any_device(
+    sym_u: str,
+    tf: str,
+):
     """
-    Try to find freshest device-scoped snap:
-      xtl:ohlc:snap:{dev}:{sym}:{tf}
+    Read the current globally latest OHLC snapshot
+    through the deterministic writer-maintained pointer:
 
-    If none exist (or none valid), fallback to:
-      xtl:ohlc:latest:{sym}:{tf}
+        xtl:ohlc:latest:<SYMBOL>:<TF>
 
-    NOTE: latest may be JSON OR a device-id pointer (e.g. "dev_...").
-    If pointer, dereference to device-scoped snap key.
+    The pointer contains the publishing device ID.
+    No Redis keyspace SCAN is performed.
 
-    Returns (snap_dict, dev) or (None, None)
+    Returns:
+        (snapshot_dict, device_id)
+
+    or:
+        (None, None)
     """
+
     try:
         R = _r()
-        sym_u = str(sym_u or "").upper().strip()
-        tf_u = str(tf or "").upper().strip()
 
-        # 1) legacy scan
-        pattern = f"xtl:ohlc:snap:*:{sym_u}:{tf_u}"
-        best_dev = None
-        best_snap = None
-        best_ms = -1
+        sym_u = str(
+            sym_u or ""
+        ).upper().strip()
 
-        for k in R.scan_iter(match=pattern, count=200):
-            key = k.decode("utf-8", "ignore") if isinstance(k, (bytes, bytearray)) else str(k)
-            parts = key.split(":")
-            if len(parts) < 6:
-                continue
-            dev = parts[3]
+        tf_u = str(
+            tf or ""
+        ).upper().strip()
 
-            snap, _ = _read_snap_for_device(dev, sym_u, tf_u)
-            if not isinstance(snap, dict):
-                continue
+        if not sym_u or not tf_u:
+            return (
+                None,
+                None,
+            )
 
-            ms = snap.get("updated_ms") or snap.get("ts_ms") or 0
+        latest_key = (
+            f"xtl:ohlc:latest:"
+            f"{sym_u}:{tf_u}"
+        )
+
+        latest_raw = _snap_get_raw_json(
+            latest_key
+        )
+
+        if not latest_raw:
+            return (
+                None,
+                None,
+            )
+
+        latest_device = None
+        snapshot_raw = latest_raw
+
+        # Normal current format:
+        # latest key contains a device-id pointer.
+        if isinstance(
+            latest_raw,
+            str,
+        ):
+            latest_text = (
+                latest_raw.strip()
+            )
+
+            if (
+                latest_text.startswith("dev_")
+                and not latest_text.startswith("{")
+                and not latest_text.startswith("[")
+            ):
+                latest_device = latest_text
+
+                snapshot_key = _snap_key(
+                    latest_device,
+                    sym_u,
+                    tf_u,
+                )
+
+                snapshot_raw = (
+                    _snap_get_raw_json(
+                        snapshot_key
+                    )
+                )
+
+                if not snapshot_raw:
+                    return (
+                        None,
+                        None,
+                    )
+
+        # Backward compatibility:
+        # an older deployment may have stored the
+        # complete snapshot directly in latest_key.
+        snapshot = (
+            snapshot_raw
+            if isinstance(
+                snapshot_raw,
+                dict,
+            )
+            else None
+        )
+
+        if snapshot is None:
             try:
-                ms = int(float(ms))
+                snapshot = (
+                    json.loads(
+                        snapshot_raw
+                    )
+                    if isinstance(
+                        snapshot_raw,
+                        str,
+                    )
+                    else None
+                )
             except Exception:
-                ms = 0
+                snapshot = None
 
-            bars = snap.get("bars") or snap.get("ohlc")
-            if not (isinstance(bars, list) and len(bars) >= 2):
-                continue
+        if not isinstance(
+            snapshot,
+            dict,
+        ):
+            return (
+                None,
+                None,
+            )
 
-            if ms > best_ms:
-                best_ms = ms
-                best_dev = dev
-                best_snap = snap
+        bars = (
+            snapshot.get("bars")
+            or snapshot.get("ohlc")
+        )
 
-        if best_snap:
-            return best_snap, best_dev
+        if not (
+            isinstance(bars, list)
+            and len(bars) >= 2
+        ):
+            return (
+                None,
+                None,
+            )
 
-        # 2) fallback: global latest key (may be JSON OR a device pointer)
-        key2 = f"xtl:ohlc:latest:{sym_u}:{tf_u}"
-        raw = _snap_get_raw_json(key2)
-        if not raw:
-            return (None, None)
+        return (
+            snapshot,
+            latest_device,
+        )
 
-        # If latest is a device-id pointer, dereference it
-        if isinstance(raw, str):
-            s = raw.strip()
-            if s.startswith("dev_") and (not s.startswith("{")) and (not s.startswith("[")):
-                key3 = _snap_key(s, sym_u, tf_u)
-                raw2 = _snap_get_raw_json(key3)
-                if raw2:
-                    raw = raw2  # now raw should be JSON snapshot content
-
-        # raw may already be dict (because _snap_get_raw_json may decode hashes)
-        snap2 = raw if isinstance(raw, dict) else None
-        if snap2 is None:
-            try:
-                snap2 = json.loads(raw) if isinstance(raw, str) else None
-            except Exception:
-                snap2 = None
-
-        if not isinstance(snap2, dict):
-            return (None, None)
-
-        bars2 = snap2.get("bars") or snap2.get("ohlc")
-        if not (isinstance(bars2, list) and len(bars2) >= 2):
-            return (None, None)
-
-        return (snap2, None)
     except Exception:
-        return (None, None)
-
+        return (
+            None,
+            None,
+        )
 
 # read a specific device snapshot for symbol/tf
 def _read_snap_for_device(device_id: str, symbol: str, tf: str, *, header_device: str | None = None):
@@ -11488,7 +13442,7 @@ def _read_freshest_snap_for_user_or_any(uid, sym_u: str, tfu: str):
     # 1) try user's devices (if you store them e.g. set user:{uid}:devices)
     dev_ids = []
     try:
-        dev_ids = list(R.smembers(f"user:{uid}:devices")) if uid else []
+        dev_ids = list(R.smembers(f"xtl:user:{uid}:devices")) if uid else []
     except Exception:
         dev_ids = []
     candidates = []
@@ -11502,24 +13456,66 @@ def _read_freshest_snap_for_user_or_any(uid, sym_u: str, tfu: str):
         except Exception:
             pass
 
-    # 2) fallback: any device with freshest update (light scan by symbol+tf)
+    
+    # -------------------------------------------------
+    # 2) Fallback to the writer-maintained global
+    # latest-device pointer. No Redis keyspace SCAN.
+    # -------------------------------------------------
     if not candidates:
         try:
-            # NOTE: if you index keys elsewhere, use that; SCAN pattern is fine on small sets
-            pattern = f"xtl:ohlc:snap:*:{sym_u}:{tfu}"
-            cur = 0
-            import json
-            while True:
-                cur, keys = R.scan(cur, match=pattern, count=50)
-                for k in keys:
-                    try:
-                        raw = R.get(k)
-                        if raw:
-                            candidates.append(json.loads(raw))
-                    except Exception:
-                        pass
-                if cur == 0:
-                    break
+            latest_dev = R.get(
+                f"xtl:ohlc:latest:"
+                f"{sym_u}:{tfu}"
+            )
+
+            if isinstance(
+                latest_dev,
+                (bytes, bytearray),
+            ):
+                latest_dev = latest_dev.decode(
+                    "utf-8",
+                    errors="ignore",
+                )
+
+            latest_dev = str(
+                latest_dev or ""
+            ).strip()
+
+            if latest_dev:
+                latest_key = (
+                    f"xtl:ohlc:snap:"
+                    f"{latest_dev}:"
+                    f"{sym_u}:{tfu}"
+                )
+
+                raw = R.get(
+                    latest_key
+                )
+
+                if raw:
+                    if isinstance(
+                        raw,
+                        (bytes, bytearray),
+                    ):
+                        raw = raw.decode(
+                            "utf-8",
+                            errors="ignore",
+                        )
+
+                    snap = (
+                        json.loads(raw)
+                        if isinstance(raw, str)
+                        else raw
+                    )
+
+                    if isinstance(
+                        snap,
+                        dict,
+                    ):
+                        candidates.append(
+                            snap
+                        )
+
         except Exception:
             pass
 
@@ -13080,6 +15076,20 @@ def trend_opportunities(
     debug_persist: bool = Query(False),
     debug_gate: int = Query(0),
     include_sr: str | None = Query(None),
+    refresh_uid: str | None = Query(
+        None,
+        include_in_schema=False,
+    ),
+
+    refresh_profile_id: str | None = Query(
+        None,
+        include_in_schema=False,
+    ),
+
+    refresh_device_id: str | None = Query(
+        None,
+        include_in_schema=False,
+    ),
     user=Depends(require_auth_optional),
 ):
     """
@@ -13162,9 +15172,76 @@ def trend_opportunities(
         except Exception:
            return None
 
-    uid_for_entry = str(
-        _uid_from_user(user) or ""
+    #
+    # Internal compute-service authentication.
+    #
+    # This path is valid only inside the dedicated process where
+    # XTL_OPPT_COMPUTE_ONLY=1. The public xauapi process therefore
+    # cannot accept refresh_uid/profile/device as an auth bypass.
+    #
+    _compute_only_process = (
+        str(
+            os.getenv(
+                "XTL_OPPT_COMPUTE_ONLY",
+                "0",
+            )
+            or "0"
+        ).strip().lower()
+        in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    )
+
+    _internal_token_expected = str(
+        os.getenv(
+            "OPPT_INTERNAL_TOKEN",
+            "",
+        )
+        or ""
     ).strip()
+
+    _internal_token_received = str(
+        request.headers.get(
+            "x-internal-refresh",
+            "",
+        )
+        or ""
+    ).strip()
+
+    _internal_refresh = bool(
+        _compute_only_process
+        and _internal_token_expected
+        and _internal_token_received
+        and secrets.compare_digest(
+            _internal_token_received,
+            _internal_token_expected,
+        )
+    )
+
+    if _compute_only_process and not _internal_refresh:
+        raise HTTPException(
+            status_code=403,
+            detail="INTERNAL_REFRESH_AUTH_REQUIRED",
+        )
+
+    if _internal_refresh:
+        uid_for_entry = str(
+            refresh_uid or ""
+        ).strip()
+
+        if not uid_for_entry:
+            raise HTTPException(
+                status_code=400,
+                detail="REFRESH_UID_REQUIRED",
+            )
+
+    else:
+        uid_for_entry = str(
+            _uid_from_user(user) or ""
+        ).strip()
 
     if not uid_for_entry:
         raise HTTPException(
@@ -13322,10 +15399,18 @@ def trend_opportunities(
     # ------------------------------------------------------------
     if uid_for_entry:
         try:
+            _requested_profile_id = (
+                str(
+                    refresh_profile_id or ""
+                ).strip().lower()
+                if _internal_refresh
+                else None
+            )
+
             execution_profile_id = str(
                 _resolve_user_prop_profile_id(
                     uid_for_entry,
-                    None,
+                    _requested_profile_id,
                 )
                 or ""
             ).strip().lower()
@@ -13372,21 +15457,50 @@ def trend_opportunities(
                 or ""
             ).strip()
 
-            if not resolved_device:
-                log.error(
-                    "[WATCHLIST] EXECUTION_DEVICE_MISSING "
-                    "uid=%s profile=%s",
+            #
+            # The profile execution context is the authoritative
+            # source of the current device.
+            #
+            # An internal caller may optionally provide a device
+            # for diagnostics, but the worker does not depend on
+            # a persisted/hardcoded device ID.
+            #
+            if _internal_refresh:
+                _requested_device_id = str(
+                    refresh_device_id or ""
+                ).strip()
+
+                if (
+                    _requested_device_id
+                    and resolved_device
+                    != _requested_device_id
+                ):
+                    log.error(
+                        "[OPPT_COMPUTE] "
+                        "REFRESH_DEVICE_MISMATCH "
+                        "uid=%s profile=%s "
+                        "requested=%s resolved=%s",
+                        uid_for_entry,
+                        execution_profile_id,
+                        _requested_device_id,
+                        resolved_device,
+                    )
+
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "REFRESH_DEVICE_MISMATCH"
+                        ),
+                    )
+
+                log.info(
+                    "[OPPT_COMPUTE] "
+                    "REFRESH_CONTEXT_RESOLVED "
+                    "uid=%s profile=%s device=%s",
                     uid_for_entry,
                     execution_profile_id,
+                    resolved_device,
                 )
-
-                return {
-                    "ok": False,
-                    "rows": [],
-                    "profile_id": execution_profile_id,
-                    "device_id": "",
-                    "reason": "EXECUTION_DEVICE_MISSING",
-                }
 
             request_device = str(
                 x_device_id_hdr
@@ -13651,6 +15765,10 @@ def trend_opportunities(
         and (not loose)
         and (str(include_sr or "").strip().lower() not in ("1", "true", "yes", "y", "on"))
     )
+    cache_key = None
+    cache_ttl_s = 0
+    last_good_cache_key = None
+    snapshot_meta_key = None
     if _is_slim_cacheable:
         _dev_for_key = ((effective_device or dev_for_gate or "").strip() or "nodev")
         _sym_for_key = ",".join(_sym_list(symbols))
@@ -13673,38 +15791,228 @@ def trend_opportunities(
             f"{_sym_for_key}"
         )
         cache_ttl_s = 10   # H1 gate/zone display tolerates ~10s staleness; price pushed separately
-    else:
-        cache_key = None
-        cache_ttl_s = 0
+        #
+        # Permanent cache infrastructure.
+        #
+        
 
-    # 1) fast-path: serve cache immediately (skips sweep + full loop)
-    if cache_key:
+        if cache_key:
+            last_good_cache_key = (
+                cache_key
+                + ":lastgood"
+            )
+
+            snapshot_meta_key = (
+                cache_key
+                + ":meta"
+            )
+    
+
+    
+    
+    # 1) Public requests may use fresh cache.
+    # Internal refresh requests must recompute.
+    if cache_key and not _internal_refresh:
         try:
             _cached_raw = R.get(cache_key)
+
             if _cached_raw:
-                _js = _json_load_twice(_cached_raw)
-                if isinstance(_js, dict) and _js.get("ok"):
+                _js = _json_load_twice(
+                    _cached_raw
+                )
+
+                if (
+                    isinstance(_js, dict)
+                    and _js.get("ok")
+                ):
                     _js["cached"] = True
-                    _js["cache_ttl_s"] = cache_ttl_s
+                    _js["cache_ttl_s"] = (
+                        cache_ttl_s
+                    )
+
                     try:
-                        _oppt_log.warning("OPPT_CACHE_HIT %s", cache_key)
+                        _oppt_log.warning(
+                            "OPPT_CACHE_HIT %s",
+                            cache_key,
+                        )
                     except Exception:
                         pass
-                    return _apply_user_open_trade_overlay_to_payload(
-                        _js,
-                        uid_for_entry,
+
+                    return (
+                        _apply_user_open_trade_overlay_to_payload(
+                            _js,
+                            uid_for_entry,
+                            execution_profile_id,
+                        )
                     )
+
         except Exception:
             pass
 
-        # -------------------------------------------------
-        # Single-flight anti-stampede lock.
+    # -------------------------------------------------
+    # Public serve-only boundary.
+    #
+    # A public request may read:
+    #   1. fresh cache, handled above;
+    #   2. bounded last-good snapshot, handled here.
+    #
+    # It must never enter the heavy opportunity
+    # computation path.
+    # -------------------------------------------------
+    if not _internal_refresh:
+        if (
+            cache_key
+            and last_good_cache_key
+        ):
+            try:
+                _last_good_raw = R.get(
+                    last_good_cache_key
+                )
+
+                if _last_good_raw:
+                    _last_good = (
+                        _json_load_twice(
+                            _last_good_raw
+                        )
+                    )
+
+                    if (
+                        isinstance(
+                            _last_good,
+                            dict,
+                        )
+                        and _last_good.get("ok")
+                    ):
+                        _computed_at_ms = int(
+                            _last_good.get(
+                                "computed_at_ms"
+                            )
+                            or 0
+                        )
+
+                        _now_ms = int(
+                            time.time() * 1000
+                        )
+
+                        _age_ms = (
+                            _now_ms
+                            - _computed_at_ms
+                            if _computed_at_ms > 0
+                            else -1
+                        )
+
+                        if (
+                            _computed_at_ms > 0
+                            and _age_ms >= 0
+                            and _age_ms
+                            <= int(
+                                OPPT_MAX_LAST_GOOD_AGE_MS
+                            )
+                        ):
+                            _served = dict(
+                                _last_good
+                            )
+
+                            _served["cached"] = True
+                            _served["stale"] = True
+                            _served["cache_note"] = (
+                                "public_last_good"
+                            )
+                            _served["age_ms"] = int(
+                                _age_ms
+                            )
+                            _served["cache_ttl_s"] = (
+                                cache_ttl_s
+                            )
+
+                            try:
+                                _oppt_log.warning(
+                                    "OPPT_PUBLIC_LASTGOOD_HIT "
+                                    "age_ms=%s key=%s",
+                                    _age_ms,
+                                    last_good_cache_key,
+                                )
+                            except Exception:
+                                pass
+
+                            return (
+                                _apply_user_open_trade_overlay_to_payload(
+                                    _served,
+                                    uid_for_entry,
+                                    execution_profile_id,
+                                )
+                            )
+
+                        try:
+                            _oppt_log.warning(
+                                "OPPT_PUBLIC_LASTGOOD_TOO_OLD "
+                                "age_ms=%s max_age_ms=%s "
+                                "key=%s",
+                                _age_ms,
+                                OPPT_MAX_LAST_GOOD_AGE_MS,
+                                last_good_cache_key,
+                            )
+                        except Exception:
+                            pass
+
+            except Exception:
+                log.exception(
+                    "[OPPT] "
+                    "PUBLIC_LASTGOOD_READ_FAILED "
+                    "key=%s",
+                    last_good_cache_key,
+                )
+
         #
-        # Exactly one request computes this cache key.
-        # Other requests wait briefly for the producer
-        # and never fall through into duplicate computation.
-        # -------------------------------------------------
-        inflight_lock_key = cache_key + ":lock"
+        # No acceptable snapshot exists.
+        #
+        # Return immediately. Never compute inside
+        # the public API request.
+        #
+        return JSONResponse(
+            status_code=202,
+            content={
+                "ok": True,
+                "busy": True,
+                "snapshot_warming": True,
+                "retry_after_ms": 3000,
+                "rows": [],
+                "history": [],
+                "mode": (
+                    "opportunities_snapshot_warming"
+                ),
+                "overlay_uid": str(
+                    uid_for_entry or ""
+                ).strip(),
+                "overlay_profile_id": str(
+                    execution_profile_id or ""
+                ).strip().lower(),
+            },
+            headers={
+                "Retry-After": "3",
+            },
+        )
+
+    # -------------------------------------------------
+    # Internal producer lock.
+    #
+    # Only the authenticated compute service may enter
+    # the heavy opportunity computation path.
+    # -------------------------------------------------
+    if _internal_refresh and not cache_key:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "INTERNAL_REFRESH_REQUIRES_"
+                "CACHEABLE_REQUEST"
+            ),
+        )
+
+    if cache_key and _internal_refresh:
+        inflight_lock_key = (
+            cache_key
+            + ":lock"
+        )
 
         try:
             inflight_got_lock = bool(
@@ -13718,7 +16026,111 @@ def trend_opportunities(
         except Exception:
             inflight_got_lock = False
 
+        
+
         if not inflight_got_lock:
+            #
+            # Another request is already refreshing this
+            # exact UID/profile/device snapshot.
+            #
+            # Serve the bounded last-good snapshot instead
+            # of waiting, when it is recent enough.
+            #
+            try:
+                _last_good_raw = (
+                    R.get(last_good_cache_key)
+                    if last_good_cache_key
+                    else None
+                )
+
+                if _last_good_raw:
+                    _last_good = _json_load_twice(
+                        _last_good_raw
+                    )
+
+                    if (
+                        isinstance(_last_good, dict)
+                        and _last_good.get("ok")
+                    ):
+                        _computed_at_ms = int(
+                            _last_good.get(
+                                "computed_at_ms"
+                            )
+                            or 0
+                        )
+
+                        _now_ms = int(
+                            time.time() * 1000
+                        )
+
+                        _last_good_age_ms = (
+                            _now_ms
+                            - _computed_at_ms
+                            if _computed_at_ms > 0
+                            else -1
+                        )
+
+                        if (
+                            _computed_at_ms > 0
+                            and _last_good_age_ms >= 0
+                            and _last_good_age_ms
+                            <= int(
+                                OPPT_MAX_LAST_GOOD_AGE_MS
+                            )
+                        ):
+                            _served = dict(
+                                _last_good
+                            )
+
+                            _served["cached"] = True
+                            _served["stale"] = True
+                            _served["cache_note"] = (
+                                "last_good_while_inflight"
+                            )
+                            _served["age_ms"] = int(
+                                _last_good_age_ms
+                            )
+                            _served[
+                                "cache_ttl_s"
+                            ] = cache_ttl_s
+
+                            try:
+                                _oppt_log.warning(
+                                    "OPPT_LASTGOOD_HIT "
+                                    "age_ms=%s key=%s",
+                                    _last_good_age_ms,
+                                    last_good_cache_key,
+                                )
+                            except Exception:
+                                pass
+
+                            return (
+                                _apply_user_open_trade_overlay_to_payload(
+                                    _served,
+                                    uid_for_entry,
+                                    execution_profile_id,
+                                )
+                            )
+
+                        try:
+                            _oppt_log.warning(
+                                "OPPT_LASTGOOD_TOO_OLD "
+                                "age_ms=%s max_age_ms=%s "
+                                "key=%s",
+                                _last_good_age_ms,
+                                OPPT_MAX_LAST_GOOD_AGE_MS,
+                                last_good_cache_key,
+                            )
+                        except Exception:
+                            pass
+
+            except Exception:
+                log.exception(
+                    "[OPPT] LASTGOOD_READ_FAILED "
+                    "key=%s",
+                    last_good_cache_key,
+                )
+
             _deadline = _time.time() + 8.0
 
             while _time.time() < _deadline:
@@ -13754,6 +16166,7 @@ def trend_opportunities(
                                 _apply_user_open_trade_overlay_to_payload(
                                     _js2,
                                     uid_for_entry,
+                                    execution_profile_id,
                                 )
                             )
 
@@ -13788,6 +16201,7 @@ def trend_opportunities(
                             _apply_user_open_trade_overlay_to_payload(
                                 _js3,
                                 uid_for_entry,
+                                execution_profile_id,
                             )
                         )
 
@@ -13830,12 +16244,40 @@ def trend_opportunities(
                         "mode": (
                             "opportunities_compute_inflight"
                         ),
+                        "overlay_uid": str(
+                            uid_for_entry or ""
+                        ).strip(),
+                        "overlay_profile_id": str(
+                            execution_profile_id or ""
+                        ).strip().lower(),
                     },
                     headers={
                         "Retry-After": "1",
                     },
                 )        
+    # -------------------------------------------------
+    # Hard process-level compute boundary.
+    #
+    # Only api.oppt_compute_app runs with:
+    #     XTL_OPPT_COMPUTE_ONLY=1
+    #
+    # The public xauapi process must never reach the
+    # heavy opportunity computation path, even if a
+    # future cache/serve-only regression occurs.
+    # -------------------------------------------------
+    if not _compute_only_process:
+        log.critical(
+            "[OPPT] PUBLIC_COMPUTE_BOUNDARY_BLOCKED "
+            "uid=%s profile=%s device=%s",
+            uid_for_entry,
+            execution_profile_id,
+            effective_device,
+        )
 
+        raise HTTPException(
+            status_code=503,
+            detail="PUBLIC_OPPORTUNITY_COMPUTE_DISABLED",
+        )
     # Build debug dict here; attach to rows later (row doesn't exist yet)
     oppt_dev_dbg = None
 
@@ -14440,7 +16882,13 @@ def trend_opportunities(
                         _side0,
                         "H1",
                     )
-                    R.delete(_watch_key)
+                    zone_watch_delete(
+                        R,
+                        uid_for_entry,
+                        _sym0,
+                        _side0,
+                        tf="H1",
+                    )
 
                     _opp_dir = "UP" if _side0 == "BUY" else "DOWN"
                     R.delete(f"xtl:trend:opp:active:{_sym0}:{_opp_dir}")
@@ -14456,16 +16904,13 @@ def trend_opportunities(
                         _rev_ms = 0
 
                     if _rev_ms > 0:
-                        R.delete(
-                            entry_claim_key(
-                                uid_for_entry,
-                                _sym0,
-                                _side0,
-                                _rev_ms,
-                                "H1",
-                            )
+                        delete_latest_entry_claim(
+                            R,
+                            uid_for_entry,
+                            _sym0,
+                            _side0,
+                            tf="H1",
                         )
-
                     # remove this break state too, so next discovery starts fresh
                     R.delete(_break_key)
 
@@ -15117,11 +17562,14 @@ def trend_opportunities(
         
 
         # cache + unlock (best effort)
+                
         if cache_key:
-            try:
-               R.setex(cache_key, cache_ttl_s, json.dumps(payload))
-            except Exception:
-               pass
+            _store_opportunity_snapshot(
+                cache_key=cache_key,
+                last_good_cache_key=last_good_cache_key,
+                payload=payload,
+                fresh_ttl_s=cache_ttl_s,
+            )
         try:
             if inflight_lock_key and inflight_got_lock:
                 R.delete(inflight_lock_key)
@@ -15134,6 +17582,7 @@ def trend_opportunities(
         return _apply_user_open_trade_overlay_to_payload(
             payload,
             uid_for_entry,
+            execution_profile_id,
         )
    
     def _fmt_zone(z):
@@ -15730,10 +18179,12 @@ def trend_opportunities(
    
 
     if cache_key:
-        try:
-            R.setex(cache_key, cache_ttl_s, json.dumps(payload, default=str))
-        except Exception:
-            pass
+        _store_opportunity_snapshot(
+            cache_key=cache_key,
+            last_good_cache_key=last_good_cache_key,
+            payload=payload,
+            fresh_ttl_s=cache_ttl_s,
+        )
 
     try:
         if inflight_lock_key and inflight_got_lock:
@@ -15745,6 +18196,7 @@ def trend_opportunities(
     return _apply_user_open_trade_overlay_to_payload(
         payload,
         uid_for_entry,
+        execution_profile_id,
     )
     
     # ---------- Reuse main prediction logic (need H1 + H4 because predict_all is TF-STRICT) ----------
@@ -17987,12 +20439,19 @@ def trend_opportunities(
     # FIX 2 (finish): write cache + unlock
     # -------------------------------------------------
     # write fresh cache + unlock
-    if cache_key and (not (debug_force or debug_gate or loose)):
-            
-        try:
-            R.setex(cache_key, cache_ttl_s, json.dumps(payload))
-        except Exception:
-            pass
+    if cache_key and (
+        not (
+            debug_force
+            or debug_gate
+            or loose
+        )
+    ):
+        _store_opportunity_snapshot(
+            cache_key=cache_key,
+            last_good_cache_key=last_good_cache_key,
+            payload=payload,
+            fresh_ttl_s=cache_ttl_s,
+        )
 
            
         try:
@@ -19075,16 +21534,40 @@ def trend_state2(
             except Exception:
                 pass
 
-        # last resort: scan a few matching device snaps (bounded)
+       
+        # Last resort: use the deterministic global
+        # latest-device pointer. No Redis keyspace SCAN.
         scanned_keys: list[str] = []
+
         if not dev_ids:
             try:
-                # limit to max 10 snaps to avoid heavy scans
-                it = R.scan_iter(match=f"xtl:ohlc:snap:*:{sym}:{tfu}", count=10)
-                for dkey in it:
-                    if isinstance(dkey, (bytes, bytearray)):
-                        dkey = dkey.decode("utf-8")
-                    scanned_keys.append(dkey)
+                latest_dev = R.get(
+                    f"xtl:ohlc:latest:"
+                    f"{sym}:{tfu}"
+                )
+
+                if isinstance(
+                    latest_dev,
+                    (bytes, bytearray),
+                ):
+                    latest_dev = (
+                        latest_dev.decode(
+                            "utf-8",
+                            errors="ignore",
+                        )
+                    )
+
+                latest_dev = str(
+                    latest_dev or ""
+                ).strip()
+
+                if latest_dev:
+                    scanned_keys.append(
+                        f"xtl:ohlc:snap:"
+                        f"{latest_dev}:"
+                        f"{sym}:{tfu}"
+                    )
+
             except Exception:
                 scanned_keys = []
 

@@ -1,6 +1,8 @@
 ﻿# xtl/mt5_client.py — robust MT5 init + closed-bar fetch (safe update)
 from __future__ import annotations
 import os, time, subprocess
+import threading
+from functools import wraps
 
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -13,7 +15,27 @@ TRIED_LOG: list[str] = []
 _MT5_READY = False
 
 
+# One MT5 terminal/IPC connection is shared by several Agent threads.
+# Serialize only broker API access; HTTP, Redis and analytics remain parallel.
+MT5_API_LOCK = threading.RLock()
+
+
+def mt5_locked(fn):
+    """
+    Serialize a complete critical MT5 transaction.
+
+    RLock is required because a protected function may call another protected
+    function, for example mt5_get_open_positions() -> mt5_init().
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        with MT5_API_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
 # Attach-only guard: detect if MT5 is already running.
+
 def _mt5_running() -> bool:
     try:
         import os
@@ -72,14 +94,29 @@ def _find_running_mt5_exe() -> str | None:
     return None
 
 
-def mt5_get_open_positions() -> list[dict]:
+@mt5_locked
+def mt5_get_open_positions() -> list[dict] | None:
+    """
+    Return:
+      list[dict] - valid broker snapshot, including [] when genuinely no positions
+      None       - MT5/IPC read failure; caller must not publish it as empty
+    """
     if not mt5_init():
-        return []
+        _log(
+            "[mt5_positions] snapshot invalid "
+            "reason=MT5_INIT_FAILED"
+        )
+        return None
 
     try:
         positions = MT5.positions_get()
+
         if positions is None:
-            return []
+            _log(
+                "[mt5_positions] snapshot invalid "
+                f"reason=POSITIONS_GET_FAILED last_error={MT5.last_error()}"
+            )
+            return None
 
         out = []
         symbol_meta_cache: dict[str, dict] = {}
@@ -165,8 +202,12 @@ def mt5_get_open_positions() -> list[dict]:
                 continue
 
         return out
-    except Exception:
-        return []
+    except Exception as e:
+        _log(
+            "[mt5_positions] snapshot invalid "
+            f"reason=EXCEPTION error={type(e).__name__}:{e}"
+        )
+        return None
 
 
 def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
@@ -408,7 +449,7 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
             
         }
 
-
+@mt5_locked
 def mt5_calc_order_margin(
     symbol: str,
     side: str,
@@ -1424,7 +1465,7 @@ def _mt5_last_error():
     except Exception:
         return (None, "unknown")
 
-
+@mt5_locked
 def _mt5_reconnect():
     """
     Hard reconnect to terminal:
@@ -1905,7 +1946,7 @@ def _np_to_dicts(rates) -> List[Dict]:
     return out
 
 
-def _assert_tail_parity(sym, tf_code, tf_ms, rows):
+def _assert_tail_parity(sym, tf_code, tf_ms, rows ,broker_off_ms=0,):
     try:
         probe = MT5.copy_rates_from_pos(sym, tf_code, 1, 1)
         if probe is None:
@@ -1916,7 +1957,10 @@ def _assert_tail_parity(sym, tf_code, tf_ms, rows):
             probe = [probe]
         if len(probe) != 1 or not rows:
             return
-        t_ms = int(probe[0]["time"]) * 1000
+        t_ms = (
+            int(probe[0]["time"]) * 1000
+            - int(broker_off_ms or 0)
+)
         if rows[-1]["t_open_ms"] != t_ms:
             raise RuntimeError(
                 f"Tail parity fail: rows[-1]={rows[-1]['t_open_ms']} vs MT5.prev={t_ms}"
@@ -2033,6 +2077,7 @@ def mt5_fetch_rates(
         _log(f"[mt5_tz] probe={probe} stored={stored_int} chosen_off={off_min_fresh}")
     except Exception:
         pass
+    
     # If probe failed (MT5 not connected in this session), bootstrap from any good hive
     # If probe failed, bootstrap only from trusted auto_detected hive.
     if probe is None:
@@ -2054,22 +2099,40 @@ def mt5_fetch_rates(
 
         except Exception:
             pass
+    # ------------------------------------------------------------
+    # Canonical timestamp conversion.
+    # off_min_fresh is final at this point, including bootstrap.
+    # ------------------------------------------------------------
+    broker_off_ms = int(off_min_fresh) * 60_000
 
-    # --- broker "now" (prefer live tick) ---
+    def _broker_epoch_to_utc_ms(value):
+        try:
+            raw = int(value or 0)
+            if raw <= 0:
+                return 0
+
+            raw_ms = (
+                raw
+                if raw >= 1_000_000_000_000
+                else raw * 1000
+            )
+
+            return raw_ms - broker_off_ms
+
+        except Exception:
+            return 0
+    
+    # Candle completion is determined by canonical UTC wall time.
+    # Never advance completion using a broker-shifted tick timestamp.
     local_now_ms = int(_time.time() * 1000)
     now_ms = local_now_ms
-    try:
-        _tick = MT5.symbol_info_tick(sym)
-        tmsc = int(getattr(_tick, "time_msc", 0) or 0)
-        if tmsc > 0 and tmsc >= local_now_ms - (2 * tf_ms):
-            now_ms = tmsc
-    except Exception:
-        pass
 
-    # --- initial broker-grid slot (OPEN of forming bar) ---
-
-    slot_ms = (now_ms // tf_ms) * tf_ms
-
+    # Current forming-bar open, aligned to the broker timeframe grid,
+    # but expressed as canonical UTC epoch.
+    slot_ms = (
+        ((now_ms + broker_off_ms) // tf_ms) * tf_ms
+        - broker_off_ms
+    )
     need = int(count or 300)
 
     try:
@@ -2131,27 +2194,48 @@ def mt5_fetch_rates(
         _log(f"[mt5_fetch_rates] giving up select for {sym} (resolved={resolved_sym})")
         return []
 
-    # --- refresh 'now' from RESOLVED symbol tick; realign; FREEZE slot0_ms ---
-    slot0_ms = slot_ms  # default in case tick2 unavailable
+    
+    # Freeze canonical broker-grid boundary for this fetch.
+    slot0_ms = slot_ms
+
+    # Tick is diagnostic only. It must not move the completion boundary.
     try:
         _tick2 = MT5.symbol_info_tick(resolved_sym)
-        tmsc2 = int(getattr(_tick2, "time_msc", 0) or 0)
-        if tmsc2 > 0:
-            now_ms = tmsc2
-            slot_ms = (now_ms // tf_ms) * tf_ms
-            slot0_ms = slot_ms
-            _log(
-                f"[mt5_fetch_rates] tick2.time_msc={tmsc2} -> recomputed slot_ms={slot_ms}; slot0_ms(frozen)={slot0_ms} tf={tf_label}"
-            )
+        raw_tick_ms = int(getattr(_tick2, "time_msc", 0) or 0)
+        canonical_tick_ms = (
+            _broker_epoch_to_utc_ms(raw_tick_ms)
+            if raw_tick_ms > 0
+            else 0
+        )
+
+        _log(
+            "[mt5_fetch_rates] "
+            f"tick_raw_ms={raw_tick_ms} "
+            f"tick_utc_ms={canonical_tick_ms} "
+            f"server_utc_ms={now_ms} "
+            f"slot0_utc_ms={slot0_ms} "
+            f"broker_off_min={off_min_fresh}"
+        )
     except Exception:
         pass
 
+    # ------------------------------------------------------------
+    # M1 anchor is diagnostic only.
+    # It must never advance or replace the canonical slot0_ms.
+    # ------------------------------------------------------------
     try:
         _log(
-            f"[mt5_fetch_rates] slot0_ms(frozen)={slot0_ms} tf_ms={tf_ms} tf={tf_label}"
+            f"[mt5_fetch_rates] slot0_ms(frozen)={slot0_ms} "
+            f"tf_ms={tf_ms} tf={tf_label}"
         )
 
-        _arr = MT5.copy_rates_from_pos(resolved_sym, MT5.TIMEFRAME_M1, 1, 2)
+        _arr = MT5.copy_rates_from_pos(
+            resolved_sym,
+            MT5.TIMEFRAME_M1,
+            1,
+            1,
+        )
+
         if _arr is None:
             _arr = []
         else:
@@ -2161,18 +2245,36 @@ def mt5_fetch_rates(
                 _arr = [_arr]
 
         if len(_arr) >= 1:
-            _rr = _arr[-1]  # last CLOSED M1 bar
-            _m1_open_ms = int(_f(_rr, "time", 0)) * 1000
-            _m1_close_ms = _m1_open_ms + 60_000
-            slot0_ms = (_m1_close_ms // tf_ms) * tf_ms  # snap close to TF grid
+            _rr = _arr[-1]
+
+            _m1_open_ms = _broker_epoch_to_utc_ms(
+                _f(_rr, "time", 0)
+            )
+            _m1_close_ms = (
+                _m1_open_ms + 60_000
+                if _m1_open_ms > 0
+                else 0
+            )
+
             _log(
-                f"[mt5_fetch_rates] anchor ok: M1 lastClosed={_m1_close_ms} -> slot0_ms={slot0_ms} (tf={tf_label})"
+                "[mt5_fetch_rates] M1_ANCHOR_DIAG "
+                f"open_utc_ms={_m1_open_ms} "
+                f"close_utc_ms={_m1_close_ms} "
+                f"slot0_utc_ms={slot0_ms} "
+                f"tf={tf_label}"
             )
         else:
-            _log("[mt5_fetch_rates] anchor skipped: no M1 bars returned")
+            _log(
+                "[mt5_fetch_rates] M1_ANCHOR_DIAG "
+                f"skipped=no_closed_m1 slot0_utc_ms={slot0_ms} "
+                f"tf={tf_label}"
+            )
+
     except Exception as _e_anchor:
         _log(
-            f"[mt5_fetch_rates] anchor fallback (kept original slot0_ms); err={_e_anchor}"
+            "[mt5_fetch_rates] M1_ANCHOR_DIAG_FAIL "
+            f"slot0_utc_ms={slot0_ms} "
+            f"tf={tf_label} err={_e_anchor}"
         )
 
     # --- MT5 readiness & TF mapping ---
@@ -2254,25 +2356,46 @@ def mt5_fetch_rates(
                 digits = 5
 
             for r in tail_list:
-                t_open_ms = int(_f(r, "time", 0)) * 1000
+                raw_t_sec = int(_f(r, "time", 0))
+                t_open_ms = _broker_epoch_to_utc_ms(raw_t_sec)
                 t_close_ms = t_open_ms + tf_ms
-                # keep ONLY closed bars not beyond the frozen slot
-                if t_close_ms <= slot0_ms:
+
+                if (
+                    t_open_ms > 0
+                    and t_close_ms <= slot0_ms
+                    and t_close_ms <= now_ms + 10_000
+                ):
                     rows.append(
                         {
-                            "t": int(_f(r, "time", 0)),
+                            "t": int(t_open_ms // 1000),
                             "o": float(_f(r, "open", 0.0)),
                             "h": float(_f(r, "high", 0.0)),
                             "l": float(_f(r, "low", 0.0)),
                             "c": float(_f(r, "close", 0.0)),
-                            "v": int(_f(r, "tick_volume", _f(r, "real_volume", 0))),
-                            # keep existing fields:
-                            "t_open_ms": t_open_ms,
-                            "t_close_ms": t_close_ms,
+                            "v": int(
+                                _f(
+                                    r,
+                                    "tick_volume",
+                                    _f(r, "real_volume", 0),
+                                )
+                            ),
+                            "t_open_ms": int(t_open_ms),
+                            "t_close_ms": int(t_close_ms),
                             "complete": True,
                         }
                     )
 
+                elif t_close_ms > now_ms + 10_000:
+                    _log(
+                        "[P0_FUTURE_BAR_REJECT] "
+                        f"symbol={sym} tf={tf_label} "
+                        f"raw_t={raw_t_sec} "
+                        f"open_utc_ms={t_open_ms} "
+                        f"close_utc_ms={t_close_ms} "
+                        f"server_utc_ms={now_ms} "
+                        f"ahead_ms={t_close_ms - now_ms} "
+                        f"broker_off_min={off_min_fresh}"
+                    )
             rows = rows[-need:]  # clamp to requested count
     except Exception as e:
         _log(f"[mt5_fetch_rates] pos-tail fetch error (will fallback to range): {e}")
@@ -2300,7 +2423,13 @@ def mt5_fetch_rates(
             pass
             # --- sanity: force tail to match MT5's previous CLOSED bar ---
         try:
-            _probe = MT5.copy_rates_from_pos(resolved_sym, tf_code, 1, 1)
+            _probe = MT5.copy_rates_from_pos(
+                resolved_sym,
+                tf_code,
+                1,
+                1,
+            )
+
             if _probe is None:
                 _probe = []
             else:
@@ -2308,27 +2437,58 @@ def mt5_fetch_rates(
                     _probe = list(_probe)
                 except Exception:
                     _probe = [_probe]
+
             if len(_probe) == 1 and rows:
-                _t_ms = int(_probe[0]["time"]) * 1000
-                if rows[-1]["t_open_ms"] != _t_ms:
-                    r = _probe[0]
-                    t_open_ms = int(r["time"]) * 1000
+                r = _probe[0]
+
+                probe_open_ms = _broker_epoch_to_utc_ms(
+                    _f(r, "time", 0)
+                )
+                probe_close_ms = probe_open_ms + tf_ms
+
+                if (
+                    probe_open_ms > 0
+                    and probe_close_ms <= slot0_ms
+                    and probe_close_ms <= now_ms + 10_000
+                    and rows[-1]["t_open_ms"] != probe_open_ms
+                ):
                     rows[-1].update(
                         {
-                            "t": int(r["time"]),
-                            "o": float(r["open"]),
-                            "h": float(r["high"]),
-                            "l": float(r["low"]),
-                            "c": float(r["close"]),
-                            "v": int(r.get("tick_volume", r.get("real_volume", 0))),
-                            "t_open_ms": t_open_ms,
-                            "t_close_ms": t_open_ms + tf_ms,
+                            "t": int(probe_open_ms // 1000),
+                            "o": float(_f(r, "open", 0.0)),
+                            "h": float(_f(r, "high", 0.0)),
+                            "l": float(_f(r, "low", 0.0)),
+                            "c": float(_f(r, "close", 0.0)),
+                            "v": int(
+                                _f(
+                                    r,
+                                    "tick_volume",
+                                    _f(r, "real_volume", 0),
+                                )
+                            ),
+                            "t_open_ms": int(probe_open_ms),
+                            "t_close_ms": int(probe_close_ms),
                             "complete": True,
                         }
                     )
-        except Exception:
-            pass
-        _assert_tail_parity(resolved_sym, tf_code, tf_ms, rows)
+
+        except Exception as exc:
+            _log(
+                "[mt5_fetch_rates] "
+                f"PARITY_PROBE_FAIL "
+                f"symbol={sym} "
+                f"tf={tf_label} "
+                f"err={exc}"
+            )
+
+        _assert_tail_parity(
+            resolved_sym,
+            tf_code,
+            tf_ms,
+            rows,
+            broker_off_ms,
+        )
+
         return rows
 
     # --- main slice logic ---
@@ -2342,7 +2502,12 @@ def mt5_fetch_rates(
             _log("[mt5_fetch_rates] no raw rates returned by MT5; returning []")
             return []
 
-        opens_ms = [int(_f(r, "time", 0)) * 1000 for r in rates]
+        opens_ms = [
+            _broker_epoch_to_utc_ms(
+                _f(r, "time", 0)
+            )
+            for r in rates
+        ]
         closes_ms = [o + tf_ms for o in opens_ms]
 
         # --- opportunistic broker-TZ detection (LOG ONLY; no more registry writes) ---
@@ -2359,8 +2524,14 @@ def mt5_fetch_rates(
                 arr2_list = [arr2] if arr2 is not None else []
             if len(arr2_list) >= 1:
                 rr = arr2_list[-1]
-                t_open_ms2 = int(_ff(rr, "time", 0)) * 1000
-                last_close = t_open_ms2 + 60_000
+                t_open_ms2 = _broker_epoch_to_utc_ms(
+                    _ff(rr, "time", 0)
+                )
+                last_close = (
+                    t_open_ms2 + 60_000
+                    if t_open_ms2 > 0
+                    else None
+                )
 
             if last_close is None and closes_ms:
                 last_close = closes_ms[-1]
@@ -2430,13 +2601,20 @@ def mt5_fetch_rates(
 
         rows = []
         for r in picked:
-            t_open_ms = int(_f(r, "time", 0)) * 1000
+            t_open_ms = _broker_epoch_to_utc_ms(
+                _f(r, "time", 0)
+            )
             t_close_ms = t_open_ms + tf_ms
-            if t_close_ms > slot0_ms:
+
+            if (
+                t_open_ms <= 0
+                or t_close_ms > slot0_ms
+                or t_close_ms > now_ms + 10_000
+            ):
                 continue
             rows.append(
                 {
-                    "t": int(_f(r, "time", 0)),
+                    "t": int(t_open_ms // 1000),
                     "o": float(_f(r, "open", 0.0)),  # ✅ no round()
                     "h": float(_f(r, "high", 0.0)),
                     "l": float(_f(r, "low", 0.0)),
@@ -2472,35 +2650,67 @@ def mt5_fetch_rates(
                         tail_list = [tail]
                 if len(tail_list) >= 1:
                     rr = tail_list[-1]
-                    t_open_ms2 = int(_f(rr, "time", 0)) * 1000
+                    t_open_ms2 = _broker_epoch_to_utc_ms(
+                        _f(rr, "time", 0)
+                    )
                     t_close_ms2 = t_open_ms2 + tf_ms
-                    if t_close_ms2 <= slot0_ms:
+
+                    if (
+                        t_open_ms2 > 0
+                        and t_close_ms2 <= slot0_ms
+                        and t_close_ms2 <= now_ms + 10_000
+                    ):
                         # avoid duplicate of last row
-                        dup = rows and rows[-1]["t_open_ms"] == t_open_ms2
+                        dup = (
+                            rows
+                            and rows[-1]["t_open_ms"] == t_open_ms2
+                        )
+
                         if not dup:
                             rows.append(
                                 {
-                                    "t": int(_f(rr, "time", 0)),
+                                    "t": int(t_open_ms2 // 1000),
                                     "o": float(
-                                        _f(rr, "open", rows[-1]["c"] if rows else 0.0)
-                                    ),  # ✅ no round()
+                                        _f(
+                                            rr,
+                                            "open",
+                                            rows[-1]["c"] if rows else 0.0,
+                                        )
+                                    ),
                                     "h": float(
-                                        _f(rr, "high", rows[-1]["c"] if rows else 0.0)
+                                        _f(
+                                            rr,
+                                            "high",
+                                            rows[-1]["c"] if rows else 0.0,
+                                        )
                                     ),
                                     "l": float(
-                                        _f(rr, "low", rows[-1]["c"] if rows else 0.0)
+                                        _f(
+                                            rr,
+                                            "low",
+                                            rows[-1]["c"] if rows else 0.0,
+                                        )
                                     ),
                                     "c": float(
-                                        _f(rr, "close", rows[-1]["c"] if rows else 0.0)
+                                        _f(
+                                            rr,
+                                            "close",
+                                            rows[-1]["c"] if rows else 0.0,
+                                        )
                                     ),
                                     "v": int(
-                                        _f(rr, "tick_volume", _f(rr, "real_volume", 0))
+                                        _f(
+                                            rr,
+                                            "tick_volume",
+                                            _f(rr, "real_volume", 0),
+                                        )
                                     ),
-                                    "t_open_ms": t_open_ms2,
-                                    "t_close_ms": t_open_ms2 + tf_ms,
+                                    "t_open_ms": int(t_open_ms2),
+                                    "t_close_ms": int(t_close_ms2),
                                     "complete": True,
                                 }
                             )
+                        
             except Exception:
                 pass
 
@@ -2547,7 +2757,13 @@ def mt5_fetch_rates(
 
         # --- sanity: force tail to match MT5's previous CLOSED bar ---
         try:
-            _probe = MT5.copy_rates_from_pos(resolved_sym, tf_code, 1, 1)
+            _probe = MT5.copy_rates_from_pos(
+                resolved_sym,
+                tf_code,
+                1,
+                1,
+            )
+
             if _probe is None:
                 _probe = []
             else:
@@ -2555,29 +2771,58 @@ def mt5_fetch_rates(
                     _probe = list(_probe)
                 except Exception:
                     _probe = [_probe]
+
             if len(_probe) == 1 and rows:
-                _t_ms = int(_probe[0]["time"]) * 1000
-                if rows[-1]["t_open_ms"] != _t_ms:
-                    r = _probe[0]
-                    t_open_ms = int(r["time"]) * 1000
+                r = _probe[0]
+
+                probe_open_ms = _broker_epoch_to_utc_ms(
+                    _f(r, "time", 0)
+                )
+                probe_close_ms = probe_open_ms + tf_ms
+
+                if (
+                    probe_open_ms > 0
+                    and probe_close_ms <= slot0_ms
+                    and probe_close_ms <= now_ms + 10_000
+                    and rows[-1]["t_open_ms"] != probe_open_ms
+                ):
                     rows[-1].update(
                         {
-                            "t": int(r["time"]),
-                            "o": float(r["open"]),
-                            "h": float(r["high"]),
-                            "l": float(r["low"]),
-                            "c": float(r["close"]),
-                            "v": int(r.get("tick_volume", r.get("real_volume", 0))),
-                            "t_open_ms": t_open_ms,
-                            "t_close_ms": t_open_ms + tf_ms,
+                            "t": int(probe_open_ms // 1000),
+                            "o": float(_f(r, "open", 0.0)),
+                            "h": float(_f(r, "high", 0.0)),
+                            "l": float(_f(r, "low", 0.0)),
+                            "c": float(_f(r, "close", 0.0)),
+                            "v": int(
+                                _f(
+                                    r,
+                                    "tick_volume",
+                                    _f(r, "real_volume", 0),
+                                )
+                            ),
+                            "t_open_ms": int(probe_open_ms),
+                            "t_close_ms": int(probe_close_ms),
                             "complete": True,
                         }
                     )
-        except Exception:
-            pass
 
-        _assert_tail_parity(resolved_sym, tf_code, tf_ms, rows)
+        except Exception as exc:
+            _log(
+                "[mt5_fetch_rates] "
+                f"PARITY_PROBE_FAIL "
+                f"symbol={sym} "
+                f"tf={tf_label} "
+                f"err={exc}"
+            )
+
+        _assert_tail_parity(
+            resolved_sym,
+            tf_code,
+            tf_ms,
+            rows,
+            broker_off_ms,
+        )
+
         return rows
-
     _log("[mt5_fetch_rates] unexpected fallthrough; returning []")
     return []

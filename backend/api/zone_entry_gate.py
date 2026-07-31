@@ -761,7 +761,10 @@ def _pick_display_zones_from_sr(sr_all: dict, price: float, atr: float, tf_tag: 
 
 from api.tenant_keys import (
     zone_watch_key,
+    zone_watch_set,
+    zone_watch_delete,
     break_state_key,
+    delete_latest_entry_claim,
 )
 def _watch_key(
     uid: str,
@@ -2025,19 +2028,39 @@ def zone_reversal_gate(
 
             if rev_ok_ms > 0 and latest_complete_close_ms > 0 and rev_ok_ms > latest_complete_close_ms:
                 # RC candle close time is in the future — forming candle was used
-                # Roll back to REV_WATCH cleanly
+                # Roll back to REV_WATCH cleanly, clearing EVERY field the
+                # confirmation path wrote (not just rev_ok_bar_*), so no
+                # half-armed REV_WATCH state with a live trigger_level
+                # survives. None-valued fields are dropped by the
+                # `if v is not None` persist filter below.
                 watch["state"] = "REV_WATCH"
                 watch["rev_ok"] = False
                 watch["rev_ok_ms"] = 0
-                watch["rev_ok_bar_hi"] = None
-                watch["rev_ok_bar_lo"] = None
-                watch["rev_ok_bar_close"] = None
+                for _rc_k in (
+                    "rev_ok_bar_hi", "rev_ok_bar_lo", "rev_ok_bar_close",
+                    "rc_open_ms", "rc_close_ms",
+                    "rc_high", "rc_low", "rc_close",
+                    "trigger_level", "rc_is_touch_candle",
+                ):
+                    watch[_rc_k] = None
+                watch.pop("discord_rc_trigger_sent", None)
+                watch.pop("discord_rc_trigger_sent_ms", None)
+                watch.pop("discord_rc_trigger_price", None)
+                watch.pop("discord_rc_trigger_error", None)
                 # Persist the rollback immediately
                 try:
-                    R.set(wkey, json.dumps(
-                        {k: v for k, v in watch.items() if v is not None},
-                        separators=(",", ":")
-                    ), ex=7 * 24 * 3600)
+                    zone_watch_set(
+                        R,
+                        uid_u,
+                        sym_u,
+                        str(watch.get("direction") or resolved_dir).upper(),
+                        json.dumps(
+                            {k: v for k, v in watch.items() if v is not None},
+                            separators=(",", ":"),
+                        ),
+                        tf=tfu,
+                        ex=7 * 24 * 3600
+                    )
                 except Exception:
                     pass
                 if debug_gate:
@@ -2235,7 +2258,15 @@ def zone_reversal_gate(
 
             if legacy and new_ok:
                 watch["zone_used"] = dict(zone_used)
-                R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
+                zone_watch_set(
+                    R,
+                    uid_u,
+                    sym_u,
+                    str(watch.get("direction") or resolved_dir).upper(),
+                    json.dumps(watch, separators=(",", ":")),
+                    tf=tfu,
+                    ex=7 * 24 * 3600,
+                )
                 did_repair = True
 
         if debug_gate:
@@ -2246,59 +2277,193 @@ def zone_reversal_gate(
 
     # ------------------------------------------------------------
     # FALLBACK: watch key missing but open registry has active trade.
-    # Do not hardcode user_id; scan open registries and match symbol.
+    # Read only this authenticated user's open registry and match ownership.
     # ------------------------------------------------------------
     try:
         if (
             not isinstance(watch, dict)
-            or str(watch.get("trade_state") or "").upper() != "TRADE_ACTIVE"
+            or str(
+                watch.get("trade_state") or ""
+            ).upper() != "TRADE_ACTIVE"
         ):
-            for open_key in R.scan_iter("xtl:strategy:oppt:open:*"):
-                open_map = R.hgetall(open_key)
-                for _k, _v in (open_map or {}).items():
-                    if isinstance(_v, (bytes, bytearray)):
-                        _v = _v.decode("utf-8", "ignore")
-                    tr = json.loads(_v) if isinstance(_v, str) else _v
+            #
+            # Ownership isolation:
+            # read only this authenticated user's open-trade ledger.
+            # Never scan xtl:strategy:oppt:open:* globally.
+            #
+            open_key = (
+                f"xtl:strategy:oppt:open:{uid_u}"
+            )
+
+            open_map = R.hgetall(open_key) or {}
+
+            gate_profile = str(
+                _kwargs.get("profile_id") or ""
+            ).strip().lower()
+
+            gate_device = (
+                str(x_device_id or "").strip()
+                or str(pinned_device or "").strip()
+            )
+
+            for _k, _v in open_map.items():
+                try:
+                    if isinstance(
+                        _v,
+                        (bytes, bytearray),
+                    ):
+                        _v = _v.decode(
+                            "utf-8",
+                            "ignore",
+                        )
+
+                    tr = (
+                        json.loads(_v)
+                        if isinstance(_v, str)
+                        else _v
+                    )
+
                     if not isinstance(tr, dict):
                         continue
 
-                    if str(tr.get("symbol") or "").upper() != sym_u:
-                        continue
-                    if str(tr.get("trade_state") or "").upper() != "TRADE_ACTIVE":
+                    #
+                    # Optional profile isolation.
+                    # Enforce it whenever the caller supplied profile_id.
+                    #
+                    trade_profile = str(
+                        tr.get("profile_id") or ""
+                    ).strip().lower()
+
+                    if (
+                        gate_profile
+                        and trade_profile != gate_profile
+                    ):
                         continue
 
-                    _side = str(tr.get("side") or "").upper()
+                    #
+                    # Device isolation.
+                    # A trade from another MT5 device/account must not
+                    # become TRADE_ACTIVE in this gate.
+                    #
+                    trade_device = str(
+                        tr.get("device_id") or ""
+                    ).strip()
+
+                    if (
+                        gate_device
+                        and trade_device
+                        and trade_device != gate_device
+                    ):
+                        continue
+
+                    if (
+                        str(
+                            tr.get("symbol") or ""
+                        ).upper().strip()
+                        != sym_u
+                    ):
+                        continue
+
+                    if (
+                        str(
+                            tr.get("trade_state") or ""
+                        ).upper().strip()
+                        != "TRADE_ACTIVE"
+                    ):
+                        continue
+
+                    _side = str(
+                        tr.get("side") or ""
+                    ).upper().strip()
+
                     if _side not in ("BUY", "SELL"):
                         continue
 
                     _zu = tr.get("entry_zone")
+
                     if not isinstance(_zu, dict):
                         _zu = {
-                            "level": tr.get("entry_zone_level"),
-                            "low": tr.get("entry_zone_low"),
-                            "high": tr.get("entry_zone_high"),
-                            "tf": tr.get("entry_zone_tf") or tfu,
-                            "kind": tr.get("entry_zone_kind"),
+                            "level": tr.get(
+                                "entry_zone_level"
+                            ),
+                            "low": tr.get(
+                                "entry_zone_low"
+                            ),
+                            "high": tr.get(
+                                "entry_zone_high"
+                            ),
+                            "tf": (
+                                tr.get("entry_zone_tf")
+                                or tfu
+                            ),
+                            "kind": tr.get(
+                                "entry_zone_kind"
+                            ),
                         }
 
                     gate["blocked"] = False
                     gate["reason"] = "TRADE_ACTIVE"
                     gate["stage"] = "MANAGE_TRADE"
-                    gate["trade_state"] = "TRADE_ACTIVE"
+                    gate["trade_state"] = (
+                        "TRADE_ACTIVE"
+                    )
                     gate["resolved_dir"] = _side
-                    gate["zone"] = dict(_zu) if isinstance(_zu, dict) else None
-                    gate["zone_used"] = dict(_zu) if isinstance(_zu, dict) else None
-                    gate["planned_zone"] = dict(_zu) if isinstance(_zu, dict) else None
+
+                    gate["zone"] = (
+                        dict(_zu)
+                        if isinstance(_zu, dict)
+                        else None
+                    )
+                    gate["zone_used"] = (
+                        dict(_zu)
+                        if isinstance(_zu, dict)
+                        else None
+                    )
+                    gate["planned_zone"] = (
+                        dict(_zu)
+                        if isinstance(_zu, dict)
+                        else None
+                    )
+
                     gate["entry_triggered"] = True
-                    gate["entry_price"] = tr.get("entry_price")
-                    gate["entry_ts_ms"] = tr.get("opened_at_ms")
-                    gate["mt5_job_id"] = tr.get("mt5_job_id")
-                    gate["mt5_ticket"] = tr.get("mt5_ticket")
-                    gate["rev_state"] = tr
+                    gate["entry_price"] = tr.get(
+                        "entry_price"
+                    )
+                    gate["entry_ts_ms"] = tr.get(
+                        "opened_at_ms"
+                    )
+                    gate["mt5_job_id"] = tr.get(
+                        "mt5_job_id"
+                    )
+                    gate["mt5_ticket"] = (
+                        tr.get("mt5_ticket")
+                        or tr.get("broker_ticket")
+                    )
+                    gate["broker_ticket"] = (
+                        tr.get("broker_ticket")
+                        or tr.get("mt5_ticket")
+                    )
+                    gate["rev_state"] = dict(tr)
 
                     return True, gate
+
+                except Exception:
+                    continue
+
     except Exception:
-        pass
+        log.exception(
+            "[WATCHLIST] OPEN_REGISTRY_FALLBACK_FAILED "
+            "uid=%s profile=%s device=%s sym=%s",
+            uid_u,
+            str(
+                _kwargs.get("profile_id") or ""
+            ).strip().lower(),
+            (
+                str(x_device_id or "").strip()
+                or str(pinned_device or "").strip()
+            ),
+            sym_u,
+        )
     
     
     # ------------------------------------------------------------
@@ -2515,7 +2680,13 @@ def zone_reversal_gate(
             if isinstance(watch, dict):
                 _st_del = str(watch.get("state") or "").upper().strip()
                 if not _is_protected_watch_state(_st_del):
-                    R.delete(wkey)
+                    zone_watch_delete(
+                        R,
+                        uid_u,
+                        sym_u,
+                        str(watch.get("direction") or resolved_dir).upper(),
+                        tf=tfu,
+                    )
                 else:
                     if debug_gate:
                         gate["dbg_delete_skipped_protected_watch"] = {
@@ -2813,9 +2984,20 @@ def zone_reversal_gate(
             "touch_source": "LIVE_TOUCH",
         }
         try:
-            R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
+            zone_watch_set(
+                R,
+                uid_u,
+                sym_u,
+                resolved_dir,
+                json.dumps(
+                    watch,
+                    separators=(",", ":"),
+                ),
+                tf=tfu,
+                ex=7 * 24 * 3600,
+            )
         except Exception:
-            pass
+             pass
         gate["zone_used"] = zone_used
         gate["watch_key"] = str(wkey)
         gate["rev_state"] = {
@@ -3107,6 +3289,9 @@ def zone_reversal_gate(
                     _cur_closed_ms
                 )
                 watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
+                # Refreshed RC closed after old rev_ok_ms, so it can never
+                # be the original touch candle — keep the flag accurate.
+                watch["rc_is_touch_candle"] = False
                 # New/refreshed RC must be allowed to send one new trigger alert.
                 watch["discord_rc_trigger_sent"] = False
                 watch.pop("discord_rc_trigger_sent_ms", None)
@@ -3147,23 +3332,30 @@ def zone_reversal_gate(
                             "H1",
                         )
                     )
-                    for _ck in R.scan_iter(
-                        entry_claim_pattern(
-                            uid_u,
-                            sym_u,
-                            _rc_side,
-                            "H1",
-                        ),
-                        count=50,
-                    ):
-                        R.delete(_ck)
+                    delete_latest_entry_claim(
+                        R,
+                        uid_u,
+                        sym_u,
+                        _rc_side,
+                        tf="H1",
+                    )
                     watch["entry_triggered"] = False
                     watch["entry_ready"] = False
                     watch.pop("entry_ready_price", None)
                     watch.pop("entry_ready_ts_ms", None)
                     watch.pop("entry_price", None)
                     watch.pop("entry_ts_ms", None)
-                    _refresh_set_ok = R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
+                    _refresh_set_ok = bool(
+                        zone_watch_set(
+                            R,
+                            uid_u,
+                            sym_u,
+                            str(watch.get("direction") or resolved_dir).upper(),
+                            json.dumps(watch, separators=(",", ":")),
+                            tf=tfu,
+                            ex=7 * 24 * 3600,
+                        )
+                    )
                 except Exception:
                     pass
                 log.warning(
@@ -3216,26 +3408,84 @@ def zone_reversal_gate(
                     if _stored_rc_lo > _stored_zh:
                        _stored_rc_valid = False
 
-            # RC candle close time must be after watch creation
+            # RC candle close time must be after watch creation,
+            # UNLESS the RC is the touch candle itself (accepted by
+            # policy in the confirmation path: touch candle closing
+            # beyond the zone is a valid RC). Without this exception
+            # the acceptance and revalidation rules contradict each
+            # other and every touch-candle RC oscillates:
+            # REV_OK -> rollback -> REV_WATCH -> REV_OK -> ...
+            _stored_rc_is_touch = bool(watch.get("rc_is_touch_candle")) or (
+                _stored_rc_ms > 0
+                # Legacy watches persisted before rc_is_touch_candle
+                # existed: re-derive from stored touch_close_ms.
+                and _stored_rc_ms == int(watch.get("touch_close_ms") or 0)
+            )
             if _stored_rc_ms > 0 and _stored_watch_created_ms > 0:
-                if _stored_rc_ms <= _stored_watch_created_ms:
+                if _stored_rc_ms <= _stored_watch_created_ms and not _stored_rc_is_touch:
                     _stored_rc_valid = False
+
+            # Stored RC must also have CLOSED beyond the zone — the same
+            # price rule acceptance enforces. Applies to EVERY RC,
+            # including the touch candle: the touch-candle exception
+            # relaxes only the TIMING rule, never the price rule.
+            # BUY:  close must be > zone_high
+            # SELL: close must be < zone_low
+            _stored_rc_cl = float(
+                watch.get("rev_ok_bar_close")
+                or watch.get("rc_close")
+                or 0
+            )
+            if _stored_rc_cl > 0 and _stored_zl > 0 and _stored_zh > 0:
+                if _stored_direction == "SELL":
+                    if _stored_rc_cl >= _stored_zl:
+                        _stored_rc_valid = False
+                else:  # BUY
+                    if _stored_rc_cl <= _stored_zh:
+                        _stored_rc_valid = False
 
         except Exception:
             _stored_rc_valid = True  # validation error — don't block
 
         if not _stored_rc_valid:
-            # Auto-rollback — clear RC fields, roll back to REV_WATCH
+            # Auto-rollback — clear EVERY field the confirmation path
+            # wrote, roll back to REV_WATCH. Leaving rc_high/rc_low/
+            # trigger_level behind creates a half-armed watch: state
+            # says REV_WATCH but downstream consumers keying off
+            # trigger_level can still arm an entry from a dead RC.
+            # (None-valued fields are dropped from the persisted JSON
+            # by the `if v is not None` filter below, so this deletes
+            # them from Redis.)
             watch["state"] = "REV_WATCH"
             watch["rev_ok"] = False
             watch["rev_ok_ms"] = 0
-            watch["rev_ok_bar_hi"] = None
-            watch["rev_ok_bar_lo"] = None
-            watch["rev_ok_bar_close"] = None
+            for _rc_k in (
+                "rev_ok_bar_hi", "rev_ok_bar_lo", "rev_ok_bar_close",
+                "rc_open_ms", "rc_close_ms",
+                "rc_high", "rc_low", "rc_close",
+                "trigger_level", "rc_is_touch_candle",
+            ):
+                watch[_rc_k] = None
+            # Stale RC alert bookkeeping must not suppress the alert
+            # for the next legitimately confirmed RC.
+            watch.pop("discord_rc_trigger_sent", None)
+            watch.pop("discord_rc_trigger_sent_ms", None)
+            watch.pop("discord_rc_trigger_price", None)
+            watch.pop("discord_rc_trigger_error", None)
             try:
                 _rollback_payload = {k: v for k, v in watch.items() if v is not None}
                 _rollback_json = json.dumps(_rollback_payload, separators=(",", ":"))
-                _set_ok = R.set(wkey, _rollback_json, ex=7 * 24 * 3600)
+                _set_ok = bool(
+                    zone_watch_set(
+                        R,
+                        uid_u,
+                        sym_u,
+                        str(watch.get("direction") or resolved_dir).upper(),
+                        _rollback_json,
+                        tf=tfu,
+                        ex=7 * 24 * 3600,
+                    )
+                )
 
                 if debug_gate:
                     gate["dbg_rc_rollback_persist"] = {
@@ -3723,6 +3973,15 @@ def zone_reversal_gate(
             watch["rc_low"] = float(lo)
             watch["rc_close"] = float(cl)
             watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
+            # POLICY: the touch candle itself is a valid RC if it closed
+            # reclaiming the zone, even though its close time is <= watch
+            # creation time. Persist WHY this RC was accepted so the
+            # stored-RC revalidation path honors the same exception
+            # instead of rolling it back on the next tick.
+            watch["rc_is_touch_candle"] = bool(
+                int((watch or {}).get("touch_close_ms") or 0) > 0
+                and int(closed_ms or 0) == int((watch or {}).get("touch_close_ms") or 0)
+            )
             # New RC must be allowed to send one new trigger alert.
             watch["discord_rc_trigger_sent"] = False
             watch.pop("discord_rc_trigger_sent_ms", None)
@@ -3886,7 +4145,17 @@ def zone_reversal_gate(
                     _e,
                 )
 
-            _set_ok = R.set(wkey, json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
+            _set_ok = bool(
+                zone_watch_set(
+                    R,
+                    uid_u,
+                    sym_u,
+                    str(watch.get("direction") or resolved_dir).upper(),
+                    json.dumps(watch, separators=(",", ":")),
+                    tf=tfu,
+                    ex=7 * 24 * 3600,
+                )
+            )
             try:
                 _bs_key = break_state_key(
                     uid_u,

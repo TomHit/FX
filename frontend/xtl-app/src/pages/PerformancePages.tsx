@@ -177,6 +177,27 @@ type PropRiskResp = {
   risk?: PropRisk;
 };
 
+type PropSnapshotResp = {
+  ok: boolean;
+  profile_id?: string;
+  active_profile_id?: string;
+  computed_at_ms?: number;
+  snapshot_source?: "COMPUTED" | "FRESH_CACHE" | "LAST_GOOD" | string;
+  snapshot_cache_hit?: boolean;
+  snapshot_stale?: boolean;
+  snapshot_age_ms?: number | null;
+  status?: PropStatusResp;
+  risk?: PropRiskResp;
+  dashboard?: DashboardResp;
+  performance?: {
+    total_ms?: number;
+    request_total_ms?: number;
+    device_resolve_ms?: number;
+    risk_read_ms?: number;
+    risk_snapshot_cache_hit?: boolean;
+  };
+};
+
 function safeNum(x: any, fallback = 0) {
   const n = typeof x === "number" ? x : Number(x);
   return Number.isFinite(n) ? n : fallback;
@@ -291,40 +312,103 @@ export default function PerformancePage() {
   const [dash, setDash] = React.useState<DashboardResp | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [err, setErr] = React.useState<string | null>(null);
+  const [noProfile, setNoProfile] = React.useState(false);
   const [lastUpdated, setLastUpdated] = React.useState<Date | null>(null);
 
-  async function load() {
+  const inFlightRef = React.useRef(false);
+
+  async function load(forceRefresh = false) {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+
     try {
-      setErr(null);
-      const API_ORIGIN = (import.meta.env.VITE_API_ORIGIN || "").replace(/\/+$/, "");
-      const [statusRes, riskRes, dashRes] = await Promise.all([
-        fetch(`${API_ORIGIN}/trend/prop/status`, { method: "GET", credentials: "include", headers: { Accept: "application/json" } }),
-        fetch(`${API_ORIGIN}/trend/prop/risk`, { method: "GET", credentials: "include", headers: { Accept: "application/json" } }),
-        fetch(`${API_ORIGIN}/trend/prop/dashboard`, { method: "GET", credentials: "include", headers: { Accept: "application/json" } }).catch(() => null),
-      ]);
-      if (!statusRes.ok) throw new Error(`prop/status HTTP ${statusRes.status} ${(await statusRes.text().catch(() => "")).trim()}`);
-      if (!riskRes.ok) throw new Error(`prop/risk HTTP ${riskRes.status} ${(await riskRes.text().catch(() => "")).trim()}`);
-      const statusJson = (await statusRes.json()) as PropStatusResp;
-      const riskJson = (await riskRes.json()) as PropRiskResp;
-      const dashJson = dashRes && dashRes.ok ? ((await dashRes.json()) as DashboardResp) : null;
-      if (!statusJson?.ok) throw new Error("prop/status returned ok=false");
-      if (!riskJson?.ok) throw new Error("prop/risk returned ok=false");
-      setStatus(statusJson);
-      setRisk(riskJson);
-      setDash(dashJson);
-      setLastUpdated(new Date());
+      setErr("");
+      if (forceRefresh || !status) setLoading(true);
+
+      const API_ORIGIN = (
+        import.meta.env.VITE_API_ORIGIN || ""
+      ).replace(/\/+$/, "");
+
+      const requestOptions: RequestInit = {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+        },
+      };
+
+      const query = forceRefresh ? "?refresh=true" : "";
+      const snapshotRes = await fetch(
+        `${API_ORIGIN}/trend/prop/snapshot${query}`,
+        requestOptions
+      );
+
+      if (snapshotRes.status === 404) {
+        let detail = "";
+        try {
+          const body = await snapshotRes.clone().json();
+          detail = String(body?.detail || "");
+        } catch {
+          detail = "";
+        }
+
+        if (
+          detail === "NO_PROP_PROFILE_CONFIGURED" ||
+          detail === "PROP_PROFILE_NOT_FOUND" ||
+          snapshotRes.status === 404
+        ) {
+          setNoProfile(true);
+          setStatus(null);
+          setRisk(null);
+          setDash(null);
+          setLastUpdated(new Date());
+          return;
+        }
+      }
+
+      if (!snapshotRes.ok) {
+        throw new Error(
+          `prop/snapshot HTTP ${snapshotRes.status} ${(
+            await snapshotRes.text().catch(() => "")
+          ).trim()}`
+        );
+      }
+
+      const snapshot = (await snapshotRes.json()) as PropSnapshotResp;
+      if (!snapshot?.ok || !snapshot.status?.ok || !snapshot.risk?.ok) {
+        throw new Error("prop/snapshot returned invalid payload");
+      }
+
+      setNoProfile(false);
+      setStatus(snapshot.status);
+      setRisk(snapshot.risk);
+      setDash(snapshot.dashboard || null);
+      setLastUpdated(
+        snapshot.computed_at_ms
+          ? new Date(snapshot.computed_at_ms)
+          : new Date()
+      );
     } catch (e: any) {
+      setNoProfile(false);
       setErr(e?.message || "Failed to load prop dashboard");
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   }
 
   React.useEffect(() => {
-    load();
-    const t = window.setInterval(load, 2000);
+    void load();
+
+    const t = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void load();
+      }
+    }, noProfile ? 15000 : 10000);
+
     return () => window.clearInterval(t);
-  }, []);
+  }, [noProfile]);
 
   const cfg = status?.config || risk?.config || {};
   const rules = status?.rules || {};
@@ -395,14 +479,72 @@ export default function PerformancePage() {
             <div className="mt-1 text-sm text-slate-400">Broker account is the source of truth for FTMO risk, margin, drawdown and execution capacity.</div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <HealthPill ok={!!cfg?.enabled} label={cfg?.enabled ? "Prop mode ON" : "Prop mode OFF"} />
-            <HealthPill ok={brokerOk} label="Broker sync" />
-            <HealthPill ok={capacityOk} label={capacityOk ? "Ready to trade" : "Trade blocked"} />
-            <button className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-white disabled:opacity-60" onClick={load} disabled={loading}>Refresh</button>
-          </div>
-        </div>
+            {!noProfile ? (
+              <>
+                <HealthPill
+                  ok={!!cfg?.enabled}
+                  label={
+                    cfg?.enabled
+                      ? "Prop mode ON"
+                      : "Prop mode OFF"
+                  }
+                />
 
-        {err ? <div className="mt-4 rounded-2xl border border-red-900/60 bg-red-950/30 p-4 text-sm text-red-200">Failed to load dashboard: <span className="font-mono">{err}</span></div> : null}
+                <HealthPill
+                  ok={brokerOk}
+                  label="Broker sync"
+                />
+
+                <HealthPill
+                  ok={capacityOk}
+                  label={
+                    capacityOk
+                      ? "Ready to trade"
+                      : "Trade blocked"
+                  }
+                />
+              </>
+             ) : null}
+
+             <button
+               className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-white disabled:opacity-60"
+               onClick={() => void load(true)}
+               disabled={loading}
+             >
+               Refresh
+             </button>
+           </div>
+        </div>
+        {noProfile ? (
+          <div className="mt-6 rounded-2xl border border-cyan-900/60 bg-cyan-950/20 p-6">
+            <div className="text-lg font-semibold text-cyan-200">
+              No Prop Firm profile configured
+            </div>
+
+            <div className="mt-2 text-sm text-slate-300">
+              This account does not have a prop-firm execution
+              profile yet. Add or configure an account from the
+              Prop Firm page before using risk and performance
+              monitoring.
+            </div>
+
+            <a
+              href="/react/prop-firm"
+              className="mt-4 inline-flex rounded-xl border border-cyan-700 bg-cyan-950/40 px-4 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-900/40"
+            >
+              Open Prop Firm Setup
+            </a>
+          </div>
+        ) : null}
+
+        {err && !noProfile ? (
+          <div className="mt-4 rounded-2xl border border-red-900/60 bg-red-950/30 p-4 text-sm text-red-200">
+            Failed to load dashboard:{" "}
+            <span className="font-mono">{err}</span>
+          </div>
+        ) : null}
+        {!noProfile ? (
+          <>
 
         <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <Card title="Balance" value={money(brokerBalance)} sub="Broker balance" loading={loading} />
@@ -501,6 +643,8 @@ export default function PerformancePage() {
           <div className="rounded-2xl border border-slate-800/60 bg-slate-950/60 p-4"><div className="text-sm font-semibold">System Health</div><div className="mt-4 space-y-2"><SmallStatus ok={!!cfg.enabled} label="Prop mode" value={cfg.enabled ? "ON" : "OFF"} /><SmallStatus ok={brokerOk} label="Broker sync" value={brokerOk ? "Healthy" : "No account"} /><SmallStatus ok={!tradingHalted} label="Trading halt" value={tradingHalted ? haltReason || "HALTED" : "Clear"} /><SmallStatus ok={!dailyRBlocked} label="Daily R breaker" value={dailyRBlocked ? dailyRBlockReason || "Blocked" : "Clear"} /></div></div>
           <div className="rounded-2xl border border-slate-800/60 bg-slate-950/60 p-4 lg:col-span-2"><div className="text-sm font-semibold">Raw State Summary</div><div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 text-sm"><div className="flex justify-between gap-3"><span className="text-slate-500">Daily key</span><span className="font-mono text-xs text-slate-300">{daily.daily_key || riskState.daily_key || "—"}</span></div><div className="flex justify-between gap-3"><span className="text-slate-500">Halt timestamp</span><span className="text-slate-300">{fmtAge(halt.halt_ts ?? riskState.halt_ts)}</span></div><div className="flex justify-between gap-3"><span className="text-slate-500">Account size</span><span className="text-slate-300">{money(cfg.account_size)}</span></div><div className="flex justify-between gap-3"><span className="text-slate-500">Target</span><span className="text-slate-300">{money(limits.target_usd)} / {pct(rules.target_pct, 0)}</span></div><div className="flex justify-between gap-3"><span className="text-slate-500">Max loss limit</span><span className="text-slate-300">{money(limits.max_loss_limit_usd)}</span></div><div className="flex justify-between gap-3"><span className="text-slate-500">Minimum days</span><span className="text-slate-300">{safeNum(rules.min_days, 0)}</span></div></div></div>
         </div>
+          </>
+        ) : null}       
       </div>
     </div>
   );

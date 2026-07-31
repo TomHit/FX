@@ -4,8 +4,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from typing import Any
+from api.trend_sr import (
+    summarize_sr_multi_tf,
+    build_market_structure_state,
+)
 
 log = logging.getLogger("uvicorn.error")
 
@@ -28,6 +33,12 @@ HISTORY_MAX_EVENTS = 5000
 MAX_BARS = 300
 MIN_FEATURE_BARS = 16
 CANDIDATE_EXPIRY_BARS = 6
+
+# Synthetic basket finalization. Five symbol snapshots arrive independently.
+# Never permanently evaluate a synthetic candle until all five contributors exist.
+SYNTHETIC_EXPECTED_PAIRS = ("EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD")
+SYNTHETIC_EXPECTED_PAIR_COUNT = len(SYNTHETIC_EXPECTED_PAIRS)
+SYNTHETIC_CLOSE_GRACE_MS = int(os.getenv("XTL_DXY_M15_CLOSE_GRACE_MS", "30000"))
 
 # Evidence-accumulation lifecycle (shadow only).
 # Bullish thresholds preserve V4 responsiveness.
@@ -67,6 +78,26 @@ SR_PIVOT_RIGHT = 2
 SR_CLUSTER_ATR = {"M15": 0.22, "H1": 0.28, "H4": 0.35}
 SR_ZONE_PAD_ATR = {"M15": 0.08, "H1": 0.10, "H4": 0.12}
 SR_NEAR_ATR = {"M15": 0.45, "H1": 0.60, "H4": 0.85}
+
+# V9 current-flow layer (same unified engine, shadow only).
+# It describes what DXY is doing now, independently from the slower turn lifecycle.
+FLOW_START_SCORE = 50
+FLOW_START_MARGIN = 20
+FLOW_STRONG_SINGLE_SCORE = 80
+FLOW_STRONG_SINGLE_MARGIN = 45
+FLOW_MAINTAIN_SCORE = 42
+FLOW_MAINTAIN_MARGIN = 8
+FLOW_FLIP_SCORE = 70
+FLOW_FLIP_MARGIN = 30
+FLOW_HARD_FLIP_NET_ATR = 0.80
+FLOW_NEUTRAL_AFTER_BARS = 2
+
+# Shared XTL SR engine settings for DXY H1/H4 structure.
+DXY_SR_PIP_FACTOR = float(os.getenv("XTL_DXY_SR_PIP_FACTOR", "0.001"))
+DXY_SR_LAST_TTL_SEC = int(os.getenv("XTL_DXY_SR_LAST_TTL_SEC", "300"))
+DXY_SR_GOOD_TTL_SEC = int(os.getenv("XTL_DXY_SR_GOOD_TTL_SEC", "900"))
+DXY_SR_LAST_PREFIX = "xtl:dxy:sr:bundle:last:M15"
+DXY_SR_GOOD_PREFIX = "xtl:dxy:sr:bundle:last_good:M15"
 
 
 def _json_load(value: Any, default=None):
@@ -462,9 +493,9 @@ def _zone_maturity(zone: dict | None) -> str:
     touches = int(zone.get("touches") or 0)
     age_bars = int(zone.get("age_bars") or 0)
     if touches >= 3:
-        return "ESTABLISHED"
+        return "STRONG"
     if touches == 2:
-        return "DEVELOPING"
+        return "BUILDING"
     if touches == 1 and age_bars <= 12:
         return "FRESH"
     return "SINGLE_PIVOT"
@@ -871,6 +902,28 @@ def _qualify_candidate(
     bearish_break = bool(
         features.get("bearish_structure_break")
     )
+    try:
+        up_steps = int(
+            features.get("up_steps")
+            or 0
+        )
+        down_steps = int(
+            features.get("down_steps")
+            or 0
+        )
+        bullish_bodies = int(
+            features.get("bullish_bodies")
+            or 0
+        )
+        bearish_bodies = int(
+            features.get("bearish_bodies")
+            or 0
+        )
+    except Exception:
+        up_steps = 0
+        down_steps = 0
+        bullish_bodies = 0
+        bearish_bodies = 0
 
     # Prevent late entries after an already overextended displacement.
     if abs(recent_net_atr) > 1.60:
@@ -886,6 +939,70 @@ def _qualify_candidate(
             "NEUTRAL",
             0,
             "RECENT_MOVE_TOO_SMALL",
+        )
+    # Strong established-reversal override.
+    #
+    # The normal qualification path requires the exact slope-cross bar.
+    # A powerful reversal can be detected one or two bars later, after the
+    # slope has already crossed. In that case, do not report NEUTRAL when
+    # displacement, structure, slope, acceleration and candle participation
+    # all strongly agree.
+    strong_bullish_reversal = (
+        raw_direction == "BULLISH"
+        and bullish_break
+        and recent_net_atr >= 1.00
+        and recent_net_atr <= 1.60
+        and slope_5_atr >= 0.20
+        and acceleration_atr >= 0.15
+        and up_steps >= 3
+        and bullish_bodies >= 3
+        and body_ratio >= 0.35
+    )
+
+    strong_bearish_reversal = (
+        raw_direction == "BEARISH"
+        and bearish_break
+        and recent_net_atr <= -1.00
+        and recent_net_atr >= -1.60
+        and slope_5_atr <= -0.20
+        and acceleration_atr <= -0.15
+        and down_steps >= 3
+        and bearish_bodies >= 3
+        and body_ratio >= 0.35
+    )
+
+    if strong_bullish_reversal or strong_bearish_reversal:
+        confidence = 80
+
+        confidence += min(
+            10,
+            int(
+                max(
+                    0.0,
+                    abs(recent_net_atr) - 1.00,
+                )
+                * 20
+            ),
+        )
+
+        confidence += min(
+            5,
+            int(
+                abs(acceleration_atr)
+                * 10
+            ),
+        )
+
+        if body_ratio >= 0.50:
+            confidence += 5
+
+        return (
+            raw_direction,
+            min(
+                100,
+                int(confidence),
+            ),
+            "QUALIFIED_STRONG_ESTABLISHED_REVERSAL",
         )
 
     if raw_direction == "BULLISH":
@@ -1199,6 +1316,468 @@ def _revoke_evidence(
     return min(100, int(score)), reasons
 
 
+
+
+
+def _public_zone(zone: dict | None, *, tf: str, role: str) -> dict | None:
+    """Return compact, chart-friendly causal SR metadata."""
+    if not isinstance(zone, dict) or not zone:
+        return None
+    level = float(zone.get("level") or 0.0)
+    low = float(zone.get("low") or level or 0.0)
+    high = float(zone.get("high") or level or 0.0)
+    if level <= 0:
+        return None
+    return {
+        "role": role,
+        "tf": tf,
+        "price": round(level, 6),
+        "low": round(low, 6),
+        "high": round(high, 6),
+        "distance_atr": zone.get("distance_atr"),
+        "near": bool(zone.get("near")),
+        "touches": int(zone.get("touches") or 0),
+        "strength": int(zone.get("strength") or 0),
+        "maturity": _zone_maturity(zone),
+        "age_bars": int(zone.get("age_bars") or 0),
+        "source_tf": str(zone.get("source_tf") or tf),
+        "causal": bool(zone.get("causal", True)),
+    }
+
+
+def _structure_aware_snapshot(sr_audit: dict, *, flow_direction: str) -> dict:
+    """Expose causal M15/H1/H4 SR and directional room in one compact object."""
+    if not isinstance(sr_audit, dict):
+        sr_audit = {}
+    context = sr_audit.get("structure_context") or {}
+    zones = []
+    for tf_key in ("m15", "h1", "h4"):
+        snap = sr_audit.get(tf_key) or {}
+        tf = str(snap.get("tf") or tf_key.upper())
+        sup = _public_zone(snap.get("nearest_support"), tf=tf, role="SUPPORT")
+        res = _public_zone(snap.get("nearest_resistance"), tf=tf, role="RESISTANCE")
+        if sup:
+            zones.append(sup)
+        if res:
+            zones.append(res)
+
+    supports = sorted(
+        [z for z in zones if z.get("role") == "SUPPORT"],
+        key=lambda z: float(z.get("price") or 0.0),
+        reverse=True,
+    )
+    resistances = sorted(
+        [z for z in zones if z.get("role") == "RESISTANCE"],
+        key=lambda z: float(z.get("price") or 0.0),
+    )
+    nearest_support = supports[0] if supports else None
+    nearest_resistance = resistances[0] if resistances else None
+    next_support = supports[1] if len(supports) > 1 else None
+    next_resistance = resistances[1] if len(resistances) > 1 else None
+
+    room_up = context.get("available_upside_atr")
+    room_down = context.get("available_downside_atr")
+    room_up = float(room_up) if room_up is not None else None
+    room_down = float(room_down) if room_down is not None else None
+    flow_direction = str(flow_direction or "NEUTRAL").upper()
+    directional_room = room_up if flow_direction == "BULLISH" else room_down if flow_direction == "BEARISH" else None
+    near_tfs = (
+        sr_audit.get("near_resistance_tfs") if flow_direction == "BULLISH"
+        else sr_audit.get("near_support_tfs") if flow_direction == "BEARISH"
+        else []
+    ) or []
+    confluence = len(near_tfs)
+
+    if directional_room is None:
+        pressure = "UNKNOWN"
+    elif directional_room <= 0.10 or confluence >= 3:
+        pressure = "EXTREME"
+    elif directional_room <= 0.35 or confluence >= 2:
+        pressure = "HIGH"
+    elif directional_room <= 0.80 or confluence >= 1:
+        pressure = "MEDIUM"
+    else:
+        pressure = "LOW"
+
+    return {
+        "schema_version": 1,
+        "context": context.get("context") or "NO_STRUCTURE",
+        "current_price": context.get("current_price"),
+        "nearest_support": nearest_support,
+        "next_support": next_support,
+        "nearest_resistance": nearest_resistance,
+        "next_resistance": next_resistance,
+        "room_up_atr": round(room_up, 4) if room_up is not None else None,
+        "room_down_atr": round(room_down, 4) if room_down is not None else None,
+        "directional_room_atr": round(directional_room, 4) if directional_room is not None else None,
+        "pressure": pressure,
+        "pressure_direction": flow_direction,
+        "near_support_tfs": list(sr_audit.get("near_support_tfs") or []),
+        "near_resistance_tfs": list(sr_audit.get("near_resistance_tfs") or []),
+        "bullish_confluence_count": int(sr_audit.get("bullish_confluence_count") or 0),
+        "bearish_confluence_count": int(sr_audit.get("bearish_confluence_count") or 0),
+        "bullish_h1_sweep_reclaim": bool(context.get("bullish_h1_sweep_reclaim")),
+        "bearish_h1_sweep_reject": bool(context.get("bearish_h1_sweep_reject")),
+        "sweep_conflict": bool(context.get("sweep_conflict")),
+        "audit_only": True,
+    }
+
+
+
+def _bars_to_sr_frame(bars: list[dict]):
+    """Convert completed aggregated DXY bars to the DataFrame expected by trend_sr.py."""
+    import pandas as pd
+
+    rows = []
+    for bar in bars or []:
+        if not isinstance(bar, dict) or not bool(bar.get("complete", True)):
+            continue
+        o = _safe_float(bar.get("o"))
+        h = _safe_float(bar.get("h"))
+        l = _safe_float(bar.get("l"))
+        c = _safe_float(bar.get("c"))
+        if None in (o, h, l, c):
+            continue
+        rows.append({
+            "t_open_ms": _bar_open_ms(bar),
+            "t_close_ms": _bar_close_ms(bar),
+            "o": float(o),
+            "h": float(h),
+            "l": float(l),
+            "c": float(c),
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=["t_open_ms", "t_close_ms", "o", "h", "l", "c"])
+
+    frame = pd.DataFrame(rows)
+    frame = frame.sort_values("t_open_ms").drop_duplicates("t_open_ms", keep="last")
+    return frame.reset_index(drop=True)
+
+
+def _persist_dxy_sr_bundle(R, *, source: str, device_id: str, bundle: dict) -> None:
+    """Publish source/device-specific DXY SR bundles without touching normal-symbol SR keys."""
+    if not isinstance(bundle, dict):
+        return
+    try:
+        payload = dict(bundle)
+        payload["_dxy_source"] = source
+        payload["_device_id"] = device_id
+        payload["_structure_engine"] = "trend_sr.py"
+        payload["_published_at_ms"] = int(time.time() * 1000)
+        raw = json.dumps(payload, separators=(",", ":"), default=str)
+        R.set(
+            f"{DXY_SR_LAST_PREFIX}:{source}:{device_id}",
+            raw,
+            
+        )
+        if (
+            payload.get("active_supports")
+            or payload.get("active_resistances")
+            or payload.get("nearest_support")
+            or payload.get("nearest_resistance")
+        ):
+            R.set(
+                f"{DXY_SR_GOOD_PREFIX}:{source}:{device_id}",
+                raw,
+                
+            )
+    except Exception:
+        log.exception(
+            "[DXY_M15] SHARED_SR_PERSIST_FAILED source=%s device=%s",
+            source,
+            device_id,
+        )
+
+
+def _market_flow_state(
+    *,
+    old: dict,
+    features: dict,
+    bull_score: int,
+    bear_score: int,
+    close_ms: int,
+    structure: dict | None = None,
+) -> dict:
+    """Fast current-flow state with two-bar promotion and hysteresis.
+
+    This is part of the same DXY engine but does not replace the conservative
+    turn lifecycle. It answers what DXY is doing now, while turn status answers
+    whether a reversal has been formally validated.
+    """
+    current_direction = (
+        "BULLISH" if bull_score > bear_score else
+        "BEARISH" if bear_score > bull_score else
+        "NEUTRAL"
+    )
+    current_score = max(int(bull_score), int(bear_score))
+    current_margin = abs(int(bull_score) - int(bear_score))
+    recent_net = float(features.get("recent_net_atr") or 0.0)
+    slope5 = float(features.get("slope_5_atr") or 0.0)
+    structure_break = bool(
+        features.get("bullish_structure_break")
+        if current_direction == "BULLISH"
+        else features.get("bearish_structure_break")
+    )
+
+    current_sign_ok = (
+        current_direction == "BULLISH" and recent_net > 0 and slope5 > 0
+    ) or (
+        current_direction == "BEARISH" and recent_net < 0 and slope5 < 0
+    )
+    current_signal = (
+        current_direction in ("BULLISH", "BEARISH")
+        and current_score >= FLOW_START_SCORE
+        and current_margin >= FLOW_START_MARGIN
+        and current_sign_ok
+    )
+    strong_single = (
+        current_signal
+        and current_score >= FLOW_STRONG_SINGLE_SCORE
+        and current_margin >= FLOW_STRONG_SINGLE_MARGIN
+        and abs(recent_net) >= 0.55
+    )
+
+    old_flow = old.get("market_flow") if isinstance(old, dict) else {}
+    if not isinstance(old_flow, dict):
+        old_flow = {}
+    old_direction = str(old_flow.get("direction") or "NEUTRAL").upper()
+    old_stage = str(old_flow.get("stage") or "NEUTRAL").upper()
+    old_support_bars = int(old_flow.get("support_bars") or 0)
+    old_opposite_bars = int(old_flow.get("opposite_bars") or 0)
+    old_weak_bars = int(old_flow.get("weak_bars") or 0)
+    old_started_ms = int(old_flow.get("started_ms") or 0)
+
+    prev_features = old.get("features") if isinstance(old, dict) else {}
+    if not isinstance(prev_features, dict):
+        prev_features = {}
+    prev_direction = str(prev_features.get("evidence_direction") or "NEUTRAL").upper()
+    prev_bull = int(prev_features.get("bull_evidence_score") or 0)
+    prev_bear = int(prev_features.get("bear_evidence_score") or 0)
+    prev_score = max(prev_bull, prev_bear)
+    prev_margin = abs(prev_bull - prev_bear)
+    previous_support = (
+        prev_direction == current_direction
+        and prev_score >= FLOW_START_SCORE
+        and prev_margin >= FLOW_START_MARGIN
+    )
+    two_bar_signal = bool(current_signal and previous_support)
+
+    direction = old_direction
+    stage = old_stage
+    support_bars = old_support_bars
+    opposite_bars = old_opposite_bars
+    weak_bars = old_weak_bars
+    started_ms = old_started_ms
+    reason = "NO_DIRECTIONAL_FLOW"
+
+    if old_direction not in ("BULLISH", "BEARISH"):
+        direction = "NEUTRAL"
+        stage = "NEUTRAL"
+        support_bars = 0
+        opposite_bars = 0
+        weak_bars = 0
+        started_ms = 0
+        if strong_single or two_bar_signal:
+            direction = current_direction
+            stage = "EARLY" if strong_single and not two_bar_signal else "BUILDING"
+            support_bars = 2 if two_bar_signal else 1
+            started_ms = close_ms
+            reason = "STRONG_SINGLE_BAR_FLOW" if strong_single and not two_bar_signal else "TWO_BAR_DIRECTIONAL_FLOW"
+    elif current_signal and current_direction == old_direction:
+        direction = old_direction
+        support_bars += 1
+        opposite_bars = 0
+        weak_bars = 0
+        stage = "STRONG" if support_bars >= 3 else "BUILDING"
+        reason = "FLOW_CONTINUES"
+    elif current_signal and current_direction != old_direction:
+        opposite_bars += 1
+        support_bars = max(1, support_bars - 1)
+        weak_bars += 1
+        hard_flip = (
+            current_score >= FLOW_FLIP_SCORE
+            and current_margin >= FLOW_FLIP_MARGIN
+            and abs(recent_net) >= FLOW_HARD_FLIP_NET_ATR
+            and (structure_break or opposite_bars >= 2)
+        )
+        if hard_flip or opposite_bars >= 2:
+            direction = current_direction
+            stage = "EARLY" if hard_flip else "BUILDING"
+            support_bars = 1 if hard_flip else 2
+            opposite_bars = 0
+            weak_bars = 0
+            started_ms = close_ms
+            reason = "HARD_FLOW_REVERSAL" if hard_flip else "TWO_BAR_FLOW_REVERSAL"
+        else:
+            direction = old_direction
+            stage = "WEAKENING"
+            reason = "ONE_BAR_OPPOSITE_EVIDENCE_HELD_BY_HYSTERESIS"
+    else:
+        opposite_bars = 0
+        weak_bars += 1
+        support_bars = max(0, support_bars - 1)
+        if current_direction == old_direction and current_score >= FLOW_MAINTAIN_SCORE and current_margin >= FLOW_MAINTAIN_MARGIN:
+            direction = old_direction
+            stage = "WEAKENING"
+            reason = "FLOW_WEAK_BUT_DIRECTION_STILL_DOMINANT"
+        elif weak_bars >= FLOW_NEUTRAL_AFTER_BARS:
+            direction = "NEUTRAL"
+            stage = "NEUTRAL"
+            support_bars = 0
+            weak_bars = 0
+            started_ms = 0
+            reason = "FLOW_DECAYED_TO_NEUTRAL"
+        else:
+            direction = old_direction
+            stage = "WEAKENING"
+            reason = "FLOW_MOMENTUM_PAUSED"
+
+    directional_score = bull_score if direction == "BULLISH" else bear_score if direction == "BEARISH" else 0
+    opposite_score = bear_score if direction == "BULLISH" else bull_score if direction == "BEARISH" else 0
+    evidence_margin = max(0, directional_score - opposite_score)
+    expansion = float(features.get("expansion_ratio") or 0.0)
+    acceleration = abs(float(features.get("acceleration_atr") or 0.0))
+
+    # Strength describes force of movement. Confidence describes reliability.
+    strength = int(max(0, min(100, round(
+        directional_score * 0.55
+        + min(25.0, abs(recent_net) * 18.0)
+        + min(10.0, abs(slope5) * 20.0)
+        + min(10.0, expansion * 8.0)
+    )))) if direction != "NEUTRAL" else 0
+    confidence = int(max(0, min(100, round(
+        directional_score * 0.50
+        + evidence_margin * 0.30
+        + min(15.0, support_bars * 5.0)
+        + (5.0 if structure_break else 0.0)
+        - min(10.0, acceleration * 8.0 if stage == "WEAKENING" else 0.0)
+    )))) if direction != "NEUTRAL" else 0
+
+    structure = structure if isinstance(structure, dict) else {}
+    pressure = str(
+        structure.get("structure_pressure")
+        or structure.get("pressure")
+        or "UNKNOWN"
+    ).upper()
+    directional_room = structure.get("directional_room_atr")
+    if direction in ("BULLISH", "BEARISH"):
+        if pressure in ("HIGH", "EXTREME") and stage in ("BUILDING", "STRONG"):
+            stage = "EXHAUSTING"
+            reason = "FLOW_AT_DIRECTIONAL_STRUCTURE_PRESSURE"
+            confidence = max(0, confidence - (15 if pressure == "EXTREME" else 8))
+        elif stage == "WEAKENING" and opposite_bars > 0:
+            stage = "REVERSING"
+        elif support_bars >= 4 and stage == "BUILDING":
+            stage = "STRONG"
+
+    return {
+        "schema_version": 1,
+        "direction": direction,
+        "strength": strength,
+        "confidence": confidence,
+        "stage": stage,
+        "reason": reason,
+        "support_bars": support_bars,
+        "opposite_bars": opposite_bars,
+        "weak_bars": weak_bars,
+        "started_ms": started_ms or None,
+        "updated_ms": close_ms,
+        "current_feature_direction": current_direction,
+        "current_feature_score": current_score,
+        "current_feature_margin": current_margin,
+        "two_bar_signal": two_bar_signal,
+        "strong_single_signal": strong_single,
+        "recent_net_atr": round(recent_net, 4),
+        "slope_5_atr": round(slope5, 5),
+        "structure_break": structure_break,
+        "structure_pressure": pressure,
+        "directional_room_atr": directional_room,
+        "structure": structure,
+        "shadow_only": True,
+    }
+
+def _synthetic_health(bar: dict, *, detected_at_ms: int, close_ms: int) -> dict:
+    pairs = [str(x).upper().strip() for x in ((bar or {}).get("synthetic_pairs") or []) if str(x).strip()]
+    pairs = list(dict.fromkeys(pairs))
+    missing = [x for x in SYNTHETIC_EXPECTED_PAIRS if x not in pairs]
+    count = int((bar or {}).get("synthetic_pair_count") or len(pairs) or 0)
+    age_ms = max(0, int(detected_at_ms or 0) - int(close_ms or 0))
+    complete = count == SYNTHETIC_EXPECTED_PAIR_COUNT and not missing
+    return {
+        "synthetic_health": "COMPLETE" if complete else "DEGRADED",
+        "synthetic_complete": bool(complete),
+        "synthetic_expected_pair_count": SYNTHETIC_EXPECTED_PAIR_COUNT,
+        "synthetic_pair_count": count,
+        "synthetic_pairs": pairs,
+        "synthetic_missing_pairs": missing,
+        "synthetic_close_age_ms": age_ms,
+        "synthetic_grace_ms": SYNTHETIC_CLOSE_GRACE_MS,
+        "synthetic_grace_complete": age_ms >= SYNTHETIC_CLOSE_GRACE_MS,
+    }
+
+
+def _persist_degraded_health(R, *, source: str, device_id: str, close_ms: int,
+                             broker_close_ms: int, offset_min: int, detected_at_ms: int,
+                             health: dict) -> None:
+    reason = (
+        "SYNTHETIC_GRACE_WAIT" if not health.get("synthetic_grace_complete")
+        else f"SYNTHETIC_PAIR_COUNT_{int(health.get('synthetic_pair_count') or 0)}"
+    )
+    diagnostic = {
+        "schema_version": 12,
+        "model": "DXY_M15_UNIFIED_MARKET_STATE_V12_COMPLETE_BASKET",
+        "source": source,
+        "device_id": device_id,
+        "bar_close_ms": int(close_ms),
+        "broker_bar_close_ms": int(broker_close_ms),
+        "broker_offset_minutes": int(offset_min),
+        "detected_at_ms": int(detected_at_ms),
+        "evaluation_final": False,
+        "candidate_qualified": False,
+        "candidate_qualification_reason": reason,
+        **health,
+    }
+    R.set(_features_key(source, device_id, close_ms), json.dumps(diagnostic, separators=(",", ":"), default=str), ex=HISTORY_TTL_SEC)
+    old = _json_load(R.get(_state_key(source, device_id)), {})
+    if not isinstance(old, dict):
+        old = {}
+    state = dict(old)
+    state.update({
+        "schema_version": max(12, int(old.get("schema_version") or 0)),
+        "model": "DXY_M15_UNIFIED_MARKET_STATE_V12_COMPLETE_BASKET",
+        "source": source,
+        "device_id": device_id,
+        "basket_health": health,
+        "synthetic_health": health.get("synthetic_health"),
+        "synthetic_complete": health.get("synthetic_complete"),
+        "synthetic_expected_pair_count": health.get("synthetic_expected_pair_count"),
+        "synthetic_pair_count": health.get("synthetic_pair_count"),
+        "synthetic_pairs": health.get("synthetic_pairs"),
+        "synthetic_missing_pairs": health.get("synthetic_missing_pairs"),
+        "latest_degraded_bar_close_ms": int(close_ms),
+        "latest_degraded_detected_at_ms": int(detected_at_ms),
+        "evaluation_pending_retry": True,
+        "shadow_only": True,
+    })
+    R.set(_state_key(source, device_id), json.dumps(state, separators=(",", ":"), default=str))
+
+
+def _history_last_confirmed_direction(R, source: str, device_id: str) -> str | None:
+    try:
+        for raw in reversed(R.lrange(_history_key(source, device_id), -100, -1) or []):
+            event = _json_load(raw, {})
+            if not isinstance(event, dict):
+                continue
+            status = str(event.get("status") or "").upper().strip()
+            direction = str(event.get("direction") or "").upper().strip()
+            if status in ("CONFIRMED", "COMPLETED", "WEAK_COMPLETION", "INVALIDATED") and direction in ("BULLISH", "BEARISH"):
+                return direction
+    except Exception:
+        pass
+    return None
+
+
 def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[dict], index: int,
                   detected_at_ms: int, offset_min: int, historical: bool) -> dict:
     prefix = bars[:index + 1]
@@ -1242,9 +1821,19 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
     )
     score_margin = abs(bull_score - bear_score)
 
+    if source == "SYNTHETIC_DXY":
+        features.update(_synthetic_health(bars[index], detected_at_ms=detected_at_ms, close_ms=close_ms))
+    else:
+        features.update({
+            "synthetic_health": None,
+            "synthetic_complete": None,
+            "synthetic_expected_pair_count": None,
+            "synthetic_missing_pairs": [],
+        })
+
     features.update({
-        "schema_version": 8,
-        "model": "DXY_M15_EARLY_REVERSAL_PIN_SR_CONTEXT_AUDIT_V8",
+        "schema_version": 12,
+        "model": "DXY_M15_UNIFIED_MARKET_STATE_V12_COMPLETE_BASKET",
         "raw_candidate_direction": raw_direction,
         "raw_candidate_confidence": raw_confidence,
         "strict_qualified_direction": qualified_direction,
@@ -1261,6 +1850,170 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
     old = _json_load(R.get(_state_key(source, device_id)), {})
     if not isinstance(old, dict):
         old = {}
+    last_confirmed_direction = str(
+        old.get("last_confirmed_direction")
+        or old.get("previous_direction")
+        or _history_last_confirmed_direction(R, source, device_id)
+        or ""
+    ).upper().strip()
+    if last_confirmed_direction not in ("BULLISH", "BEARISH"):
+        last_confirmed_direction = None
+    previous_direction = str(old.get("previous_direction") or last_confirmed_direction or "").upper().strip()
+    if previous_direction not in ("BULLISH", "BEARISH"):
+        previous_direction = None
+
+    provisional_flow_direction = (
+        "BULLISH" if bull_score > bear_score else
+        "BEARISH" if bear_score > bull_score else
+        "NEUTRAL"
+    )
+
+    # Build causal completed H1/H4 bars from this evaluation prefix, then ask
+    # the canonical XTL SR engine for structure.
+    h1_bars = _aggregate_bars_causal(prefix, 4 * TF_MS)
+    h4_bars = _aggregate_bars_causal(prefix, 16 * TF_MS)
+    h1_df = _bars_to_sr_frame(h1_bars)
+    h4_df = _bars_to_sr_frame(h4_bars)
+
+    bundle = summarize_sr_multi_tf(
+        symbol=f"{source}:{device_id}",
+        price=current_close,
+        h4_df=h4_df,
+        h1_df=h1_df,
+        pip_factor=DXY_SR_PIP_FACTOR,
+        cache=None,
+    )
+    if not historical:
+        _persist_dxy_sr_bundle(
+            R,
+            source=source,
+            device_id=device_id,
+            bundle=bundle,
+        )
+
+    structure = build_market_structure_state(
+        bundle,
+        price=current_close,
+        flow_direction=provisional_flow_direction,
+    )
+
+    market_flow = _market_flow_state(
+        old=old,
+        features=features,
+        bull_score=bull_score,
+        bear_score=bear_score,
+        close_ms=close_ms,
+        structure=structure,
+    )
+    # Recalculate directional pressure using the persisted/hysteretic flow direction.
+    structure = build_market_structure_state(
+        bundle,
+        price=current_close,
+        flow_direction=market_flow.get("direction"),
+    )
+    log.warning(
+        "[DXY] STRUCTURE_PATH_DEBUG "
+        "dir=%s "
+        "support_path=%d "
+        "resistance_path=%d",
+        market_flow.get("direction"),
+        len(structure.get("support_path") or []),
+        len(structure.get("resistance_path") or []),
+    )
+
+    market_flow["structure"] = structure
+    market_flow["structure_pressure"] = structure.get(
+        "structure_pressure"
+    )
+    market_flow["directional_room_atr"] = structure.get(
+        "directional_room_atr"
+    )
+
+    features["market_flow"] = market_flow
+    features["structure"] = structure
+    features["structure_source"] = "trend_sr"
+
+    # ------------------------------------------------------------
+    # Shadow analytics: track both directional SR candidates.
+    #
+    # NEAREST:
+    #   Closest canonical active SR in the flow direction.
+    #
+    # BEST:
+    #   Highest-scored valid SR in the flow direction.
+    #
+    # This does not change flow, pressure, target selection, or execution.
+    # Future hit-order/timestamps belong to analytics tracking.
+    # ------------------------------------------------------------
+    flow_dir = str(
+        market_flow.get("direction")
+        or "NEUTRAL"
+    ).upper().strip()
+
+    if flow_dir == "BULLISH":
+        structure_targets = {
+            "schema_version": 1,
+            "analytics_only": True,
+            "direction": "BULLISH",
+            "role": "RESISTANCE",
+            "created_at_bar_close_ms": int(close_ms),
+            "origin_price": float(current_close),
+
+            "nearest": structure.get("nearest_resistance"),
+            "best": structure.get("best_resistance"),
+            "path": structure.get("resistance_path") or [],
+            "nearest_reached": False,
+            "nearest_reached_at_ms": None,
+            "best_reached": False,
+            "best_reached_at_ms": None,
+            "first_reached": None,
+        }
+
+    elif flow_dir == "BEARISH":
+        structure_targets = {
+            "schema_version": 1,
+            "analytics_only": True,
+            "direction": "BEARISH",
+            "role": "SUPPORT",
+            "created_at_bar_close_ms": int(close_ms),
+            "origin_price": float(current_close),
+
+            "nearest": structure.get("nearest_support"),
+            "best": structure.get("best_support"),
+            "path": structure.get("support_path") or [],
+            "nearest_reached": False,
+            "nearest_reached_at_ms": None,
+            "best_reached": False,
+            "best_reached_at_ms": None,
+            "first_reached": None,
+        }
+
+    else:
+        structure_targets = {
+            "schema_version": 1,
+            "analytics_only": True,
+            "direction": "NEUTRAL",
+            "role": None,
+            "created_at_bar_close_ms": int(close_ms),
+            "origin_price": float(current_close),
+
+            "nearest": None,
+            "best": None,
+
+            "nearest_reached": False,
+            "nearest_reached_at_ms": None,
+            "best_reached": False,
+            "best_reached_at_ms": None,
+            "first_reached": None,
+        }
+    # ---------------------------------------------------------
+    # Keep only the first 5 structure levels.
+    # ---------------------------------------------------------
+    if structure_targets.get("path"):
+        structure_targets["path"] = structure_targets["path"][:5]
+
+    # Save in per-bar features as well as the live state.
+    features["structure_targets"] = structure_targets
 
     old_status = str(old.get("status") or "IDLE").upper().strip()
     old_direction = str(old.get("candidate_direction") or old.get("direction") or "NEUTRAL").upper().strip()
@@ -1438,9 +2191,9 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
     event_record = None
     if event:
         payload = {
-            "schema_version": 8,
-            "event_type": "DXY_M15_EARLY_REVERSAL",
-            "model": "DXY_M15_EARLY_REVERSAL_PIN_SR_CONTEXT_AUDIT_V8",
+            "schema_version": 11,
+            "event_type": "DXY_M15_MARKET_STATE_TURN",
+            "model": "DXY_M15_UNIFIED_MARKET_STATE_V12_COMPLETE_BASKET",
             "source": source,
             "device_id": device_id,
             "uids": binding.get("uids") or [],
@@ -1480,10 +2233,17 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
         event_record = payload
         _append_event_once(R, payload)
 
+    if event and str(event.get("status") or "").upper() == "CONFIRMED":
+        confirmed_direction_now = str(event.get("direction") or "").upper().strip()
+        if confirmed_direction_now in ("BULLISH", "BEARISH"):
+            if last_confirmed_direction and last_confirmed_direction != confirmed_direction_now:
+                previous_direction = last_confirmed_direction
+            last_confirmed_direction = confirmed_direction_now
+
     state = {
-        "schema_version": 8,
+        "schema_version": 12,
         "initialized": True,
-        "model": "DXY_M15_EARLY_REVERSAL_PIN_SR_CONTEXT_AUDIT_V8",
+        "model": "DXY_M15_UNIFIED_MARKET_STATE_V12_COMPLETE_BASKET",
         "source": source,
         "device_id": device_id,
         "uids": binding.get("uids") or [],
@@ -1492,6 +2252,8 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
         "status": status,
         "candidate_direction": direction if active else "NEUTRAL",
         "direction": direction if active else "NEUTRAL",
+        "previous_direction": previous_direction or last_confirmed_direction,
+        "last_confirmed_direction": last_confirmed_direction,
         "candidate_started_ms": started_ms if active else None,
         "candidate_age_bars": age_bars if active else None,
         "candidate_start_price": start_price if active else None,
@@ -1509,6 +2271,48 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
         "bars_to_peak": bars_to_peak if active else 0,
         "revoke_score": revoke_score,
         "revoke_reasons": revoke_reasons,
+        "market_flow": market_flow,
+        "market_flow_direction": market_flow.get("direction"),
+        "market_flow_strength": market_flow.get("strength"),
+        "market_flow_confidence": market_flow.get("confidence"),
+        "market_flow_stage": market_flow.get("stage"),
+        "market_flow_reason": market_flow.get("reason"),
+
+        "structure": structure,
+        "structure_targets": structure_targets,
+        "structure_source": "trend_sr",
+        "structure_pressure": structure.get("structure_pressure"),
+        "structure_pressure_reason": structure.get("structure_pressure_reason"),
+        "nearest_support": structure.get("nearest_support"),
+        "nearest_resistance": structure.get("nearest_resistance"),
+        "next_support": structure.get("next_support"),
+        "next_resistance": structure.get("next_resistance"),
+        "best_support": structure.get("best_support"),
+        "best_resistance": structure.get("best_resistance"),
+        "active_target": structure.get("active_target"),
+        "active_target_source": structure.get("active_target_source"),
+        "room_up_atr": structure.get("room_up_atr"),
+        "room_down_atr": structure.get("room_down_atr"),
+        "summary": {
+            "flow": market_flow.get("direction"),
+            "stage": market_flow.get("stage"),
+            "strength": market_flow.get("strength"),
+            "confidence": market_flow.get("confidence"),
+            "pressure": structure.get("structure_pressure"),
+            "directional_room_atr": structure.get("directional_room_atr"),
+            "nearest_resistance": (structure.get("nearest_resistance") or {}).get("price"),
+            "nearest_support": (structure.get("nearest_support") or {}).get("price"),
+            "active_target": (structure.get("active_target") or {}).get("price"),
+            "active_target_source": structure.get("active_target_source"),
+            "structure_source": "trend_sr",
+            "expectation": (
+                "REVERSAL_RISK_HIGH" if structure.get("structure_pressure") in ("HIGH", "EXTREME")
+                else "CONTINUATION_FAVOURED" if market_flow.get("direction") in ("BULLISH", "BEARISH")
+                else "NO_DIRECTIONAL_EDGE"
+            ),
+        },
+        "turn_status": status,
+        "turn_direction": direction if active else "NEUTRAL",
         "latest_feature_direction": score_direction,
         "latest_feature_qualified": bool(features.get("candidate_qualified")),
         "latest_qualification_reason": qualification_reason,
@@ -1520,6 +2324,15 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
         "broker_offset_minutes": offset_min,
         "detected_at_ms": detected_at_ms,
         "features": features,
+        "basket_health": {
+            "synthetic_health": features.get("synthetic_health"),
+            "synthetic_complete": features.get("synthetic_complete"),
+            "synthetic_expected_pair_count": features.get("synthetic_expected_pair_count"),
+            "synthetic_pair_count": features.get("synthetic_pair_count"),
+            "synthetic_pairs": features.get("synthetic_pairs"),
+            "synthetic_missing_pairs": features.get("synthetic_missing_pairs"),
+        } if source == "SYNTHETIC_DXY" else None,
+        "evaluation_pending_retry": False,
         "shadow_only": True,
     }
 
@@ -1754,6 +2567,7 @@ def update_global_dxy_m15_state(*, R, now_ms: int | None = None) -> dict:
         "bindings": 0, "devices": 0, "real_available": 0,
         "synthetic_available": 0, "series_built": 0,
         "bootstrapped": 0, "evaluated": 0, "candidate_events": 0,
+        "grace_wait": 0, "degraded_retry": 0, "eval_failed_retry": 0,
         "errors": 0, "lock": False,
     }
     try:
@@ -1789,8 +2603,28 @@ def update_global_dxy_m15_state(*, R, now_ms: int | None = None) -> dict:
                     )
                     if marker.get("completed"):
                         stats["bootstrapped"] += 1
-                    close_ms = _broker_to_utc_ms(_bar_close_ms(bars[-1]), offset_min)
-                    if not R.set(_eval_key(source, device_id, close_ms), str(detected_at_ms), nx=True, ex=2 * 60 * 60):
+                    broker_close_ms = _bar_close_ms(bars[-1])
+                    close_ms = _broker_to_utc_ms(broker_close_ms, offset_min)
+                    if source == "SYNTHETIC_DXY":
+                        health = _synthetic_health(bars[-1], detected_at_ms=detected_at_ms, close_ms=close_ms)
+                        if not health.get("synthetic_grace_complete"):
+                            stats["grace_wait"] += 1
+                            _persist_degraded_health(
+                                R, source=source, device_id=device_id, close_ms=close_ms,
+                                broker_close_ms=broker_close_ms, offset_min=offset_min,
+                                detected_at_ms=detected_at_ms, health=health,
+                            )
+                            continue
+                        if not health.get("synthetic_complete"):
+                            stats["degraded_retry"] += 1
+                            _persist_degraded_health(
+                                R, source=source, device_id=device_id, close_ms=close_ms,
+                                broker_close_ms=broker_close_ms, offset_min=offset_min,
+                                detected_at_ms=detected_at_ms, health=health,
+                            )
+                            continue
+                    eval_key = _eval_key(source, device_id, close_ms)
+                    if not R.set(eval_key, str(detected_at_ms), nx=True, ex=2 * 60 * 60):
                         continue
                     result = _evaluate_one(
                         R, source=source, device_id=device_id, binding=binding,
@@ -1799,6 +2633,12 @@ def update_global_dxy_m15_state(*, R, now_ms: int | None = None) -> dict:
                     )
                     if result.get("ok"):
                         stats["evaluated"] += 1
+                    else:
+                        try:
+                            R.delete(eval_key)
+                        except Exception:
+                            pass
+                        stats["eval_failed_retry"] += 1
                     if result.get("event"):
                         stats["candidate_events"] += 1
                         log.warning(

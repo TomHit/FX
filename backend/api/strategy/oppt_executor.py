@@ -65,8 +65,77 @@ def _discord_trade_post(content: str) -> bool:
     except Exception:
         return False
 
+def _refresh_prop_risk_snapshot_after_event(
+    uid: str,
+    profile_id: str,
+    event: str,
+) -> dict:
+    """
+    Recompute and publish the authoritative prop-risk snapshot
+    after a confirmed writer-side lifecycle transition.
+
+    This helper is best-effort. Snapshot publication failure
+    must never fail entry, close, or broker reconciliation.
+    """
+    uid_u = str(uid or "").strip()
+    profile_u = str(profile_id or "").strip().lower()
+    event_u = str(event or "UNKNOWN").strip().upper()
+
+    if not uid_u or not profile_u:
+        log.warning(
+            "[PROP] SNAPSHOT_REFRESH_SKIP "
+            "event=%s uid_present=%s profile=%s",
+            event_u,
+            bool(uid_u),
+            profile_u or None,
+        )
+        return {}
+
+    started_ms = int(time.time() * 1000)
+
+    try:
+        risk = _get_prop_risk_state(
+            uid_u,
+            profile_u,
+        ) or {}
+
+        elapsed_ms = (
+            int(time.time() * 1000)
+            - started_ms
+        )
+
+        log.warning(
+            "[PROP] SNAPSHOT_REFRESH_OK "
+            "event=%s uid=%s profile=%s "
+            "elapsed_ms=%s generated_at_ms=%s "
+            "open_risk_usd=%s open_positions=%s",
+            event_u,
+            uid_u,
+            profile_u,
+            elapsed_ms,
+            risk.get("snapshot_generated_at_ms"),
+            risk.get("open_risk_usd"),
+            len(risk.get("open_positions") or []),
+        )
+
+        return risk
+
+    except Exception as exc:
+        log.exception(
+            "[PROP] SNAPSHOT_REFRESH_FAILED "
+            "event=%s uid=%s profile=%s err=%r",
+            event_u,
+            uid_u,
+            profile_u,
+            exc,
+        )
+        return {}
+
+
 def _sticky_dev_key(user_id: str, sym: str, tf: str = "M1") -> str:
     return f"xtl:sticky_device:{user_id}:{sym.upper()}:{tf.upper()}"
+
+
 
 def _mt5_cmdq_key(dev_id: str) -> str:
     return f"xtl:mt5:cmdq:{dev_id}"
@@ -1714,7 +1783,13 @@ def _sync_watches_for_broker_active_position(uid: str,bp: dict, reason: str = "B
         opp_side = "SELL" if side == "BUY" else "BUY"
 
         # Opposite side must not remain REV_OK/ENTRY_READY while broker position exists.
-        R.delete(_zone_watch_key(uid_u,sym, opp_side, "H1"))
+        zone_watch_delete(
+            R,
+            uid_u,
+            sym,
+            opp_side,
+            tf="H1",
+        )
         R.delete(
             break_state_key(
                 uid_u,
@@ -1723,15 +1798,13 @@ def _sync_watches_for_broker_active_position(uid: str,bp: dict, reason: str = "B
                 "H1",
             )
         )
-        for k in R.scan_iter(
-            entry_claim_pattern(
-                uid_u,
-                sym,
-                opp_side,
-                "H1",
-            )
-        ):
-            R.delete(k)
+        tenant_delete_latest_entry_claim(
+            R,
+            uid_u,
+            sym,
+            opp_side,
+            "H1",
+        )
 
         # Same side must always show broker-truth TRADE_ACTIVE.
         same_key = _zone_watch_key(uid_u,sym, side, "H1")
@@ -1919,10 +1992,14 @@ def _get_enabled_user_ids(limit: int = 500) -> list[str]:
 
 from api.tenant_keys import (
     zone_watch_key,
-    zone_watch_pattern,
+    zone_watch_delete,
     break_state_key,
     entry_claim_key,
-    entry_claim_pattern,
+    zone_watch_index_key,
+    
+    entry_claim_acquire as tenant_entry_claim_acquire,
+    delete_latest_entry_claim as tenant_delete_latest_entry_claim,
+   
 )
 
 def _zone_watch_key(
@@ -3522,6 +3599,14 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
             profile_id=close_profile_id,
         )
 
+        # Writer-side snapshot publication:
+        # reservation and daily close accounting are now finalized.
+        _refresh_prop_risk_snapshot_after_event(
+            uid,
+            close_profile_id,
+            "TRADE_CLOSED",
+        )
+
     except Exception as e:
         log.warning(
             "[PROP] RELEASE_FAILED "
@@ -4090,7 +4175,16 @@ def tick_user(uid: str) -> None:
                     pass
 
                 _open_trade(uid, pos)  # update stored open trade
-                # ── analytics: capture AFTER ticket + real fill are on pos ──
+
+                # Writer-side snapshot publication:
+                # broker ACK is successful and TRADE_ACTIVE has been persisted.
+                _refresh_prop_risk_snapshot_after_event(
+                    uid,
+                    str(pos.get("profile_id") or ""),
+                    "MT5_ACK_FILLED",
+                )
+
+                # Analytics runs only after the authoritative snapshot refresh.
                 try:
                     from api.xtl_analytics import capture_entry
                     capture_entry(pos, capture_source="normal")
@@ -4274,16 +4368,13 @@ def tick_user(uid: str) -> None:
 
                     # Release the short watch entry claim.
                     try:
-                        for _claim_key in R.scan_iter(
-                            entry_claim_pattern(
-                                uid,
-                                _sym_fail,
-                                _side_fail,
-                                "H1",
-                            ),
-                            count=50,
-                        ):
-                            R.delete(_claim_key)
+                        tenant_delete_latest_entry_claim(
+                            R,
+                            uid,
+                            _sym_fail,
+                            _side_fail,
+                            "H1",
+                        )
                     except Exception:
                         pass
 
@@ -5452,16 +5543,177 @@ def tick_user(uid: str) -> None:
     # OPPT rows are advisory/history only.
     # -------------------------------------------------
     try:
-        for wkey in R.scan_iter(
-            zone_watch_pattern(
+        # WATCH_INDEX_SELF_HEAL_V1
+        #
+        # Actual tenant watch keys are the source of truth.
+        # The Redis set index is an optimization only.
+        # A missing index member must never make a valid
+        # REV_OK watch invisible to the executor.
+        _watch_index_key = (
+            zone_watch_index_key(
                 uid,
                 "H1",
             )
-        ):
+        )
+
+        try:
+            _indexed_watch_keys = {
+                (
+                    _k.decode(
+                        "utf-8",
+                        errors="ignore",
+                    )
+                    if isinstance(
+                        _k,
+                        (bytes, bytearray),
+                    )
+                    else str(_k)
+                ).strip()
+                for _k in (
+                    R.smembers(
+                        _watch_index_key
+                    )
+                    or []
+                )
+                if _k
+            }
+            _indexed_watch_keys.discard("")
+        except Exception:
+            log.exception(
+                "[WATCHLIST] "
+                "WATCH_INDEX_READ_FAILED "
+                "uid=%s index=%s",
+                uid,
+                _watch_index_key,
+            )
+            _indexed_watch_keys = set()
+
+        _watch_pattern = (
+            f"xtl:zone:watch:"
+            f"{uid}:*:H1"
+        )
+
+        try:
+            _actual_watch_keys = {
+                (
+                    _k.decode(
+                        "utf-8",
+                        errors="ignore",
+                    )
+                    if isinstance(
+                        _k,
+                        (bytes, bytearray),
+                    )
+                    else str(_k)
+                ).strip()
+                for _k in R.scan_iter(
+                    match=_watch_pattern,
+                    count=200,
+                )
+                if _k
+            }
+            _actual_watch_keys.discard("")
+        except Exception:
+            log.exception(
+                "[WATCHLIST] "
+                "WATCH_SCAN_FAILED "
+                "uid=%s pattern=%s",
+                uid,
+                _watch_pattern,
+            )
+            _actual_watch_keys = set()
+
+        _missing_watch_keys = (
+            _actual_watch_keys
+            - _indexed_watch_keys
+        )
+
+        if _missing_watch_keys:
             try:
+                R.sadd(
+                    _watch_index_key,
+                    *_missing_watch_keys,
+                )
+
+                log.warning(
+                    "[WATCHLIST] "
+                    "WATCH_INDEX_REPAIRED "
+                    "uid=%s index=%s "
+                    "repaired=%s keys=%s",
+                    uid,
+                    _watch_index_key,
+                    len(_missing_watch_keys),
+                    sorted(
+                        _missing_watch_keys
+                    ),
+                )
+            except Exception:
+                log.exception(
+                    "[WATCHLIST] "
+                    "WATCH_INDEX_REPAIR_FAILED "
+                    "uid=%s index=%s "
+                    "missing=%s",
+                    uid,
+                    _watch_index_key,
+                    sorted(
+                        _missing_watch_keys
+                    ),
+                )
+
+        # Process repaired watches immediately in this
+        # executor cycle.
+        _watch_keys = sorted(
+            _indexed_watch_keys
+            | _actual_watch_keys
+        )
+
+        for wkey in _watch_keys:
+            try:
+                if isinstance(
+                    wkey,
+                    (bytes, bytearray),
+                ):
+                    wkey = wkey.decode(
+                        "utf-8",
+                        errors="ignore",
+                    )
+
+                wkey = str(
+                    wkey or ""
+                ).strip()
+
+                if not wkey:
+                    continue
                 raw_w = R.get(wkey)
-                watch = _sj(raw_w, {}) if raw_w else {}
-                if not isinstance(watch, dict) or not watch:
+
+                if not raw_w:
+                    try:
+                        R.srem(
+                            _watch_index_key,
+                            wkey,
+                        )
+                    except Exception:
+                        pass
+
+                    continue
+
+                watch = _sj(
+                    raw_w,
+                    {},
+                )
+
+                if not isinstance(
+                    watch,
+                    dict,
+                ) or not watch:
+                    try:
+                        R.srem(
+                            _watch_index_key,
+                            wkey,
+                        )
+                    except Exception:
+                        pass
+
                     continue
 
                 parts = str(wkey).split(":")
@@ -5813,16 +6065,63 @@ def tick_user(uid: str) -> None:
                 except Exception:
                     broker_offset_min = 0
 
-                # If watch does not carry broker TZ, read it from OHLC snapshot.
+                
+                # If the watch does not carry broker TZ,
+                # read the deterministic latest OHLC
+                # publisher for this symbol. No SCAN.
                 if not broker_offset_min:
                     try:
-                        for _k in R.scan_iter(f"xtl:ohlc:snap:*:{sym_w}:H1", count=20):
-                            _js = _sj(R.get(_k), {}) or {}
-                            _br = _js.get("broker") if isinstance(_js.get("broker"), dict) else {}
-                            _off = int(_br.get("tz_offset_min") or 0)
-                            if _off:
-                                broker_offset_min = _off
-                                break
+                        _latest_dev = R.get(
+                            f"xtl:ohlc:latest:"
+                            f"{sym_w}:H1"
+                        )
+
+                        if isinstance(
+                            _latest_dev,
+                            (bytes, bytearray),
+                        ):
+                            _latest_dev = (
+                                _latest_dev.decode(
+                                    "utf-8",
+                                    errors="ignore",
+                                )
+                            )
+
+                        _latest_dev = str(
+                            _latest_dev or ""
+                        ).strip()
+
+                        if _latest_dev:
+                            _snap_key = (
+                                f"xtl:ohlc:snap:"
+                                f"{_latest_dev}:"
+                                f"{sym_w}:H1"
+                            )
+
+                            _js = _sj(
+                                R.get(_snap_key),
+                                {},
+                            ) or {}
+
+                            _br = (
+                                _js.get("broker")
+                                if isinstance(
+                                    _js.get("broker"),
+                                    dict,
+                                )
+                                else {}
+                            )
+
+                            broker_offset_min = int(
+                                _br.get(
+                                    "tz_offset_min"
+                                )
+                                or _br.get(
+                                    "broker_tz_offset_min"
+                                )
+                                or 0
+                            )
+
                     except Exception:
                         broker_offset_min = 0
 
@@ -5898,7 +6197,13 @@ def tick_user(uid: str) -> None:
                             sym_w, side_w, trigger_level, live_px, late_move, max_move, wkey
                         )
                         try:
-                            R.delete(str(wkey))
+                            zone_watch_delete(
+                                R,
+                                uid,
+                                sym_w,
+                                side_w,
+                                tf="H1",
+                            )
                             R.delete(
                                 break_state_key(
                                     uid,
@@ -5907,16 +6212,13 @@ def tick_user(uid: str) -> None:
                                     "H1",
                                 )
                             )
-                            for _ck in R.scan_iter(
-                                entry_claim_pattern(
-                                    uid,
-                                    sym_w,
-                                    side_w,
-                                    "H1",
-                                ),
-                                count=50,
-                            ):
-                                R.delete(_ck)
+                            tenant_delete_latest_entry_claim(
+                                R,
+                                uid,
+                                sym_w,
+                                side_w,
+                                "H1",
+                            )
                         except Exception:
                             pass
                         continue
@@ -6156,18 +6458,32 @@ def tick_user(uid: str) -> None:
                 if state_now in ("ORDER_PENDING", "TRADE_ACTIVE"):
                     continue
 
+                claim_rev_ms = int(
+                    watch.get("rev_ok_ms")
+                    or watch.get("started_ms")
+                    or 0
+                )
+
                 claim_key = entry_claim_key(
                     uid,
                     sym_w,
                     side_w,
-                    int(
-                        watch.get("rev_ok_ms")
-                        or watch.get("started_ms")
-                        or 0
-                    ),
+                    claim_rev_ms,
                     "H1",
                 )
-                claimed = R.set(claim_key, str(now_ms()), nx=True, ex=120)
+
+                claim_created_ms = now_ms()
+
+                claimed = tenant_entry_claim_acquire(
+                    R,
+                    uid,
+                    sym_w,
+                    side_w,
+                    claim_rev_ms,
+                    str(claim_created_ms),
+                    tf="H1",
+                    ex=120,
+                )
                 log.warning(
                     "[WATCHLIST] CLAIM_RESULT sym=%s side=%s claimed=%s claim_key=%s",
                     sym_w,
@@ -6216,13 +6532,32 @@ def tick_user(uid: str) -> None:
 
                 if sl_price <= 0 or tp_price <= 0:
                     log.warning(
-                        "[WATCHLIST] SKIP_ENTRY no_structure_sl sym=%s side=%s entry=%s zone=%s key=%s",
-                        sym_w, side_w, entry_px, zone, wkey
+                        "[WATCHLIST] SKIP_ENTRY no_structure_sl "
+                        "sym=%s side=%s entry=%s zone=%s key=%s",
+                        sym_w,
+                        side_w,
+                        entry_px,
+                        zone,
+                        wkey,
                     )
+
                     try:
-                        R.delete(claim_key)
-                    except Exception:
-                        pass
+                        tenant_delete_latest_entry_claim(
+                            R,
+                            uid,
+                            sym_w,
+                            side_w,
+                            tf="H1",
+                        )
+                    except Exception as claim_cleanup_exc:
+                        log.warning(
+                            "[WATCHLIST] ENTRY_CLAIM_CLEANUP_FAILED "
+                            "sym=%s side=%s reason=no_structure_sl err=%r",
+                            sym_w,
+                            side_w,
+                            claim_cleanup_exc,
+                        )
+
                     continue
                 log.warning(
                    "[WATCHLIST] BUILDING_ENTRY_EVENT sym=%s side=%s trade_id=%s",
@@ -7593,7 +7928,13 @@ def tick_user(uid: str) -> None:
 
                         try:
                             if _wk_late:
-                                R.delete(_wk_late)
+                                zone_watch_delete(
+                                    R,
+                                    uid,
+                                    sym,
+                                    side,
+                                    tf="H1",
+                                )
                             R.delete(
                                 break_state_key(
                                     uid,
@@ -7602,15 +7943,13 @@ def tick_user(uid: str) -> None:
                                     "H1",
                                 )
                             )
-                            for _ck in R.scan_iter(
-                                entry_claim_pattern(
-                                    uid,
-                                    sym,
-                                    side,
-                                    "H1",
-                                )
-                            ):
-                                R.delete(_ck)
+                            tenant_delete_latest_entry_claim(
+                                R,
+                                uid,
+                                sym,
+                                side,
+                                "H1",
+                            )
                         except Exception:
                             pass
 
@@ -7705,15 +8044,13 @@ def tick_user(uid: str) -> None:
                 # release watchlist claim so it can retry next cycle
                 try:
                     if is_watchlist_event:
-                        for k in R.scan_iter(
-                            entry_claim_pattern(
-                                uid,
-                                sym,
-                                side,
-                                "H1",
-                            )
-                        ):
-                            R.delete(k)
+                        tenant_delete_latest_entry_claim(
+                            R,
+                            uid,
+                            sym,
+                            side,
+                            "H1",
+                        )
                 except Exception:
                     pass
 
@@ -7852,7 +8189,13 @@ def tick_user(uid: str) -> None:
             # -------------------------------------------------
             try:
                 opp_side = "SELL" if side == "BUY" else "BUY"
-                R.delete(_zone_watch_key(uid,sym, opp_side, "H1"))
+                zone_watch_delete(
+                    R,
+                    uid,
+                    sym,
+                    opp_side,
+                    tf="H1",
+                )
                 R.delete(
                     break_state_key(
                         uid,
@@ -7861,15 +8204,13 @@ def tick_user(uid: str) -> None:
                         "H1",
                     )
                 )
-                for k in R.scan_iter(
-                    entry_claim_pattern(
-                        uid,
-                        sym,
-                        opp_side,
-                        "H1",
-                    )
-                ):
-                    R.delete(k)
+                tenant_delete_latest_entry_claim(
+                    R,
+                    uid_u,
+                    sym,
+                    opp_side,
+                    "H1",
+                )
 
                 log.warning(
                     "[WATCHLIST] OPPOSITE_WATCH_CLEARED_ON_ENTRY sym=%s active_side=%s cleared_side=%s trade_id=%s",
