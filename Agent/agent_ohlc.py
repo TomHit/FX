@@ -29,6 +29,23 @@ _last_sent_bar: dict[tuple[str, str], int] = {}  # (symbol, TF) -> last 't' sent
 _LAST_MT5_POSITIONS: dict[int, dict] = {}
 _MT5_POS_STATE_LOADED = False
 
+_PENDING_MT5_DEALS: dict[int, dict] = {}
+_MT5_DEAL_STATE_LOADED = False
+
+DEAL_RETRY_DELAYS_SEC = (
+    60,
+    120,
+    300,
+    600,
+    1800,
+    3600,
+    6 * 3600,
+    12 * 3600,
+    24 * 3600,
+)
+
+DEAL_RETRY_OVERDUE_SEC = 24 * 3600
+
 
 def _mt5_pos_state_path(dev_id: str, mt5_account: str = "demo") -> Path:
     base = os.environ.get("XTL_AGENT_STATE_DIR")
@@ -206,6 +223,241 @@ DEFAULT_SYMBOLS_CSV = ",".join(DEFAULT_SYMBOLS)
 # Self-contained registry getter (prefers registry, falls back to env)
 
 
+
+def _mt5_pending_deals_path(
+    dev_id: str,
+    mt5_account: str = "demo",
+) -> Path:
+    base = os.environ.get("XTL_AGENT_STATE_DIR")
+
+    if base:
+        root = Path(base)
+    elif os.name == "nt":
+        root = (
+            Path(
+                os.environ.get(
+                    "PROGRAMDATA",
+                    r"C:\ProgramData",
+                )
+            )
+            / "XTL"
+            / "state"
+        )
+    else:
+        root = Path.home() / ".xtl"
+
+    return root / (
+        f"mt5_pending_deals_"
+        f"{dev_id}_{mt5_account}.json"
+    )
+
+
+def _load_pending_mt5_deals(
+    dev_id: str,
+    mt5_account: str = "demo",
+) -> dict[int, dict]:
+    try:
+        path = _mt5_pending_deals_path(
+            dev_id,
+            mt5_account,
+        )
+
+        if not path.exists():
+            return {}
+
+        payload = json.loads(
+            path.read_text(
+                encoding="utf-8-sig"
+            )
+            or "{}"
+        )
+
+        rows = payload.get("pending_deals") or {}
+
+        result: dict[int, dict] = {}
+
+        for raw_ticket, raw_row in rows.items():
+            try:
+                ticket = int(raw_ticket)
+
+                if (
+                    ticket > 0
+                    and isinstance(raw_row, dict)
+                ):
+                    result[ticket] = dict(raw_row)
+
+            except Exception:
+                continue
+
+        return result
+
+    except Exception as exc:
+        log.warning(
+            "MT5_PENDING_DEALS_LOAD_FAIL "
+            "dev=%s acct=%s err=%s",
+            dev_id,
+            mt5_account,
+            exc,
+        )
+        return {}
+
+
+def _save_pending_mt5_deals(
+    dev_id: str,
+    mt5_account: str,
+    pending: dict[int, dict],
+) -> None:
+    path = _mt5_pending_deals_path(
+        dev_id,
+        mt5_account,
+    )
+
+    try:
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        payload = {
+            "saved_at_ms": int(
+                time.time() * 1000
+            ),
+            "device_id": str(dev_id),
+            "mt5_account": str(mt5_account),
+            "pending_deals": {
+                str(ticket): row
+                for ticket, row in (
+                    pending or {}
+                ).items()
+            },
+        }
+
+        tmp = path.with_suffix(".tmp")
+
+        tmp.write_text(
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+
+        tmp.replace(path)
+
+    except Exception as exc:
+        log.warning(
+            "MT5_PENDING_DEALS_SAVE_FAIL "
+            "dev=%s acct=%s pending=%s err=%s",
+            dev_id,
+            mt5_account,
+            len(pending or {}),
+            exc,
+        )
+
+
+def _deal_retry_delay_ms(
+    attempt_count: int,
+) -> int:
+    attempt = max(
+        1,
+        int(attempt_count or 1),
+    )
+
+    index = min(
+        attempt - 1,
+        len(DEAL_RETRY_DELAYS_SEC) - 1,
+    )
+
+    return int(
+        DEAL_RETRY_DELAYS_SEC[index]
+        * 1000
+    )
+
+
+def _queue_pending_mt5_deal(
+    ticket: int,
+    prev_position: dict,
+    now_ms: int,
+) -> None:
+    ticket_i = int(ticket or 0)
+
+    if ticket_i <= 0:
+        return
+
+    row = _PENDING_MT5_DEALS.get(
+        ticket_i
+    )
+
+    if not isinstance(row, dict):
+        row = {
+            "ticket": ticket_i,
+            "status": "PENDING_FETCH",
+            "first_seen_ms": int(now_ms),
+            "last_attempt_ms": None,
+            "next_retry_ms": int(now_ms),
+            "attempt_count": 0,
+            "last_error": None,
+            "prev_position": dict(
+                prev_position or {}
+            ),
+            "deal_payload": None,
+        }
+
+        _PENDING_MT5_DEALS[
+            ticket_i
+        ] = row
+
+    elif (
+        not row.get("prev_position")
+        and prev_position
+    ):
+        row["prev_position"] = dict(
+            prev_position
+        )
+
+
+def _mark_pending_deal_failure(
+    row: dict,
+    error: str,
+    now_ms: int,
+) -> None:
+    attempt_count = int(
+        row.get("attempt_count")
+        or 0
+    ) + 1
+
+    delay_ms = _deal_retry_delay_ms(
+        attempt_count
+    )
+
+    row.update({
+        "status": "PENDING_FETCH",
+        "attempt_count": attempt_count,
+        "last_attempt_ms": int(now_ms),
+        "next_retry_ms": (
+            int(now_ms) + delay_ms
+        ),
+        "retry_delay_ms": delay_ms,
+        "last_error": str(
+            error or "UNKNOWN"
+        ),
+        "deal_payload": None,
+    })
+
+
+def _mark_pending_deal_ready(
+    row: dict,
+    deal: dict,
+    now_ms: int,
+) -> None:
+    row.update({
+        "status": "READY_TO_PUSH",
+        "last_attempt_ms": int(now_ms),
+        "next_retry_ms": int(now_ms),
+        "last_error": None,
+        "deal_payload": dict(deal),
+    })
 def reg_get(name: str) -> Optional[str]:
     import os
     import winreg
@@ -283,90 +535,389 @@ TF_SEC = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600, "H2": 7200, "H4": 14400}
 
 
 def push_mt5_positions_once(
-    api_base: str, dev_id: str, token: str, mt5_account: str = "demo"
+    api_base: str,
+    dev_id: str,
+    token: str,
+    mt5_account: str = "demo",
 ) -> bool:
-    global _LAST_MT5_POSITIONS, _MT5_POS_STATE_LOADED
+    global _LAST_MT5_POSITIONS
+    global _MT5_POS_STATE_LOADED
+    global _PENDING_MT5_DEALS
+    global _MT5_DEAL_STATE_LOADED
 
     try:
-        # P0: load previous broker positions from disk once after agent restart.
-        # This lets us detect trades that closed while the agent was stopped.
+        now_ms = int(time.time() * 1000)
+
+        # ---------------------------------------------------------
+        # Load both persistent recovery states once after startup.
+        # ---------------------------------------------------------
         if not _MT5_POS_STATE_LOADED:
-            _LAST_MT5_POSITIONS = _load_last_mt5_positions(dev_id, mt5_account)
+            _LAST_MT5_POSITIONS = (
+                _load_last_mt5_positions(
+                    dev_id,
+                    mt5_account,
+                )
+            )
+
             _MT5_POS_STATE_LOADED = True
+
             log.warning(
-                "MT5_POS_STATE_LOADED dev=%s acct=%s previous_positions=%s",
+                "MT5_POS_STATE_LOADED "
+                "dev=%s acct=%s "
+                "previous_positions=%s",
                 dev_id,
                 mt5_account,
-                len(_LAST_MT5_POSITIONS or {}),
+                len(
+                    _LAST_MT5_POSITIONS
+                    or {}
+                ),
+            )
+
+        if not _MT5_DEAL_STATE_LOADED:
+            _PENDING_MT5_DEALS = (
+                _load_pending_mt5_deals(
+                    dev_id,
+                    mt5_account,
+                )
+            )
+
+            _MT5_DEAL_STATE_LOADED = True
+
+            log.warning(
+                "MT5_PENDING_DEALS_LOADED "
+                "dev=%s acct=%s pending=%s",
+                dev_id,
+                mt5_account,
+                len(
+                    _PENDING_MT5_DEALS
+                    or {}
+                ),
             )
 
         positions = mt5_get_open_positions()
+
         if positions is None:
             log.warning(
                 "MT5_POS_PUSH_SKIP_INVALID_SNAPSHOT "
-                "dev=%s acct=%s reason=MT5_POSITIONS_READ_FAILED",
+                "dev=%s acct=%s "
+                "reason=MT5_POSITIONS_READ_FAILED",
                 dev_id,
                 mt5_account,
             )
             return False
-        
-        current_positions = {}
-        for p in positions or []:
+
+        canonicalize_outbound(positions)
+
+        current_positions: dict[int, dict] = {}
+
+        for position in positions or []:
             try:
-                tk = int(p.get("ticket") or 0)
-                sym = str(p.get("symbol") or "").upper().strip()
-                vol = float(p.get("volume") or 0.0)
+                ticket = int(
+                    position.get("ticket")
+                    or 0
+                )
 
-                if tk > 0 and sym and vol > 0:
-                    current_positions[tk] = dict(p)
+                symbol = str(
+                    position.get("symbol")
+                    or ""
+                ).upper().strip()
+
+                volume = float(
+                    position.get("volume")
+                    or 0.0
+                )
+
+                if (
+                    ticket > 0
+                    and symbol
+                    and volume > 0
+                ):
+                    current_positions[
+                        ticket
+                    ] = dict(position)
+
             except Exception:
-                pass
+                continue
 
-        closed_deals = []
+        # ---------------------------------------------------------
+        # Any position that disappeared enters the durable queue.
+        # It is NOT forgotten when the current-position baseline
+        # advances.
+        # ---------------------------------------------------------
         disappeared = sorted(
-            set(_LAST_MT5_POSITIONS.keys()) - set(current_positions.keys())
+            set(
+                _LAST_MT5_POSITIONS.keys()
+            )
+            - set(
+                current_positions.keys()
+            )
         )
 
-        for tk in disappeared:
-            prev_pos = _LAST_MT5_POSITIONS.get(tk) or {}
+        for ticket in disappeared:
+            _queue_pending_mt5_deal(
+                ticket,
+                _LAST_MT5_POSITIONS.get(
+                    ticket
+                )
+                or {},
+                now_ms,
+            )
+
+        # Persist immediately so a crash after detection does not
+        # lose the disappeared position.
+        _save_pending_mt5_deals(
+            dev_id,
+            mt5_account,
+            _PENDING_MT5_DEALS,
+        )
+
+        closed_deals = []
+        ready_tickets = []
+
+        # ---------------------------------------------------------
+        # Process durable pending deal jobs.
+        # ---------------------------------------------------------
+        for ticket in sorted(
+            list(
+                _PENDING_MT5_DEALS.keys()
+            )
+        ):
+            row = _PENDING_MT5_DEALS.get(
+                ticket
+            )
+
+            if not isinstance(row, dict):
+                continue
+
+            status = str(
+                row.get("status")
+                or "PENDING_FETCH"
+            ).upper().strip()
+
+            prev_position = (
+                row.get("prev_position")
+                if isinstance(
+                    row.get("prev_position"),
+                    dict,
+                )
+                else {}
+            )
+
+            # A broker position became live again. This can happen
+            # during an unreliable empty snapshot. Do not classify
+            # it as closed.
+            if ticket in current_positions:
+                log.warning(
+                    "MT5_PENDING_DEAL_CANCEL_LIVE "
+                    "ticket=%s symbol=%s",
+                    ticket,
+                    current_positions[
+                        ticket
+                    ].get("symbol"),
+                )
+
+                _PENDING_MT5_DEALS.pop(
+                    ticket,
+                    None,
+                )
+                continue
+
+            # Already recovered but not yet acknowledged by API:
+            # resend the cached broker payload.
+            cached_deal = row.get(
+                "deal_payload"
+            )
+
+            if (
+                status == "READY_TO_PUSH"
+                and isinstance(
+                    cached_deal,
+                    dict,
+                )
+                and cached_deal.get("ok")
+                is True
+            ):
+                deal = dict(cached_deal)
+
+                deal["prev_position"] = (
+                    prev_position
+                )
+
+                deal["recovery_source"] = (
+                    deal.get(
+                        "recovery_source"
+                    )
+                    or "agent_pending_queue"
+                )
+
+                canonicalize_outbound(deal)
+                canonicalize_outbound(
+                    deal.get("prev_position")
+                )
+
+                closed_deals.append(deal)
+                ready_tickets.append(ticket)
+                continue
+
+            next_retry_ms = int(
+                row.get("next_retry_ms")
+                or 0
+            )
+
+            if (
+                next_retry_ms > 0
+                and now_ms < next_retry_ms
+            ):
+                continue
+
             try:
-                # Use larger window for startup recovery.
-                deal = mt5_get_deal_summary(int(tk), 14)
+                deal = mt5_get_deal_summary(
+                    int(ticket),
+                    30,
+                )
 
-                if isinstance(deal, dict) and deal.get("ok") is True:
-                    deal["prev_position"] = prev_pos
-                    deal["recovery_source"] = "agent_position_state"
+                if (
+                    isinstance(deal, dict)
+                    and deal.get("ok")
+                    is True
+                ):
+                    deal["prev_position"] = (
+                        prev_position
+                    )
+
+                    deal["recovery_source"] = (
+                        "agent_pending_queue"
+                    )
+
+                    _mark_pending_deal_ready(
+                        row,
+                        deal,
+                        now_ms,
+                    )
+
+                    canonicalize_outbound(deal)
+                    canonicalize_outbound(
+                        deal.get(
+                            "prev_position"
+                        )
+                    )
+
                     closed_deals.append(deal)
+                    ready_tickets.append(
+                        ticket
+                    )
 
                     log.warning(
-                        "MT5_DEAL_CAPTURE ticket=%s ok=%s broker_reason=%s symbol=%s close_price=%s net_profit=%s prev_symbol=%s",
-                        tk,
-                        deal.get("ok"),
-                        deal.get("broker_reason"),
-                        deal.get("symbol"),
-                        deal.get("close_price"),
-                        deal.get("net_profit"),
-                        prev_pos.get("symbol"),
+                        "MT5_DEAL_RECOVERY_READY "
+                        "ticket=%s attempts=%s "
+                        "history_source=%s "
+                        "broker_reason=%s "
+                        "close_price=%s "
+                        "net_profit=%s",
+                        ticket,
+                        row.get(
+                            "attempt_count"
+                        ),
+                        deal.get(
+                            "history_source"
+                        ),
+                        deal.get(
+                            "broker_reason"
+                        ),
+                        deal.get(
+                            "close_price"
+                        ),
+                        deal.get(
+                            "net_profit"
+                        ),
                     )
+
                 else:
-                    log.warning(
-                        "MT5_DEAL_CAPTURE_SKIP ticket=%s ok=%s error=%s prev_symbol=%s",
-                        tk,
-                        deal.get("ok") if isinstance(deal, dict) else None,
-                        deal.get("error") if isinstance(deal, dict) else "bad_deal_payload",
-                        prev_pos.get("symbol"),
+                    error = (
+                        deal.get("error")
+                        if isinstance(
+                            deal,
+                            dict,
+                        )
+                        else
+                        "BAD_DEAL_PAYLOAD"
                     )
 
-            except Exception as e:
-                log.warning("MT5_DEAL_CAPTURE_EXC ticket=%s err=%s", tk, e)
+                    _mark_pending_deal_failure(
+                        row,
+                        error,
+                        now_ms,
+                    )
+
+                    log.warning(
+                        "MT5_DEAL_RECOVERY_RETRY "
+                        "ticket=%s attempt=%s "
+                        "error=%s "
+                        "retry_delay_ms=%s "
+                        "next_retry_ms=%s "
+                        "prev_symbol=%s",
+                        ticket,
+                        row.get(
+                            "attempt_count"
+                        ),
+                        row.get(
+                            "last_error"
+                        ),
+                        row.get(
+                            "retry_delay_ms"
+                        ),
+                        row.get(
+                            "next_retry_ms"
+                        ),
+                        prev_position.get(
+                            "symbol"
+                        ),
+                    )
+
+            except Exception as exc:
+                _mark_pending_deal_failure(
+                    row,
+                    (
+                        f"{type(exc).__name__}:"
+                        f"{exc}"
+                    ),
+                    now_ms,
+                )
+
+                log.warning(
+                    "MT5_DEAL_RECOVERY_EXC "
+                    "ticket=%s attempt=%s "
+                    "next_retry_ms=%s err=%s",
+                    ticket,
+                    row.get(
+                        "attempt_count"
+                    ),
+                    row.get(
+                        "next_retry_ms"
+                    ),
+                    exc,
+                )
+
+        _save_pending_mt5_deals(
+            dev_id,
+            mt5_account,
+            _PENDING_MT5_DEALS,
+        )
 
         log.warning(
-            "MT5_POS_PUSH_START dev=%s acct=%s positions=%s disappeared=%s closed_deals=%s",
+            "MT5_POS_PUSH_START "
+            "dev=%s acct=%s positions=%s "
+            "disappeared=%s pending=%s "
+            "closed_deals=%s",
             dev_id,
             mt5_account,
             len(positions or []),
-            len(disappeared or []),
-            len(closed_deals or []),
+            len(disappeared),
+            len(
+                _PENDING_MT5_DEALS
+                or {}
+            ),
+            len(closed_deals),
         )
 
         payload = {
@@ -374,10 +925,10 @@ def push_mt5_positions_once(
             "mt5_account": mt5_account,
             "positions": positions,
             "closed_deals": closed_deals,
-            "ts_ms": int(time.time() * 1000),
+            "ts_ms": now_ms,
         }
 
-        r = api_post(
+        response = api_post(
             api_base,
             f"/devices/{dev_id}/mt5/positions",
             payload,
@@ -385,21 +936,80 @@ def push_mt5_positions_once(
             timeout=6,
         )
 
-        ok = bool(getattr(r, "status_code", 0) == 200)
+        ok = bool(
+            getattr(
+                response,
+                "status_code",
+                0,
+            )
+            == 200
+        )
 
-        # Save current snapshot after successful API push.
-        # This becomes the restart recovery baseline.
         if ok:
-            _LAST_MT5_POSITIONS = dict(current_positions)
-            _save_last_mt5_positions(dev_id, mt5_account, _LAST_MT5_POSITIONS)
+            # The API has accepted these recovered deals. Only now
+            # may they be removed from the durable queue.
+            for ticket in ready_tickets:
+                _PENDING_MT5_DEALS.pop(
+                    int(ticket),
+                    None,
+                )
+
+            _LAST_MT5_POSITIONS = dict(
+                current_positions
+            )
+
+            _save_last_mt5_positions(
+                dev_id,
+                mt5_account,
+                _LAST_MT5_POSITIONS,
+            )
+
+            _save_pending_mt5_deals(
+                dev_id,
+                mt5_account,
+                _PENDING_MT5_DEALS,
+            )
+
+            if ready_tickets:
+                log.warning(
+                    "MT5_DEAL_RECOVERY_ACKED "
+                    "dev=%s tickets=%s "
+                    "remaining_pending=%s",
+                    dev_id,
+                    sorted(ready_tickets),
+                    len(
+                        _PENDING_MT5_DEALS
+                        or {}
+                    ),
+                )
+
+        else:
+            # READY_TO_PUSH payloads remain cached and will be
+            # resent. Nothing is removed on HTTP/API failure.
+            log.warning(
+                "MT5_POS_PUSH_API_FAILED "
+                "dev=%s acct=%s status=%s "
+                "ready_tickets=%s",
+                dev_id,
+                mt5_account,
+                getattr(
+                    response,
+                    "status_code",
+                    None,
+                ),
+                sorted(ready_tickets),
+            )
 
         return ok
 
-    except Exception as e:
-        try:
-            log.warning("push_mt5_positions_once failed: %s", e)
-        except Exception:
-            pass
+    except Exception as exc:
+        log.exception(
+            "MT5_POS_PUSH_EXC "
+            "dev=%s acct=%s err=%s",
+            dev_id,
+            mt5_account,
+            exc,
+        )
         return False
 
 def push_mt5_account_once(
@@ -2011,68 +2621,140 @@ def _mt5_close_position(cmd: dict) -> dict:
     }
 
 
+# -------------------------------------------------------------------
+# Permanent worker supervision
+# -------------------------------------------------------------------
+_WORKER_HEALTH_LOCK = threading.RLock()
+_WORKER_HEALTH: dict[str, dict] = {}
+_WORKER_SPECS: dict[str, tuple] = {}
+_SUPERVISOR_STARTED = False
+
+
+def _worker_mark(name: str, event: str, **extra) -> None:
+    now = time.monotonic()
+    with _WORKER_HEALTH_LOCK:
+        row = _WORKER_HEALTH.setdefault(name, {})
+        row[event] = now
+        row.update(extra)
+
+
+def _start_supervised_thread(name: str, target, args: tuple):
+    th = threading.Thread(target=target, args=args, name=name, daemon=True)
+    with _WORKER_HEALTH_LOCK:
+        _WORKER_SPECS[name] = (target, args)
+        _WORKER_HEALTH[name] = {
+            "thread": th,
+            "started": time.monotonic(),
+            "loop_started": 0.0,
+            "loop_completed": time.monotonic(),
+            "last_success": 0.0,
+            "consecutive_failures": 0,
+            "last_error": "",
+        }
+    th.start()
+    return th
+
+
+def _worker_supervisor_loop(check_sec: float = 2.0) -> None:
+    # A blocked Python thread cannot be killed safely. For a critical stall,
+    # terminate the Agent so the Windows service manager can restart it cleanly.
+    critical_age = {
+        "mt5-account-heartbeat": 60.0,
+        "mt5-positions-heartbeat": 90.0,
+        "ohlc-worker": 120.0,
+        "mt5-cmd-worker": 90.0,
+    }
+
+    while True:
+        time.sleep(max(1.0, float(check_sec)))
+        now = time.monotonic()
+
+        with _WORKER_HEALTH_LOCK:
+            snapshot = {k: dict(v) for k, v in _WORKER_HEALTH.items()}
+            specs = dict(_WORKER_SPECS)
+
+        for name, row in snapshot.items():
+            th = row.get("thread")
+            if th is not None and not th.is_alive():
+                spec = specs.get(name)
+                if spec is None:
+                    continue
+                log.error("WORKER_DEAD_RESTART name=%s", name)
+                target, args = spec
+                _start_supervised_thread(name, target, args)
+                continue
+
+            loop_started = float(row.get("loop_started") or 0.0)
+            loop_completed = float(row.get("loop_completed") or 0.0)
+            # Stuck means a cycle started and has not completed since.
+            if loop_started > loop_completed:
+                age = now - loop_started
+                limit = float(critical_age.get(name, 120.0))
+                if age >= limit:
+                    log.critical(
+                        "WORKER_STUCK_FATAL name=%s age_sec=%.1f limit_sec=%.1f "
+                        "last_error=%s",
+                        name,
+                        age,
+                        limit,
+                        row.get("last_error") or "",
+                    )
+                    try:
+                        for h in logging.getLogger().handlers:
+                            h.flush()
+                    except Exception:
+                        pass
+                    os._exit(70)
+
+
+def _ensure_worker_supervisor() -> None:
+    global _SUPERVISOR_STARTED
+    with _WORKER_HEALTH_LOCK:
+        if _SUPERVISOR_STARTED:
+            return
+        _SUPERVISOR_STARTED = True
+    threading.Thread(
+        target=_worker_supervisor_loop,
+        name="agent-worker-supervisor",
+        daemon=True,
+    ).start()
+
+
 def start_ohlc_worker(
     api_base, device_id, token, symbols, tfs, bars=300, period_sec=10
 ):
     log.info(
-        f"OHLC: starting worker symbols={symbols} tfs={tfs} bars={bars} every {period_sec}s"
+        "OHLC: starting worker symbols=%s tfs=%s bars=%s every %ss",
+        symbols, tfs, bars, period_sec,
+    )
+    _ensure_worker_supervisor()
+
+    _start_supervised_thread(
+        "mt5-account-heartbeat",
+        _mt5_account_heartbeat_loop,
+        (api_base, device_id, token, "demo", 5),
+    )
+    _start_supervised_thread(
+        "mt5-positions-heartbeat",
+        _mt5_positions_heartbeat_loop,
+        (api_base, device_id, token, "demo", 10),
+    )
+    return _start_supervised_thread(
+        "ohlc-worker",
+        _ohlc_loop_target(),        
+        (api_base, device_id, token, symbols, tfs, bars, period_sec),
     )
 
-    # ---------------------------------------------------------
-    # Critical broker account snapshot.
-    # Runs independently of OHLC processing.
-    # ---------------------------------------------------------
-    th_acc = threading.Thread(
-        target=_mt5_account_heartbeat_loop,
-        args=(api_base, device_id, token, "demo", 5),
-        name="mt5-account-heartbeat",
-        daemon=True,
-    )
-    th_acc.start()
-
-    # ---------------------------------------------------------
-    # Critical broker positions snapshot.
-    # Runs independently of OHLC processing.
-    # ---------------------------------------------------------
-    th_pos = threading.Thread(
-        target=_mt5_positions_heartbeat_loop,
-        args=(api_base, device_id, token, "demo", 10),
-        name="mt5-positions-heartbeat",
-        daemon=True,
-    )
-    th_pos.start()
-
-    # ---------------------------------------------------------
-    # OHLC publisher.
-    # ---------------------------------------------------------
-    th = threading.Thread(
-        target=_ohlc_loop,
-        args=(
-            api_base,
-            device_id,
-            token,
-            symbols,
-            tfs,
-            bars,
-            period_sec,
-        ),
-        name="ohlc-worker",
-        daemon=True,
-    )
-    th.start()
-
-    return th
 
 def start_mt5_cmd_worker(api_base, device_id, token, poll_sec=2):
     log.info("MT5 CMD: starting worker")
-    th = threading.Thread(
-        target=_mt5_cmd_loop,
-        args=(api_base, device_id, token, poll_sec),
-        name="mt5-cmd-worker",
-        daemon=True,
+    _ensure_worker_supervisor()
+    return _start_supervised_thread(
+        "mt5-cmd-worker",
+        _mt5_cmd_loop,
+        (api_base, device_id, token, poll_sec),
     )
-    th.start()
-    return th
+
 
 def _mt5_account_heartbeat_loop(
     api_base,
@@ -2081,63 +2763,53 @@ def _mt5_account_heartbeat_loop(
     mt5_account="demo",
     period_sec=5,
 ):
+    name = threading.current_thread().name
     period = max(5.0, min(float(period_sec or 5), 15.0))
     next_run = time.monotonic()
     consecutive_failures = 0
 
     while True:
         started = time.monotonic()
-
+        _worker_mark(name, "loop_started", last_error="")
+        ok = False
         try:
             ok = push_mt5_account_once(
-                api_base,
-                device_id,
-                token,
-                mt5_account=mt5_account,
+                api_base, device_id, token, mt5_account=mt5_account
             )
-
-            if ok:
-                consecutive_failures = 0
-            else:
-                consecutive_failures += 1
+            consecutive_failures = 0 if ok else consecutive_failures + 1
+            if not ok:
                 log.warning(
-                    "MT5_ACCOUNT_HEARTBEAT_FAILED dev=%s acct=%s "
-                    "consecutive=%s",
-                    device_id,
-                    mt5_account,
-                    consecutive_failures,
+                    "MT5_ACCOUNT_HEARTBEAT_FAILED dev=%s acct=%s consecutive=%s",
+                    device_id, mt5_account, consecutive_failures,
                 )
-
-        except Exception:
+        except Exception as exc:
             consecutive_failures += 1
+            _worker_mark(name, "last_error_at", last_error=f"{type(exc).__name__}:{exc}")
             log.exception(
-                "MT5_ACCOUNT_HEARTBEAT_EXC dev=%s acct=%s "
-                "consecutive=%s",
-                device_id,
-                mt5_account,
-                consecutive_failures,
+                "MT5_ACCOUNT_HEARTBEAT_EXC dev=%s acct=%s consecutive=%s",
+                device_id, mt5_account, consecutive_failures,
             )
-
-        took_ms = int((time.monotonic() - started) * 1000)
+        finally:
+            _worker_mark(
+                name,
+                "loop_completed",
+                consecutive_failures=consecutive_failures,
+                **({"last_success": time.monotonic()} if ok else {}),
+            )
 
         log.info(
-            "MT5_ACCOUNT_HEARTBEAT_DONE dev=%s acct=%s "
-            "ok=%s took_ms=%s",
-            device_id,
-            mt5_account,
-            consecutive_failures == 0,
-            took_ms,
+            "MT5_ACCOUNT_HEARTBEAT_DONE dev=%s acct=%s ok=%s took_ms=%s",
+            device_id, mt5_account, ok,
+            int((time.monotonic() - started) * 1000),
         )
-
         next_run += period
         delay = next_run - time.monotonic()
-
         if delay <= 0:
             next_run = time.monotonic() + period
             delay = period
+        time.sleep(max(0.1, delay))
 
-        time.sleep(delay)
-        
+
 def _mt5_positions_heartbeat_loop(
     api_base,
     device_id,
@@ -2145,93 +2817,98 @@ def _mt5_positions_heartbeat_loop(
     mt5_account="demo",
     period_sec=10,
 ):
-    """
-    Publish broker positions independently of OHLC, price, DXY,
-    command polling and deal-history workloads.
-    """
+    name = threading.current_thread().name
     period = max(5.0, min(float(period_sec or 10), 15.0))
     next_run = time.monotonic()
     consecutive_failures = 0
 
     while True:
         started = time.monotonic()
-
+        _worker_mark(name, "loop_started", last_error="")
+        ok = False
         try:
             ok = push_mt5_positions_once(
-                api_base,
-                device_id,
-                token,
-                mt5_account=mt5_account,
+                api_base, device_id, token, mt5_account=mt5_account
             )
-
-            if ok:
-                consecutive_failures = 0
-            else:
-                consecutive_failures += 1
+            consecutive_failures = 0 if ok else consecutive_failures + 1
+            if not ok:
                 log.warning(
-                    "MT5_POS_HEARTBEAT_FAILED dev=%s acct=%s "
-                    "consecutive=%s",
-                    device_id,
-                    mt5_account,
-                    consecutive_failures,
+                    "MT5_POS_HEARTBEAT_FAILED dev=%s acct=%s consecutive=%s",
+                    device_id, mt5_account, consecutive_failures,
                 )
-
-        except Exception:
+        except Exception as exc:
             consecutive_failures += 1
+            _worker_mark(name, "last_error_at", last_error=f"{type(exc).__name__}:{exc}")
             log.exception(
-                "MT5_POS_HEARTBEAT_EXC dev=%s acct=%s "
-                "consecutive=%s",
-                device_id,
-                mt5_account,
-                consecutive_failures,
+                "MT5_POS_HEARTBEAT_EXC dev=%s acct=%s consecutive=%s",
+                device_id, mt5_account, consecutive_failures,
             )
-
-        took_ms = int((time.monotonic() - started) * 1000)
+        finally:
+            _worker_mark(
+                name,
+                "loop_completed",
+                consecutive_failures=consecutive_failures,
+                **({"last_success": time.monotonic()} if ok else {}),
+            )
 
         log.info(
-            "MT5_POS_HEARTBEAT_DONE dev=%s acct=%s "
-            "ok=%s took_ms=%s",
-            device_id,
-            mt5_account,
-            consecutive_failures == 0,
-            took_ms,
+            "MT5_POS_HEARTBEAT_DONE dev=%s acct=%s ok=%s took_ms=%s",
+            device_id, mt5_account, ok,
+            int((time.monotonic() - started) * 1000),
         )
-
         next_run += period
         delay = next_run - time.monotonic()
-
         if delay <= 0:
             next_run = time.monotonic() + period
             delay = period
+        time.sleep(max(0.1, delay))
 
-        time.sleep(delay)
-        
+
 def _ohlc_loop(api_base, device_id, token, symbols, tfs, bars, period_sec):
-    next_run = time.time()
+    name = threading.current_thread().name
+    period = max(1.0, float(period_sec or 10))
+    next_run = time.monotonic()
+
     while True:
+        started = time.monotonic()
+        _worker_mark(name, "loop_started", last_error="")
+        ok = False
         try:
-            tick_start = time.time()
             log.info("OHLC: tick begin")
-
             _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars)
+            ok = True
+            log.info("OHLC: tick done in %.2fs", time.monotonic() - started)
+        except Exception as exc:
+            _worker_mark(name, "last_error_at", last_error=f"{type(exc).__name__}:{exc}")
+            log.exception("OHLC: tick exception")
+        finally:
+            _worker_mark(
+                name,
+                "loop_completed",
+                **({"last_success": time.monotonic()} if ok else {}),
+            )
 
-            
-
-            
-
-            took = time.time() - tick_start
-            log.info(f"OHLC: tick done in {took:.2f}s")
-        except Exception as e:
-            log.info(f"OHLC: tick exception: {e}\n{traceback.format_exc()}")
-
-        next_run += period_sec
-        time.sleep(max(0, next_run - time.time()))
+        # Skip missed runs. Never hammer MT5 with zero-sleep catch-up cycles.
+        next_run += period
+        delay = next_run - time.monotonic()
+        if delay <= 0:
+            log.warning(
+                "OHLC_SCHEDULE_OVERRUN took_ms=%s period_ms=%s skipped_catchup=1",
+                int((time.monotonic() - started) * 1000),
+                int(period * 1000),
+            )
+            next_run = time.monotonic() + period
+            delay = period
+        time.sleep(max(0.1, delay))
 
 
 def _mt5_cmd_loop(api_base, device_id, token, poll_sec):
+    name = threading.current_thread().name
     while True:
+        _worker_mark(name, "loop_started", last_error="")
         try:
             r = api_get(api_base, f"/devices/{device_id}/mt5/next", token)
+            _worker_mark(name, "loop_completed", last_success=time.monotonic())
             if getattr(r, "status_code", 0) != 200:
                 time.sleep(poll_sec)
                 continue
@@ -2343,6 +3020,7 @@ def _mt5_cmd_loop(api_base, device_id, token, poll_sec):
                 pass
 
         except Exception as e:
+            _worker_mark(name, "loop_completed", last_error=f"{type(e).__name__}:{e}")
             log.warning("MT5 CMD loop error: %s", e)
 
         time.sleep(poll_sec)
@@ -2358,16 +3036,18 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
     import time
 
     # --- ensure defaults exist (no-op \if already present) ---
-    try:
-        ensure_registry_defaults()
-    except Exception:
-        pass
-    # --- new-install reset (based on ConfigVersion or env toggle) ---
-    try:
-        maybe_reset_registry_on_new_install()
-    except Exception:
-        pass
-
+    global _REG_STARTUP_DONE
+    if not _REG_STARTUP_DONE:
+        try:
+            ensure_registry_defaults()
+        except Exception:
+            pass
+        # --- new-install reset (based on ConfigVersion or env toggle) ---
+        try:
+            maybe_reset_registry_on_new_install()
+        except Exception:
+            pass
+        _REG_STARTUP_DONE = True
     # --- include_latest from registry (service path has no CLI kw) ---
     reg_inc = (reg_get("IncludeLatest") or "0").strip() in (
         "1",
@@ -2683,3 +3363,343 @@ def push_ohlc_once(
                 continue
 
     log.info("OHLC: push_once done; total series posted=%s", total_pushed)
+
+# ============================================================================
+# XTL PHASE 1 PATCH — append this entire block to the END of agent_ohlc.py
+# Implements: 4.6 canonical writer, 4.1 bar-close-aligned scheduler,
+#             4.2 delta-capable event loop (delta OFF by default, see guide).
+# Enable with registry value  Agent.EventDriven = 1  (fallback: legacy loop).
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 4.6 — CANONICAL SYMBOL WRITER
+# The ONLY place instrument names are normalized before leaving the agent.
+# Broker-native names travel only in explicit broker_symbol fields.
+# ---------------------------------------------------------------------------
+_CANON_BASES = (
+    "XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD",
+)
+_DXY_PREFIXES = ("DXY", "USDX", "USDINDEX")
+
+
+def canonical_symbol(s) -> str:
+    """EURUSDC -> EURUSD, XAUUSD.a -> XAUUSD, DXY.cash -> DXY. Unknown -> unchanged."""
+    u = str(s or "").upper().strip()
+    if not u:
+        return u
+    for b in _CANON_BASES:
+        if u == b or u.startswith(b):
+            return b
+    for p in _DXY_PREFIXES:
+        if u.startswith(p):
+            return "DXY"
+    return u
+
+
+def canonicalize_outbound(obj):
+    """
+    Normalize the 'symbol' field of a dict (or list of dicts) in place,
+    preserving the broker name in 'broker_symbol'. Returns the same object.
+    """
+    def _one(d):
+        if not isinstance(d, dict):
+            return
+        raw = str(d.get("symbol") or "")
+        if not raw:
+            return
+        canon = canonical_symbol(raw)
+        if canon != raw:
+            d.setdefault("broker_symbol", raw)
+            d["symbol"] = canon
+    if isinstance(obj, dict):
+        _one(obj)
+    elif isinstance(obj, (list, tuple)):
+        for it in obj:
+            _one(it)
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# 4.1 — BAR-CLOSE-ALIGNED SCHEDULER + EVENT LOOP
+# Fires per-TF shortly after each broker-grid bar boundary. Between boundaries
+# the agent sleeps. Weekend/idle markets are detected and skipped cheaply.
+# ---------------------------------------------------------------------------
+_TF_SEC = {"M1": 60, "M15": 900, "H1": 3600, "H2": 7200, "H4": 14400}
+
+_EVT_FULL_LAST: dict = {}          # (sym, tf) -> monotonic ts of last full-history push
+_REG_STARTUP_DONE = False          # 4.5: registry defaults run once, not per tick
+
+
+def _reg_float(name: str, default: float) -> float:
+    try:
+        v = (reg_get(name) or "").strip()
+        return float(v) if v else float(default)
+    except Exception:
+        return float(default)
+
+
+def _reg_flag(name: str, default: bool = False) -> bool:
+    try:
+        v = (reg_get(name) or "").strip().lower()
+        if not v:
+            return bool(default)
+        return v in ("1", "true", "yes", "on")
+    except Exception:
+        return bool(default)
+
+
+def _broker_off_ms_safe() -> int:
+    """Broker offset in ms for boundary math. Never raises; 0 on unknown."""
+    try:
+        from . import mt5_client as _mc
+    except Exception:
+        import mt5_client as _mc  # type: ignore
+    try:
+        return int(_mc._broker_offset_min()) * 60_000
+    except Exception:
+        return 0
+
+
+def _next_fire_ms(tf_sec: int, now_ms: int, off_ms: int, grace_ms: int) -> int:
+    """Next bar boundary on the broker grid, expressed in UTC ms, plus grace."""
+    tf_ms = tf_sec * 1000
+    boundary = (((now_ms + off_ms) // tf_ms) + 1) * tf_ms - off_ms
+    return boundary + grace_ms
+
+
+def _market_idle(threshold_s: float = 600.0) -> bool:
+    """True when no symbol has ticked within threshold (weekend / holiday)."""
+    try:
+        from . import mt5_client as _mc
+    except Exception:
+        import mt5_client as _mc  # type: ignore
+    try:
+        import MetaTrader5 as MT5
+        newest = 0
+        for base in ("EURUSD", "XAUUSD"):
+            try:
+                t = MT5.symbol_info_tick(_mc._resolve_broker_symbol(base))
+                newest = max(newest, int(getattr(t, "time", 0) or 0))
+            except Exception:
+                continue
+        if newest <= 0:
+            return False           # unknown -> assume open (fail-safe)
+        return (time.time() - newest) > threshold_s
+    except Exception:
+        return False
+
+
+def _push_ohlc_for_tfs(api_base, device_id, token, symbols, only_tfs, bars,
+                       include_latest, delta_on, delta_bars, full_refresh_s):
+    """
+    One event's worth of work: fetch + push ONLY the timeframes that just
+    closed a bar. Same dedupe and push_rates_batch path as the legacy worker.
+    """
+    base = (api_base or "").strip().rstrip("/")
+    if base.lower().endswith("/api"):
+        base = base[:-4]
+
+    try:
+        _ = _last_sent_bar  # noqa: F841
+    except NameError:
+        globals()["_last_sent_bar"] = {}
+
+    def _to_sec(t_any):
+        try:
+            t = int(t_any or 0)
+            return (t // 1000) if t >= 1_000_000_000_000 else t
+        except Exception:
+            return 0
+
+    now_mono = time.monotonic()
+    for sym in symbols:
+        sym_u = str(sym or "").upper().strip()
+        sym_tfs = ["H1"] if sym_u == "DXY" else only_tfs
+        for tf in sym_tfs:
+            tf_u = str(tf).upper()
+            key = (sym_u, tf_u)
+
+            # ---- 4.2 count selection: delta window vs full history ----
+            full_count = 1500 if tf_u == "H1" else int(bars or 300)
+            if delta_on:
+                last_full = _EVT_FULL_LAST.get(key, 0.0)
+                if (now_mono - last_full) >= full_refresh_s:
+                    tf_count, is_full = full_count, True
+                else:
+                    tf_count, is_full = max(2, int(delta_bars)), False
+            else:
+                tf_count, is_full = full_count, True
+
+            try:
+                rates = mt5_fetch_rates(
+                    sym, tf_u, count=tf_count, include_latest=include_latest
+                )
+            except Exception as e:
+                log.warning("EVT fetch failed %s/%s: %s", sym_u, tf_u, e)
+                continue
+            if not rates:
+                continue
+
+            last_closed = next(
+                (b for b in reversed(rates) if b.get("complete", True)), None
+            )
+            if not last_closed:
+                continue
+            last_t_s = _to_sec(last_closed.get("t"))
+            if _last_sent_bar.get(key) == last_t_s:
+                continue  # boundary fired but broker not finalized yet; sweep will catch
+
+            try:
+                sent = push_rates_batch(
+                    base, device_id, token, sym, tf_u, rates,
+                    include_latest=include_latest, count=tf_count,
+                )
+                if sent:
+                    _last_sent_bar[key] = last_t_s
+                    if is_full:
+                        _EVT_FULL_LAST[key] = now_mono
+                    log.info("EVT pushed %s/%s bars=%s last_closed=%s%s",
+                             sym_u, tf_u, len(rates), last_t_s,
+                             " (full)" if is_full else " (delta)")
+                else:
+                    log.warning("EVT POST failed %s/%s", sym_u, tf_u)
+            except Exception as e:
+                log.warning("EVT post exc %s/%s: %s", sym_u, tf_u, e)
+
+
+def _ohlc_event_loop(api_base, device_id, token, symbols, tfs, bars, period_sec):
+    """
+    4.1 event-driven replacement for _ohlc_loop (same signature -> supervisor
+    compatible). period_sec is reused as the safety-sweep interval floor.
+    """
+    global _REG_STARTUP_DONE
+    name = threading.current_thread().name
+
+    # ---- 4.5: registry defaults ONCE at startup, not per tick ----
+    if not _REG_STARTUP_DONE:
+        try:
+            ensure_registry_defaults()
+        except Exception:
+            pass
+        try:
+            maybe_reset_registry_on_new_install()
+        except Exception:
+            pass
+        _REG_STARTUP_DONE = True
+
+    grace_ms = int(_reg_float("Agent.BarGraceSec", 2.0) * 1000)
+    sweep_s = max(60.0, _reg_float("Agent.SafetySweepSec", 300.0))
+    idle_thresh = _reg_float("Agent.IdleTickAgeSec", 600.0)
+    delta_on = _reg_flag("Agent.DeltaPush", False)   # see guide before enabling
+    delta_bars = int(_reg_float("Agent.DeltaBars", 5))
+    full_refresh = _reg_float("Agent.FullRefreshSec", 3600.0)
+
+    include_latest = (reg_get("IncludeLatest") or "0").strip() in (
+        "1", "true", "TRUE", "yes", "YES",
+    )
+
+    # symbols/tfs: same resolution as legacy worker
+    syms = [s.strip().upper() for s in (symbols or []) if (s or "").strip()]
+    if not syms:
+        try:
+            reg_syms, _rt, _ = _agent_pull_cfg()
+            syms = list(dict.fromkeys(reg_syms or []))
+        except Exception:
+            pass
+    if not syms:
+        syms = list(DEFAULT_SYMBOLS)
+    tflist = [str(t or "").upper().strip() for t in (tfs or []) if str(t or "").strip()]
+    tflist = [t for t in tflist if t in _TF_SEC] or ["M1", "M15", "H1", "H2", "H4"]
+
+    log.info("EVT loop start symbols=%s tfs=%s grace_ms=%s delta=%s sweep_s=%s",
+             syms, tflist, grace_ms, delta_on, sweep_s)
+
+    # ---- startup backfill: one legacy full pass populates history + dedupe ----
+    _worker_mark(name, "loop_started", last_error="")
+    try:
+        _push_ohlc_once_safe(api_base, device_id, token, syms, tflist, bars)
+        _worker_mark(name, "loop_completed", last_success=time.monotonic())
+    except Exception as exc:
+        _worker_mark(name, "last_error_at", last_error=f"{type(exc).__name__}:{exc}")
+        log.exception("EVT startup backfill failed")
+
+    off_ms = _broker_off_ms_safe()
+    now_ms = int(time.time() * 1000)
+    fires = {tf: _next_fire_ms(_TF_SEC[tf], now_ms, off_ms, grace_ms) for tf in tflist}
+    next_sweep = time.monotonic() + sweep_s
+    next_off_refresh = time.monotonic() + 3600.0
+    idle_logged = False
+
+    while True:
+        now_ms = int(time.time() * 1000)
+        now_mono = time.monotonic()
+
+        # periodic broker-offset refresh (registry may update after detection)
+        if now_mono >= next_off_refresh:
+            off_ms = _broker_off_ms_safe()
+            next_off_refresh = now_mono + 3600.0
+
+        due = [tf for tf in tflist if now_ms >= fires[tf]]
+
+        # ---- safety sweep: catches anything a boundary fire missed ----
+        if not due and now_mono >= next_sweep:
+            _worker_mark(name, "loop_started", last_error="")
+            try:
+                _push_ohlc_for_tfs(api_base, device_id, token, syms, tflist,
+                                   bars, include_latest, delta_on, delta_bars,
+                                   full_refresh)
+                _worker_mark(name, "loop_completed", last_success=time.monotonic())
+            except Exception as exc:
+                _worker_mark(name, "last_error_at",
+                             last_error=f"{type(exc).__name__}:{exc}")
+            next_sweep = time.monotonic() + sweep_s
+            continue
+
+        if not due:
+            wait_ms = min(fires[tf] for tf in tflist) - now_ms
+            wait_s = min(max(wait_ms / 1000.0, 0.2),
+                         max(0.2, next_sweep - now_mono), 30.0)
+            time.sleep(wait_s)
+            continue
+
+        # ---- idle market: don't fetch, roll boundaries forward, sleep long ----
+        if _market_idle(idle_thresh):
+            if not idle_logged:
+                log.info("EVT market idle (weekend/holiday); sleeping in 60s steps")
+                idle_logged = True
+            for tf in due:
+                fires[tf] = _next_fire_ms(_TF_SEC[tf], now_ms, off_ms, grace_ms)
+            _worker_mark(name, "loop_completed", last_success=time.monotonic())
+            time.sleep(60.0)
+            continue
+        idle_logged = False
+
+        # ---- fire: fetch + push exactly the TFs whose bar just closed ----
+        _worker_mark(name, "loop_started", last_error="")
+        try:
+            due_sorted = sorted(due, key=lambda t: _TF_SEC[t])
+            _push_ohlc_for_tfs(api_base, device_id, token, syms, due_sorted,
+                               bars, include_latest, delta_on, delta_bars,
+                               full_refresh)
+            _worker_mark(name, "loop_completed", last_success=time.monotonic())
+        except Exception as exc:
+            _worker_mark(name, "last_error_at",
+                         last_error=f"{type(exc).__name__}:{exc}")
+            log.exception("EVT tick exception")
+        finally:
+            for tf in due:
+                fires[tf] = _next_fire_ms(_TF_SEC[tf], int(time.time() * 1000),
+                                          off_ms, grace_ms)
+
+
+# ---------------------------------------------------------------------------
+# Flag-gated worker start. In start_ohlc_worker(), replace the line that
+# passes _ohlc_loop to _start_supervised_thread with _ohlc_loop_target()
+# (see PHASE1_PATCH_GUIDE.md, edit A2).
+# ---------------------------------------------------------------------------
+def _ohlc_loop_target():
+    if _reg_flag("Agent.EventDriven", False):
+        log.info("OHLC: EVENT-DRIVEN loop selected (Agent.EventDriven=1)")
+        return _ohlc_event_loop
+    log.info("OHLC: legacy fixed-interval loop selected")
+    return _ohlc_loop

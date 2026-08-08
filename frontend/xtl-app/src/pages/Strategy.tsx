@@ -553,13 +553,8 @@ export function StrategyConfigurator() {
     return sanitizeQtyBySymbol((config?.risk as any)?.qty_by_symbol);
   }, [config]);
 
-  const requireQtyOverrides =
-    String((config?.risk as any)?.risk_mode || "qty_by_symbol") === "qty_by_symbol";
-
-  const hasQtyOverrides = Object.keys(qtyOverrides).length > 0;
-
-  const missingQtyOverrides = requireQtyOverrides && !hasQtyOverrides;
-const [showAdvanced, setShowAdvanced] = React.useState(false);
+ 
+  const [showAdvanced, setShowAdvanced] = React.useState(false);
   const [advancedJson, setAdvancedJson] = React.useState("");
 
   const [paperTrades, setPaperTrades] = React.useState<PaperTradesResp | null>(null);
@@ -712,30 +707,40 @@ const [showAdvanced, setShowAdvanced] = React.useState(false);
       }
 
       
-      const qbs = sanitizeQtyBySymbol((nextCfg?.risk as any)?.qty_by_symbol);
-      if (String((nextCfg?.risk as any)?.risk_mode || "qty_by_symbol") === "qty_by_symbol") {
-        if (Object.keys(qbs).length === 0) {
-          throw new Error("Please add at least one Qty Override (symbol + qty) before saving or starting auto.");
-        }
-      }
+      const qbs = sanitizeQtyBySymbol(
+        (nextCfg?.risk as any)?.qty_by_symbol
+      );
 
-const payload: Partial<OpptState> = {
-        execution_mode: nextCfg?.execution?.mode,
-        mt5_account: nextCfg?.execution?.mt5_account,
+      const payload: Partial<OpptState> = {
+        execution_mode:
+          nextCfg?.execution?.mode,
+        mt5_account:
+          nextCfg?.execution?.mt5_account,
         risk_mode: "qty_by_symbol",
         qty_by_symbol: qbs,
-        max_positions: Number(nextCfg?.risk?.max_positions ?? 1),
-        cooldown_min: Number((nextCfg?.risk as any)?.cooldown_min ?? 0),
-        min_score: Number(nextCfg?.entry?.opportunity?.min_score ?? 0),
-        min_confidence: (nextCfg?.entry?.opportunity?.min_confidence || "medium") as any,
+        max_positions: Number(
+          nextCfg?.risk?.max_positions ?? 1
+        ),
+        cooldown_min: Number(
+          (nextCfg?.risk as any)?.cooldown_min ?? 0
+        ),
+        min_score: Number(
+          nextCfg?.entry?.opportunity?.min_score ?? 0
+        ),
+        min_confidence: (
+          nextCfg?.entry?.opportunity?.min_confidence ||
+          "medium"
+        ) as any,
       };
 
       const st = await opptApi.patch(payload);
       setServerState(st);
       setEnabled(!!st.enabled);
       await load();
+
     } catch (e: any) {
       setErr(e?.message || String(e));
+
     } finally {
       setSaveBusy(false);
     }
@@ -751,12 +756,7 @@ const payload: Partial<OpptState> = {
           const ok = window.confirm("Start auto trading now?");
           if (!ok) return;
         }
-        if (missingQtyOverrides) {
-          const msg = "Qty Overrides are required. Please add at least one symbol + qty before starting auto.";
-          setErr(msg);
-          window.alert(msg);
-          return;
-        }
+        
 
         if (isDirty) {
           try {
@@ -850,7 +850,7 @@ const payload: Partial<OpptState> = {
           <button
             type="button"
             onClick={toggleBot}
-            disabled={toggleBusy || loading || (!enabled && missingQtyOverrides)}
+            disabled={toggleBusy || loading}
             className={cx(
               "rounded-xl border px-4 py-2 text-sm font-semibold transition",
               enabled
@@ -887,11 +887,7 @@ const payload: Partial<OpptState> = {
           </button>
         </div>
 
-        {!enabled && missingQtyOverrides ? (
-          <div className="mt-2 text-xs text-rose-300">
-            Qty Overrides are required (per-symbol sizing). Add at least one symbol + qty to enable Start Auto.
-          </div>
-        ) : null}
+        
       </div>
 
       {err ? (

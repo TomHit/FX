@@ -189,7 +189,19 @@ def _broker_offset_minutes(R, device_id: str) -> int:
 
 
 def _broker_to_utc_ms(broker_ms: int, offset_min: int) -> int:
-    return int(broker_ms or 0) - int(offset_min or 0) * 60 * 1000
+    """Return the canonical UTC epoch carried by an OHLC bar.
+
+    MT5/Redis bar timestamps are Unix epochs.  A Unix epoch is already UTC;
+    ``broker_tz_offset_min`` only describes how that instant is displayed on
+    the broker chart.  Subtracting the display offset here moved every M15
+    feature -- and its causally aggregated H1/H4 context -- several hours into
+    the past.
+
+    Keep ``offset_min`` in the signature for backward-compatible callers and
+    continue persisting it as display metadata, but never apply it to epochs.
+    """
+    del offset_min
+    return int(broker_ms or 0)
 
 
 def _load_source_bars(source: str, device_id: str) -> list[dict]:
@@ -311,7 +323,7 @@ def _pin_bar_metrics(bar: dict, atr: float) -> dict:
 def _aggregate_bars_causal(bars: list[dict], tf_ms: int) -> list[dict]:
     """Aggregate completed M15 bars into completed higher-timeframe bars.
 
-    Buckets are based on broker timestamps. The current incomplete H1/H4
+    Buckets are based on canonical UTC epoch timestamps. The current incomplete H1/H4
     bucket is excluded, so replay sees exactly what live processing knew.
     """
     if not bars or tf_ms <= 0:
@@ -2370,6 +2382,7 @@ def _persist_series(R, source: str, device_id: str, bars: list[dict], offset_min
     payload = {
         "schema_version": 1,
         "model": "DXY_M15_BROKER_ALIGNED_SERIES_V1",
+        "timestamp_basis": "UTC_EPOCH",
         "source": source,
         "tf": TF,
         "device_id": device_id,
@@ -2566,7 +2579,8 @@ def update_global_dxy_m15_state(*, R, now_ms: int | None = None) -> dict:
     stats = {
         "bindings": 0, "devices": 0, "real_available": 0,
         "synthetic_available": 0, "series_built": 0,
-        "bootstrapped": 0, "evaluated": 0, "candidate_events": 0,
+        "bootstrapped": 0, "evaluated": 0, "catchup_evaluated": 0,
+        "candidate_events": 0,
         "grace_wait": 0, "degraded_retry": 0, "eval_failed_retry": 0,
         "errors": 0, "lock": False,
     }
@@ -2603,50 +2617,72 @@ def update_global_dxy_m15_state(*, R, now_ms: int | None = None) -> dict:
                     )
                     if marker.get("completed"):
                         stats["bootstrapped"] += 1
-                    broker_close_ms = _bar_close_ms(bars[-1])
-                    close_ms = _broker_to_utc_ms(broker_close_ms, offset_min)
-                    if source == "SYNTHETIC_DXY":
-                        health = _synthetic_health(bars[-1], detected_at_ms=detected_at_ms, close_ms=close_ms)
-                        if not health.get("synthetic_grace_complete"):
-                            stats["grace_wait"] += 1
-                            _persist_degraded_health(
-                                R, source=source, device_id=device_id, close_ms=close_ms,
-                                broker_close_ms=broker_close_ms, offset_min=offset_min,
-                                detected_at_ms=detected_at_ms, health=health,
-                            )
-                            continue
-                        if not health.get("synthetic_complete"):
-                            stats["degraded_retry"] += 1
-                            _persist_degraded_health(
-                                R, source=source, device_id=device_id, close_ms=close_ms,
-                                broker_close_ms=broker_close_ms, offset_min=offset_min,
-                                detected_at_ms=detected_at_ms, health=health,
-                            )
-                            continue
-                    eval_key = _eval_key(source, device_id, close_ms)
-                    if not R.set(eval_key, str(detected_at_ms), nx=True, ex=2 * 60 * 60):
-                        continue
-                    result = _evaluate_one(
-                        R, source=source, device_id=device_id, binding=binding,
-                        bars=bars, index=len(bars) - 1, detected_at_ms=detected_at_ms,
-                        offset_min=offset_min, historical=False,
+                    # Evaluate every unseen completed bar in chronological order.
+                    # The former latest-only path permanently lost intermediate
+                    # M15 evidence whenever the source advanced by two or more bars.
+                    state = _json_load(R.get(_state_key(source, device_id)), {})
+                    last_evaluated_ms = int(
+                        (state or {}).get("last_evaluated_bar_close_ms") or 0
                     )
-                    if result.get("ok"):
-                        stats["evaluated"] += 1
-                    else:
-                        try:
-                            R.delete(eval_key)
-                        except Exception:
-                            pass
-                        stats["eval_failed_retry"] += 1
-                    if result.get("event"):
-                        stats["candidate_events"] += 1
-                        log.warning(
-                            "[DXY_M15] CANDIDATE_EVENT source=%s device=%s status=%s direction=%s close_ms=%s confidence=%s",
-                            source, device_id, result["event"].get("status"),
-                            result["event"].get("direction"), close_ms,
-                            (result.get("state") or {}).get("confidence"),
+                    pending_indexes = [
+                        idx for idx in range(MIN_FEATURE_BARS - 1, len(bars))
+                        if _broker_to_utc_ms(_bar_close_ms(bars[idx]), offset_min)
+                        > last_evaluated_ms
+                    ]
+                    for pending_pos, idx in enumerate(pending_indexes):
+                        broker_close_ms = _bar_close_ms(bars[idx])
+                        close_ms = _broker_to_utc_ms(broker_close_ms, offset_min)
+                        if close_ms <= 0 or close_ms > detected_at_ms + 120000:
+                            continue
+                        if source == "SYNTHETIC_DXY":
+                            health = _synthetic_health(
+                                bars[idx], detected_at_ms=detected_at_ms,
+                                close_ms=close_ms,
+                            )
+                            if not health.get("synthetic_grace_complete"):
+                                stats["grace_wait"] += 1
+                                continue
+                            if not health.get("synthetic_complete"):
+                                stats["degraded_retry"] += 1
+                                _persist_degraded_health(
+                                    R, source=source, device_id=device_id,
+                                    close_ms=close_ms,
+                                    broker_close_ms=broker_close_ms,
+                                    offset_min=offset_min,
+                                    detected_at_ms=detected_at_ms, health=health,
+                                )
+                                continue
+                        eval_key = _eval_key(source, device_id, close_ms)
+                        if not R.set(eval_key, str(detected_at_ms), nx=True, ex=2 * 60 * 60):
+                            continue
+                        result = _evaluate_one(
+                            R, source=source, device_id=device_id,
+                            binding=binding, bars=bars, index=idx,
+                            detected_at_ms=detected_at_ms,
+                            offset_min=offset_min,
+                            historical=(pending_pos < len(pending_indexes) - 1),
                         )
+                        if result.get("ok"):
+                            stats["evaluated"] += 1
+                            if len(pending_indexes) > 1:
+                                stats["catchup_evaluated"] += 1
+                        else:
+                            try:
+                                R.delete(eval_key)
+                            except Exception:
+                                pass
+                            stats["eval_failed_retry"] += 1
+                            # Preserve causal ordering: retry this bar before
+                            # advancing the state to any later candle.
+                            break
+                        if result.get("event"):
+                            stats["candidate_events"] += 1
+                            log.warning(
+                                "[DXY_M15] CANDIDATE_EVENT source=%s device=%s status=%s direction=%s close_ms=%s confidence=%s",
+                                source, device_id, result["event"].get("status"),
+                                result["event"].get("direction"), close_ms,
+                                (result.get("state") or {}).get("confidence"),
+                            )
                 except Exception:
                     stats["errors"] += 1
                     log.exception("[DXY_M15] UPDATE_FAILED source=%s device=%s", source, device_id)

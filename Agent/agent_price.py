@@ -386,26 +386,58 @@ def price_loop() -> None:
                 if _should_publish(sym, price, ts_ms):
                     if _push_price_http(sym, price, ts_ms):
                         last_ok_ts = time.time()   # ⭐ SUCCESS TRACKED
+                        globals()["_stall_resets"] = 0 
 
             except Exception:
                 continue
 
-        # --- HARD RECOVERY: no successful publish for 5 minutes ---
+        
+        # --- HARD RECOVERY (idle-aware): distinguish market-idle from stall ---
         try:
             if time.time() - last_ok_ts > 300:
+                # Age of the newest tick we've actually seen across symbols.
+                if _last_ts_ms:
+                    newest_age = min(
+                        time.time() - (_last_ts_ms.get(s, 0) / 1000.0)
+                        for s in SYMBOLS
+                    )
+                else:
+                    newest_age = 1e9  # never saw a tick this session
+
+                if newest_age > 300:
+                    # Market idle (weekend/holiday/session gap): this is a
+                    # healthy state, not a fault. Reset nothing; sleep long.
+                    last_ok_ts = time.time()
+                    _warn_throttled(
+                        "price_idle",
+                        "[agent_price] market idle (no fresh ticks); "
+                        "sleeping 30s cycles, no reset",
+                        every_sec=1800.0,
+                    )
+                    time.sleep(30.0)
+                    continue
+
+                # Ticks ARE advancing but nothing published for 5m:
+                # genuine pipeline stall -> reset with exponential backoff.
+                _stall_resets = globals().setdefault("_stall_resets", 0)
+                globals()["_stall_resets"] = min(_stall_resets + 1, 4)
+                backoff = 300 * (2 ** _stall_resets)          # 5m,10m,20m,40m cap
                 _warn_throttled(
                     "price_stall",
-                    "[agent_price] no successful publish for 5m → force reset",
-                    every_sec=300.0,
+                    f"[agent_price] ticks advancing but no publish for 5m "
+                    f"-> force reset (next check in {backoff}s)",
+                    every_sec=60.0,
                 )
                 _reset_http_session()
                 _api_mark_ok()
-                last_ok_ts = time.time()
+                last_ok_ts = time.time() + (backoff - 300)    # push next trigger out
+            
         except Exception:
             pass
 
-        # --- sleep once per full cycle (prevents hot-loop + pool saturation) ---
-        time.sleep(0.15)
+        # --- cycle sleep aligned to publish interval (was a fixed 0.15s spin) ---
+        # MT5 IPC calls drop from ~40/sec to ~12/sec at interval=1.0.
+        time.sleep(max(0.25, PRICE_PUBLISH_INTERVAL_SEC / 2.0))
 
 
 def start_price_publisher(

@@ -271,38 +271,135 @@ def start_oppt_executor_manager() -> None:
                     "[DXY_M15] manager update failed pid=%s",
                     pid,
                 )
+            # ---------------------------------------------------------
+            # H1 DXY directional feature publisher.
+            #
+            # Shadow analytics only:
+            # - no entry gating
+            # - no trade scoring changes
+            # - no risk or execution changes
+            # - no H1 turn lifecycle yet
+            # ---------------------------------------------------------
+            try:
+                from api.dxy_h1_features import (
+                    update_global_dxy_h1_features,
+                )
+
+                _dxy_h1_stats = (
+                    update_global_dxy_h1_features(
+                        R=R,
+                        now_ms=int(now_ms),
+                    )
+                )
+
+                if (
+                    _dxy_h1_stats
+                    and (
+                        int(
+                            _dxy_h1_stats.get(
+                                "published"
+                            )
+                            or 0
+                        ) > 0
+                        or int(
+                            _dxy_h1_stats.get(
+                                "errors"
+                            )
+                            or 0
+                        ) > 0
+                    )
+                ):
+                    log.info(
+                        "[DXY_H1] tick "
+                        "devices=%s real=%s "
+                        "synthetic=%s published=%s "
+                        "unchanged=%s errors=%s",
+                        _dxy_h1_stats.get(
+                            "devices"
+                        ),
+                        _dxy_h1_stats.get(
+                            "real_available"
+                        ),
+                        _dxy_h1_stats.get(
+                            "synthetic_available"
+                        ),
+                        _dxy_h1_stats.get(
+                            "published"
+                        ),
+                        _dxy_h1_stats.get(
+                            "unchanged"
+                        ),
+                        _dxy_h1_stats.get(
+                            "errors"
+                        ),
+                    )
+
+            except Exception:
+                log.exception(
+                    "[DXY_H1] manager update failed "
+                    "pid=%s",
+                    pid,
+                )
 
             # Analytics truth maintenance is independent of whether strategy
-            # execution is enabled. Reconcile first, then sweep. The sweep itself
-            # skips owners whose broker-open snapshot is unavailable/unverified.
+            # execution is enabled. Update open-trade milestones first,
+            # then reconcile broker truth, then sweep closed trades.
             try:
                 from api.xtl_analytics import (
+                    update_open_trade_snapshots,
                     reconcile_pending_broker_truth,
                     sweep_closed_trades,
                 )
 
-                _recon = reconcile_pending_broker_truth() or {}
-                _sw = sweep_closed_trades() or {}
+                _milestones = (
+                    update_open_trade_snapshots()
+                    or {}
+                )
+
+                _recon = (
+                    reconcile_pending_broker_truth()
+                    or {}
+                )
+
+                _sw = (
+                    sweep_closed_trades()
+                    or {}
+                )
 
                 if (
-                    int(_recon.get("upgraded") or 0) > 0
+                    int(_milestones.get("updated") or 0) > 0
+                    or int(_milestones.get("missing") or 0) > 0
+                    or int(_milestones.get("errors") or 0) > 0
+                    or int(_recon.get("upgraded") or 0) > 0
                     or int(_sw.get("finalized") or 0) > 0
                     or int(_sw.get("skipped_unverified") or 0) > 0
                     or int(_recon.get("errors") or 0) > 0
                     or int(_sw.get("errors") or 0) > 0
                 ):
                     log.info(
-                        "[ANALYTICS] reconcile upgraded=%s checked=%s "
-                        "sweep finalized=%s checked=%s skipped_unverified=%s errors=%s",
+                        "[ANALYTICS] "
+                        "milestones updated=%s checked=%s missing=%s errors=%s | "
+                        "reconcile upgraded=%s checked=%s errors=%s | "
+                        "sweep finalized=%s checked=%s "
+                        "skipped_unverified=%s errors=%s",
+                        _milestones.get("updated"),
+                        _milestones.get("checked"),
+                        _milestones.get("missing"),
+                        _milestones.get("errors"),
                         _recon.get("upgraded"),
                         _recon.get("checked"),
+                        _recon.get("errors"),
                         _sw.get("finalized"),
                         _sw.get("checked"),
                         _sw.get("skipped_unverified"),
-                        int(_recon.get("errors") or 0) + int(_sw.get("errors") or 0),
+                        _sw.get("errors"),
                     )
+
             except Exception:
-                log.exception("[ANALYTICS] lifecycle maintenance error pid=%s", pid)
+                log.exception(
+                    "[ANALYTICS] lifecycle maintenance error pid=%s",
+                    pid,
+                )
 
             # Strategy execution can sleep longer when nobody is enabled.
             # Global DXY and analytics maintenance above have already run.

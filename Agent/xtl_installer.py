@@ -3845,7 +3845,7 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
                     alog(f"HB: push_now ohlc error: {e!s}")
 
             # Cadence push while active
-            if trend_active and mt5_ok_flag:
+            if trend_active and mt5_ok_flag and not _event_driven_enabled():
                 for sym in symbols:
                     for tfu in tfs:
                         if _due(sym, tfu, cadence, now_s):
@@ -3964,6 +3964,14 @@ def read_config() -> dict:
 
     return {}
 
+
+def _event_driven_enabled() -> bool:
+    """Read Agent.EventDriven flag (HKLM\\SOFTWARE\\XTL) — same source agent_ohlc uses."""
+    try:
+        v = (reg_get("Agent.EventDriven") or "").strip().lower()
+        return v in ("1", "true", "yes", "on")
+    except Exception:
+        return False
 
 def _maybe_mt5_worker(api_base: str) -> None:
     """
@@ -4101,6 +4109,27 @@ def _maybe_mt5_worker(api_base: str) -> None:
         alog(
             f"OHLC: starting worker symbols={symbols} tfs={tfs} bars={bars} every {s_per_cycle}s"
         )
+        # ---- EVENT-DRIVEN MODE: delegate to the supervised agent worker ----
+        if _event_driven_enabled():
+            try:
+                from xtl.agent_ohlc import start_ohlc_worker
+                alog("OHLC: EVENT-DRIVEN mode -> delegating to agent_ohlc.start_ohlc_worker")
+                start_ohlc_worker(
+                    api_base=api_base,
+                    device_id=device_id,
+                    token=device_token,
+                    symbols=symbols,
+                    tfs=tfs,
+                    bars=bars,
+                    period_sec=float(s_per_cycle),
+                )
+                while not _stop.is_set():   # worker runs supervised in its own thread
+                    _stop.wait(30)
+                alog("OHLC: event-driven wrapper exiting")
+                return
+            except Exception as e:
+                alog(f"OHLC: event-driven start failed ({e!s}); falling back to legacy loop")
+        # ---- legacy loop below runs only when flag is off or start failed ----
 
         # Main loop
         while not _stop.is_set():

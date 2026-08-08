@@ -42,7 +42,7 @@ JSONL_PATH     = "/opt/xauapi/api/trend/out/trades.jsonl"
 JSONL_LOCK_PATH = JSONL_PATH + ".lock"
 PENDING_TRUTH_KEY = "xtl:analytics:pending_truth"
 ORPHAN_AGE_MS  = 10 * 60 * 1000
-SCHEMA_VERSION = "1.8"
+SCHEMA_VERSION = "2.0"
 
 # First close-sweep after process start performs pending-set reseed and broker
 # truth reconciliation before any absence-based close detection. This makes
@@ -60,10 +60,54 @@ LIVE_TZ_OFFSET_H = 0.0
 # REAL_DXY / SYNTHETIC_DXY detector. Analytics reads them only; it never
 # changes the detector or blocks/modifies a trade.
 DXY_M15_SOURCES = ("REAL_DXY", "SYNTHETIC_DXY")
+
 DXY_M15_STATE_PREFIX = "xtl:dxy:turn:state:M15"
 DXY_M15_HISTORY_PREFIX = "xtl:dxy:turn:history:M15"
 DXY_M15_MAX_TRACKED_EVENTS = 200
 DXY_M15_STATE_FRESH_MS = 90 * 60 * 1000
+
+# Phase-1 REAL DXY M15 extreme-impulse classification.  Shadow analytics only:
+# it records that a new entry would ideally WAIT during an abnormal directional
+# USD candle, but this module never blocks/modifies trading.  Thresholds were
+# calibrated against the current canonical FTMO REAL DXY sample (286 completed
+# M15 bars): range >=1.75 ATR, body >=1.50 ATR, directional body >=70% of range.
+DXY_M15_EXTREME_RANGE_ATR = float(os.getenv(
+    "XTL_DXY_M15_EXTREME_RANGE_ATR",
+    "1.75",
+))
+DXY_M15_EXTREME_BODY_ATR = float(os.getenv(
+    "XTL_DXY_M15_EXTREME_BODY_ATR",
+    "1.50",
+))
+DXY_M15_EXTREME_BODY_RATIO = float(os.getenv(
+    "XTL_DXY_M15_EXTREME_BODY_RATIO",
+    "0.70",
+))
+DXY_M15_EXTREME_SNAPSHOT_FRESH_MS = int(os.getenv(
+    "XTL_DXY_M15_EXTREME_SNAPSHOT_FRESH_MS",
+    str(30 * 60 * 1000),
+))
+# DXY H1 directional-feature analytics.
+#
+# Produced by api/dxy_h1_features.py. Read-only here:
+# this never changes entry direction, gates, scoring, risk, or execution.
+DXY_H1_SOURCES = (
+    "REAL_DXY",
+    "SYNTHETIC_DXY",
+)
+
+DXY_H1_FEATURE_PREFIX = "xtl:dxy:features:H1"
+DXY_H1_LATEST_PREFIX = "xtl:dxy:features:latest:H1"
+
+# Entry capture may use the most recently completed H1 bar only when it
+# was reasonably fresh at the trade-entry timestamp.
+DXY_H1_FEATURE_FRESH_MS = int(
+    os.getenv(
+        "XTL_DXY_H1_FEATURE_FRESH_MS",
+        str(2 * 60 * 60 * 1000),
+    )
+)
+
 DXY_CANONICAL_H1_FRESH_MS = int(os.getenv(
     "XTL_DXY_CANONICAL_H1_FRESH_MS",
     str(2 * 60 * 60 * 1000),
@@ -97,6 +141,27 @@ DRIFT_TABLE = {
     "XAUUSD": {"Asia":   {"signed": 4.3, "reliab": 2.56}},
     "USDCAD": {"London": {"signed": 2.1, "reliab": 2.24}},
 }
+
+
+# Live per-trade milestone analytics (shadow-only; never changes orders).
+MILESTONE_LEVELS = (
+    ("r_025", 0.25),
+    ("r_050", 0.50),
+    ("r_075", 0.75),
+    ("r_100", 1.00),
+    ("r_150", 1.50),
+    ("r_200", 2.00),
+)
+MILESTONE_UPDATE_MIN_INTERVAL_MS = int(os.getenv(
+    "XTL_ANALYTICS_MILESTONE_UPDATE_MIN_MS",
+    "5000",
+))
+MILESTONE_DXY_SAMPLE_INTERVAL_MS = int(os.getenv(
+    "XTL_ANALYTICS_MILESTONE_DXY_SAMPLE_MS",
+    "60000",
+))
+MILESTONE_MAX_DXY_EVENTS = 100
+MILESTONE_MAX_EXIT_CANDIDATES = 50
 
 
 # -- tiny helpers -------------------------------------------------------------
@@ -163,6 +228,77 @@ def _json_load(value, default=None):
 
     except Exception:
         return default
+
+
+
+def _new_trade_milestone_state() -> dict:
+    return {
+        "schema_version": 1,
+        "analytics_only": True,
+        "initialized_at_ms": _now_ms(),
+        "milestones": {
+            name: {
+                "target_r": target,
+                "reached": False,
+                "first_reached_ms": None,
+                "first_reached_price": None,
+                "dxy_snapshot": None,
+            }
+            for name, target in MILESTONE_LEVELS
+        },
+        "state": {
+            "current_r": None,
+            "current_price": None,
+            "last_update_ms": None,
+            "max_r_seen": None,
+            "max_r_seen_ms": None,
+            "max_r_seen_price": None,
+            "min_r_seen": None,
+            "min_r_seen_ms": None,
+            "min_r_seen_price": None,
+            "highest_milestone_reached": None,
+            "giveback_from_max_r": None,
+            "lowest_r_after_050": None,
+            "lowest_r_after_075": None,
+            "lowest_r_after_100": None,
+            "returned_to_entry_after_050": False,
+            "returned_to_entry_after_075": False,
+            "returned_to_entry_after_100": False,
+            "returned_below_050_after_100": False,
+        },
+        "dxy_events": [],
+        "dxy_last_signature": None,
+        "dxy_last_sample_ms": None,
+        "exit_candidates": [],
+        "exit_candidate_keys": [],
+    }
+
+
+def _ensure_trade_milestone_state(snap: dict) -> dict:
+    current = snap.get("trade_milestone_history")
+    if not isinstance(current, dict):
+        current = _new_trade_milestone_state()
+        snap["trade_milestone_history"] = current
+
+    current.setdefault("schema_version", 1)
+    current.setdefault("analytics_only", True)
+    current.setdefault("milestones", {})
+    current.setdefault("state", {})
+    current.setdefault("dxy_events", [])
+    current.setdefault("exit_candidates", [])
+    current.setdefault("exit_candidate_keys", [])
+
+    for name, target in MILESTONE_LEVELS:
+        current["milestones"].setdefault(name, {
+            "target_r": target,
+            "reached": False,
+            "first_reached_ms": None,
+            "first_reached_price": None,
+            "dxy_snapshot": None,
+        })
+
+    return current
+
 
 def analyze_liquidity_target_during_trade(
     snap: dict,
@@ -711,17 +847,19 @@ def _dxy_real_device_health(R, device_id: str, now_ms: int | None = None) -> dic
     return out
 
 
-def _discover_freshest_real_dxy_device(R, now_ms: int | None = None) -> dict:
-    """Discover the freshest healthy REAL_DXY device deterministically."""
+
+def _discover_freshest_real_dxy_device(
+    R,
+    now_ms: int | None = None,
+) -> dict:
     now = int(now_ms or _now_ms())
     devices: set[str] = set()
+
+    # Existing derived M15 state discovery.
     try:
-        for key in R.scan_iter(
-            f"{DXY_M15_STATE_PREFIX}:REAL_DXY:*",
-            count=200,
-        ):
+        prefix = f"{DXY_M15_STATE_PREFIX}:REAL_DXY:"
+        for key in R.scan_iter(f"{prefix}*", count=200):
             key_s = _redis_key_text(key)
-            prefix = f"{DXY_M15_STATE_PREFIX}:REAL_DXY:"
             if key_s.startswith(prefix):
                 dev = key_s[len(prefix):].strip()
                 if dev:
@@ -729,8 +867,42 @@ def _discover_freshest_real_dxy_device(R, now_ms: int | None = None) -> dict:
     except Exception:
         pass
 
-    candidates = [_dxy_real_device_health(R, dev, now) for dev in sorted(devices)]
-    healthy = [item for item in candidates if item.get("healthy")]
+    # NEW: discover directly from raw REAL DXY snapshots.
+    try:
+        raw_prefix = "xtl:ohlc:snap:"
+        raw_suffix = ":DXY:M15"
+
+        for key in R.scan_iter(
+            "xtl:ohlc:snap:*:DXY:M15",
+            count=200,
+        ):
+            key_s = _redis_key_text(key)
+
+            if (
+                key_s.startswith(raw_prefix)
+                and key_s.endswith(raw_suffix)
+            ):
+                dev = key_s[
+                    len(raw_prefix):
+                    -len(raw_suffix)
+                ].strip()
+
+                if dev:
+                    devices.add(dev)
+    except Exception:
+        pass
+
+    candidates = [
+        _dxy_real_device_health(R, dev, now)
+        for dev in sorted(devices)
+    ]
+
+    healthy = [
+        item
+        for item in candidates
+        if item.get("healthy")
+    ]
+
     healthy.sort(
         key=lambda item: (
             int(item.get("freshness_ms") or 0),
@@ -738,12 +910,12 @@ def _discover_freshest_real_dxy_device(R, now_ms: int | None = None) -> dict:
         ),
         reverse=True,
     )
+
     return {
         "selected": healthy[0] if healthy else None,
         "candidates_checked": len(candidates),
         "healthy_candidates": len(healthy),
     }
-
 
 def resolve_canonical_dxy_source(
     R,
@@ -1478,7 +1650,102 @@ def default_fetch_h1_bars(symbol: str, start_ms: int, end_ms: int, device_id: st
         return []
 
 
-# -- Phase-F §13: reversal-candle OHLC reconstructed from H1 bar at rc_open_ms -
+def default_fetch_m1_bars(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    device_id: str = None,
+) -> list:
+    """
+    Load completed broker M1 bars from the exact trade device.
+
+    Redis timestamps are broker-wall epoch seconds in `t`.
+    Filtering to the trade lifetime happens inside the excursion calculator.
+    """
+    try:
+        if not symbol or not device_id:
+            return []
+
+        R = from_app_R()
+
+        key = (
+            f"xtl:ohlc:snap:"
+            f"{str(device_id).strip()}:"
+            f"{str(symbol).upper().strip()}:M1"
+        )
+
+        raw = R.get(key)
+
+        if not raw:
+            return []
+
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode(
+                "utf-8",
+                "ignore",
+            )
+
+        payload = json.loads(raw)
+
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        bars = (
+            payload.get("bars")
+            if isinstance(payload, dict)
+            else []
+        )
+
+        if not isinstance(bars, list):
+            return []
+
+        result = []
+
+        for bar in bars:
+            if (
+                not isinstance(bar, dict)
+                or bar.get("complete") is False
+            ):
+                continue
+
+            open_ms = _norm_ms(
+                bar.get("t_open_ms")
+                or bar.get("t")
+                or bar.get("time")
+                or 0
+            )
+
+            if open_ms <= 0:
+                continue
+
+            row = dict(bar)
+            row["t_open_ms"] = int(open_ms)
+            row["t_close_ms"] = int(
+                open_ms + 60_000
+            )
+            row["complete"] = True
+
+            result.append(row)
+
+        result.sort(
+            key=lambda row: int(
+                row.get("t_open_ms") or 0
+            )
+        )
+
+        return result
+
+    except Exception as exc:
+        log.warning(
+            "analytics: default_fetch_m1_bars "
+            "failed symbol=%s device=%s err=%r",
+            symbol,
+            device_id,
+            exc,
+        )
+        return []
+
+# -- Phase-F  13: reversal-candle OHLC reconstructed from H1 bar at rc_open_ms -
 def read_reversal_candle(symbol: str, device_id: str, pos: dict) -> dict:
     """Multi-source RC capture with provenance. Resolves rc_open_ms from the first
     available source (pos -> entry_gate.rev_state -> live watch -> touch fallback),
@@ -1491,6 +1758,40 @@ def read_reversal_candle(symbol: str, device_id: str, pos: dict) -> dict:
           "rc_capture_note": "missing"}
     try:
         p = pos if isinstance(pos, dict) else {}
+
+        # The broker-entry payload is the only authoritative description of the
+        # RC that actually triggered this trade.  Use it only when complete;
+        # older/incomplete payloads continue through the pre-existing fallback
+        # chain below.  This is analytics-only and never changes gate state.
+        ec = p.get("entry_confirmation")
+        if isinstance(ec, dict):
+            ec_rc = {
+                "rc_open_ms": ec.get("rc_open_ms") or ec.get("open_ms"),
+                "rc_open": _safe_float(ec.get("rc_open") if ec.get("rc_open") is not None else ec.get("open")),
+                "rc_high": _safe_float(ec.get("rc_high") if ec.get("rc_high") is not None else ec.get("high")),
+                "rc_low": _safe_float(ec.get("rc_low") if ec.get("rc_low") is not None else ec.get("low")),
+                "rc_close": _safe_float(ec.get("rc_close") if ec.get("rc_close") is not None else ec.get("close")),
+            }
+            if ec_rc["rc_open_ms"] and None not in (
+                ec_rc["rc_open"], ec_rc["rc_high"],
+                ec_rc["rc_low"], ec_rc["rc_close"],
+            ):
+                rc.update(ec_rc)
+                rc["rc_open_ms"] = int(ec_rc["rc_open_ms"])
+                rc["rc_found"] = True
+                rc["rc_source"] = "entry_confirmation"
+                rc["rc_capture_note"] = "authoritative_entry_time_rc"
+                o, h, l, c = (rc["rc_open"], rc["rc_high"], rc["rc_low"], rc["rc_close"])
+                rng = (h - l) or 0.0
+                rc["rc_size_pips"] = round(rng / _pip(symbol), 1) if rng else 0.0
+                rc["rc_body_pct"] = round(abs(c - o) / rng * 100.0, 1) if rng else 0.0
+                rc["rc_direction"] = "BULL" if c > o else ("BEAR" if c < o else "DOJI")
+                for key in ("rc_shifted_before_entry", "rc_shifted"):
+                    if key in ec:
+                        rc["rc_shifted_before_entry"] = bool(ec.get(key))
+                        break
+                return rc
+
         sources = [("pos", p)]
         eg = p.get("entry_gate")
         if isinstance(eg, dict):
@@ -1573,6 +1874,7 @@ def read_reversal_candle(symbol: str, device_id: str, pos: dict) -> dict:
                     rc["rc_high"]  = _safe_float(bar.get("h"))
                     rc["rc_low"]   = _safe_float(bar.get("l"))
                     rc["rc_close"] = _safe_float(bar.get("c"))
+                    rc["rc_capture_note"] = f"{rc.get('rc_capture_note')}:h1_reconstructed"
 
         # derive body/size/direction if we have OHLC
         o, h, l, c = rc["rc_open"], rc["rc_high"], rc["rc_low"], rc["rc_close"]
@@ -1587,7 +1889,7 @@ def read_reversal_candle(symbol: str, device_id: str, pos: dict) -> dict:
         return rc
 
 
-# -- Phase-F §14: full liquidity breakdown from liq_detail/bsl_ssl ------------
+# -- Phase-F  14: full liquidity breakdown from liq_detail/bsl_ssl ------------
 def read_liquidity_detail(liq_res: dict, side: str) -> dict:
     """Extract EQH/EQL, session liquidity, swept flags, sweep direction from the
     detect_liq_signals result (already computed in read_liquidity_at_ack)."""
@@ -1623,7 +1925,7 @@ def read_liquidity_detail(liq_res: dict, side: str) -> dict:
     return out
 
 
-# -- setup quality flags — testable risk hypotheses frozen at entry -----------
+# -- setup quality flags   testable risk hypotheses frozen at entry -----------
 # NOTE: these are HYPOTHESES to validate against outcomes, not proven rules.
 # 1H matters as REGIME (reversals need RANGE; TREND runs zones over).
 # 4H matters as DIRECTION (fading against a strong higher-TF trend is risky).
@@ -1659,7 +1961,7 @@ def compute_setup_quality_flags(snap_like: dict) -> list:
             adx4 = _safe_float(r4.get("adx"), 0.0) or 0.0
             if adx4 >= QFLAG_4H_ADX_TREND:
                 # direction proxy: a reversal SELL fades at resistance (betting price
-                # falls) — risky if 4H trend is UP; a BUY fades at support — risky if
+                # falls)   risky if 4H trend is UP; a BUY fades at support   risky if
                 # 4H trend is DOWN. We lack 4H slope here, so flag the STRONG-4H-trend
                 # condition and let analysis confirm direction correlation.
                 flags.append("strong_4h_trend")
@@ -1695,7 +1997,7 @@ def compute_setup_quality_flags(snap_like: dict) -> list:
     return flags
 
 
-# -- Phase-F §11: news_block context (shadow read — observes, never blocks) ---
+# -- Phase-F  11: news_block context (shadow read   observes, never blocks) ---
 def read_news_at_ack(symbol: str, ts_ms: int) -> dict:
     """Record whether this entry sat near a scheduled high-impact event, using the
     canonical check_news_block() in SHADOW mode (reports, does not block). Captures
@@ -1803,7 +2105,7 @@ def read_ftmo_state_at_ack(
             max_age_ms=None,
             fallback_compute=False,
         ) or {}
-        # §7 FTMO state
+        #  7 FTMO state
         out["drawdown_pct"]            = rs.get("drawdown_pct")
         out["drawdown_band"]           = rs.get("drawdown_band")
         out["effective_risk_pct"]      = rs.get("effective_risk_pct")
@@ -1818,7 +2120,7 @@ def read_ftmo_state_at_ack(
         out["halt_reason"]             = rs.get("halt_reason")
         out["wins_today"]              = rs.get("wins_today")
         out["losses_today"]            = rs.get("losses_today")
-        # §8 account-core (engine's view) / §10 portfolio
+        #  8 account-core (engine's view) /  10 portfolio
         out["broker_balance"]          = rs.get("broker_balance")
         out["broker_equity"]           = rs.get("broker_equity")
         out["floating_pnl"]            = rs.get("floating_pnl")
@@ -1887,7 +2189,7 @@ def read_account_at_ack(device_id: str, account_type: str = "demo") -> dict:
 #   h1_20_slope_atr      least-squares slope per bar, in ATR units
 #   h1_20_r2             0..1, how linear/clean the move was (trend vs chop)
 #   h1_20_bars_used      how many closes actually went into the calc
-#   h1_20_vs_trade       WITH/AGAINST/NEUTRAL — trade side vs GATED direction
+#   h1_20_vs_trade       WITH/AGAINST/NEUTRAL   trade side vs GATED direction
 # -----------------------------------------------------------------------------
 
 
@@ -1926,7 +2228,7 @@ def _h1_window_direction(bars_h1, atr, n=20, r2_gate=0.20):
         sxy = sum((xs[i] - mx) * (closes[i] - my) for i in range(m))
         slope = (sxy / sxx) if sxx else 0.0
 
-        # 3) r^2 — how linear the move was (0 choppy .. 1 clean trend)
+        # 3) r^2   how linear the move was (0 choppy .. 1 clean trend)
         ss_tot = sum((c - my) ** 2 for c in closes)
         if ss_tot > 0:
             ss_res = sum(
@@ -1957,7 +2259,7 @@ def _h1_window_direction(bars_h1, atr, n=20, r2_gate=0.20):
         # Trend tilt (analytics only)
         #
         # Unlike h1_20_direction, tilt does NOT require a
-        # 1 ATR displacement or high R².
+        # 1 ATR displacement or high R .
         #
         # It answers:
         # "If there is any directional bias at all,
@@ -2651,6 +2953,13 @@ def capture_dxy_market_snapshot(
 
             "dxy_unavailable_reason": None,
         })
+
+        # Immutable raw H1 candle behavior for cross-market entry research.
+        # It is descriptive only and is never consumed by execution.
+        out["dxy_h1_last10_behavior"] = _h1_last10_behavior(
+            closed_bars,
+            atr,
+        )
 
         return out
 
@@ -3492,126 +3801,766 @@ def _dxy_reason_part_code(name: str) -> str:
 
 
 def _dxy_m15_reasoning(state_snapshot: dict) -> dict:
-    """Build an explainable, analytics-only decision ledger from one DXY state.
+    """Build an explainable, analytics-only interpretation of one DXY state.
 
-    This function never changes candidate qualification, status, direction, or
-    confidence. SR is explicitly marked AUDIT_ONLY while sr_score_enabled=false.
+    Important:
+      - Never changes DXY lifecycle status or direction.
+      - Never changes candidate qualification or confidence.
+      - Never blocks, permits, delays, sizes, or modifies a trade.
+      - SR remains analytics/audit context only.
     """
-    state = state_snapshot if isinstance(state_snapshot, dict) else {}
-    features = state.get("features") if isinstance(state.get("features"), dict) else {}
-    detail = features.get("evidence_detail") if isinstance(features.get("evidence_detail"), dict) else {}
-    bull_parts = detail.get("bull_parts") if isinstance(detail.get("bull_parts"), dict) else {}
-    bear_parts = detail.get("bear_parts") if isinstance(detail.get("bear_parts"), dict) else {}
-    evidence_direction = _dxy_m15_direction(features.get("evidence_direction"))
-    status = str(state.get("status") or "UNAVAILABLE").upper().strip()
-    direction = _dxy_m15_direction(state.get("direction"))
-    alignment = str(state.get("trade_alignment") or "NEUTRAL").upper().strip()
-    qualified = bool(features.get("candidate_qualified"))
-    qualification_reason = str(features.get("candidate_qualification_reason") or "").upper().strip() or None
+    state = (
+        state_snapshot
+        if isinstance(state_snapshot, dict)
+        else {}
+    )
 
-    selected_parts = bull_parts if evidence_direction == "BULLISH" else bear_parts if evidence_direction == "BEARISH" else {}
-    opposing_parts = bear_parts if evidence_direction == "BULLISH" else bull_parts if evidence_direction == "BEARISH" else {}
+    features = (
+        state.get("features")
+        if isinstance(state.get("features"), dict)
+        else {}
+    )
+
+    detail = (
+        features.get("evidence_detail")
+        if isinstance(features.get("evidence_detail"), dict)
+        else {}
+    )
+
+    bull_parts = (
+        detail.get("bull_parts")
+        if isinstance(detail.get("bull_parts"), dict)
+        else {}
+    )
+
+    bear_parts = (
+        detail.get("bear_parts")
+        if isinstance(detail.get("bear_parts"), dict)
+        else {}
+    )
+
+    evidence_direction = _dxy_m15_direction(
+        features.get("evidence_direction")
+    )
+
+    status = str(
+        state.get("status") or "UNAVAILABLE"
+    ).upper().strip()
+
+    direction = _dxy_m15_direction(
+        state.get("direction")
+    )
+
+    alignment = str(
+        state.get("trade_alignment") or "NEUTRAL"
+    ).upper().strip()
+
+    qualified = bool(
+        features.get("candidate_qualified")
+    )
+
+    qualification_reason = str(
+        features.get("candidate_qualification_reason")
+        or ""
+    ).upper().strip() or None
+
+    selected_parts = (
+        bull_parts
+        if evidence_direction == "BULLISH"
+        else bear_parts
+        if evidence_direction == "BEARISH"
+        else {}
+    )
+
+    opposing_parts = (
+        bear_parts
+        if evidence_direction == "BULLISH"
+        else bull_parts
+        if evidence_direction == "BEARISH"
+        else {}
+    )
 
     positive_factors = []
     penalties = []
+
     for name, raw_value in selected_parts.items():
         value = _safe_float(raw_value)
+
         if value is None or value == 0:
             continue
-        item = {"code": _dxy_reason_part_code(name), "contribution": round(value, 4)}
+
+        item = {
+            "code": _dxy_reason_part_code(name),
+            "contribution": round(value, 4),
+        }
+
         if value > 0:
             positive_factors.append(item)
         else:
             penalties.append(item)
 
     opposing_factors = []
+
     for name, raw_value in opposing_parts.items():
         value = _safe_float(raw_value)
+
         if value is None or value <= 0:
             continue
-        opposing_factors.append({"code": _dxy_reason_part_code(name), "contribution": round(value, 4)})
 
-    positive_factors.sort(key=lambda x: abs(float(x.get("contribution") or 0)), reverse=True)
-    penalties.sort(key=lambda x: abs(float(x.get("contribution") or 0)), reverse=True)
-    opposing_factors.sort(key=lambda x: abs(float(x.get("contribution") or 0)), reverse=True)
+        opposing_factors.append({
+            "code": _dxy_reason_part_code(name),
+            "contribution": round(value, 4),
+        })
+
+    positive_factors.sort(
+        key=lambda item: abs(
+            float(item.get("contribution") or 0)
+        ),
+        reverse=True,
+    )
+
+    penalties.sort(
+        key=lambda item: abs(
+            float(item.get("contribution") or 0)
+        ),
+        reverse=True,
+    )
+
+    opposing_factors.sort(
+        key=lambda item: abs(
+            float(item.get("contribution") or 0)
+        ),
+        reverse=True,
+    )
 
     blockers = []
+
     if not qualified and qualification_reason:
         blockers.append(qualification_reason)
-    if status == "IDLE" and state.get("last_event_status") == "REJECTED":
-        blockers.append(str(state.get("last_event_reason") or "LAST_CANDIDATE_REJECTED").upper())
-    if not state.get("available"):
-        blockers.append(str(state.get("unavailable_reason") or "DXY_STATE_UNAVAILABLE").upper())
 
-    sr = features.get("sr") if isinstance(features.get("sr"), dict) else {}
-    context = sr.get("structure_context") if isinstance(sr.get("structure_context"), dict) else {}
-    sr_enabled = bool(features.get("sr_score_enabled"))
-    sr_applied = _safe_float(features.get("sr_score_applied"), 0.0) or 0.0
+    if (
+        status == "IDLE"
+        and state.get("last_event_status") == "REJECTED"
+    ):
+        blockers.append(
+            str(
+                state.get("last_event_reason")
+                or "LAST_CANDIDATE_REJECTED"
+            ).upper()
+        )
+
+    if not state.get("available"):
+        blockers.append(
+            str(
+                state.get("unavailable_reason")
+                or "DXY_STATE_UNAVAILABLE"
+            ).upper()
+        )
+
+    sr = (
+        features.get("sr")
+        if isinstance(features.get("sr"), dict)
+        else {}
+    )
+
+    context = (
+        sr.get("structure_context")
+        if isinstance(sr.get("structure_context"), dict)
+        else {}
+    )
+
+    sr_enabled = bool(
+        features.get("sr_score_enabled")
+    )
+
+    sr_applied = (
+        _safe_float(
+            features.get("sr_score_applied"),
+            0.0,
+        )
+        or 0.0
+    )
+
+    downside_room_atr = _safe_float(
+        context.get("available_downside_atr")
+    )
+
+    upside_room_atr = _safe_float(
+        context.get("available_upside_atr")
+    )
+
+    near_h1_support = bool(
+        context.get("near_h1_support")
+    )
+
+    near_h1_resistance = bool(
+        context.get("near_h1_resistance")
+    )
+
+    inside_h4_support = bool(
+        context.get("inside_h4_support")
+    )
+
+    inside_h4_resistance = bool(
+        context.get("inside_h4_resistance")
+    )
+
+    inside_m15_support = bool(
+        context.get("inside_m15_support")
+    )
+
+    inside_m15_resistance = bool(
+        context.get("inside_m15_resistance")
+    )
+
+    near_support_tfs = (
+        sr.get("near_support_tfs")
+        if isinstance(sr.get("near_support_tfs"), list)
+        else []
+    )
+
+    near_resistance_tfs = (
+        sr.get("near_resistance_tfs")
+        if isinstance(sr.get("near_resistance_tfs"), list)
+        else []
+    )
+
     sr_context = {
         "context": context.get("context"),
-        "near_h1_support": bool(context.get("near_h1_support")),
-        "near_h1_resistance": bool(context.get("near_h1_resistance")),
-        "inside_h4_support": bool(context.get("inside_h4_support")),
-        "inside_h4_resistance": bool(context.get("inside_h4_resistance")),
-        "inside_m15_support": bool(context.get("inside_m15_support")),
-        "inside_m15_resistance": bool(context.get("inside_m15_resistance")),
-        "bullish_h1_sweep_reclaim": bool(context.get("bullish_h1_sweep_reclaim")),
-        "bearish_h1_sweep_reject": bool(context.get("bearish_h1_sweep_reject")),
-        "sweep_conflict": bool(context.get("sweep_conflict")),
-        "available_downside_atr": _safe_float(context.get("available_downside_atr")),
-        "available_upside_atr": _safe_float(context.get("available_upside_atr")),
-        "bullish_room_ratio": _safe_float(context.get("bullish_room_ratio")),
-        "bearish_room_ratio": _safe_float(context.get("bearish_room_ratio")),
-        "near_support_tfs": sr.get("near_support_tfs") if isinstance(sr.get("near_support_tfs"), list) else [],
-        "near_resistance_tfs": sr.get("near_resistance_tfs") if isinstance(sr.get("near_resistance_tfs"), list) else [],
-        "bullish_confluence_count": _safe_int(sr.get("bullish_confluence_count"), 0),
-        "bearish_confluence_count": _safe_int(sr.get("bearish_confluence_count"), 0),
-        "influence_mode": "ACTIVE_BOUNDED" if sr_enabled else "AUDIT_ONLY",
-        "score_applied": round(sr_applied, 4),
+        "near_h1_support": near_h1_support,
+        "near_h1_resistance": near_h1_resistance,
+        "inside_h4_support": inside_h4_support,
+        "inside_h4_resistance": inside_h4_resistance,
+        "inside_m15_support": inside_m15_support,
+        "inside_m15_resistance": inside_m15_resistance,
+        "bullish_h1_sweep_reclaim": bool(
+            context.get("bullish_h1_sweep_reclaim")
+        ),
+        "bearish_h1_sweep_reject": bool(
+            context.get("bearish_h1_sweep_reject")
+        ),
+        "sweep_conflict": bool(
+            context.get("sweep_conflict")
+        ),
+        "available_downside_atr": downside_room_atr,
+        "available_upside_atr": upside_room_atr,
+        "bullish_room_ratio": _safe_float(
+            context.get("bullish_room_ratio")
+        ),
+        "bearish_room_ratio": _safe_float(
+            context.get("bearish_room_ratio")
+        ),
+        "near_support_tfs": near_support_tfs,
+        "near_resistance_tfs": near_resistance_tfs,
+        "bullish_confluence_count": _safe_int(
+            sr.get("bullish_confluence_count"),
+            0,
+        ),
+        "bearish_confluence_count": _safe_int(
+            sr.get("bearish_confluence_count"),
+            0,
+        ),
+        "influence_mode": (
+            "ACTIVE_BOUNDED"
+            if sr_enabled
+            else "AUDIT_ONLY"
+        ),
+        "score_applied": round(
+            sr_applied,
+            4,
+        ),
     }
 
+    # ---------------------------------------------------------
+    # Existing lifecycle-level analytics interpretation.
+    # ---------------------------------------------------------
     if status == "UNAVAILABLE":
         decision = "DXY_UNAVAILABLE"
-        decision_reason = state.get("unavailable_reason") or "STATE_UNAVAILABLE"
+        decision_reason = (
+            state.get("unavailable_reason")
+            or "STATE_UNAVAILABLE"
+        )
+
     elif status == "CONFIRMED":
         decision = "CONFIRMED_DXY_OPINION"
-        decision_reason = f"CONFIRMED_{direction}"
+        decision_reason = (
+            f"CONFIRMED_{direction}"
+        )
+
     elif status == "PENDING":
         decision = "DEVELOPING_DXY_OPINION"
-        decision_reason = f"PENDING_{direction}"
+        decision_reason = (
+            f"PENDING_{direction}"
+        )
+
     elif status == "IDLE":
         decision = "NO_DXY_OPINION"
-        if evidence_direction in ("BULLISH", "BEARISH") and not qualified:
-            decision_reason = f"{evidence_direction}_EVIDENCE_PRESENT_BUT_CANDIDATE_NOT_QUALIFIED"
+
+        if (
+            evidence_direction
+            in ("BULLISH", "BEARISH")
+            and not qualified
+        ):
+            decision_reason = (
+                f"{evidence_direction}_EVIDENCE_PRESENT_"
+                "BUT_CANDIDATE_NOT_QUALIFIED"
+            )
         else:
-            decision_reason = "NO_ACTIVE_QUALIFIED_TURN"
+            decision_reason = (
+                "NO_ACTIVE_QUALIFIED_TURN"
+            )
+
     else:
         decision = "LIFECYCLE_STATE_ONLY"
-        decision_reason = f"STATUS_{status}"
+        decision_reason = (
+            f"STATUS_{status}"
+        )
+
+    # ---------------------------------------------------------
+    # NEW: analytics-only DXY timing/location interpretation.
+    #
+    # This layer explains whether the directional evidence has
+    # structural room or is approaching a possible reversal area.
+    # It does not alter detector state or execution.
+    # ---------------------------------------------------------
+    analysis_direction = (
+        direction
+        if direction in ("BULLISH", "BEARISH")
+        else evidence_direction
+    )
+
+    directional_room_atr = None
+    near_directional_structure = False
+    inside_directional_structure = False
+    structure_conflict = False
+
+    if analysis_direction == "BEARISH":
+        directional_room_atr = downside_room_atr
+
+        near_directional_structure = bool(
+            near_h1_support
+            or "H1" in near_support_tfs
+            or "H4" in near_support_tfs
+        )
+
+        inside_directional_structure = bool(
+            inside_h4_support
+            or inside_m15_support
+        )
+
+    elif analysis_direction == "BULLISH":
+        directional_room_atr = upside_room_atr
+
+        near_directional_structure = bool(
+            near_h1_resistance
+            or "H1" in near_resistance_tfs
+            or "H4" in near_resistance_tfs
+        )
+
+        inside_directional_structure = bool(
+            inside_h4_resistance
+            or inside_m15_resistance
+        )
+
+    structure_conflict = bool(
+        analysis_direction in ("BULLISH", "BEARISH")
+        and (
+            near_directional_structure
+            or inside_directional_structure
+        )
+    )
+
+    # Conservative structural room labels.
+    if directional_room_atr is None:
+        room_class = "UNKNOWN"
+
+    elif directional_room_atr < 0.25:
+        room_class = "VERY_LOW"
+
+    elif directional_room_atr < 0.50:
+        room_class = "LOW"
+
+    elif directional_room_atr < 1.00:
+        room_class = "MODERATE"
+
+    else:
+        room_class = "OPEN"
+
+    # Estimate reversal/location risk from structure only.
+    if inside_directional_structure:
+        reversal_risk = "VERY_HIGH"
+
+    elif (
+        near_directional_structure
+        and directional_room_atr is not None
+        and directional_room_atr < 0.50
+    ):
+        reversal_risk = "HIGH"
+
+    elif near_directional_structure:
+        reversal_risk = "ELEVATED"
+
+    elif (
+        directional_room_atr is not None
+        and directional_room_atr < 0.50
+    ):
+        reversal_risk = "ELEVATED"
+
+    else:
+        reversal_risk = "LOW"
+
+    # Timing phase describes lifecycle + location.
+    if status == "UNAVAILABLE":
+        timing_phase = "UNAVAILABLE"
+        timing_opinion = "IGNORE"
+        timing_reason = "DXY_STATE_UNAVAILABLE"
+
+    elif analysis_direction not in (
+        "BULLISH",
+        "BEARISH",
+    ):
+        timing_phase = "NO_DIRECTION"
+        timing_opinion = "IGNORE"
+        timing_reason = "NO_DIRECTIONAL_DXY_EVIDENCE"
+
+    elif (
+        status == "CONFIRMED"
+        and qualified
+        and structure_conflict
+    ):
+        timing_phase = "CONFIRMED_NEAR_STRUCTURE"
+        timing_opinion = "CAUTION"
+        timing_reason = (
+            f"CONFIRMED_{analysis_direction}_"
+            "BUT_NEAR_OPPOSING_STRUCTURE"
+        )
+
+    elif (
+        status == "CONFIRMED"
+        and qualified
+        and not structure_conflict
+        and room_class in ("MODERATE", "OPEN")
+    ):
+        timing_phase = "CONFIRMED_WITH_ROOM"
+        timing_opinion = "CONFIRM"
+        timing_reason = (
+            f"CONFIRMED_{analysis_direction}_"
+            "WITH_DIRECTIONAL_ROOM"
+        )
+
+    elif (
+        status == "CONFIRMED"
+        and qualified
+    ):
+        timing_phase = "CONFIRMED_LIMITED_ROOM"
+        timing_opinion = "CAUTION"
+        timing_reason = (
+            f"CONFIRMED_{analysis_direction}_"
+            f"WITH_{room_class}_ROOM"
+        )
+
+    elif (
+        status == "PENDING"
+        and structure_conflict
+    ):
+        timing_phase = "DEVELOPING_NEAR_STRUCTURE"
+        timing_opinion = "WAIT"
+        timing_reason = (
+            f"PENDING_{analysis_direction}_"
+            "NEAR_OPPOSING_STRUCTURE"
+        )
+
+    elif status == "PENDING":
+        timing_phase = "DEVELOPING_WITH_ROOM"
+        timing_opinion = "WAIT"
+        timing_reason = (
+            f"PENDING_{analysis_direction}_"
+            "NOT_YET_CONFIRMED"
+        )
+
+    elif (
+        status == "IDLE"
+        and evidence_direction
+        in ("BULLISH", "BEARISH")
+        and structure_conflict
+    ):
+        timing_phase = "EVIDENCE_NEAR_STRUCTURE"
+        timing_opinion = "WAIT"
+        timing_reason = (
+            f"{evidence_direction}_EVIDENCE_"
+            "AT_POSSIBLE_REVERSAL_STRUCTURE"
+        )
+
+    elif (
+        status == "IDLE"
+        and evidence_direction
+        in ("BULLISH", "BEARISH")
+    ):
+        timing_phase = "UNQUALIFIED_EVIDENCE"
+        timing_opinion = "IGNORE"
+        timing_reason = (
+            f"{evidence_direction}_EVIDENCE_"
+            "NOT_QUALIFIED"
+        )
+
+    else:
+        timing_phase = "NO_ACTIVE_TURN"
+        timing_opinion = "IGNORE"
+        timing_reason = "NO_ACTIVE_DXY_TURN"
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "analytics_only": True,
+
         "decision": decision,
         "decision_reason": decision_reason,
+
         "status": status,
         "direction": direction,
         "trade_alignment": alignment,
+
         "evidence_direction": evidence_direction,
-        "bull_score": _safe_int(features.get("bull_evidence_score"), _safe_int(state.get("bull_score"), 0)),
-        "bear_score": _safe_int(features.get("bear_evidence_score"), _safe_int(state.get("bear_score"), 0)),
-        "evidence_margin": _safe_float(features.get("evidence_margin")),
+        "bull_score": _safe_int(
+            features.get("bull_evidence_score"),
+            _safe_int(
+                state.get("bull_score"),
+                0,
+            ),
+        ),
+        "bear_score": _safe_int(
+            features.get("bear_evidence_score"),
+            _safe_int(
+                state.get("bear_score"),
+                0,
+            ),
+        ),
+        "evidence_margin": _safe_float(
+            features.get("evidence_margin")
+        ),
+
         "candidate_qualified": qualified,
-        "candidate_qualification_reason": qualification_reason,
+        "candidate_qualification_reason": (
+            qualification_reason
+        ),
+
         "positive_factors": positive_factors,
         "penalties": penalties,
         "opposing_factors": opposing_factors,
-        "blockers": list(dict.fromkeys(blockers)),
-        "top_positive_factor": positive_factors[0] if positive_factors else None,
-        "top_penalty": penalties[0] if penalties else None,
-        "top_opposing_factor": opposing_factors[0] if opposing_factors else None,
+        "blockers": list(
+            dict.fromkeys(blockers)
+        ),
+
+        "top_positive_factor": (
+            positive_factors[0]
+            if positive_factors
+            else None
+        ),
+        "top_penalty": (
+            penalties[0]
+            if penalties
+            else None
+        ),
+        "top_opposing_factor": (
+            opposing_factors[0]
+            if opposing_factors
+            else None
+        ),
+
         "sr_context": sr_context,
+
+        # New analytics-only timing fields.
+        "analysis_direction": analysis_direction,
+        "timing_phase": timing_phase,
+        "timing_opinion": timing_opinion,
+        "timing_reason": timing_reason,
+        "directional_room_atr": (
+            round(directional_room_atr, 4)
+            if directional_room_atr is not None
+            else None
+        ),
+        "room_class": room_class,
+        "reversal_risk": reversal_risk,
+        "structure_conflict": structure_conflict,
+        "near_directional_structure": (
+            near_directional_structure
+        ),
+        "inside_directional_structure": (
+            inside_directional_structure
+        ),
     }
+
+def _capture_real_dxy_m15_extreme_impulse(
+    R,
+    device_id: str,
+    entry_ms: int,
+) -> dict:
+    """Freeze the latest completed canonical REAL DXY M15 candle at entry.
+
+    This is deliberately independent of the normal DXY turn classifier.  It
+    answers only one Phase-1 question: was the latest completed REAL DXY M15
+    candle an unusually large *directional* impulse?
+
+    Analytics only.  No trading/gate/risk/execution side effects.
+    """
+    out = {
+        "schema_version": 1,
+        "analytics_only": True,
+        "source": "REAL_DXY",
+        "device_id": str(device_id or "").strip() or None,
+        "available": False,
+        "fresh": False,
+        "classification": "NOT_EVALUATED",
+        "extreme_impulse": False,
+        "direction": "NEUTRAL",
+        "shadow_entry_action": None,
+        "shadow_entry_reason": None,
+        "bar_open_ms": None,
+        "bar_close_ms": None,
+        "open": None,
+        "high": None,
+        "low": None,
+        "close": None,
+        "range": None,
+        "body": None,
+        "atr14": None,
+        "range_atr": None,
+        "body_atr": None,
+        "body_ratio": None,
+        "range_pct": None,
+        "body_pct": None,
+        "signed_change_pct": None,
+        "snapshot_received_ms": None,
+        "snapshot_age_ms": None,
+        "thresholds": {
+            "range_atr_gte": DXY_M15_EXTREME_RANGE_ATR,
+            "body_atr_gte": DXY_M15_EXTREME_BODY_ATR,
+            "body_ratio_gte": DXY_M15_EXTREME_BODY_RATIO,
+        },
+        "unavailable_reason": None,
+    }
+
+    try:
+        dev = str(device_id or "").strip()
+        if not dev:
+            out["classification"] = "UNAVAILABLE"
+            out["unavailable_reason"] = "REAL_DXY_DEVICE_MISSING"
+            return out
+
+        raw = R.get(f"xtl:ohlc:snap:{dev}:DXY:M15") if R is not None else None
+        snap = _dxy_m15_decode(raw, {})
+        if not isinstance(snap, dict) or not snap:
+            out["classification"] = "UNAVAILABLE"
+            out["unavailable_reason"] = "REAL_DXY_M15_SNAPSHOT_MISSING"
+            return out
+
+        bars = snap.get("bars") if isinstance(snap.get("bars"), list) else []
+        completed = [
+            b for b in bars
+            if isinstance(b, dict) and b.get("complete") is not False
+        ]
+        if len(completed) < 15:
+            out["classification"] = "UNAVAILABLE"
+            out["unavailable_reason"] = "INSUFFICIENT_COMPLETED_M15_BARS"
+            return out
+
+        received_ms = _safe_int(
+            snap.get("server_received_ms")
+            or snap.get("received_at_ms")
+            or snap.get("published_at_ms"),
+            0,
+        ) or 0
+        if 0 < received_ms < 10_000_000_000:
+            received_ms *= 1000
+        now_ms = int(entry_ms or _now_ms())
+        age_ms = max(0, now_ms - received_ms) if received_ms else None
+        fresh = bool(
+            age_ms is not None
+            and age_ms <= DXY_M15_EXTREME_SNAPSHOT_FRESH_MS
+        )
+
+        b = completed[-1]
+        o = _safe_float(b.get("o")); h = _safe_float(b.get("h"))
+        l = _safe_float(b.get("l")); c = _safe_float(b.get("c"))
+        if None in (o, h, l, c) or h < l:
+            out["classification"] = "UNAVAILABLE"
+            out["unavailable_reason"] = "INVALID_LATEST_COMPLETED_M15_BAR"
+            return out
+
+        atr = _atr_from_bars(completed, 14)
+        if not atr or atr <= 0:
+            out["classification"] = "UNAVAILABLE"
+            out["unavailable_reason"] = "M15_ATR_UNAVAILABLE"
+            return out
+
+        rng = max(0.0, h - l)
+        body = abs(c - o)
+        range_atr = rng / atr if atr > 0 else None
+        body_atr = body / atr if atr > 0 else None
+        body_ratio = body / rng if rng > 0 else 0.0
+        range_pct = (rng / o) * 100.0 if o else None
+        body_pct = (body / o) * 100.0 if o else None
+        signed_change_pct = ((c - o) / o) * 100.0 if o else None
+        direction = "BULLISH" if c > o else "BEARISH" if c < o else "NEUTRAL"
+
+        extreme = bool(
+            fresh
+            and direction in ("BULLISH", "BEARISH")
+            and range_atr is not None
+            and range_atr >= DXY_M15_EXTREME_RANGE_ATR
+            and body_atr is not None
+            and body_atr >= DXY_M15_EXTREME_BODY_ATR
+            and body_ratio >= DXY_M15_EXTREME_BODY_RATIO
+        )
+
+        bar_open_ms = _bar_ms_any(b) or None
+        bar_close_ms = (bar_open_ms + 15 * 60 * 1000) if bar_open_ms else None
+
+        out.update({
+            "available": True,
+            "fresh": fresh,
+            "classification": (
+                "REAL_DXY_M15_EXTREME_IMPULSE"
+                if extreme
+                else "REAL_DXY_M15_NORMAL"
+            ),
+            "extreme_impulse": extreme,
+            "direction": direction,
+            "shadow_entry_action": "WAIT_NEW_ENTRY" if extreme else None,
+            "shadow_entry_reason": (
+                "REAL_DXY_M15_EXTREME_IMPULSE" if extreme else None
+            ),
+            "bar_open_ms": bar_open_ms,
+            "bar_close_ms": bar_close_ms,
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "range": round(rng, 8),
+            "body": round(body, 8),
+            "atr14": round(float(atr), 8),
+            "range_atr": round(float(range_atr), 4),
+            "body_atr": round(float(body_atr), 4),
+            "body_ratio": round(float(body_ratio), 4),
+            "range_pct": round(float(range_pct), 5) if range_pct is not None else None,
+            "body_pct": round(float(body_pct), 5) if body_pct is not None else None,
+            "signed_change_pct": (
+                round(float(signed_change_pct), 5)
+                if signed_change_pct is not None
+                else None
+            ),
+            "snapshot_received_ms": received_ms or None,
+            "snapshot_age_ms": age_ms,
+            "unavailable_reason": None if fresh else "REAL_DXY_M15_SNAPSHOT_STALE",
+        })
+        return out
+
+    except Exception as exc:
+        out["classification"] = "UNAVAILABLE"
+        out["unavailable_reason"] = (
+            f"EXTREME_IMPULSE_CAPTURE_EXCEPTION:{type(exc).__name__}"
+        )
+        return out
+
 
 def _dxy_m15_state_snapshot(R, source: str, device_id: str, symbol: str, side: str, now_ms: int) -> dict:
     out = {
@@ -3715,6 +4664,7 @@ def read_dxy_m15_at_entry(device_id: str, symbol: str, side: str, entry_ms: int,
         "fallback_used": False,
         "fallback_reason": None,
         "selected": None,
+        "real_dxy_extreme_impulse": None,
         "shadow_only": True,
     }
     try:
@@ -3749,6 +4699,17 @@ def read_dxy_m15_at_entry(device_id: str, symbol: str, side: str, entry_ms: int,
         )
         result["sources"]["SYNTHETIC_DXY"] = _dxy_m15_state_snapshot(
             R, "SYNTHETIC_DXY", synthetic_dev, symbol, side, int(entry_ms or _now_ms())
+        )
+
+        # Phase-1 only: freeze the latest completed canonical REAL DXY M15
+        # candle and classify unusually large directional displacement.  This
+        # remains independent of the normal DXY turn state and never blocks.
+        result["real_dxy_extreme_impulse"] = (
+            _capture_real_dxy_m15_extreme_impulse(
+                R,
+                real_dev,
+                int(entry_ms or _now_ms()),
+            )
         )
 
         real = result["sources"].get("REAL_DXY") or {}
@@ -3858,6 +4819,869 @@ def read_dxy_m15_at_entry(device_id: str, symbol: str, side: str, entry_ms: int,
         result["capture_error"] = f"{type(exc).__name__}:{exc}"
         return result
 
+
+
+def _dxy_h1_decode(
+    raw,
+    default=None,
+):
+    try:
+        if raw is None:
+            return default
+
+        if isinstance(
+            raw,
+            (bytes, bytearray),
+        ):
+            raw = raw.decode(
+                "utf-8",
+                "replace",
+            )
+
+        value = json.loads(raw)
+
+        return (
+            value
+            if isinstance(value, dict)
+            else default
+        )
+
+    except Exception:
+        return default
+
+
+def _dxy_h1_feature_key(
+    source: str,
+    device_id: str,
+    broker_close_ms: int,
+) -> str:
+    return (
+        f"{DXY_H1_FEATURE_PREFIX}:"
+        f"{str(source).upper().strip()}:"
+        f"{str(device_id or '').strip()}:"
+        f"{int(broker_close_ms or 0)}"
+    )
+
+
+def _dxy_h1_latest_key(
+    source: str,
+    device_id: str,
+) -> str:
+    return (
+        f"{DXY_H1_LATEST_PREFIX}:"
+        f"{str(source).upper().strip()}:"
+        f"{str(device_id or '').strip()}"
+    )
+
+
+def _dxy_h1_feature_at_or_before(
+    R,
+    *,
+    source: str,
+    device_id: str,
+    symbol: str,
+    side: str,
+    entry_ms: int,
+) -> dict:
+    """
+    Read the latest completed H1 feature whose broker bar close is not
+    later than the trade-entry timestamp.
+
+    This prevents future-candle leakage when analytics capture is delayed,
+    repaired, replayed or performed after a service restart.
+    """
+    source_u = str(
+        source or ""
+    ).upper().strip()
+
+    device_u = str(
+        device_id or ""
+    ).strip()
+
+    entry_ms_i = _safe_int(
+        entry_ms,
+        0,
+    ) or 0
+
+    out = {
+        "source": source_u,
+        "device_id": device_u or None,
+        "available": False,
+        "fresh": False,
+        "stale": False,
+        "feature_age_ms": None,
+        "unavailable_reason": None,
+        "feature_key": None,
+        "feature": None,
+    }
+
+    if not device_u:
+        out["unavailable_reason"] = (
+            "DEVICE_ID_MISSING"
+        )
+        return out
+
+    if entry_ms_i <= 0:
+        out["unavailable_reason"] = (
+            "ENTRY_TIMESTAMP_MISSING"
+        )
+        return out
+
+    try:
+        selected = None
+        selected_key = None
+        selected_close_ms = 0
+
+        # ---------------------------------------------------------
+        # Fast path.
+        #
+        # In normal live capture, the latest immutable H1 payload is
+        # normally the correct completed bar at entry.
+        # ---------------------------------------------------------
+        latest_raw = R.get(
+            _dxy_h1_latest_key(
+                source_u,
+                device_u,
+            )
+        )
+
+        latest = _dxy_h1_decode(
+            latest_raw,
+            {},
+        )
+
+        latest_close_ms = _safe_int(
+            latest.get(
+                "broker_bar_close_ms"
+            )
+            if isinstance(latest, dict)
+            else 0,
+            0,
+        ) or 0
+
+        if (
+            isinstance(latest, dict)
+            and latest
+            and latest_close_ms > 0
+            and latest_close_ms <= entry_ms_i
+        ):
+            selected = latest
+            selected_close_ms = (
+                latest_close_ms
+            )
+            selected_key = (
+                _dxy_h1_feature_key(
+                    source_u,
+                    device_u,
+                    selected_close_ms,
+                )
+            )
+
+        # ---------------------------------------------------------
+        # Historical fallback.
+        #
+        # Required for delayed ACK, broker repair, restart recovery
+        # and analytics replay. Select the greatest close timestamp
+        # that is <= entry time.
+        # ---------------------------------------------------------
+        if selected is None:
+            pattern = (
+                f"{DXY_H1_FEATURE_PREFIX}:"
+                f"{source_u}:"
+                f"{device_u}:*"
+            )
+
+            for raw_key in R.scan_iter(
+                match=pattern,
+                count=200,
+            ):
+                key_s = (
+                    raw_key.decode(
+                        "utf-8",
+                        "ignore",
+                    )
+                    if isinstance(
+                        raw_key,
+                        (bytes, bytearray),
+                    )
+                    else str(raw_key)
+                )
+
+                try:
+                    close_ms = int(
+                        key_s.rsplit(
+                            ":",
+                            1,
+                        )[-1]
+                    )
+                except Exception:
+                    continue
+
+                if (
+                    close_ms <= 0
+                    or close_ms > entry_ms_i
+                    or close_ms <= selected_close_ms
+                ):
+                    continue
+
+                raw_payload = R.get(
+                    raw_key
+                )
+
+                payload = _dxy_h1_decode(
+                    raw_payload,
+                    {},
+                )
+
+                if not payload:
+                    continue
+
+                payload_close_ms = (
+                    _safe_int(
+                        payload.get(
+                            "broker_bar_close_ms"
+                        ),
+                        close_ms,
+                    )
+                    or close_ms
+                )
+
+                if payload_close_ms > entry_ms_i:
+                    continue
+
+                selected = payload
+                selected_key = key_s
+                selected_close_ms = (
+                    payload_close_ms
+                )
+
+        if not isinstance(
+            selected,
+            dict,
+        ) or not selected:
+            out["unavailable_reason"] = (
+                "FEATURE_NOT_FOUND_AT_OR_BEFORE_ENTRY"
+            )
+            return out
+
+        feature_age_ms = max(
+            0,
+            entry_ms_i
+            - int(selected_close_ms),
+        )
+
+        fresh = (
+            feature_age_ms
+            <= DXY_H1_FEATURE_FRESH_MS
+        )
+
+        direction = str(
+            selected.get(
+                "candidate_direction"
+            )
+            or "NEUTRAL"
+        ).upper().strip()
+
+        if direction not in (
+            "BULLISH",
+            "BEARISH",
+            "NEUTRAL",
+        ):
+            direction = "NEUTRAL"
+
+        evidence_direction = str(
+            selected.get(
+                "evidence_direction"
+            )
+            or "NEUTRAL"
+        ).upper().strip()
+
+        if evidence_direction not in (
+            "BULLISH",
+            "BEARISH",
+            "NEUTRAL",
+        ):
+            evidence_direction = "NEUTRAL"
+
+        compact_feature = {
+            "schema_version": selected.get(
+                "schema_version"
+            ),
+            "model": selected.get(
+                "model"
+            ),
+            "timeframe": "H1",
+            "source": source_u,
+            "device_id": device_u,
+
+            "broker_bar_open_ms": (
+                selected.get(
+                    "broker_bar_open_ms"
+                )
+            ),
+            "broker_bar_close_ms": (
+                selected_close_ms
+            ),
+            "bar_close_ms": selected.get(
+                "bar_close_ms"
+            ),
+            "detected_at_ms": selected.get(
+                "detected_at_ms"
+            ),
+
+            "candidate_direction": (
+                direction
+            ),
+            "candidate_confidence": (
+                _safe_int(
+                    selected.get(
+                        "candidate_confidence"
+                    ),
+                    0,
+                )
+            ),
+
+            "evidence_direction": (
+                evidence_direction
+            ),
+            "bull_evidence_score": (
+                _safe_int(
+                    selected.get(
+                        "bull_evidence_score"
+                    ),
+                    0,
+                )
+            ),
+            "bear_evidence_score": (
+                _safe_int(
+                    selected.get(
+                        "bear_evidence_score"
+                    ),
+                    0,
+                )
+            ),
+            "evidence_margin": (
+                _safe_float(
+                    selected.get(
+                        "evidence_margin"
+                    )
+                )
+            ),
+
+            "bullish_structure_break": bool(
+                selected.get(
+                    "bullish_structure_break"
+                )
+            ),
+            "bearish_structure_break": bool(
+                selected.get(
+                    "bearish_structure_break"
+                )
+            ),
+
+            "recent_net_atr": _safe_float(
+                selected.get(
+                    "recent_net_atr"
+                )
+            ),
+            "prior_net_atr": _safe_float(
+                selected.get(
+                    "prior_net_atr"
+                )
+            ),
+            "slope_5_atr": _safe_float(
+                selected.get(
+                    "slope_5_atr"
+                )
+            ),
+            "prior_slope_5_atr": (
+                _safe_float(
+                    selected.get(
+                        "prior_slope_5_atr"
+                    )
+                )
+            ),
+            "slope_12_atr": _safe_float(
+                selected.get(
+                    "slope_12_atr"
+                )
+            ),
+            "acceleration_atr": (
+                _safe_float(
+                    selected.get(
+                        "acceleration_atr"
+                    )
+                )
+            ),
+
+            "up_steps": _safe_int(
+                selected.get(
+                    "up_steps"
+                ),
+                0,
+            ),
+            "down_steps": _safe_int(
+                selected.get(
+                    "down_steps"
+                ),
+                0,
+            ),
+            "bullish_bodies": _safe_int(
+                selected.get(
+                    "bullish_bodies"
+                ),
+                0,
+            ),
+            "bearish_bodies": _safe_int(
+                selected.get(
+                    "bearish_bodies"
+                ),
+                0,
+            ),
+
+            "pin_bar_direction": (
+                selected.get(
+                    "pin_bar_direction"
+                )
+            ),
+            "compression_ratio": (
+                _safe_float(
+                    selected.get(
+                        "compression_ratio"
+                    )
+                )
+            ),
+            "expansion_ratio": (
+                _safe_float(
+                    selected.get(
+                        "expansion_ratio"
+                    )
+                )
+            ),
+            "body_ratio": _safe_float(
+                selected.get(
+                    "body_ratio"
+                )
+            ),
+
+            "bars_used": _safe_int(
+                selected.get(
+                    "bars_used"
+                ),
+                0,
+            ),
+
+            "sr_status": selected.get(
+                "sr_status"
+            ),
+
+            "shadow_only": True,
+            "execution_wired": False,
+            "entry_gate_wired": False,
+            "risk_wired": False,
+        }
+
+        out.update({
+            "available": True,
+            "fresh": bool(fresh),
+            "stale": not bool(fresh),
+            "feature_age_ms": int(
+                feature_age_ms
+            ),
+            "feature_key": selected_key,
+            "broker_bar_close_ms": int(
+                selected_close_ms
+            ),
+            "direction": direction,
+            "confidence": (
+                compact_feature.get(
+                    "candidate_confidence"
+                )
+            ),
+            "evidence_direction": (
+                evidence_direction
+            ),
+            "trade_alignment": (
+                _dxy_m15_trade_alignment(
+                    symbol,
+                    side,
+                    direction,
+                )
+            ),
+            "feature": compact_feature,
+            "unavailable_reason": (
+                None
+                if fresh
+                else "FEATURE_STALE_AT_ENTRY"
+            ),
+        })
+
+        return out
+
+    except Exception as exc:
+        out["unavailable_reason"] = (
+            "FEATURE_READ_EXCEPTION:"
+            f"{type(exc).__name__}"
+        )
+        return out
+
+
+def _dxy_h1_source_agreement(
+    real: dict,
+    synthetic: dict,
+) -> str:
+    real_available = bool(
+        isinstance(real, dict)
+        and real.get("available")
+        and real.get("fresh")
+    )
+
+    synthetic_available = bool(
+        isinstance(synthetic, dict)
+        and synthetic.get("available")
+        and synthetic.get("fresh")
+    )
+
+    if (
+        not real_available
+        and not synthetic_available
+    ):
+        return "UNAVAILABLE"
+
+    if not real_available:
+        return "SYNTHETIC_ONLY"
+
+    if not synthetic_available:
+        return "REAL_ONLY"
+
+    real_dir = str(
+        real.get("direction")
+        or "NEUTRAL"
+    ).upper()
+
+    synthetic_dir = str(
+        synthetic.get("direction")
+        or "NEUTRAL"
+    ).upper()
+
+    if real_dir == synthetic_dir:
+        return (
+            "AGREE_NEUTRAL"
+            if real_dir == "NEUTRAL"
+            else "AGREE"
+        )
+
+    if (
+        real_dir == "NEUTRAL"
+        or synthetic_dir == "NEUTRAL"
+    ):
+        return "PARTIAL"
+
+    return "CONFLICT"
+
+
+def _dxy_m15_h1_alignment(
+    dxy_m15_entry: dict,
+    dxy_h1_entry: dict,
+) -> str:
+    try:
+        m15_selected = (
+            dxy_m15_entry.get("selected")
+            if isinstance(
+                dxy_m15_entry,
+                dict,
+            )
+            else {}
+        ) or {}
+
+        h1_selected = (
+            dxy_h1_entry.get("selected")
+            if isinstance(
+                dxy_h1_entry,
+                dict,
+            )
+            else {}
+        ) or {}
+
+        if (
+            not m15_selected
+            or not h1_selected
+            or not m15_selected.get(
+                "available"
+            )
+            or not h1_selected.get(
+                "available"
+            )
+            or not m15_selected.get(
+                "fresh",
+                True,
+            )
+            or not h1_selected.get(
+                "fresh"
+            )
+        ):
+            return "UNAVAILABLE"
+
+        m15_direction = str(
+            m15_selected.get(
+                "direction"
+            )
+            or "NEUTRAL"
+        ).upper()
+
+        h1_direction = str(
+            h1_selected.get(
+                "direction"
+            )
+            or "NEUTRAL"
+        ).upper()
+
+        if m15_direction == h1_direction:
+            return (
+                "AGREE_NEUTRAL"
+                if m15_direction == "NEUTRAL"
+                else "AGREE"
+            )
+
+        if (
+            m15_direction == "NEUTRAL"
+            or h1_direction == "NEUTRAL"
+        ):
+            return "PARTIAL"
+
+        return "CONFLICT"
+
+    except Exception:
+        return "UNAVAILABLE"
+
+
+def read_dxy_h1_at_entry(
+    device_id: str,
+    symbol: str,
+    side: str,
+    entry_ms: int,
+    *,
+    trade_firm: str | None = None,
+    trade_profile_id: str | None = None,
+    dxy_m15_entry: dict | None = None,
+) -> dict:
+    """
+    Freeze REAL and SYNTHETIC native-H1 directional features at entry.
+
+    Shadow analytics only. This function does not affect production
+    direction, entry permission, risk, sizing or order placement.
+    """
+    trade_dev = str(
+        device_id or ""
+    ).strip()
+
+    trade_firm_u = str(
+        trade_firm or ""
+    ).strip().lower()
+
+    trade_profile = str(
+        trade_profile_id or ""
+    ).strip().lower()
+
+    entry_ms_i = int(
+        entry_ms or _now_ms()
+    )
+
+    result = {
+        "schema_version": 1,
+        "model": (
+            "DXY_H1_ENTRY_SNAPSHOT_V1_"
+            "SHADOW_ANALYTICS"
+        ),
+        "timeframe": "H1",
+        "captured_at_ms": entry_ms_i,
+
+        "trade_device_id": (
+            trade_dev or None
+        ),
+        "trade_firm": (
+            trade_firm_u or None
+        ),
+        "trade_profile_id": (
+            trade_profile or None
+        ),
+
+        "canonical_real_device_id": None,
+        "sources": {},
+        "source_devices": {},
+
+        "selected_source": None,
+        "selected_device_id": None,
+        "selected": None,
+
+        "real_synthetic_agreement": (
+            "UNAVAILABLE"
+        ),
+        "m15_h1_alignment": (
+            "UNAVAILABLE"
+        ),
+
+        "fallback_used": False,
+        "fallback_reason": None,
+
+        "shadow_only": True,
+        "analytics_only": True,
+        "execution_wired": False,
+        "entry_gate_wired": False,
+        "risk_wired": False,
+    }
+
+    try:
+        R = from_app_R()
+
+        canonical = resolve_canonical_dxy_source(
+            R,
+            trade_dev,
+            trade_firm=trade_firm_u,
+            trade_profile_id=trade_profile,
+        )
+
+        real_dev = str(
+            canonical.get(
+                "real_device_id"
+            )
+            or ""
+        ).strip()
+
+        synthetic_dev = str(
+            canonical.get(
+                "synthetic_device_id"
+            )
+            or trade_dev
+            or ""
+        ).strip()
+
+        result[
+            "canonical_real_device_id"
+        ] = real_dev or None
+
+        result["source_devices"] = {
+            "REAL_DXY": real_dev or None,
+            "SYNTHETIC_DXY": (
+                synthetic_dev or None
+            ),
+        }
+
+        real = (
+            _dxy_h1_feature_at_or_before(
+                R,
+                source="REAL_DXY",
+                device_id=real_dev,
+                symbol=symbol,
+                side=side,
+                entry_ms=entry_ms_i,
+            )
+        )
+
+        synthetic = (
+            _dxy_h1_feature_at_or_before(
+                R,
+                source="SYNTHETIC_DXY",
+                device_id=synthetic_dev,
+                symbol=symbol,
+                side=side,
+                entry_ms=entry_ms_i,
+            )
+        )
+
+        result["sources"] = {
+            "REAL_DXY": real,
+            "SYNTHETIC_DXY": synthetic,
+        }
+
+        # Same source-selection policy as existing M15 entry capture:
+        # fresh canonical REAL first, then fresh SYNTHETIC fallback.
+        if (
+            real.get("available")
+            and real.get("fresh")
+        ):
+            selected_source = "REAL_DXY"
+
+        elif (
+            synthetic.get("available")
+            and synthetic.get("fresh")
+        ):
+            selected_source = (
+                "SYNTHETIC_DXY"
+            )
+
+        elif real.get("available"):
+            selected_source = "REAL_DXY"
+
+        elif synthetic.get("available"):
+            selected_source = (
+                "SYNTHETIC_DXY"
+            )
+
+        else:
+            selected_source = None
+
+        result["selected_source"] = (
+            selected_source
+        )
+
+        result["selected"] = (
+            result["sources"].get(
+                selected_source
+            )
+            if selected_source
+            else None
+        )
+
+        result["selected_device_id"] = (
+            (result.get("selected") or {}).get(
+                "device_id"
+            )
+            if selected_source
+            else None
+        )
+
+        result["fallback_used"] = (
+            selected_source
+            == "SYNTHETIC_DXY"
+        )
+
+        if selected_source == "SYNTHETIC_DXY":
+            result["fallback_reason"] = (
+                "CANONICAL_REAL_H1_STALE"
+                if real.get("available")
+                and not real.get("fresh")
+                else
+                "CANONICAL_REAL_H1_UNAVAILABLE"
+            )
+
+        elif selected_source is None:
+            result["fallback_reason"] = (
+                "REAL_AND_SYNTHETIC_H1_"
+                "UNAVAILABLE"
+            )
+
+        result[
+            "real_synthetic_agreement"
+        ] = _dxy_h1_source_agreement(
+            real,
+            synthetic,
+        )
+
+        result["m15_h1_alignment"] = (
+            _dxy_m15_h1_alignment(
+                dxy_m15_entry or {},
+                result,
+            )
+        )
+
+        return result
+
+    except Exception as exc:
+        result["capture_error"] = (
+            f"{type(exc).__name__}:{exc}"
+        )
+        return result
 
 def _dxy_m15_event_id(event: dict) -> str:
     return "|".join((
@@ -4773,7 +6597,565 @@ def _build_entry_usd_context(snap: dict) -> dict:
             ),
         }
 
+def _classify_actual_market_behavior(snap: dict, bars_h1: list) -> dict:
+    """Observe the realized zone behavior after entry, independent of P/L."""
+    out = {
+        "observation_classifier_version": "market_behavior_observation_v2",
+        "analytics_only": True,
+        "observed_market_behavior": "UNCLASSIFIED",
+        "observed_direction": None,
+        "reason_codes": ["INSUFFICIENT_POST_ENTRY_EVIDENCE"],
+        "continuation_sequence": {
+            "momentum_present": False,
+            "zone_break_confirmed": False,
+            "retest_present": False,
+            "retest_held": False,
+        },
+        "evidence_after_entry": {},
+    }
+    out["observation_data_resolution"] = "H1_FULL_BARS_AFTER_ENTRY"
+    out["entry_overlap_bar_excluded"] = True
+    try:
+        side = str(snap.get("side") or "").upper().strip()
+        entry = _safe_float(snap.get("entry_price"))
+        sl = _safe_float(snap.get("sl_price"))
+        setup = snap.get("setup_analysis") if isinstance(snap.get("setup_analysis"), dict) else {}
+        pred_ev = setup.get("evidence_at_prediction") if isinstance(setup.get("evidence_at_prediction"), dict) else {}
+        zl = _safe_float(snap.get("zone_low"), _safe_float(pred_ev.get("zone_low")))
+        zh = _safe_float(snap.get("zone_high"), _safe_float(pred_ev.get("zone_high")))
+        if side not in ("BUY", "SELL") or entry is None or sl is None or zl is None or zh is None:
+            return out
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return out
+
+        entry_ms = _norm_ms(snap.get("broker_open_time_utc_ms") or snap.get("enqueue_timestamp") or 0)
+        close_ms = _norm_ms(snap.get("broker_close_time_utc_ms") or snap.get("close_timestamp") or 0)
+        rows = []
+        for b in bars_h1 or []:
+            if not isinstance(b, dict):
+                continue
+            bo = _norm_ms(b.get("t_open_ms") or b.get("t") or b.get("time") or 0)
+            bc = _norm_ms(b.get("t_close_ms") or 0) or (bo + 3_600_000 if bo else 0)
+            # Actual behavior must use price action strictly after entry.
+            # H1 OHLC cannot tell which part of an overlapping candle occurred
+            # before versus after entry, so skip the entry candle entirely.
+            if entry_ms and bo and bo < entry_ms < bc:
+                continue
+            if entry_ms and bc and bc <= entry_ms:
+                continue
+            if close_ms and bo and bo >= close_ms:
+                continue
+            o=_safe_float(b.get("o")); h=_safe_float(b.get("h")); l=_safe_float(b.get("l")); c=_safe_float(b.get("c"))
+            if None in (o,h,l,c):
+                continue
+            rows.append({"bo":bo,"bc":bc,"o":o,"h":h,"l":l,"c":c})
+
+        if not rows:
+            return out
+
+        max_fav = max_adv = 0.0
+        first_away_050 = None
+        first_break = None
+        break_idx = None
+        directional_after_break = 0
+        retest_present = False
+        retest_held = False
+
+        for i,b in enumerate(rows):
+            if side == "BUY":
+                fav=max(0.0,b["h"]-entry)/risk; adv=max(0.0,entry-b["l"])/risk
+                broke=b["c"] < zl
+            else:
+                fav=max(0.0,entry-b["l"])/risk; adv=max(0.0,b["h"]-entry)/risk
+                broke=b["c"] > zh
+            max_fav=max(max_fav,fav); max_adv=max(max_adv,adv)
+            if first_away_050 is None and fav >= 0.50:
+                first_away_050=b["bo"] or b["bc"] or None
+            if first_break is None and broke:
+                first_break=b["bo"] or b["bc"] or None; break_idx=i
+
+        if break_idx is not None:
+            # After a support break, bearish candles indicate continuation;
+            # after a resistance break, bullish candles indicate continuation.
+            zone_side = str(pred_ev.get("zone_side") or "").upper()
+            for b in rows[break_idx:min(len(rows), break_idx+3)]:
+                if zone_side == "SUPPORT" and b["c"] < b["o"]:
+                    directional_after_break += 1
+                elif zone_side == "RESISTANCE" and b["c"] > b["o"]:
+                    directional_after_break += 1
+            for b in rows[break_idx+1:]:
+                touched = b["h"] >= zl if zone_side == "SUPPORT" else b["l"] <= zh
+                if touched:
+                    retest_present=True
+                    retest_held = b["c"] < zl if zone_side == "SUPPORT" else b["c"] > zh
+                    break
+
+        break_first = bool(first_break and (not first_away_050 or first_break < first_away_050))
+        momentum_after_break = bool(break_idx is not None and directional_after_break >= 2 and max_adv >= 0.50)
+
+        ev={
+            "bars_used":len(rows),
+            "max_favorable_r":round(max_fav,3),
+            "max_adverse_r":round(max_adv,3),
+            "first_reversal_followthrough_0_5r_ms":first_away_050,
+            "first_zone_break_ms":first_break,
+            "zone_break_before_reversal_followthrough":break_first,
+            "directional_bars_after_break":directional_after_break,
+        }
+        out["evidence_after_entry"]=ev
+        out["continuation_sequence"]={
+            "momentum_present":momentum_after_break,
+            "zone_break_confirmed":bool(first_break),
+            "retest_present":retest_present,
+            "retest_held":retest_held,
+        }
+
+        if break_first and max_adv >= 0.50:
+            out.update({
+                "observed_market_behavior":"CONTINUATION",
+                "observed_direction":"SELL" if side=="BUY" else "BUY",
+                "reason_codes":["ZONE_BREAK_AGAINST_REVERSAL", "CONTINUATION_FOLLOWTHROUGH_GE_0_5R"],
+            })
+        elif max_fav >= 0.50 and not break_first:
+            out.update({
+                "observed_market_behavior":"REVERSAL",
+                "observed_direction":side,
+                "reason_codes":["ZONE_REJECTION_FOLLOWTHROUGH_GE_0_5R", "NO_EARLY_ZONE_ACCEPTANCE"],
+            })
+        elif max_fav < 0.50 and max_adv < 0.50:
+            out.update({"observed_market_behavior":"CHOP","observed_direction":None,"reason_codes":["NO_DIRECTION_REACHED_0_5R"]})
+        else:
+            out.update({"observed_market_behavior":"MIXED","observed_direction":None,"reason_codes":["CONFLICTING_POST_ENTRY_PATH"]})
+        return out
+    except Exception as exc:
+        out["reason_codes"]=[f"CLASSIFIER_ERROR:{type(exc).__name__}"]
+        return out
+
+
+def _merge_setup_actual(snap: dict, bars_h1: list) -> None:
+    frozen = snap.get("setup_analysis") if isinstance(snap.get("setup_analysis"), dict) else {}
+    predicted = str(frozen.get("predicted_market_behavior") or "UNCLASSIFIED").upper()
+    observed = _classify_actual_market_behavior(snap, bars_h1)
+    actual = str(observed.get("observed_market_behavior") or "UNCLASSIFIED").upper()
+    comparable = predicted in ("REVERSAL","CONTINUATION") and actual in ("REVERSAL","CONTINUATION")
+    comparison={
+        "comparison_version":"market_behavior_comparison_v2",
+        "prediction":predicted,
+        "observation":actual,
+        "comparable":comparable,
+        "match":bool(comparable and predicted==actual),
+        "transition":f"{predicted}_TO_{actual}",
+    }
+    if not frozen:
+        frozen={
+            "schema_version":2,
+            "analytics_only":True,
+            "immutable_prediction":True,
+            "prediction_classifier_version":"legacy_missing",
+            "predicted_market_behavior":"UNCLASSIFIED",
+            "prediction_stage":"UNKNOWN",
+            "reason_codes":["PREDICTION_NOT_CAPTURED"],
+            "continuation_sequence":{},
+            "evidence_at_prediction":{},
+            "selected_production_strategy":"ZONE_REVERSAL",
+        }
+    snap["market_behavior"]={
+        "schema_version":2,
+        "analytics_only":True,
+        "prediction":frozen,
+        "observation":observed,
+        "comparison":comparison,
+    }
+    # Compatibility: keep the entry object intact under setup_analysis too.
+    snap["setup_analysis"]=frozen
+    snap["predicted_market_behavior"]=predicted
+    snap["observed_market_behavior"]=actual
+    snap["market_behavior_match"]=comparison["match"] if comparable else None
+    snap["market_behavior_transition"]=comparison["transition"]
+
+
 # -- ENTRY: build snapshot from a pos/repaired record -------------------------
+def _phase1_label(label: str, evidence: dict) -> dict:
+    """Small, stable, auditable classification record."""
+    return {"classification": label, "evidence": evidence}
+
+
+def _h1_last10_behavior(bars: list, atr: float | None = None) -> dict:
+    """Summarize the last ten completed H1 candles without using future bars.
+
+    This deliberately describes candle pressure only.  S/R location remains a
+    separate frozen fact so later research can change the interpretation without
+    rewriting the underlying evidence.
+    """
+    rows = []
+    for bar in list(bars or []):
+        if not isinstance(bar, dict) or bar.get("complete") is False:
+            continue
+        o = _safe_float(bar.get("o")); h = _safe_float(bar.get("h"))
+        l = _safe_float(bar.get("l")); c = _safe_float(bar.get("c"))
+        if None in (o, h, l, c) or h < l:
+            continue
+        rows.append({"o": o, "h": h, "l": l, "c": c,
+                     "open_ms": _norm_ms(bar.get("t_open_ms") or bar.get("t") or 0) or None})
+    rows = rows[-10:]
+    if not rows:
+        return {"schema_version": 1, "analytics_only": True,
+                "completed_bars_used": 0, "classification": "INSUFFICIENT_DATA"}
+    bullish = sum(1 for r in rows if r["c"] > r["o"])
+    bearish = sum(1 for r in rows if r["c"] < r["o"])
+    higher = sum(1 for a, b in zip(rows, rows[1:]) if b["c"] > a["c"])
+    lower = sum(1 for a, b in zip(rows, rows[1:]) if b["c"] < a["c"])
+    upper_rejections = 0; lower_rejections = 0
+    for r in rows:
+        rng = r["h"] - r["l"]
+        if rng <= 0:
+            continue
+        body_hi = max(r["o"], r["c"]); body_lo = min(r["o"], r["c"])
+        if (r["h"] - body_hi) / rng >= 0.40:
+            upper_rejections += 1
+        if (body_lo - r["l"]) / rng >= 0.40:
+            lower_rejections += 1
+    net = rows[-1]["c"] - rows[0]["o"]
+    net_atr = net / atr if atr and atr > 0 else None
+    if bearish >= 6 and lower >= 5:
+        classification = "BEARISH_PRESSURE"
+    elif bullish >= 6 and higher >= 5:
+        classification = "BULLISH_PRESSURE"
+    elif upper_rejections >= 3 and bearish >= bullish:
+        classification = "UPPER_REJECTION_PRESSURE"
+    elif lower_rejections >= 3 and bullish >= bearish:
+        classification = "LOWER_REJECTION_PRESSURE"
+    else:
+        classification = "MIXED"
+    return {
+        "schema_version": 1, "analytics_only": True, "bars_requested": 10,
+        "completed_bars_used": len(rows), "first_open_ms": rows[0]["open_ms"],
+        "last_open_ms": rows[-1]["open_ms"], "bullish_bodies": bullish,
+        "bearish_bodies": bearish, "doji_bodies": len(rows) - bullish - bearish,
+        "higher_closes": higher, "lower_closes": lower,
+        "upper_wick_rejections": upper_rejections,
+        "lower_wick_rejections": lower_rejections,
+        "net_move": round(net, 8),
+        "net_move_atr": round(net_atr, 4) if net_atr is not None else None,
+        "classification": classification,
+    }
+
+
+def _dxy_supportive_direction(symbol: str, side: str) -> tuple[str | None, str]:
+    """Return the DXY direction supportive of the trade, plus relationship."""
+    sym = str(symbol or "").upper().replace(".", "")
+    side = str(side or "").upper()
+    if side not in ("BUY", "SELL"):
+        return None, "UNKNOWN"
+    if sym.startswith("XAUUSD") or sym.startswith("XAGUSD"):
+        return ("BEARISH" if side == "BUY" else "BULLISH"), "INVERSE"
+    if len(sym) >= 6:
+        base, quote = sym[:3], sym[3:6]
+        if base == "USD":
+            return ("BULLISH" if side == "BUY" else "BEARISH"), "DIRECT"
+        if quote == "USD":
+            return ("BEARISH" if side == "BUY" else "BULLISH"), "INVERSE"
+    return None, "CONTEXT_ONLY"
+
+
+def _apply_phase1_entry_analytics(snap: dict) -> None:
+    """Freeze additive Phase-1 entry analytics from data already in *snap*.
+
+    No live reads are performed here.  Unknown facts remain None/UNKNOWN and no
+    result is consumed by trading, risk, sizing, gates or execution.
+    """
+    if not isinstance(snap, dict):
+        return
+    try:
+        side = str(snap.get("side") or "").upper()
+        entry = _safe_float(snap.get("entry_price"))
+        atr = _safe_float(snap.get("atr"))
+        zone_low = _safe_float(snap.get("zone_low"))
+        zone_high = _safe_float(snap.get("zone_high"))
+
+        zone_distance = None
+        if entry is not None and zone_low is not None and zone_high is not None:
+            lo, hi = sorted((zone_low, zone_high))
+            zone_distance = max(lo - entry, entry - hi, 0.0)
+        elif entry is not None:
+            zl = _safe_float(snap.get("zone_level"))
+            if zl is not None:
+                zone_distance = abs(entry - zl)
+        zone_distance_atr = (
+            zone_distance / atr if zone_distance is not None and atr and atr > 0 else None
+        )
+
+        barrier_type = "RESISTANCE" if side == "BUY" else ("SUPPORT" if side == "SELL" else None)
+        candidates = []
+        for key in (("nearest_resistance", "best_resistance") if side == "BUY" else
+                    (("nearest_support", "best_support") if side == "SELL" else ())):
+            value = _safe_float(snap.get(key))
+            if value is not None and entry is not None:
+                if (side == "BUY" and value > entry) or (side == "SELL" and value < entry):
+                    candidates.append(value)
+        barrier = (min(candidates) if side == "BUY" else max(candidates)) if candidates else None
+        room = abs(barrier - entry) if barrier is not None and entry is not None else None
+        room_atr = room / atr if room is not None and atr and atr > 0 else None
+
+        # Current SR evidence is nested under the frozen bias snapshot.  Read
+        # the opposing-side candidates directly so the flat Phase-1 warning is
+        # guaranteed to describe the same immutable zones retained for audit.
+        bias = snap.get("shadow_bias_snapshot") if isinstance(snap.get("shadow_bias_snapshot"), dict) else {}
+        context_key = "sell_zone_context" if side == "BUY" else "buy_zone_context"
+        opposing = bias.get(context_key) if isinstance(bias.get(context_key), dict) else {}
+        nested_zones = []
+        best_zone = opposing.get("best_zone")
+        if isinstance(best_zone, dict):
+            nested_zones.append(best_zone)
+        for row in opposing.get("top_candidates") or []:
+            if isinstance(row, dict):
+                nested_zones.append(row)
+        nested_candidates = []
+        for row in nested_zones:
+            level = _safe_float(row.get("level"))
+            low = _safe_float(row.get("low")); high = _safe_float(row.get("high"))
+            if entry is None or level is None:
+                continue
+            if side == "BUY" and (high is None or high <= entry):
+                continue
+            if side == "SELL" and (low is None or low >= entry):
+                continue
+            distance = _safe_float(row.get("distance"))
+            if distance is None:
+                distance = max((low or level) - entry, 0.0) if side == "BUY" else max(entry - (high or level), 0.0)
+            distance_atr = _safe_float(row.get("distance_atr"))
+            if distance_atr is None and atr and atr > 0:
+                distance_atr = distance / atr
+            nested_candidates.append((distance, distance_atr, level, row))
+        if nested_candidates:
+            distance, distance_atr, level, barrier_evidence = min(
+                nested_candidates,
+                key=lambda item: (item[0], item[1] if item[1] is not None else float("inf")),
+            )
+            barrier = level
+            room = distance
+            room_atr = distance_atr
+        else:
+            barrier_evidence = None
+
+        extension = _safe_float(snap.get("h1_20_net_atr"))
+        late_extension = abs(extension) >= 3.0 if extension is not None else None
+        far_from_zone = zone_distance_atr >= 0.75 if zone_distance_atr is not None else None
+        low_room = room_atr < 0.50 if room_atr is not None else None
+        weak_zone = None
+        zone_score = _safe_float(snap.get("zone_score"))
+        if zone_score is not None:
+            weak_zone = zone_score < QFLAG_WEAK_ZONE_SCORE
+
+        setup = snap.get("setup_analysis") if isinstance(snap.get("setup_analysis"), dict) else {}
+        predicted = setup.get("predicted_direction") or snap.get("predicted_direction")
+        if not predicted:
+            behavior = setup.get("predicted_market_behavior") or snap.get("predicted_market_behavior")
+            if isinstance(behavior, dict):
+                predicted = behavior.get("direction") or behavior.get("predicted_direction")
+        predicted = str(predicted or "").upper() or None
+        prediction_alignment = (
+            "ALIGNED" if predicted == side else "CONFLICT" if predicted in ("BUY", "SELL") else "UNCONFIRMED"
+        )
+
+        real_available = bool(snap.get("dxy_available"))
+        real_alignment = str(snap.get("dxy_alignment_at_entry") or "UNAVAILABLE").upper()
+        real_direction = snap.get("dxy_h1_20_direction")
+        real_timing = "UNAVAILABLE"
+        m15 = snap.get("dxy_m15_entry") if isinstance(snap.get("dxy_m15_entry"), dict) else {}
+        real_m15 = (m15.get("sources") or {}).get("REAL_DXY") if isinstance(m15.get("sources"), dict) else {}
+        if isinstance(real_m15, dict) and real_m15:
+            real_timing = str(real_m15.get("status") or real_m15.get("timing_opinion") or "UNKNOWN").upper()
+
+        real_extreme = (
+            m15.get("real_dxy_extreme_impulse")
+            if isinstance(m15.get("real_dxy_extreme_impulse"), dict)
+            else {}
+        )
+        real_extreme_active = bool(real_extreme.get("extreme_impulse"))
+
+        supportive_dxy, dxy_relationship = _dxy_supportive_direction(
+            snap.get("symbol"), side,
+        )
+        symbol_h1_behavior = (
+            snap.get("symbol_h1_last10_behavior")
+            if isinstance(snap.get("symbol_h1_last10_behavior"), dict) else {}
+        )
+        dxy_h1_behavior = (
+            snap.get("dxy_h1_last10_behavior")
+            if isinstance(snap.get("dxy_h1_last10_behavior"), dict) else {}
+        )
+        dxy_selected_direction = str(
+            real_m15.get("direction")
+            or snap.get("dxy_h1_direction_at_entry")
+            or real_direction
+            or ""
+        ).upper() or None
+        dxy_momentum_alignment = (
+            "ALIGNED" if supportive_dxy and dxy_selected_direction == supportive_dxy
+            else "AGAINST" if supportive_dxy and dxy_selected_direction in ("BULLISH", "BEARISH")
+            else "CONTEXT_ONLY" if not supportive_dxy else "UNAVAILABLE"
+        )
+        real_reasoning = real_m15.get("entry_reasoning") if isinstance(real_m15, dict) else {}
+        if not isinstance(real_reasoning, dict):
+            real_reasoning = real_m15.get("reasoning") if isinstance(real_m15, dict) else {}
+        if not isinstance(real_reasoning, dict):
+            real_reasoning = {}
+        sr_context = real_reasoning.get("sr_context") if isinstance(real_reasoning.get("sr_context"), dict) else {}
+        dxy_at_resistance = bool(
+            sr_context.get("near_h1_resistance")
+            or sr_context.get("inside_h1_resistance")
+            or "RESISTANCE" in str(sr_context.get("context") or "").upper()
+        )
+        dxy_at_support = bool(
+            sr_context.get("near_h1_support")
+            or sr_context.get("inside_h1_support")
+            or "SUPPORT" in str(sr_context.get("context") or "").upper()
+        )
+        location_supportive = bool(
+            (supportive_dxy == "BEARISH" and dxy_at_resistance)
+            or (supportive_dxy == "BULLISH" and dxy_at_support)
+        )
+        if not supportive_dxy:
+            comparison_class = "NOT_DXY_SENSITIVE"
+        elif dxy_momentum_alignment == "ALIGNED":
+            comparison_class = "FULLY_ALIGNED"
+        elif location_supportive:
+            comparison_class = "CONDITIONAL_REVERSAL_SETUP"
+        elif dxy_momentum_alignment == "AGAINST":
+            comparison_class = "DXY_ADVERSE"
+        else:
+            comparison_class = "INSUFFICIENT_DATA"
+        snap["entry_market_comparison"] = {
+            "schema_version": 1,
+            "captured_at_ms": snap.get("enqueue_timestamp"),
+            "immutable_entry_snapshot": True,
+            "analytics_only": True,
+            "symbol": snap.get("symbol"),
+            "trade_side": side,
+            "symbol_h1_behavior": symbol_h1_behavior,
+            "dxy_h1_behavior": dxy_h1_behavior,
+            "dxy_relationship": dxy_relationship,
+            "supportive_dxy_direction": supportive_dxy,
+            "dxy_direction": dxy_selected_direction,
+            "dxy_m15_status": real_timing,
+            "dxy_at_h1_resistance": dxy_at_resistance,
+            "dxy_at_h1_support": dxy_at_support,
+            "momentum_alignment": dxy_momentum_alignment,
+            "location_alignment": "SUPPORTIVE" if location_supportive else "NOT_SUPPORTIVE",
+            "overall_classification": comparison_class,
+            "decision_note": (
+                "DXY momentum is aligned with the trade."
+                if comparison_class == "FULLY_ALIGNED" else
+                "DXY momentum is adverse, but its H1 location supports a reversal thesis."
+                if comparison_class == "CONDITIONAL_REVERSAL_SETUP" and dxy_momentum_alignment == "AGAINST" else
+                "DXY H1 location supports a reversal thesis; momentum is not confirmed."
+                if comparison_class == "CONDITIONAL_REVERSAL_SETUP" else
+                "DXY momentum and location are adverse to the trade."
+                if comparison_class == "DXY_ADVERSE" else
+                "DXY is contextual only for this symbol."
+                if comparison_class == "NOT_DXY_SENSITIVE" else
+                "Insufficient frozen evidence for a DXY comparison."
+            ),
+        }
+
+        flags = []
+        evidence = []
+        def add(label, facts):
+            flags.append(label); evidence.append(_phase1_label(label, facts))
+        if side == "SELL" and barrier_type == "SUPPORT" and low_room:
+            add("SELL_INTO_STRONG_SUPPORT", {"entry_price": entry, "support_price": barrier, "directional_room_atr": room_atr})
+        if side == "BUY" and barrier_type == "RESISTANCE" and low_room:
+            add("BUY_INTO_STRONG_RESISTANCE", {"entry_price": entry, "resistance_price": barrier, "directional_room_atr": room_atr})
+        if late_extension:
+            add("LATE_EXTENSION", {"h1_20_net_atr": extension, "threshold_abs_atr": 3.0})
+        if far_from_zone:
+            add("FAR_FROM_SELECTED_ZONE", {"distance_from_zone_atr": zone_distance_atr, "threshold_atr": 0.75})
+        if low_room:
+            add("LOW_DIRECTIONAL_ROOM", {"barrier_type": barrier_type, "barrier_price": barrier, "directional_room_atr": room_atr, "threshold_atr": 0.50})
+        if weak_zone:
+            add("WEAK_ENTRY_ZONE", {"zone_score": zone_score, "threshold": QFLAG_WEAK_ZONE_SCORE})
+        if prediction_alignment != "ALIGNED":
+            add("PREDICTION_" + prediction_alignment, {"trade_side": side, "predicted_direction": predicted})
+        if not real_available:
+            add("REAL_DXY_UNAVAILABLE", {"reason": snap.get("dxy_unavailable_reason")})
+        elif real_timing in ("WAIT", "PENDING", "IDLE"):
+            add("REAL_DXY_WAIT", {"status": real_timing, "direction": real_direction, "alignment": real_alignment})
+        elif real_alignment in ("AGAINST", "CONFLICT"):
+            add("REAL_DXY_CONFLICT", {"direction": real_direction, "alignment": real_alignment})
+        if real_extreme_active:
+            add(
+                "REAL_DXY_M15_EXTREME_IMPULSE",
+                {
+                    "source": "REAL_DXY",
+                    "direction": real_extreme.get("direction"),
+                    "bar_open_ms": real_extreme.get("bar_open_ms"),
+                    "bar_close_ms": real_extreme.get("bar_close_ms"),
+                    "open": real_extreme.get("open"),
+                    "high": real_extreme.get("high"),
+                    "low": real_extreme.get("low"),
+                    "close": real_extreme.get("close"),
+                    "atr14": real_extreme.get("atr14"),
+                    "range_atr": real_extreme.get("range_atr"),
+                    "body_atr": real_extreme.get("body_atr"),
+                    "body_ratio": real_extreme.get("body_ratio"),
+                    "range_pct": real_extreme.get("range_pct"),
+                    "body_pct": real_extreme.get("body_pct"),
+                    "signed_change_pct": real_extreme.get("signed_change_pct"),
+                    "thresholds": real_extreme.get("thresholds"),
+                    "shadow_entry_action": "WAIT_NEW_ENTRY",
+                },
+            )
+        if not snap.get("rc_found"):
+            add("RC_CAPTURE_MISSING", {"rc_source": snap.get("rc_source"), "note": snap.get("rc_capture_note")})
+        elif "reconstructed" in str(snap.get("rc_capture_note") or "").lower():
+            add("RC_RECONSTRUCTED", {"rc_source": snap.get("rc_source"), "note": snap.get("rc_capture_note")})
+
+        shadow_decision = "BLOCK" if late_extension and far_from_zone and low_room else ("REVIEW" if flags else "ALLOW")
+        shadow_reason = "LATE_EXTENSION_FAR_FROM_ZONE_LOW_ROOM" if shadow_decision == "BLOCK" else (flags[0] if flags else "NO_PHASE1_WARNING")
+        shadow_entry_action = "WAIT_NEW_ENTRY" if real_extreme_active else "NONE"
+        shadow_entry_reason = (
+            "REAL_DXY_M15_EXTREME_IMPULSE" if real_extreme_active else None
+        )
+        summary = {
+            "schema_version": 1, "captured_at_ms": snap.get("enqueue_timestamp"),
+            "immutable_entry_snapshot": True, "analytics_only": True,
+            "prediction_alignment": prediction_alignment,
+            "trend_h1_direction": snap.get("h1_20_direction"),
+            "trend_h1_vs_trade": snap.get("h1_20_vs_trade"),
+            "real_dxy_available": real_available, "real_dxy_direction": real_direction,
+            "real_dxy_alignment": real_alignment, "real_dxy_timing": real_timing,
+            "real_dxy_m15_extreme_impulse": real_extreme_active,
+            "real_dxy_m15_extreme_impulse_evidence": (dict(real_extreme) if real_extreme else None),
+            "shadow_entry_action": shadow_entry_action,
+            "shadow_entry_reason": shadow_entry_reason,
+            "distance_from_zone_price": zone_distance, "distance_from_zone_atr": zone_distance_atr,
+            "far_from_zone": far_from_zone, "nearest_directional_barrier_type": barrier_type,
+            "nearest_directional_barrier_price": barrier, "directional_room_price": room,
+            "directional_room_atr": room_atr, "low_directional_room": low_room,
+            "h1_20_net_atr": extension, "h1_20_slope_atr": snap.get("h1_20_slope_atr"),
+            "h1_20_r2": snap.get("h1_20_r2"), "late_extension": late_extension,
+            "weak_zone": weak_zone, "rc_capture_complete": bool(snap.get("rc_found")),
+            "rc_capture_source": snap.get("rc_source"), "entry_flags": list(flags),
+            "shadow_decision": shadow_decision, "shadow_reason": shadow_reason,
+        }
+        if isinstance(barrier_evidence, dict):
+            summary["nearest_directional_barrier_evidence"] = dict(barrier_evidence)
+        if "rc_shifted_before_entry" in snap:
+            summary["rc_shifted_before_entry"] = bool(snap.get("rc_shifted_before_entry"))
+        snap["entry_quality_summary"] = summary
+        snap["entry_flags"] = list(flags)
+        snap["entry_situation_classifications"] = evidence
+        snap["shadow_decision"] = shadow_decision
+        snap["shadow_reason"] = shadow_reason
+        snap["shadow_entry_action"] = shadow_entry_action
+        snap["shadow_entry_reason"] = shadow_entry_reason
+        snap["real_dxy_m15_extreme_impulse"] = dict(real_extreme) if real_extreme else None
+    except Exception as exc:
+        log.warning("analytics: Phase-1 entry analytics failed: %s", exc)
+
+
 def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
     """Map a pos (clean) or repaired record -> frozen entry snapshot.
     Provenance-aware; reads prop from the prop_check dict so it works for both the
@@ -4852,7 +7234,7 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
         sr = read_sr_at_ack(sym)
 
         # -------------------------------------------------
-        # XTL Evidence Bias — frozen at broker-confirmed entry.
+        # XTL Evidence Bias   frozen at broker-confirmed entry.
         #
         # Shadow analytics only. This result never changes live
         # direction, zones, watches, gate, risk or execution.
@@ -4929,6 +7311,10 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "side":             side,
             "entry_provenance": provenance,
             "capture_source":   str(capture_source or "normal"),
+            "setup_analysis": (dict(p.get("setup_analysis")) if isinstance(p.get("setup_analysis"), dict) else None),
+            "entry_confirmation": (dict(p.get("entry_confirmation")) if isinstance(p.get("entry_confirmation"), dict) else None),
+            "selected_strategy": ((p.get("setup_analysis") or {}).get("selected_production_strategy") if isinstance(p.get("setup_analysis"), dict) else None),
+            "predicted_market_behavior": ((p.get("setup_analysis") or {}).get("predicted_market_behavior") if isinstance(p.get("setup_analysis"), dict) else None),
             "enqueue_timestamp": ets,
             "session":          session,
 
@@ -4948,7 +7334,7 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "regime_4h":        (regime or {}).get("h4"),
             "regime_1d":        (regime or {}).get("d1"),
             # flat, sortable regime scalars (so analysis buckets by raw ADX/ER,
-            # not just the TREND/MIXED label — lets data find the real threshold)
+            # not just the TREND/MIXED label   lets data find the real threshold)
             "regime_1h_label":  ((regime or {}).get("h1") or {}).get("label"),
             "regime_1h_adx":    _safe_float(((regime or {}).get("h1") or {}).get("adx")),
             "regime_1h_er":     _safe_float(((regime or {}).get("h1") or {}).get("er")),
@@ -5025,26 +7411,26 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "distance_to_resistance": dist_res,
             "distance_to_support":    dist_sup,
 
-            # -- timing derivations (§6) --
+            # -- timing derivations ( 6) --
             "weekday":   weekday,
             "month":     month,
             "quarter":   quarter,
             "year":      year,
 
-            # -- position geometry (§9) --
+            # -- position geometry ( 9) --
             "stop_distance": stop_distance,
             "tp_distance":   tp_distance,
 
-            # -- richer zone (§12) --
+            # -- richer zone ( 12) --
             "zone_width":     zone_width,
             "zone_strength":  zone_strength,
             "zone_merged_tfs": zone_merged_tfs,
             "zone_reaction":  zone_reaction,
 
-            # -- market-context derivation (§11) --
+            # -- market-context derivation ( 11) --
             "atr_pct":   atr_pct,
 
-            # -- news context @ entry (§11, shadow — observed not blocking) --
+            # -- news context @ entry ( 11, shadow   observed not blocking) --
             "news_block":            news.get("news_block"),
             "news_verdict":          news.get("news_verdict"),
             "news_event":            news.get("news_event"),
@@ -5065,16 +7451,16 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                 "nearest_news_relation"
             ),
 
-            # -- FTMO risk state @ entry (§7/§8-core/§10) — canonical source --
+            # -- FTMO risk state @ entry ( 7/ 8-core/ 10)   canonical source --
             "ftmo":      ftmo,
 
-            # -- account snapshot @ entry (§8) --
+            # -- account snapshot @ entry ( 8) --
             "account":   acct,
 
-            # -- prop object, UNFLATTENED (§16) --
+            # -- prop object, UNFLATTENED ( 16) --
             "prop_check": prop_obj,
 
-            # -- reversal candle (§13) --
+            # -- reversal candle ( 13) --
             "rc_open":      rc.get("rc_open"),
             "rc_high":      rc.get("rc_high"),
             "rc_low":       rc.get("rc_low"),
@@ -5087,7 +7473,7 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "rc_source":    rc.get("rc_source"),
             "rc_capture_note": rc.get("rc_capture_note"),
 
-            # -- full liquidity breakdown (§14) --
+            # -- full liquidity breakdown ( 14) --
             "equal_highs":        liqdet.get("equal_highs"),
             "equal_lows":         liqdet.get("equal_lows"),
             "liquidity_pool_count": liqdet.get("liquidity_pool_count"),
@@ -5096,7 +7482,7 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "bsl_level":          liqdet.get("bsl_level"),
             "ssl_level":          liqdet.get("ssl_level"),
 
-            # -- gate detail (§17) --
+            # -- gate detail ( 17) --
             "watch_key":       p.get("watch_key") or (f"xtl:zone:watch:{sym}:{side}:{p.get('entry_zone_tf') or 'H1'}"),
             "gate_reason":     p.get("entry_gate_reason"),
             "selection_model": (z.get("selection_model") if z else None) or p.get("selection_model"),
@@ -5111,6 +7497,8 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                 "entry_snapshot_complete": True,
                 "exit_snapshot_complete": False,
                 "broker_verified": False,
+                "dxy_h1_entry_captured": False,
+                "dxy_h1_entry_data_ok": False,
                 "analytics_schema_version": SCHEMA_VERSION,
                 "shadow_bias_captured": bool(
                     isinstance(shadow_bias_snapshot, dict)
@@ -5157,6 +7545,10 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             ).lower().strip(),
             "source":           p.get("source"),
         }
+
+        # Optional only: do not manufacture a false value for older payloads.
+        if "rc_shifted_before_entry" in rc:
+            snap["rc_shifted_before_entry"] = bool(rc.get("rc_shifted_before_entry"))
         
         # compute quality flags from the assembled snapshot (self-documenting risk)
         try:
@@ -5199,6 +7591,11 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                 _h1dir["h1_20_vs_trade"] = _h1_dir_vs_trade(
                     _h1dir.get("h1_20_direction"), side)
                 snap.update(_h1dir)
+            if _dir_bars:
+                snap["symbol_h1_last10_behavior"] = _h1_last10_behavior(
+                    _dir_bars,
+                    _safe_float(liq.get("atr")),
+                )
         except Exception as _he:
             log.warning("analytics: h1_20 direction capture failed: %s", _he)
         
@@ -5401,7 +7798,262 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                     f"{_usd_ctx_exc}"
                 ),
             }
+        
+        # -- Native H1 DXY directional features at ENTRY --
+        #
+        # Frozen entry-time analytics only:
+        # - REAL_DXY plus SYNTHETIC_DXY
+        # - no entry blocking
+        # - no score or classifier production change
+        # - no risk or order-placement change
+        try:
+            snap["dxy_h1_entry"] = (
+                read_dxy_h1_at_entry(
+                    device_id=p.get(
+                        "device_id"
+                    ),
+                    symbol=sym,
+                    side=side,
+                    entry_ms=ets,
+                    trade_firm=(
+                        pc.get("firm")
+                        or p.get(
+                            "prop_firm"
+                        )
+                    ),
+                    trade_profile_id=(
+                        p.get(
+                            "profile_id"
+                        )
+                    ),
+                    dxy_m15_entry=(
+                        snap.get(
+                            "dxy_m15_entry"
+                        )
+                        if isinstance(
+                            snap.get(
+                                "dxy_m15_entry"
+                            ),
+                            dict,
+                        )
+                        else {}
+                    ),
+                )
+            )
 
+            # Flat fields for quick jq/pandas grouping.
+            _dxy_h1_selected = (
+                snap["dxy_h1_entry"].get(
+                    "selected"
+                )
+                if isinstance(
+                    snap.get(
+                        "dxy_h1_entry"
+                    ),
+                    dict,
+                )
+                else {}
+            ) or {}
+
+            _dxy_h1_feature = (
+                _dxy_h1_selected.get(
+                    "feature"
+                )
+                if isinstance(
+                    _dxy_h1_selected,
+                    dict,
+                )
+                else {}
+            ) or {}
+
+            snap[
+                "dxy_h1_selected_source"
+            ] = snap[
+                "dxy_h1_entry"
+            ].get(
+                "selected_source"
+            )
+
+            snap[
+                "dxy_h1_direction_at_entry"
+            ] = _dxy_h1_selected.get(
+                "direction"
+            )
+
+            snap[
+                "dxy_h1_confidence_at_entry"
+            ] = _dxy_h1_selected.get(
+                "confidence"
+            )
+
+            snap[
+                "dxy_h1_trade_alignment_at_entry"
+            ] = _dxy_h1_selected.get(
+                "trade_alignment"
+            )
+
+            snap[
+                "dxy_h1_evidence_direction_at_entry"
+            ] = _dxy_h1_selected.get(
+                "evidence_direction"
+            )
+
+            snap[
+                "dxy_h1_bull_score_at_entry"
+            ] = _dxy_h1_feature.get(
+                "bull_evidence_score"
+            )
+
+            snap[
+                "dxy_h1_bear_score_at_entry"
+            ] = _dxy_h1_feature.get(
+                "bear_evidence_score"
+            )
+
+            snap[
+                "dxy_h1_bullish_break_at_entry"
+            ] = bool(
+                _dxy_h1_feature.get(
+                    "bullish_structure_break"
+                )
+            )
+
+            snap[
+                "dxy_h1_bearish_break_at_entry"
+            ] = bool(
+                _dxy_h1_feature.get(
+                    "bearish_structure_break"
+                )
+            )
+
+            snap[
+                "dxy_h1_real_synthetic_agreement"
+            ] = snap[
+                "dxy_h1_entry"
+            ].get(
+                "real_synthetic_agreement"
+            )
+
+            snap[
+                "dxy_m15_h1_alignment_at_entry"
+            ] = snap[
+                "dxy_h1_entry"
+            ].get(
+                "m15_h1_alignment"
+            )
+
+            snap[
+                "dxy_h1_shadow_only"
+            ] = True
+
+        except Exception as _dxy_h1_exc:
+            log.warning(
+                "analytics: DXY H1 entry capture "
+                "failed ticket=%s err=%r",
+                ticket,
+                _dxy_h1_exc,
+            )
+
+            snap["dxy_h1_entry"] = {
+                "schema_version": 1,
+                "timeframe": "H1",
+                "captured_at_ms": ets,
+                "sources": {},
+                "selected_source": None,
+                "selected": None,
+                "capture_error": (
+                    f"{type(_dxy_h1_exc).__name__}:"
+                    f"{_dxy_h1_exc}"
+                ),
+                "shadow_only": True,
+                "analytics_only": True,
+                "execution_wired": False,
+                "entry_gate_wired": False,
+                "risk_wired": False,
+            }
+
+            snap[
+                "dxy_h1_selected_source"
+            ] = None
+
+            snap[
+                "dxy_h1_direction_at_entry"
+            ] = None
+
+            snap[
+                "dxy_h1_trade_alignment_at_entry"
+            ] = "UNAVAILABLE"
+
+            snap[
+                "dxy_h1_real_synthetic_agreement"
+            ] = "UNAVAILABLE"
+
+            snap[
+                "dxy_m15_h1_alignment_at_entry"
+            ] = "UNAVAILABLE"
+
+            snap[
+                "dxy_h1_shadow_only"
+            ] = True
+
+        # -------------------------------------------------------------
+        # Final H1 DXY capture-status update
+        # -------------------------------------------------------------
+        try:
+            _capture_status = (
+                snap.get("capture_status")
+                if isinstance(
+                    snap.get("capture_status"),
+                    dict,
+                )
+                else {}
+            )
+
+            _h1_entry = (
+                snap.get("dxy_h1_entry")
+                if isinstance(
+                    snap.get("dxy_h1_entry"),
+                    dict,
+                )
+                else {}
+            )
+
+            _h1_selected = (
+                _h1_entry.get("selected")
+                if isinstance(_h1_entry, dict)
+                else {}
+            ) or {}
+
+            _capture_status[
+                "dxy_h1_entry_captured"
+            ] = bool(
+                isinstance(_h1_entry, dict)
+                and _h1_entry
+                and not _h1_entry.get("capture_error")
+            )
+
+            _capture_status[
+                "dxy_h1_entry_data_ok"
+            ] = bool(
+                _h1_selected.get("available")
+                and _h1_selected.get("fresh")
+                and isinstance(
+                    _h1_selected.get("feature"),
+                    dict,
+                )
+            )
+
+            snap["capture_status"] = _capture_status
+
+        except Exception as _h1_status_exc:
+            log.warning(
+                "analytics: DXY H1 capture-status update "
+                "failed ticket=%s err=%r",
+                ticket,
+                _h1_status_exc,
+            )
+
+        _apply_phase1_entry_analytics(snap)
         return snap
         
     except Exception as e:
@@ -5520,6 +8172,10 @@ def write_entry_snapshot(snap: dict) -> bool:
         snap.setdefault("enqueue_timestamp", _now_ms())
         snap["_status"] = "open"
 
+        # Initialize per-ticket journey tracking at broker-confirmed entry.
+        # This is shadow analytics only and never changes SL/TP/orders.
+        _ensure_trade_milestone_state(snap)
+
         R.set(
             SNAP_PREFIX + ticket,
             json.dumps(
@@ -5587,7 +8243,7 @@ def approximate_exit(snap: dict, bars_h1: list) -> dict:
                 continue
             tp_hit = tp is not None and (hi >= tp if side == "BUY" else lo <= tp)
             sl_hit = (lo <= sl if side == "BUY" else hi >= sl)
-            if tp_hit and sl_hit:       # same bar — can't order — conservative SL
+            if tp_hit and sl_hit:       # same bar   can't order   conservative SL
                 hit, hit_ts = "sl", t; break
             if sl_hit:
                 hit, hit_ts = "sl", t; break
@@ -5606,7 +8262,7 @@ def approximate_exit(snap: dict, bars_h1: list) -> dict:
         # Bound excursion to the trade's own lifetime. Bars are chronological, so
         # slice out anything at/after the exit before measuring MFE/MAE. Without
         # this, _excursion_r reads bars AFTER the trade closed and reports
-        # favorable/adverse moves the trade never actually experienced —
+        # favorable/adverse moves the trade never actually experienced  
         # inflating mfe_r AND mae_r (this is why SL trades showed mae_r < -1).
         _end_ts = _norm_ms(hit_ts or int(out.get("close_timestamp") or 0))
         if _end_ts:
@@ -5875,21 +8531,7 @@ def _exit_from_broker_deal(ticket: str, snap: dict, R) -> dict | None:
                 realized_r = ((close_price - entry) if side == "BUY"
                               else (entry - close_price)) / risk
 
-        # classify: net_profit sign is the source of truth for win/loss;
-        # proximity of close to TP/SL labels the reason.
-        tol = (abs(entry - sl) * 0.10) if (entry and sl) else 0.0
-        near_tp = tp is not None and abs(close_price - tp) <= tol
-        near_sl = sl is not None and abs(close_price - sl) <= tol
-        if near_tp:
-            exit_reason = "tp"
-        elif near_sl:
-            exit_reason = "sl"
-        elif net_profit is not None and net_profit > 0:
-            exit_reason = "tp"      # profitable close not at a level = manual win, count as tp-side
-        elif net_profit is not None and net_profit < 0:
-            exit_reason = "manual"  # losing close not at SL
-        else:
-            exit_reason = "manual"
+        
 
    
 
@@ -5899,6 +8541,82 @@ def _exit_from_broker_deal(ticket: str, snap: dict, R) -> dict | None:
         _final_sl = _prev.get("sl")
         _final_tp = float(_final_tp) if _final_tp not in (None, 0) else None
         _final_sl = float(_final_sl) if _final_sl not in (None, 0) else None
+
+        # Broker-native exit reason is authoritative.
+      
+        # Price proximity is only a fallback for old/incomplete
+        # deal payloads. Never relabel an explicit broker SL as
+        # MANUAL merely because the final fill differs from the
+        # frozen SL price.
+        # ---------------------------------------------------------
+        broker_reason_raw = str(
+            deal.get("broker_reason")
+            or deal.get("exit_reason")
+            or deal.get("reason")
+            or ""
+        ).upper().strip()
+
+        broker_reason_map = {
+            "TP": "tp",
+            "TAKE_PROFIT": "tp",
+            "TAKEPROFIT": "tp",
+
+            "SL": "sl",
+            "STOP_LOSS": "sl",
+            "STOPLOSS": "sl",
+
+            "SO": "stopout",
+            "STOP_OUT": "stopout",
+            "STOPOUT": "stopout",
+
+            "CLIENT": "manual",
+            "EXPERT": "manual",
+            "MOBILE": "manual",
+            "WEB": "manual",
+            "MANUAL": "manual",
+        }
+
+        exit_reason = broker_reason_map.get(
+            broker_reason_raw
+        )
+
+        exit_reason_source = (
+            "BROKER_REASON"
+            if exit_reason
+            else None
+        )
+
+        # Fallback only when broker reason is missing or unknown.
+        if not exit_reason:
+            tol = (
+                abs(entry - sl) * 0.10
+                if entry and sl
+                else 0.0
+            )
+
+            near_tp = bool(
+                tp is not None
+                and abs(close_price - tp) <= tol
+            )
+
+            near_sl = bool(
+                sl is not None
+                and abs(close_price - sl) <= tol
+            )
+
+            if near_tp:
+                exit_reason = "tp"
+                exit_reason_source = "PRICE_NEAR_TP"
+
+            elif near_sl:
+                exit_reason = "sl"
+                exit_reason_source = "PRICE_NEAR_SL"
+
+            else:
+                exit_reason = "manual"
+                exit_reason_source = (
+                    "BROKER_REASON_UNAVAILABLE"
+                )
         tp_modified = bool(_final_tp and tp and abs(_final_tp - tp) > 1e-9)
         sl_modified = bool(_final_sl and sl and abs(_final_sl - sl) > 1e-9)
         # R-impact of a TP move: what the original TP would have been in R vs actual
@@ -5913,6 +8631,18 @@ def _exit_from_broker_deal(ticket: str, snap: dict, R) -> dict | None:
             "exit_confidence": "high",
             "exit_price": round(close_price, 5),
             "exit_reason": exit_reason,
+            "exit_reason_source": exit_reason_source,
+            "broker_reason": (
+                broker_reason_raw or None
+            ),
+            "broker_close_reason_code": (
+                deal.get("close_reason_code")
+                or deal.get("exit_deal_reason")
+            ),
+            "broker_exit_comment": (
+                deal.get("exit_comment")
+                or deal.get("comment")
+            ),
             "realized_r": round(realized_r, 3) if realized_r is not None else None,
             "net_profit": net_profit,
             
@@ -6036,9 +8766,441 @@ def _apply_realized_r_net_and_outcome(record: dict) -> dict:
     record["exit_type"] = {
         "tp": "TP",
         "sl": "SL",
+        "stopout": "STOP_OUT",
         "manual": "MANUAL",
     }.get(exit_reason, "OTHER")
     return record
+
+def _excursion_r_m1(
+    snap: dict,
+    bars_m1: list,
+    entry: float,
+    sl: float,
+) -> dict:
+    """
+    Compute MFE/MAE from completed broker M1 bars overlapping the actual
+    trade lifetime.
+
+    Entry and exit M1 candles are included, but confidence reflects that
+    their OHLC may contain movement immediately before entry or after exit.
+    """
+    try:
+        side = str(
+            snap.get("side") or ""
+        ).upper().strip()
+
+        risk = abs(
+            float(entry) - float(sl)
+        )
+
+        if (
+            side not in ("BUY", "SELL")
+            or risk <= 0
+        ):
+            return {}
+
+        offset_min = int(
+            _safe_int(
+                snap.get(
+                    "broker_tz_offset_minutes"
+                ),
+                0,
+            )
+            or 0
+        )
+
+        offset_ms = offset_min * 60_000
+
+        entry_utc_ms = _norm_ms(
+            snap.get(
+                "broker_open_time_utc_ms"
+            )
+            or snap.get(
+                "enqueue_timestamp"
+            )
+            or snap.get(
+                "opened_at_ms"
+            )
+            or 0
+        )
+
+        close_utc_ms = _norm_ms(
+            snap.get(
+                "broker_close_time_utc_ms"
+            )
+            or 0
+        )
+
+        if close_utc_ms <= 0:
+            raw_close_ms = _norm_ms(
+                snap.get(
+                    "broker_close_time_ms"
+                )
+                or snap.get(
+                    "close_timestamp"
+                )
+                or 0
+            )
+
+            if raw_close_ms > 0:
+                close_utc_ms = (
+                    raw_close_ms - offset_ms
+                )
+
+        if (
+            entry_utc_ms <= 0
+            or close_utc_ms <= entry_utc_ms
+        ):
+            return {}
+
+        first_expected_open_ms = (
+            entry_utc_ms // 60_000
+        ) * 60_000
+
+        last_expected_open_ms = (
+            close_utc_ms // 60_000
+        ) * 60_000
+
+        expected_bars = int(
+            (
+                last_expected_open_ms
+                - first_expected_open_ms
+            )
+            // 60_000
+        ) + 1
+
+        selected = []
+        seen_open_ms = set()
+
+        for bar in bars_m1 or []:
+            if not isinstance(bar, dict):
+                continue
+
+            wall_open_ms = _norm_ms(
+                bar.get("t_open_ms")
+                or bar.get("t")
+                or bar.get("time")
+                or 0
+            )
+
+            if wall_open_ms <= 0:
+                continue
+
+            bar_open_utc_ms = (
+                wall_open_ms - offset_ms
+            )
+
+            bar_close_utc_ms = (
+                bar_open_utc_ms + 60_000
+            )
+
+            # Include every M1 candle that overlaps the true trade lifetime.
+            if bar_close_utc_ms <= entry_utc_ms:
+                continue
+
+            if bar_open_utc_ms > close_utc_ms:
+                continue
+
+            hi = _safe_float(
+                bar.get("h")
+            )
+            lo = _safe_float(
+                bar.get("l")
+            )
+
+            if hi is None or lo is None:
+                continue
+
+            if bar_open_utc_ms in seen_open_ms:
+                continue
+
+            selected.append({
+                "open_utc_ms": (
+                    bar_open_utc_ms
+                ),
+                "close_utc_ms": (
+                    bar_close_utc_ms
+                ),
+                "high": hi,
+                "low": lo,
+            })
+
+            seen_open_ms.add(
+                bar_open_utc_ms
+            )
+
+        selected.sort(
+            key=lambda row: row[
+                "open_utc_ms"
+            ]
+        )
+
+        observed_bars = len(selected)
+
+        coverage_pct = (
+            round(
+                min(
+                    100.0,
+                    observed_bars
+                    / expected_bars
+                    * 100.0,
+                ),
+                2,
+            )
+            if expected_bars > 0
+            else 0.0
+        )
+
+        gap_count = 0
+
+        for index in range(
+            1,
+            len(selected),
+        ):
+            gap_minutes = int(
+                (
+                    selected[index][
+                        "open_utc_ms"
+                    ]
+                    - selected[index - 1][
+                        "open_utc_ms"
+                    ]
+                )
+                // 60_000
+            )
+
+            if gap_minutes > 1:
+                gap_count += (
+                    gap_minutes - 1
+                )
+
+        best = None
+        worst = None
+        best_price = None
+        worst_price = None
+        best_ts = None
+        worst_ts = None
+
+        for row in selected:
+            hi = row["high"]
+            lo = row["low"]
+
+            if side == "BUY":
+                favorable = (
+                    hi - entry
+                ) / risk
+
+                adverse = (
+                    lo - entry
+                ) / risk
+
+                favorable_price = hi
+                adverse_price = lo
+
+            else:
+                favorable = (
+                    entry - lo
+                ) / risk
+
+                adverse = (
+                    entry - hi
+                ) / risk
+
+                favorable_price = lo
+                adverse_price = hi
+
+            if (
+                best is None
+                or favorable > best
+            ):
+                best = favorable
+                best_price = (
+                    favorable_price
+                )
+                best_ts = row[
+                    "open_utc_ms"
+                ]
+
+            if (
+                worst is None
+                or adverse < worst
+            ):
+                worst = adverse
+                worst_price = adverse_price
+                worst_ts = row[
+                    "open_utc_ms"
+                ]
+
+        # Entry is an exact, observed 0R point in every trade lifetime.
+        # Including it prevents positive MAE or negative MFE when price moves
+        # immediately in only one direction after entry.
+        if best is not None and best < 0.0:
+            best = 0.0
+            best_price = float(entry)
+            best_ts = entry_utc_ms
+
+        if worst is not None and worst > 0.0:
+            worst = 0.0
+            worst_price = float(entry)
+            worst_ts = entry_utc_ms
+
+        first_bar_partial = bool(
+            selected
+            and entry_utc_ms
+            > selected[0][
+                "open_utc_ms"
+            ]
+        )
+
+        last_bar_partial = bool(
+            selected
+            and close_utc_ms
+            < selected[-1][
+                "close_utc_ms"
+            ]
+        )
+
+        # M1 OHLC cannot distinguish movement before entry or after exit inside
+        # the boundary candles. Keep this visible in confidence classification.
+        if (
+            coverage_pct >= 95.0
+            and gap_count == 0
+        ):
+            confidence = "HIGH"
+        elif coverage_pct >= 70.0:
+            confidence = "MEDIUM"
+        elif observed_bars > 0:
+            confidence = "LOW"
+        else:
+            confidence = "UNAVAILABLE"
+
+        eligible = bool(
+            confidence == "HIGH"
+            and observed_bars > 0
+        )
+
+        pipf = _pip(
+            snap.get("symbol")
+        )
+
+        out = {
+            "mfe_r": (
+                round(best, 3)
+                if best is not None
+                else None
+            ),
+            "mae_r": (
+                round(worst, 3)
+                if worst is not None
+                else None
+            ),
+
+            "excursion_source": (
+                "BROKER_M1"
+                if observed_bars
+                else "BROKER_M1_UNAVAILABLE"
+            ),
+            "excursion_timeframe": "M1",
+            "excursion_precision": (
+                confidence.lower()
+            ),
+            "excursion_confidence": (
+                confidence
+            ),
+
+            "excursion_expected_bars": (
+                expected_bars
+            ),
+            "excursion_observed_bars": (
+                observed_bars
+            ),
+            "excursion_bars_used": (
+                observed_bars
+            ),
+            "excursion_coverage_pct": (
+                coverage_pct
+            ),
+            "excursion_gap_count": (
+                gap_count
+            ),
+
+            "excursion_first_bar_partial": (
+                first_bar_partial
+            ),
+            "excursion_last_bar_partial": (
+                last_bar_partial
+            ),
+
+            "excursion_window_start_utc_ms": (
+                entry_utc_ms
+            ),
+            "excursion_window_end_utc_ms": (
+                close_utc_ms
+            ),
+            "excursion_broker_offset_minutes": (
+                offset_min
+            ),
+
+            "excursion_initial_sl_source": (
+                "ENTRY_SNAPSHOT"
+            ),
+            "excursion_eligible_for_optimization": (
+                eligible
+            ),
+        }
+
+        if best_price is not None:
+            out["mfe_price"] = round(
+                best_price,
+                5,
+            )
+            out["mfe_pips"] = (
+                round(
+                    abs(
+                        best_price - entry
+                    )
+                    / pipf,
+                    1,
+                )
+                if pipf
+                else None
+            )
+            out["mfe_bar_ts_ms"] = (
+                best_ts
+            )
+
+        if worst_price is not None:
+            out["mae_price"] = round(
+                worst_price,
+                5,
+            )
+            out["mae_pips"] = (
+                round(
+                    abs(
+                        worst_price - entry
+                    )
+                    / pipf,
+                    1,
+                )
+                if pipf
+                else None
+            )
+            out["mae_bar_ts_ms"] = (
+                worst_ts
+            )
+
+        return out
+
+    except Exception as exc:
+        log.warning(
+            "analytics: M1 excursion "
+            "failed ticket=%s err=%r",
+            snap.get("mt5_ticket")
+            if isinstance(snap, dict)
+            else None,
+            exc,
+        )
+        return {}
 
 def _excursion_r(snap, bars_h1, entry, sl) -> dict:
     """Compute conservative H1 MFE/MAE inside the verified trade lifetime.
@@ -6161,6 +9323,20 @@ def _excursion_r(snap, bars_h1, entry, sl) -> dict:
                     adv, adv_price, bar_open_utc_ms, idx
                 )
 
+        # Entry is the exact 0R baseline. Keep unavailable H1 measurements as
+        # None, but constrain measured excursions to their valid sign domains.
+        if best is not None and best < 0.0:
+            best = 0.0
+            best_price = float(entry)
+            best_ts = entry_utc_ms or None
+            best_idx = 0
+
+        if worst is not None and worst > 0.0:
+            worst = 0.0
+            worst_price = float(entry)
+            worst_ts = entry_utc_ms or None
+            worst_idx = 0
+
         # Excursion is measured in price-R using abs(entry - sl), therefore
         # its invariant floor must use price-based realized_r. realized_r_net
         # divides money P/L by frozen planned risk_usd and is a different unit.
@@ -6227,20 +9403,56 @@ def _excursion_r(snap, bars_h1, entry, sl) -> dict:
 
 
 _EXCURSION_FIELDS = (
-    "mfe_r", "mae_r",
-    "mfe_price", "mae_price",
-    "mfe_pips", "mae_pips",
-    "mfe_bars_after_entry", "mae_bars_after_entry",
-    "mfe_bar_ts_ms", "mae_bar_ts_ms",
-    "excursion_source", "excursion_precision",
+    "mfe_r",
+    "mae_r",
+    "mfe_price",
+    "mae_price",
+    "mfe_price_source",
+    "mae_price_source",
+    "mfe_pips",
+    "mae_pips",
+    "mfe_bars_after_entry",
+    "mae_bars_after_entry",
+    "mfe_bar_ts_ms",
+    "mae_bar_ts_ms",
+
+    "excursion_source",
+    "excursion_timeframe",
+    "excursion_precision",
+    "excursion_confidence",
+
     "excursion_bars_used",
+    "excursion_expected_bars",
+    "excursion_observed_bars",
+    "excursion_coverage_pct",
+    "excursion_gap_count",
+
+    "excursion_first_bar_partial",
+    "excursion_last_bar_partial",
+    "excursion_boundary_precision",
+    "excursion_boundary_extrema_exact",
+
     "excursion_window_start_utc_ms",
     "excursion_window_end_utc_ms",
     "excursion_broker_offset_minutes",
+
     "excursion_partial_bars_excluded",
     "excursion_realized_floor_applied",
-)
+    "excursion_initial_sl_source",
+    "excursion_eligible_for_optimization",
 
+    "excursion_live_price_samples",
+    "excursion_finalized_at_ms",
+    "excursion_fallback_reason",
+    "excursion_history_truncated_bars",
+    "excursion_internal_gap_count",
+    "excursion_retained_expected_bars",
+    "excursion_retained_coverage_pct",
+    "excursion_leading_unobserved_bars",
+    "excursion_trailing_unobserved_bars",
+    "excursion_coverage_status",
+    "excursion_confidence_reason",
+)
 
 def _clear_excursion_fields(record: dict) -> None:
     """Remove stale excursion values before any lifecycle-path recomputation."""
@@ -6250,39 +9462,750 @@ def _clear_excursion_fields(record: dict) -> None:
         record.pop(key, None)
 
 
+def _finalize_live_excursion(
+    record: dict,
+) -> dict:
+    """
+    Convert the persisted live M1 accumulator into final MFE/MAE fields.
+
+    Source priority inside the accumulator:
+      1. completed M1 high/low
+      2. broker live-price samples
+      3. exact broker exit fill
+
+    The original frozen entry SL remains the R normalizer.
+
+    This is analytics-only and never changes execution.
+    """
+    try:
+        if not isinstance(record, dict):
+            return {}
+
+        live = record.get("excursion_live")
+
+        if not isinstance(live, dict):
+            return {}
+
+        side = str(
+            record.get("side")
+            or ""
+        ).upper().strip()
+
+        entry = _safe_float(
+            record.get("entry_price")
+        )
+
+        sl = _safe_float(
+            record.get("sl_price")
+        )
+
+        if (
+            side not in ("BUY", "SELL")
+            or entry is None
+            or sl is None
+        ):
+            return {}
+
+        risk = abs(
+            float(entry)
+            - float(sl)
+        )
+
+        if risk <= 0:
+            return {}
+
+        entry_ms = _norm_ms(
+            record.get("broker_open_time_utc_ms")
+            or record.get("enqueue_timestamp")
+            or record.get("opened_at_ms")
+            or live.get("entry_utc_ms")
+            or 0
+        )
+
+        close_ms = _norm_ms(
+            record.get("broker_close_time_utc_ms")
+            or record.get("close_timestamp")
+            or record.get("broker_close_time_ms")
+            or 0
+        )
+
+        if (
+            entry_ms <= 0
+            or close_ms <= entry_ms
+        ):
+            return {}
+
+        highest_high = _safe_float(
+            live.get("highest_high")
+        )
+
+        lowest_low = _safe_float(
+            live.get("lowest_low")
+        )
+
+        highest_ts_ms = _norm_ms(
+            live.get("highest_high_ts_ms")
+            or 0
+        ) or None
+
+        lowest_ts_ms = _norm_ms(
+            live.get("lowest_low_ts_ms")
+            or 0
+        ) or None
+
+        highest_source = str(
+            live.get("highest_high_source")
+            or ""
+        ).strip() or None
+
+        lowest_source = str(
+            live.get("lowest_low_source")
+            or ""
+        ).strip() or None
+
+        # Entry itself is exact excursion evidence at 0R. Older accumulators
+        # may not contain this baseline, so restore it during finalization.
+        if highest_high is None or highest_high < float(entry):
+            highest_high = float(entry)
+            highest_ts_ms = int(entry_ms)
+            highest_source = "ENTRY_BASELINE"
+
+        if lowest_low is None or lowest_low > float(entry):
+            lowest_low = float(entry)
+            lowest_ts_ms = int(entry_ms)
+            lowest_source = "ENTRY_BASELINE"
+
+        # -------------------------------------------------
+        # The broker exit fill is an exact price observed
+        # inside the trade lifetime. Always include it.
+        # -------------------------------------------------
+        exit_price = _safe_float(
+            record.get("exit_price")
+            or record.get("close_price")
+        )
+
+        if exit_price is not None:
+            if (
+                highest_high is None
+                or float(exit_price)
+                > highest_high
+            ):
+                highest_high = float(
+                    exit_price
+                )
+                highest_ts_ms = int(
+                    close_ms
+                )
+                highest_source = (
+                    "BROKER_EXIT_FILL"
+                )
+
+            if (
+                lowest_low is None
+                or float(exit_price)
+                < lowest_low
+            ):
+                lowest_low = float(
+                    exit_price
+                )
+                lowest_ts_ms = int(
+                    close_ms
+                )
+                lowest_source = (
+                    "BROKER_EXIT_FILL"
+                )
+
+        if (
+            highest_high is None
+            or lowest_low is None
+        ):
+            return {}
+
+        if side == "BUY":
+            mfe_price = highest_high
+            mae_price = lowest_low
+
+            mfe_r = (
+                highest_high
+                - float(entry)
+            ) / risk
+
+            mae_r = (
+                lowest_low
+                - float(entry)
+            ) / risk
+
+            mfe_ts_ms = highest_ts_ms
+            mae_ts_ms = lowest_ts_ms
+
+            mfe_source = highest_source
+            mae_source = lowest_source
+
+        else:
+            mfe_price = lowest_low
+            mae_price = highest_high
+
+            mfe_r = (
+                float(entry)
+                - lowest_low
+            ) / risk
+
+            mae_r = (
+                float(entry)
+                - highest_high
+            ) / risk
+
+            mfe_ts_ms = lowest_ts_ms
+            mae_ts_ms = highest_ts_ms
+
+            mfe_source = lowest_source
+            mae_source = highest_source
+
+        # -------------------------------------------------
+        # Broker-truth realized-R safety floor.
+        #
+        # A profitable close cannot have MFE below its
+        # realized price R, and a losing close cannot have
+        # MAE less adverse than its realized price R.
+        # -------------------------------------------------
+        realized_r = _safe_float(
+            record.get("realized_r")
+        )
+
+        floor_applied = False
+
+        if realized_r is not None:
+            if (
+                realized_r > 0
+                and mfe_r < realized_r
+            ):
+                mfe_r = realized_r
+
+                if exit_price is not None:
+                    mfe_price = float(
+                        exit_price
+                    )
+                    mfe_ts_ms = int(
+                        close_ms
+                    )
+                    mfe_source = (
+                        "BROKER_EXIT_REALIZED_FLOOR"
+                    )
+
+                floor_applied = True
+
+            elif (
+                realized_r < 0
+                and mae_r > realized_r
+            ):
+                mae_r = realized_r
+
+                if exit_price is not None:
+                    mae_price = float(
+                        exit_price
+                    )
+                    mae_ts_ms = int(
+                        close_ms
+                    )
+                    mae_source = (
+                        "BROKER_EXIT_REALIZED_FLOOR"
+                    )
+
+                floor_applied = True
+
+        entry_minute_ms = (
+            entry_ms // 60_000
+        ) * 60_000
+
+        close_minute_ms = (
+            close_ms // 60_000
+        ) * 60_000
+
+        expected_bars = int(
+            (
+                close_minute_ms
+                - entry_minute_ms
+            )
+            // 60_000
+        ) + 1
+
+        observed_bars = int(
+            _safe_int(
+                live.get(
+                    "observed_m1_bars"
+                ),
+                0,
+            )
+            or 0
+        )
+
+        internal_gap_count = int(
+            _safe_int(
+                live.get(
+                    "internal_gap_count"
+                ),
+                live.get("gap_count")
+                or 0,
+            )
+            or 0
+        )
+
+        history_truncated_bars = int(
+            _safe_int(
+                live.get(
+                    "history_truncated_bars"
+                ),
+                0,
+            )
+            or 0
+        )
+
+        coverage_pct = (
+            round(
+                min(
+                    100.0,
+                    observed_bars
+                    / expected_bars
+                    * 100.0,
+                ),
+                2,
+            )
+            if expected_bars > 0
+            else 0.0
+        )
+        retained_expected_bars = max(
+            0,
+            expected_bars
+            - history_truncated_bars,
+        )
+
+        retained_coverage_pct = (
+            round(
+                min(
+                    100.0,
+                    observed_bars
+                    / retained_expected_bars
+                    * 100.0,
+                ),
+                2,
+            )
+            if retained_expected_bars > 0
+            else 0.0
+        )
+
+        first_partial = bool(
+            entry_ms % 60_000
+        )
+
+        last_partial = bool(
+            close_ms % 60_000
+        )
+
+        live_samples = int(
+            _safe_int(
+                live.get(
+                    "live_price_samples"
+                ),
+                0,
+            )
+            or 0
+        )
+
+        first_observed_ms = _norm_ms(live.get("first_m1_open_ms") or 0)
+        last_observed_ms = _norm_ms(live.get("last_m1_open_ms") or 0)
+        leading_unobserved_bars = (
+            max(0, int((first_observed_ms - entry_minute_ms) // 60_000))
+            if first_observed_ms > entry_minute_ms else 0
+        )
+        trailing_unobserved_bars = (
+            max(0, int((close_minute_ms - last_observed_ms) // 60_000))
+            if last_observed_ms > 0 and close_minute_ms > last_observed_ms
+            else expected_bars if last_observed_ms <= 0 else 0
+        )
+
+        # -------------------------------------------------
+        # Confidence policy
+        # -------------------------------------------------
+        if (
+            coverage_pct >= 95.0
+            and internal_gap_count == 0
+            and history_truncated_bars == 0
+            and observed_bars > 0
+        ):
+            confidence = "HIGH"
+
+        elif (
+            coverage_pct >= 70.0
+            and observed_bars > 0
+        ):
+            confidence = "MEDIUM"
+
+        elif (
+            observed_bars > 0
+            or live_samples > 0
+        ):
+            confidence = "LOW"
+
+        else:
+            confidence = "UNAVAILABLE"
+
+        # Only high-coverage records may later be used to
+        # tune entry gates or exits automatically.
+        eligible = bool(
+            confidence == "HIGH"
+            and coverage_pct >= 95.0
+            and internal_gap_count == 0
+            and history_truncated_bars == 0
+
+        )
+
+        if confidence == "HIGH":
+            coverage_status = "COMPLETE"
+            confidence_reason = "M1_LIFETIME_COVERAGE_GE_95_PCT"
+        elif leading_unobserved_bars and trailing_unobserved_bars:
+            coverage_status = "PARTIAL_BOTH_BOUNDARIES"
+            confidence_reason = "M1_LEADING_AND_TRAILING_COVERAGE_MISSING"
+        elif leading_unobserved_bars:
+            coverage_status = "PARTIAL_LEADING"
+            confidence_reason = "M1_HISTORY_BEGAN_AFTER_ENTRY"
+        elif trailing_unobserved_bars:
+            coverage_status = "PARTIAL_TRAILING"
+            confidence_reason = "M1_FEED_DID_NOT_REACH_BROKER_CLOSE"
+        else:
+            coverage_status = "PARTIAL_INTERNAL_OR_SPARSE"
+            confidence_reason = "M1_LIFETIME_COVERAGE_BELOW_95_PCT"
+
+        pipf = _pip(
+            record.get("symbol")
+        )
+
+        return {
+            "mfe_r": round(
+                float(mfe_r),
+                4,
+            ),
+            "mae_r": round(
+                float(mae_r),
+                4,
+            ),
+
+            "mfe_price": round(
+                float(mfe_price),
+                8,
+            ),
+            "mae_price": round(
+                float(mae_price),
+                8,
+            ),
+
+            "mfe_pips": (
+                round(
+                    abs(
+                        float(mfe_price)
+                        - float(entry)
+                    )
+                    / pipf,
+                    1,
+                )
+                if pipf
+                else None
+            ),
+
+            "mae_pips": (
+                round(
+                    abs(
+                        float(mae_price)
+                        - float(entry)
+                    )
+                    / pipf,
+                    1,
+                )
+                if pipf
+                else None
+            ),
+
+            "mfe_bar_ts_ms": (
+                int(mfe_ts_ms)
+                if mfe_ts_ms
+                else None
+            ),
+
+            "mae_bar_ts_ms": (
+                int(mae_ts_ms)
+                if mae_ts_ms
+                else None
+            ),
+
+            "mfe_price_source": (
+                mfe_source
+            ),
+
+            "mae_price_source": (
+                mae_source
+            ),
+
+            "excursion_source": (
+                "LIVE_M1_ACCUMULATOR"
+            ),
+
+            "excursion_timeframe": "M1",
+
+            "excursion_precision": (
+                "high"
+                if confidence == "HIGH"
+                else (
+                    "medium"
+                    if confidence == "MEDIUM"
+                    else "low"
+                )
+            ),
+
+            "excursion_confidence": (
+                confidence
+            ),
+
+            "excursion_bars_used": (
+                observed_bars
+            ),
+
+            "excursion_expected_bars": (
+                expected_bars
+            ),
+
+            "excursion_observed_bars": (
+                observed_bars
+            ),
+
+            "excursion_coverage_pct": (
+                coverage_pct
+            ),
+
+            "excursion_gap_count": (
+                internal_gap_count
+            ),
+
+            "excursion_internal_gap_count": (
+                internal_gap_count
+            ),
+
+            "excursion_history_truncated_bars": (
+                history_truncated_bars
+            ),
+
+            "excursion_retained_expected_bars": (
+                retained_expected_bars
+            ),
+
+            "excursion_retained_coverage_pct": (
+                retained_coverage_pct
+            ),
+
+            "excursion_leading_unobserved_bars": leading_unobserved_bars,
+            "excursion_trailing_unobserved_bars": trailing_unobserved_bars,
+            "excursion_coverage_status": coverage_status,
+            "excursion_confidence_reason": confidence_reason,
+
+            "excursion_first_bar_partial": (
+                first_partial
+            ),
+
+            "excursion_last_bar_partial": (
+                last_partial
+            ),
+
+            "excursion_boundary_precision": (
+                live.get(
+                    "boundary_precision"
+                )
+                or "M1_OHLC_PARTIAL_BOUNDARIES"
+            ),
+
+            "excursion_boundary_extrema_exact": (
+                False
+            ),
+
+            "excursion_window_start_utc_ms": (
+                int(entry_ms)
+            ),
+
+            "excursion_window_end_utc_ms": (
+                int(close_ms)
+            ),
+
+            "excursion_broker_offset_minutes": 0,
+
+            "excursion_partial_bars_excluded": (
+                False
+            ),
+
+            "excursion_realized_floor_applied": (
+                floor_applied
+            ),
+
+            "excursion_initial_sl_source": (
+                "ENTRY_SNAPSHOT"
+            ),
+
+            "excursion_eligible_for_optimization": (
+                eligible
+            ),
+
+            "excursion_live_price_samples": (
+                live_samples
+            ),
+
+            "excursion_finalized_at_ms": (
+                _now_ms()
+            ),
+        }
+
+    except Exception as exc:
+        log.warning(
+            "analytics: live excursion finalize "
+            "failed ticket=%s err=%r",
+            (
+                record.get("mt5_ticket")
+                if isinstance(record, dict)
+                else None
+            ),
+            exc,
+        )
+        return {}
+
+
 def _recompute_excursion(
     record: dict,
     bars_h1: list | None = None,
     fetch_h1_bars=None,
+    fetch_m1_bars=None,
 ) -> dict:
-    """Rebuild excursion from the record's current, final timestamp truth.
+    """
+    Rebuild excursion from the record's current final truth.
 
-    Used by normal finalization, broker-truth reconciliation and historical
-    repair. Existing excursion fields are always cleared first so approximate
-    windows can never survive a broker-truth upgrade.
+    Priority:
+      1. Persisted live M1 accumulator
+      2. Current rolling M1 Redis snapshot
+      3. Conservative H1 fallback
+
+    Every path writes source, confidence, coverage and optimization eligibility.
     """
     _clear_excursion_fields(record)
 
-    entry = _safe_float(record.get("entry_price"))
-    sl = _safe_float(record.get("sl_price"))
+    entry = _safe_float(
+        record.get("entry_price")
+    )
+
+    sl = _safe_float(
+        record.get("sl_price")
+    )
+
     if entry is None or sl is None:
         return {}
 
-    bars = list(bars_h1 or [])
-    if not bars and fetch_h1_bars is not None:
-        start_ms = _norm_ms(
-            record.get("broker_open_time_utc_ms")
-            or record.get("enqueue_timestamp")
-            or record.get("opened_at_ms")
-            or 0
+    # -------------------------------------------------
+    # 1. Persisted live M1 accumulator
+    # -------------------------------------------------
+    live_result = (
+        _finalize_live_excursion(
+            record
         )
-        end_ms = _norm_ms(
-            record.get("broker_close_time_utc_ms")
-            or record.get("close_timestamp")
-            or record.get("broker_close_time_ms")
-            or _now_ms()
+    )
+
+    if live_result:
+        record.update(
+            live_result
         )
-        device_id = _resolve_device(record)
+        return live_result
+
+    start_ms = _norm_ms(
+        record.get(
+            "broker_open_time_utc_ms"
+        )
+        or record.get(
+            "enqueue_timestamp"
+        )
+        or record.get(
+            "opened_at_ms"
+        )
+        or 0
+    )
+
+    end_ms = _norm_ms(
+        record.get(
+            "broker_close_time_utc_ms"
+        )
+        or record.get(
+            "close_timestamp"
+        )
+        or record.get(
+            "broker_close_time_ms"
+        )
+        or _now_ms()
+    )
+
+    device_id = _resolve_device(
+        record
+    )
+
+    # -------------------------------------------------
+    # 2. Current rolling M1 snapshot
+    # -------------------------------------------------
+    m1_fetcher = (
+        fetch_m1_bars
+        or default_fetch_m1_bars
+    )
+
+    bars_m1 = []
+
+    try:
+        bars_m1 = m1_fetcher(
+            record.get("symbol"),
+            start_ms,
+            end_ms,
+            device_id,
+        ) or []
+
+    except TypeError:
+        try:
+            bars_m1 = m1_fetcher(
+                record.get("symbol"),
+                start_ms,
+                end_ms,
+            ) or []
+        except Exception:
+            bars_m1 = []
+
+    except Exception:
+        bars_m1 = []
+
+    if bars_m1:
+        m1_result = _excursion_r_m1(
+            record,
+            bars_m1,
+            entry,
+            sl,
+        )
+
+        if m1_result:
+            # Rolling M1 may cover only the final five hours.
+            # Its own coverage calculation determines whether
+            # it is eligible for optimization.
+            record.update(
+                m1_result
+            )
+            return m1_result
+
+    # -------------------------------------------------
+    # 3. Conservative H1 fallback
+    # -------------------------------------------------
+    bars = list(
+        bars_h1 or []
+    )
+
+    if (
+        not bars
+        and fetch_h1_bars is not None
+    ):
         try:
             bars = fetch_h1_bars(
                 record.get("symbol"),
@@ -6290,6 +10213,7 @@ def _recompute_excursion(
                 end_ms,
                 device_id,
             ) or []
+
         except TypeError:
             bars = fetch_h1_bars(
                 record.get("symbol"),
@@ -6297,10 +10221,33 @@ def _recompute_excursion(
                 end_ms,
             ) or []
 
-    result = _excursion_r(record, bars, entry, sl)
-    if result:
-        record.update(result)
-    return result
+        except Exception:
+            bars = []
+
+    h1_result = _excursion_r(
+        record,
+        bars,
+        entry,
+        sl,
+    )
+
+    if h1_result:
+        h1_result.update({
+            "excursion_timeframe": "H1",
+            "excursion_confidence": "LOW",
+            "excursion_eligible_for_optimization": False,
+            "excursion_initial_sl_source": "ENTRY_SNAPSHOT",
+            "excursion_fallback_reason": (
+                "LIVE_M1_AND_ROLLING_M1_UNAVAILABLE"
+            ),
+            "excursion_finalized_at_ms": _now_ms(),
+        })
+
+        record.update(
+            h1_result
+        )
+
+    return h1_result
 
 # -- FINALIZE + APPEND --------------------------------------------------------
 def _jsonl_has_ticket_unlocked(ticket: str) -> bool:
@@ -6508,6 +10455,159 @@ def _apply_news_during_trade(snap: dict) -> None:
             snap.get("mt5_ticket"),
             exc,
         )
+def _phase1_level_change(record: dict, kind: str) -> dict:
+    original = _safe_float(record.get(f"{kind}_original"))
+    final = _safe_float(record.get(f"{kind}_final"))
+    entry = _safe_float(record.get("entry_price"))
+    symbol = str(record.get("symbol") or "")
+    side = str(record.get("side") or "").upper().strip()
+    delta = final - original if original is not None and final is not None else None
+    # The module has no broker symbol-spec/tick-size snapshot.  Use its existing
+    # pip unit as the conservative normalization unit; <= half a unit is broker
+    # precision noise, while larger changes remain UNKNOWN without provenance.
+    tick = _pip(symbol) if symbol else None
+    ticks = delta / tick if delta is not None and tick else None
+    changed = delta is not None and abs(delta) > 1e-9
+    change_type = "NONE"
+    evidence = {"original": original, "final": final, "delta_price": delta,
+                "normalization_unit": tick, "delta_ticks": ticks,
+                "normalization_unit_source": "EXISTING_SYMBOL_PIP"}
+    if changed:
+        if tick and abs(delta) <= tick * 0.500001:
+            change_type = "BROKER_ROUNDING"
+        elif kind == "sl" and entry is not None and final is not None and tick and abs(final - entry) <= tick:
+            change_type = "BREAK_EVEN"
+        elif kind == "sl" and entry is not None and side in ("BUY", "SELL"):
+            if (side == "BUY" and final > entry) or (side == "SELL" and final < entry):
+                change_type = "PROFIT_LOCK"
+            else:
+                original_risk = abs(original - entry) if original is not None else None
+                final_risk = abs(final - entry)
+                change_type = (
+                    "RISK_REDUCED" if original_risk is not None and final_risk < original_risk
+                    else "RISK_INCREASED" if original_risk is not None and final_risk > original_risk
+                    else "UNKNOWN"
+                )
+        elif kind == "tp" and side in ("BUY", "SELL"):
+            favorable_delta = delta if side == "BUY" else -delta
+            change_type = "TP_EXTENDED" if favorable_delta > 0 else "TP_REDUCED"
+        else:
+            # The closed-trade payload does not prove who/what changed a level.
+            # Preserve uncertainty instead of inventing trailing/manual intent.
+            change_type = "UNKNOWN"
+    return {"change_type": change_type, "evidence": evidence}
+
+
+def _apply_phase1_close_analytics(snap: dict) -> None:
+    """Add deterministic close-time summaries immediately before JSONL write."""
+    if not isinstance(snap, dict):
+        return
+    try:
+        sl_change = _phase1_level_change(snap, "sl")
+        tp_change = _phase1_level_change(snap, "tp")
+        snap["sl_change_type"] = sl_change["change_type"]
+        snap["tp_change_type"] = tp_change["change_type"]
+        snap["sl_delta"] = sl_change["evidence"]["delta_price"]
+        snap["tp_delta"] = tp_change["evidence"]["delta_price"]
+        snap["sl_change_ticks"] = sl_change["evidence"]["delta_ticks"]
+        snap["tp_change_ticks"] = tp_change["evidence"]["delta_ticks"]
+        snap["tp_sl_change_classification"] = {
+            "schema_version": 1, "sl": sl_change, "tp": tp_change,
+            "broker_normalized": (
+                sl_change["change_type"] in ("NONE", "BROKER_ROUNDING") and
+                tp_change["change_type"] in ("NONE", "BROKER_ROUNDING")
+            ), "analytics_only": True,
+        }
+
+        reason = str(snap.get("exit_reason") or "").lower()
+        net = _safe_float(snap.get("net_profit"))
+        rr = _safe_float(snap.get("realized_r"))
+        outcome = ("TP_HIT" if reason == "tp" else "SL_HIT" if reason == "sl" else
+                   "BREAK_EVEN" if (rr is not None and abs(rr) <= 0.05) or (rr is None and net is not None and abs(net) <= 0.01) else
+                   "MANUAL_CLOSE" if reason == "manual" else "BROKER_CLOSE")
+        snap["outcome_classification"] = outcome
+        snap["outcome_classification_evidence"] = {
+            "exit_reason": reason or None, "exit_reason_source": snap.get("exit_reason_source"),
+            "realized_r": rr, "realized_r_net": snap.get("realized_r_net"), "net_profit": net,
+            "broker_verified": bool(snap.get("broker_verified")),
+        }
+
+        mfe = _safe_float(snap.get("mfe_r")); mae = _safe_float(snap.get("mae_r"))
+        behavior = []
+        def add(label, facts): behavior.append(_phase1_label(label, facts))
+        if mae is not None and mae <= -0.50 and (mfe is None or mfe < 0.10):
+            add("IMMEDIATE_ADVERSE_MOVE", {"mae_r": mae, "mfe_r": mfe, "threshold_mae_r": -0.50})
+        if mfe is not None and mfe < 0.10:
+            add("NO_MEANINGFUL_FAVORABLE_MOVE", {"mfe_r": mfe, "threshold_r": 0.10})
+        if mfe is not None and mfe >= 0.50 and outcome in ("SL_HIT", "BREAK_EVEN"):
+            add("FAVORABLE_THEN_REVERSED", {"mfe_r": mfe, "outcome": outcome})
+        if outcome == "TP_HIT" and mae is not None and mae > -0.25:
+            add("CLEAN_TREND_FOLLOW_THROUGH", {"mae_r": mae, "outcome": outcome, "threshold_mae_r": -0.25})
+        dxy_summary = snap.get("dxy_m15_trade_summary") if isinstance(snap.get("dxy_m15_trade_summary"), dict) else {}
+        if str(dxy_summary.get("trade_alignment") or dxy_summary.get("final_alignment") or "").upper() == "AGAINST":
+            add("REAL_DXY_TURNED_AGAINST", {"source": "REAL_DXY", "trade_alignment": "AGAINST"})
+        snap["trade_behavior_flags"] = [x["classification"] for x in behavior]
+        snap["trade_behavior_classifications"] = behavior
+
+        missing = []
+        def require(ok, name):
+            if not ok: missing.append(name)
+            return bool(ok)
+        entry_ok = require(bool(snap.get("entry_price") is not None and snap.get("enqueue_timestamp")), "ENTRY_SNAPSHOT")
+        broker_entry_ok = require(bool(snap.get("broker_open_time_ms") and snap.get("mt5_ticket")), "BROKER_ENTRY_TRUTH")
+        broker_exit_ok = require(bool(snap.get("broker_verified") and snap.get("exit_price") is not None), "BROKER_EXIT_TRUTH")
+        zone_ok = require(bool(snap.get("zone_low") is not None or snap.get("zone_level") is not None), "ZONE_SNAPSHOT")
+        rc_ok = require(bool(snap.get("rc_found") and None not in (snap.get("rc_open_ms"), snap.get("rc_open"), snap.get("rc_high"), snap.get("rc_low"), snap.get("rc_close"))), "ENTRY_RC")
+        prediction_ok = require(bool(isinstance(snap.get("setup_analysis"), dict)), "PREDICTION_SNAPSHOT")
+        trend_ok = require(bool(snap.get("h1_20_direction") is not None), "TREND_CONTEXT")
+        dxy_ok = require(bool(snap.get("dxy_available")), "REAL_DXY_ENTRY_SNAPSHOT")
+        risk_ok = require(bool(snap.get("sl_price") is not None and snap.get("tp_price") is not None and snap.get("risk_usd") is not None), "RISK_CONTEXT")
+        outcome_ok = require(bool(snap.get("exit_reason") and (rr is not None or net is not None)), "OUTCOME")
+        class_ok = require(bool(snap.get("entry_situation_classifications") is not None and snap.get("trade_behavior_classifications") is not None), "CLASSIFICATIONS")
+        runtime_present = bool(snap.get("excursion_source") and mfe is not None and mae is not None)
+        mfe_sign_ok = bool(mfe is None or mfe >= 0.0)
+        mae_sign_ok = bool(mae is None or mae <= 0.0)
+        excursion_quality_ok = bool(
+            snap.get("excursion_eligible_for_optimization")
+        )
+        runtime_ok = bool(
+            runtime_present
+            and mfe_sign_ok
+            and mae_sign_ok
+            and excursion_quality_ok
+        )
+        warnings = []
+        if snap.get("rc_source") != "entry_confirmation": warnings.append("RC_NOT_FROM_ENTRY_CONFIRMATION")
+        if not runtime_present: warnings.append("RUNTIME_EXCURSION_INCOMPLETE")
+        elif not excursion_quality_ok: warnings.append("RUNTIME_EXCURSION_LOW_COVERAGE")
+        if not mfe_sign_ok: warnings.append("MFE_SIGN_INVALID")
+        if not mae_sign_ok: warnings.append("MAE_SIGN_INVALID")
+        eligibility = {
+            "entry_quality": entry_ok and zone_ok and rc_ok and prediction_ok and trend_ok and risk_ok,
+            "outcome_analysis": broker_entry_ok and broker_exit_ok and outcome_ok and risk_ok,
+            "real_dxy_analysis": dxy_ok and entry_ok,
+            "runtime_management": broker_entry_ok and broker_exit_ok and runtime_ok,
+        }
+        snap["learning_eligibility"] = eligibility
+        snap["pipeline_validation"] = {
+            "schema_version": 1, "entry_snapshot_complete": entry_ok,
+            "broker_entry_verified": broker_entry_ok, "broker_exit_verified": broker_exit_ok,
+            "zone_complete": zone_ok, "rc_complete": rc_ok,
+            "prediction_complete": prediction_ok, "trend_context_complete": trend_ok,
+            "real_dxy_entry_complete": dxy_ok,
+            "real_dxy_tracking_complete": bool(dxy_summary), "risk_context_complete": risk_ok,
+            "sl_tp_truth_complete": bool(sl_change and tp_change), "outcome_complete": outcome_ok,
+            "classification_complete": class_ok,
+            "excursion_sign_valid": bool(mfe_sign_ok and mae_sign_ok),
+            "excursion_quality_complete": excursion_quality_ok,
+            "missing_fields": missing,
+            "warnings": warnings, "ready_for_learning": all(eligibility.values()),
+            "analytics_only": True,
+        }
+    except Exception as exc:
+        log.warning("analytics: Phase-1 close analytics failed: %s", exc)
+
+
 def finalize_ticket(ticket: str, bars_h1: list) -> bool:
     """Read snapshot, approximate exit, append JSONL, delete snapshot.
     Snapshot is deleted ONLY after the durable JSONL write succeeds."""
@@ -6578,7 +10678,7 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
             snap["exit_deal_timeout"] = False
 
         else:
-            # -- Deal not present yet — it may still be arriving (the agent's deal
+            # -- Deal not present yet   it may still be arriving (the agent's deal
             #    push races this sweep). Defer finalize and retry on later sweeps;
             #    only approximate after a real timeout so nothing hangs forever. --
             _now = _now_ms()
@@ -6648,6 +10748,13 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
             _recompute_excursion(snap, bars_h1=bars_h1)
         except Exception as _e:
             log.warning("analytics: excursion compute failed: %s", _e)
+
+        # Entry expectation remains immutable; actual behavior is derived only
+        # after the full trade path is available. Analytics-only.
+        try:
+            _merge_setup_actual(snap, bars_h1)
+        except Exception as _e:
+            log.warning("analytics: setup behavior classification failed: %s", _e)
         # Analyze whether price reached the entry-frozen opposing
         # liquidity target during this trade.
         try:
@@ -6671,7 +10778,7 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
         snap["_status"] = "closed"
        
 
-        # -- §18: account-after / FTMO-after (no agent change — re-read at close) --
+        # --  18: account-after / FTMO-after (no agent change   re-read at close) --
         try:
             close_uid = str(
                 snap.get("uid")
@@ -6726,7 +10833,7 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
 
         except Exception:
             snap["broker_holding_minutes"] = None
-        # -- §18: trade classification from data on hand --
+        # --  18: trade classification from data on hand --
         try:
             _apply_realized_r_net_and_outcome(snap)
             rr = _safe_float(snap.get("realized_r"))
@@ -6795,6 +10902,10 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
                 ticket,
                 exc,
             )
+
+        # Final additive Phase-1 record.  Entry classifications read only the
+        # immutable snapshot; close classifications read verified outcome/path.
+        _apply_phase1_close_analytics(snap)
         
         if _append_jsonl(snap):
             R.delete(SNAP_PREFIX + ticket)
@@ -6937,7 +11048,7 @@ def reconcile_pending_broker_truth(fetch_h1_bars=None) -> dict:
                             )
 
                             if isinstance(be, dict):
-                                # Build on a COPY — never mutate the real row
+                                # Build on a COPY   never mutate the real row
                                 # until the broker result is validated.
                                 upgraded_row = dict(r)
                                 upgraded_row.update(be)
@@ -7103,6 +11214,12 @@ def reconcile_pending_broker_truth(fetch_h1_bars=None) -> dict:
                                         _dxy_err,
                                     )
 
+                                # Broker truth changes every close-derived
+                                # classification.  Rebuild these only after the
+                                # authoritative deal, excursion and DXY lifetime
+                                # have all been reconciled.
+                                _apply_phase1_close_analytics(upgraded_row)
+
                                 rows.append(upgraded_row)
                                 upgraded_tickets.add(tk)
                                 out["upgraded"] += 1
@@ -7188,7 +11305,7 @@ def reconcile_pending_broker_truth(fetch_h1_bars=None) -> dict:
                     "reconcile: JSONL upgraded but pending cleanup failed "
                     "tickets=%s err=%s", sorted(upgraded_tickets), exc)
 
-        # deal exists but no JSONL row — a real upstream bug. Surface, keep pending.
+        # deal exists but no JSONL row   a real upstream bug. Surface, keep pending.
         orphans = ready - matched_tickets
         for tk in sorted(orphans):
             log.error(                                             
@@ -7278,7 +11395,7 @@ def _recover_analytics_uid(
         return "", "NO_TICKET"
 
     # ---------------------------------------------------------
-    # 1. Open strategy ledger — strongest ownership source
+    # 1. Open strategy ledger   strongest ownership source
     # ---------------------------------------------------------
     try:
         for ledger_key in R.scan_iter("xtl:strategy:oppt:open:*"):
@@ -7384,6 +11501,1477 @@ def _recover_analytics_uid(
         )
 
     return "", "NOT_FOUND"
+
+
+
+
+def _load_broker_position_for_snapshot(
+    R,
+    snap: dict,
+) -> dict | None:
+    """
+    Find the exact live broker position for an analytics snapshot.
+
+    Priority:
+      1. Frozen entry device/account.
+      2. Fallback across live MT5 position snapshots when the Agent device ID
+         changed after reinstall/re-registration.
+
+    A fallback is accepted only when exactly one live ticket match exists.
+    """
+    try:
+        ticket = str(
+            snap.get("mt5_ticket")
+            or ""
+        ).strip()
+
+        device_id = str(
+            snap.get("device_id")
+            or ""
+        ).strip()
+
+        account_type = str(
+            snap.get("mt5_account")
+            or snap.get("account_type")
+            or "demo"
+        ).strip().lower()
+
+        if not ticket:
+            return None
+
+        def _positions_from_key(
+            key: str,
+        ) -> list:
+            raw = R.get(key)
+            positions = _json_load(
+                raw,
+                [],
+            )
+
+            if isinstance(positions, dict):
+                positions = (
+                    positions.get("positions")
+                    or positions.get("rows")
+                    or positions.get("items")
+                    or []
+                )
+
+            return (
+                positions
+                if isinstance(positions, list)
+                else []
+            )
+
+        def _find_ticket(
+            positions: list,
+        ) -> dict | None:
+            for position in positions:
+                if not isinstance(
+                    position,
+                    dict,
+                ):
+                    continue
+
+                position_ticket = str(
+                    position.get("ticket")
+                    or position.get(
+                        "position_ticket"
+                    )
+                    or position.get(
+                        "mt5_ticket"
+                    )
+                    or ""
+                ).strip()
+
+                if position_ticket == ticket:
+                    return dict(position)
+
+            return None
+
+        # -------------------------------------------------
+        # Primary: exact frozen device/account.
+        # -------------------------------------------------
+        if device_id:
+            exact_key = (
+                f"xtl:mt5:pos:"
+                f"{device_id}:{account_type}"
+            )
+
+            exact_position = _find_ticket(
+                _positions_from_key(
+                    exact_key
+                )
+            )
+
+            if exact_position:
+                exact_position[
+                    "_analytics_position_key"
+                ] = exact_key
+
+                exact_position[
+                    "_analytics_device_resolution"
+                ] = "ENTRY_DEVICE"
+
+                return exact_position
+
+        # -------------------------------------------------
+        # Fallback:
+        # Agent reinstall/re-registration may change the
+        # device ID while the same broker position remains
+        # open. Search current broker snapshots by ticket.
+        #
+        # This runs only after the exact lookup fails.
+        # -------------------------------------------------
+        matches = []
+
+        for raw_key in R.scan_iter(
+            "xtl:mt5:pos:*"
+        ):
+            key = (
+                raw_key.decode(
+                    "utf-8",
+                    "ignore",
+                )
+                if isinstance(
+                    raw_key,
+                    (bytes, bytearray),
+                )
+                else str(raw_key)
+            )
+
+            # Prefer the same account type.
+            if not key.endswith(
+                f":{account_type}"
+            ):
+                continue
+
+            position = _find_ticket(
+                _positions_from_key(key)
+            )
+
+            if not position:
+                continue
+
+            key_parts = key.split(":")
+
+            resolved_device_id = (
+                key_parts[-2]
+                if len(key_parts) >= 2
+                else ""
+            )
+
+            matches.append({
+                "position": position,
+                "key": key,
+                "device_id": (
+                    resolved_device_id
+                ),
+            })
+
+        # Ticket must resolve unambiguously.
+        if len(matches) != 1:
+            if len(matches) > 1:
+                log.error(
+                    "analytics: broker position "
+                    "ambiguous ticket=%s "
+                    "entry_device=%s matches=%s",
+                    ticket,
+                    device_id,
+                    [
+                        item.get("key")
+                        for item in matches
+                    ],
+                )
+
+            return None
+
+        selected = matches[0]
+
+        position = dict(
+            selected["position"]
+        )
+
+        resolved_device_id = str(
+            selected.get("device_id")
+            or ""
+        ).strip()
+
+        position[
+            "_analytics_position_key"
+        ] = selected["key"]
+
+        position[
+            "_analytics_device_resolution"
+        ] = "TICKET_FALLBACK"
+
+        position[
+            "_analytics_original_device_id"
+        ] = device_id or None
+
+        position[
+            "_analytics_resolved_device_id"
+        ] = resolved_device_id or None
+
+        # Repair the in-memory snapshot. The caller persists
+        # this snapshot when update_open_trade_snapshot()
+        # returns True.
+        if (
+            resolved_device_id
+            and resolved_device_id
+            != device_id
+        ):
+            snap[
+                "entry_device_id"
+            ] = (
+                snap.get("entry_device_id")
+                or device_id
+                or None
+            )
+
+            snap[
+                "device_id"
+            ] = resolved_device_id
+
+            snap[
+                "analytics_device_rebound"
+            ] = True
+
+            snap[
+                "analytics_device_rebound_at_ms"
+            ] = _now_ms()
+
+            snap[
+                "analytics_device_rebound_reason"
+            ] = (
+                "LIVE_TICKET_FOUND_ON_NEW_DEVICE"
+            )
+
+            log.warning(
+                "analytics: live position device "
+                "rebound ticket=%s "
+                "old_device=%s new_device=%s "
+                "key=%s",
+                ticket,
+                device_id,
+                resolved_device_id,
+                selected["key"],
+            )
+
+        return position
+
+    except Exception as exc:
+        log.warning(
+            "analytics: broker position lookup "
+            "failed ticket=%s err=%r",
+            (
+                snap.get("mt5_ticket")
+                if isinstance(snap, dict)
+                else None
+            ),
+            exc,
+        )
+        return None
+
+
+def _compact_live_dxy_snapshot(snap: dict, captured_ms: int) -> dict:
+    """Capture a compact current DXY view using the existing canonical/fallback reader."""
+    try:
+        full = read_dxy_m15_at_entry(
+            device_id=snap.get("device_id"),
+            symbol=str(snap.get("symbol") or "").upper().strip(),
+            side=str(snap.get("side") or "").upper().strip(),
+            entry_ms=int(captured_ms),
+            trade_firm=snap.get("prop_firm"),
+            trade_profile_id=snap.get("profile_id"),
+        )
+        selected = full.get("selected") if isinstance(full, dict) else {}
+        if not isinstance(selected, dict):
+            selected = {}
+
+        return {
+            "captured_at_ms": int(captured_ms),
+            "selected_source": full.get("selected_source") if isinstance(full, dict) else None,
+            "selected_device_id": full.get("selected_device_id") if isinstance(full, dict) else None,
+            "fallback_used": bool(full.get("fallback_used")) if isinstance(full, dict) else False,
+            "available": bool(selected.get("available")),
+            "fresh": bool(selected.get("fresh")),
+            "status": selected.get("status"),
+            "direction": selected.get("direction"),
+            "trade_alignment": selected.get("trade_alignment"),
+            "confidence": selected.get("confidence"),
+            "directional_move_atr": selected.get("directional_move_atr"),
+            "max_favorable_atr": selected.get("max_favorable_atr"),
+            "max_adverse_atr": selected.get("max_adverse_atr"),
+            "last_event_status": selected.get("last_event_status"),
+            "last_event_reason": selected.get("last_event_reason"),
+            "last_event_ms": selected.get("last_event_ms"),
+            "state_age_ms": selected.get("state_age_ms"),
+            "reasoning": selected.get("reasoning"),
+            "unavailable_reason": selected.get("unavailable_reason"),
+            "shadow_only": True,
+        }
+    except Exception as exc:
+        return {
+            "captured_at_ms": int(captured_ms),
+            "available": False,
+            "fresh": False,
+            "capture_error": f"{type(exc).__name__}:{exc}",
+            "shadow_only": True,
+        }
+
+
+def _dxy_milestone_signature(dxy: dict) -> str:
+    if not isinstance(dxy, dict):
+        return ""
+    fields = (
+        "selected_source",
+        "available",
+        "fresh",
+        "status",
+        "direction",
+        "trade_alignment",
+        "confidence",
+        "last_event_status",
+        "last_event_reason",
+    )
+    return "|".join(str(dxy.get(field) or "") for field in fields)
+
+
+def _append_exit_candidate(
+    history: dict,
+    *,
+    key: str,
+    ts_ms: int,
+    price: float,
+    current_r: float,
+    reasons: list[str],
+    dxy: dict | None,
+) -> None:
+    keys = history.setdefault("exit_candidate_keys", [])
+    if key in keys:
+        return
+
+    rows = history.setdefault("exit_candidates", [])
+    rows.append({
+        "ts_ms": int(ts_ms),
+        "price": round(float(price), 8),
+        "trade_r": round(float(current_r), 4),
+        "candidate_action": "CONSIDER_EXIT",
+        "reasons": list(reasons),
+        "dxy_snapshot": dxy if isinstance(dxy, dict) else None,
+        "analytics_only": True,
+        "order_modified": False,
+        "sl_modified": False,
+        "tp_modified": False,
+        "trade_closed": False,
+    })
+    keys.append(key)
+
+    if len(rows) > MILESTONE_MAX_EXIT_CANDIDATES:
+        del rows[:-MILESTONE_MAX_EXIT_CANDIDATES]
+    if len(keys) > MILESTONE_MAX_EXIT_CANDIDATES:
+        del keys[:-MILESTONE_MAX_EXIT_CANDIDATES]
+
+
+def _update_live_m1_excursion_accumulator(
+    snap: dict,
+    broker_position: dict,
+    *,
+    now_ms: int,
+) -> bool:
+    """
+    Persist compact M1/live-price excursion evidence for one active trade.
+
+    Analytics-only:
+      - does not modify orders
+      - does not modify SL/TP
+      - does not affect gates or execution
+
+    M1 candles provide authoritative intraminute high/low.
+    Broker price_current supplements the currently forming minute.
+
+    MT5 rates.time stored in Redis is Unix epoch UTC seconds, so no broker
+    timezone offset is applied here.
+    """
+    try:
+        if (
+            not isinstance(snap, dict)
+            or not isinstance(broker_position, dict)
+        ):
+            return False
+
+        symbol = str(
+            snap.get("symbol")
+            or broker_position.get("symbol")
+            or ""
+        ).upper().strip()
+
+        device_id = str(
+            _resolve_device(snap)
+            or snap.get("device_id")
+            or ""
+        ).strip()
+
+        if not symbol or not device_id:
+            return False
+
+        entry_price = _safe_float(
+            snap.get("entry_price")
+        )
+
+        initial_sl = _safe_float(
+            snap.get("sl_price")
+        )
+
+        live_price = _safe_float(
+            broker_position.get("price_current")
+            or broker_position.get("current_price")
+            or broker_position.get("price")
+        )
+
+        entry_utc_ms = _norm_ms(
+            snap.get("broker_open_time_utc_ms")
+            or snap.get("enqueue_timestamp")
+            or snap.get("opened_at_ms")
+            or 0
+        )
+
+        if (
+            entry_price is None
+            or initial_sl is None
+            or entry_utc_ms <= 0
+        ):
+            return False
+
+        initial_risk = abs(
+            float(entry_price)
+            - float(initial_sl)
+        )
+
+        if initial_risk <= 0:
+            return False
+
+        R = from_app_R()
+
+        m1_key = (
+            f"xtl:ohlc:snap:"
+            f"{device_id}:{symbol}:M1"
+        )
+
+        raw = R.get(m1_key)
+
+        payload = {}
+
+        if raw:
+            if isinstance(
+                raw,
+                (bytes, bytearray),
+            ):
+                raw = raw.decode(
+                    "utf-8",
+                    "ignore",
+                )
+
+            payload = json.loads(raw)
+
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+
+            if not isinstance(payload, dict):
+                payload = {}
+
+        bars = payload.get("bars") or []
+
+        if not isinstance(bars, list):
+            bars = []
+
+        accumulator = snap.get(
+            "excursion_live"
+        )
+
+        if not isinstance(
+            accumulator,
+            dict,
+        ):
+            accumulator = {
+                "version": 1,
+                "coverage_schema_version": 2,
+                "source": (
+                    "LIVE_M1_PLUS_BROKER_PRICE"
+                ),
+                "analytics_only": True,
+
+                "symbol": symbol,
+                "device_id": device_id,
+                "m1_key": m1_key,
+
+                "entry_price": round(
+                    float(entry_price),
+                    8,
+                ),
+                "initial_sl": round(
+                    float(initial_sl),
+                    8,
+                ),
+                "initial_risk_price": round(
+                    float(initial_risk),
+                    8,
+                ),
+                "initial_sl_source": (
+                    "ENTRY_SNAPSHOT"
+                ),
+
+                "entry_utc_ms": int(
+                    entry_utc_ms
+                ),
+                "entry_minute_open_ms": int(
+                    (
+                        entry_utc_ms
+                        // 60_000
+                    )
+                    * 60_000
+                ),
+                "boundary_precision": (
+                    "M1_OHLC_PARTIAL_BOUNDARIES"
+                ),
+                "boundary_extrema_exact": False,
+
+
+                "highest_high": round(float(entry_price), 8),
+                "highest_high_ts_ms": int(entry_utc_ms),
+                "highest_high_source": "ENTRY_BASELINE",
+
+                "lowest_low": round(float(entry_price), 8),
+                "lowest_low_ts_ms": int(entry_utc_ms),
+                "lowest_low_source": "ENTRY_BASELINE",
+
+                "first_m1_open_ms": None,
+                "last_m1_open_ms": None,
+                "observed_m1_bars": 0,
+                "expected_m1_bars_so_far": 0,
+                "coverage_pct_so_far": 0.0,
+
+                "coverage_quality_note": (
+                    "Lifetime coverage includes rolling-history truncation. "
+                    "internal_gap_count counts missing candles only after "
+                    "accumulation begins. Entry/exit boundary candles may "
+                    "contain pre-entry or post-exit movement."
+                ),
+
+                # Candles older than the available rolling M1 snapshot.
+                "history_truncated_bars": 0,
+
+                # Missing candles inside the period actively observed by XTL.
+                "internal_gap_count": 0,
+
+                # Compatibility alias. Keep this equal to internal_gap_count.
+                "gap_count": 0,
+
+                "first_bar_partial": bool(
+                    entry_utc_ms % 60_000
+                ),
+                "last_bar_partial": True,
+
+                "live_price_samples": 0,
+                "last_live_price": None,
+                "last_live_price_ms": None,
+
+                "m1_snapshot_server_received_ms": None,
+                "m1_snapshot_last_closed_ms": None,
+
+                "started_at_ms": int(now_ms),
+                "last_updated_ms": None,
+            }
+
+        changed = False
+
+        previous_last_m1_ms = _safe_int(
+            accumulator.get(
+                "last_m1_open_ms"
+            ),
+            0,
+        ) or 0
+
+        highest_high = _safe_float(
+            accumulator.get(
+                "highest_high"
+            )
+        )
+
+        lowest_low = _safe_float(
+            accumulator.get(
+                "lowest_low"
+            )
+        )
+
+        # Migrate older active accumulators to the exact entry baseline.
+        if highest_high is None or highest_high < float(entry_price):
+            highest_high = float(entry_price)
+            accumulator["highest_high"] = round(highest_high, 8)
+            accumulator["highest_high_ts_ms"] = int(entry_utc_ms)
+            accumulator["highest_high_source"] = "ENTRY_BASELINE"
+            changed = True
+
+        if lowest_low is None or lowest_low > float(entry_price):
+            lowest_low = float(entry_price)
+            accumulator["lowest_low"] = round(lowest_low, 8)
+            accumulator["lowest_low_ts_ms"] = int(entry_utc_ms)
+            accumulator["lowest_low_source"] = "ENTRY_BASELINE"
+            changed = True
+
+        observed = int(
+            _safe_int(
+                accumulator.get(
+                    "observed_m1_bars"
+                ),
+                0,
+            )
+            or 0
+        )
+
+        # -------------------------------------------------
+        # Load the new split coverage fields.
+        #
+        # Older live accumulators stored both rolling-history
+        # truncation and genuine internal gaps in one field:
+        #
+        #     gap_count
+        #
+        # Migrate that legacy value deterministically using
+        # the distance from the entry minute to the first M1
+        # candle that XTL actually observed.
+        # -------------------------------------------------
+        coverage_schema_version = int(
+            _safe_int(
+                accumulator.get(
+                    "coverage_schema_version"
+                ),
+                0,
+            )
+            or 0
+        )
+
+        if coverage_schema_version >= 2:
+            internal_gap_count = int(
+                _safe_int(
+                    accumulator.get(
+                        "internal_gap_count"
+                    ),
+                    0,
+                )
+                or 0
+            )
+
+            history_truncated_bars = int(
+                _safe_int(
+                    accumulator.get(
+                        "history_truncated_bars"
+                    ),
+                    0,
+                )
+                or 0
+            )
+
+        else:
+            # Older accumulators may already contain the new field
+            # names because an intermediate deployment copied the
+            # legacy combined gap_count into internal_gap_count.
+            legacy_gap_count = int(
+                _safe_int(
+                    accumulator.get(
+                        "legacy_gap_count_before_migration"
+                    ),
+                    accumulator.get(
+                        "internal_gap_count"
+                    )
+                    or accumulator.get(
+                        "gap_count"
+                    )
+                    or 0,
+                )
+                or 0
+            )
+
+            entry_minute_for_migration = int(
+                accumulator.get(
+                    "entry_minute_open_ms"
+                )
+                or (
+                    entry_utc_ms // 60_000
+                ) * 60_000
+            )
+
+            first_m1_for_migration = int(
+                _safe_int(
+                    accumulator.get(
+                        "first_m1_open_ms"
+                    ),
+                    0,
+                )
+                or 0
+            )
+
+            initial_unobserved_bars = 0
+
+            if (
+                first_m1_for_migration > 0
+                and first_m1_for_migration
+                > entry_minute_for_migration
+            ):
+                initial_unobserved_bars = int(
+                    (
+                        first_m1_for_migration
+                        - entry_minute_for_migration
+                    )
+                    // 60_000
+                )
+
+            history_truncated_bars = min(
+                legacy_gap_count,
+                max(
+                    0,
+                    initial_unobserved_bars,
+                ),
+            )
+
+            internal_gap_count = max(
+                0,
+                legacy_gap_count
+                - history_truncated_bars,
+            )
+
+            accumulator[
+                "coverage_schema_version"
+            ] = 2
+
+            accumulator[
+                "coverage_schema_migrated"
+            ] = True
+
+            accumulator[
+                "coverage_schema_migrated_at_ms"
+            ] = int(now_ms)
+
+            accumulator[
+                "legacy_gap_count_before_migration"
+            ] = legacy_gap_count
+
+            accumulator[
+                "history_truncated_bars"
+            ] = history_truncated_bars
+
+            accumulator[
+                "internal_gap_count"
+            ] = internal_gap_count
+
+            accumulator[
+                "gap_count"
+            ] = internal_gap_count
+
+            changed = True
+
+        normalized_new_bars = []
+
+        for bar in bars:
+            if (
+                not isinstance(bar, dict)
+                or bar.get("complete") is False
+            ):
+                continue
+
+            bar_open_ms = _norm_ms(
+                bar.get("t_open_ms")
+                or bar.get("t")
+                or bar.get("time")
+                or 0
+            )
+
+            if bar_open_ms <= 0:
+                continue
+
+            bar_close_ms = (
+                bar_open_ms + 60_000
+            )
+
+            # Ignore candles ending before or exactly at entry.
+            if bar_close_ms <= entry_utc_ms:
+                continue
+
+            # Process only bars not already persisted.
+            if (
+                previous_last_m1_ms > 0
+                and bar_open_ms
+                <= previous_last_m1_ms
+            ):
+                continue
+
+            high = _safe_float(
+                bar.get("h")
+            )
+
+            low = _safe_float(
+                bar.get("l")
+            )
+
+            if (
+                high is None
+                or low is None
+                or high <= 0
+                or low <= 0
+                or low > high
+            ):
+                continue
+
+            normalized_new_bars.append({
+                "open_ms": int(
+                    bar_open_ms
+                ),
+                "high": float(high),
+                "low": float(low),
+            })
+
+        normalized_new_bars.sort(
+            key=lambda row: row["open_ms"]
+        )
+
+        for row in normalized_new_bars:
+            bar_open_ms = int(
+                row["open_ms"]
+            )
+
+            high = float(
+                row["high"]
+            )
+
+            low = float(
+                row["low"]
+            )
+
+            last_known_open_ms = _safe_int(
+                accumulator.get(
+                    "last_m1_open_ms"
+                ),
+                0,
+            ) or 0
+
+            if last_known_open_ms > 0:
+                minute_distance = int(
+                    (
+                        bar_open_ms
+                        - last_known_open_ms
+                    )
+                    // 60_000
+                )
+
+                if minute_distance > 1:
+                    internal_gap_count += (
+                        minute_distance - 1
+                    )
+
+            elif accumulator.get(
+                "first_m1_open_ms"
+            ) is None:
+                entry_minute_ms = int(
+                    accumulator[
+                        "entry_minute_open_ms"
+                    ]
+                )
+
+                initial_distance = int(
+                    (
+                        bar_open_ms
+                        - entry_minute_ms
+                    )
+                    // 60_000
+                )
+
+                # These candles are not internal data gaps. They are older
+                # than the currently retained rolling M1 history.
+                if initial_distance > 0:
+                    history_truncated_bars = max(
+                        history_truncated_bars,
+                        initial_distance,
+                    )
+
+                accumulator[
+                    "first_m1_open_ms"
+                ] = bar_open_ms
+            observed += 1
+
+            accumulator[
+                "last_m1_open_ms"
+            ] = bar_open_ms
+
+            if (
+                highest_high is None
+                or high > highest_high
+            ):
+                highest_high = high
+
+                accumulator[
+                    "highest_high"
+                ] = round(
+                    high,
+                    8,
+                )
+
+                accumulator[
+                    "highest_high_ts_ms"
+                ] = bar_open_ms
+
+                accumulator[
+                    "highest_high_source"
+                ] = "COMPLETED_M1_HIGH"
+
+            if (
+                lowest_low is None
+                or low < lowest_low
+            ):
+                lowest_low = low
+
+                accumulator[
+                    "lowest_low"
+                ] = round(
+                    low,
+                    8,
+                )
+
+                accumulator[
+                    "lowest_low_ts_ms"
+                ] = bar_open_ms
+
+                accumulator[
+                    "lowest_low_source"
+                ] = "COMPLETED_M1_LOW"
+
+            changed = True
+
+        accumulator[
+            "observed_m1_bars"
+        ] = observed
+
+        accumulator[
+            "history_truncated_bars"
+        ] = history_truncated_bars
+
+        accumulator[
+            "internal_gap_count"
+        ] = internal_gap_count
+
+        # Compatibility alias for existing readers.
+        accumulator[
+            "gap_count"
+        ] = internal_gap_count
+
+        # -------------------------------------------------
+        # Supplement the forming M1 candle using broker
+        # position price. This reduces history dependency,
+        # but does not replace completed M1 high/low.
+        # -------------------------------------------------
+        if live_price is not None:
+            live_price_f = float(
+                live_price
+            )
+
+            accumulator[
+                "live_price_samples"
+            ] = int(
+                _safe_int(
+                    accumulator.get(
+                        "live_price_samples"
+                    ),
+                    0,
+                )
+                or 0
+            ) + 1
+
+            accumulator[
+                "last_live_price"
+            ] = round(
+                live_price_f,
+                8,
+            )
+
+            accumulator[
+                "last_live_price_ms"
+            ] = int(now_ms)
+
+            if (
+                highest_high is None
+                or live_price_f
+                > highest_high
+            ):
+                highest_high = live_price_f
+
+                accumulator[
+                    "highest_high"
+                ] = round(
+                    live_price_f,
+                    8,
+                )
+
+                accumulator[
+                    "highest_high_ts_ms"
+                ] = int(now_ms)
+
+                accumulator[
+                    "highest_high_source"
+                ] = (
+                    "BROKER_LIVE_PRICE_SAMPLE"
+                )
+
+            if (
+                lowest_low is None
+                or live_price_f
+                < lowest_low
+            ):
+                lowest_low = live_price_f
+
+                accumulator[
+                    "lowest_low"
+                ] = round(
+                    live_price_f,
+                    8,
+                )
+
+                accumulator[
+                    "lowest_low_ts_ms"
+                ] = int(now_ms)
+
+                accumulator[
+                    "lowest_low_source"
+                ] = (
+                    "BROKER_LIVE_PRICE_SAMPLE"
+                )
+
+            changed = True
+
+        latest_closed_open_ms = _safe_int(
+            accumulator.get(
+                "last_m1_open_ms"
+            ),
+            0,
+        ) or 0
+
+        entry_minute_ms = int(
+            accumulator.get(
+                "entry_minute_open_ms"
+            )
+            or (
+                entry_utc_ms // 60_000
+            )
+            * 60_000
+        )
+
+        expected = 0
+
+        if latest_closed_open_ms >= entry_minute_ms:
+            expected = int(
+                (
+                    latest_closed_open_ms
+                    - entry_minute_ms
+                )
+                // 60_000
+            ) + 1
+
+        coverage_pct = (
+            round(
+                min(
+                    100.0,
+                    observed
+                    / expected
+                    * 100.0,
+                ),
+                2,
+            )
+            if expected > 0
+            else 0.0
+        )
+        retained_expected_bars = max(
+            0,
+            expected
+            - history_truncated_bars,
+        )
+
+        retained_coverage_pct = (
+            round(
+                min(
+                    100.0,
+                    observed
+                    / retained_expected_bars
+                    * 100.0,
+                ),
+                2,
+            )
+            if retained_expected_bars > 0
+            else 0.0
+        )
+
+        accumulator[
+            "expected_m1_bars_so_far"
+        ] = expected
+
+        accumulator[
+            "coverage_pct_so_far"
+        ] = coverage_pct
+        
+        accumulator[
+            "retained_expected_m1_bars"
+        ] = retained_expected_bars
+
+        accumulator[
+            "retained_coverage_pct"
+        ] = retained_coverage_pct
+
+        accumulator[
+            "m1_snapshot_server_received_ms"
+        ] = _norm_ms(
+            payload.get(
+                "server_received_ms"
+            )
+            or payload.get(
+                "written_at"
+            )
+            or 0
+        ) or None
+
+        accumulator[
+            "m1_snapshot_last_closed_ms"
+        ] = _norm_ms(
+            payload.get(
+                "lastClosedTs"
+            )
+            or 0
+        ) or None
+
+        accumulator[
+            "last_updated_ms"
+        ] = int(now_ms)
+
+        accumulator[
+            "last_bar_partial"
+        ] = True
+
+        # Preliminary live R values. Final close-time MFE/MAE will be
+        side_u = str(
+            snap.get("side")
+            or ""
+        ).upper().strip()
+
+        # Preliminary live R values. Final close-time MFE/MAE will be
+        # recomputed and quality-gated separately.
+        if side_u == "BUY":
+
+            if highest_high is not None:
+                accumulator["live_mfe_r"] = round(
+                    (
+                       highest_high
+                       - float(entry_price)
+                    )
+                    / initial_risk,
+                    4,
+                )
+
+            if lowest_low is not None:
+                accumulator["live_mae_r"] = round(
+                    (
+                       lowest_low
+                       - float(entry_price)
+                    )
+                    / initial_risk,
+                    4,
+                )
+
+        elif side_u == "SELL":
+
+            if lowest_low is not None:
+                accumulator["live_mfe_r"] = round(
+                    (
+                       float(entry_price)
+                       - lowest_low
+                    )
+                    / initial_risk,
+                    4,
+                )
+
+            if highest_high is not None:
+                accumulator["live_mae_r"] = round(
+                    (
+                       float(entry_price)
+                       - highest_high
+                    )
+                    / initial_risk,
+                    4,
+                )
+
+        snap["excursion_live"] = (
+            accumulator
+        )
+
+        return changed
+
+    except Exception as exc:
+        log.warning(
+            "analytics: live M1 excursion "
+            "update failed ticket=%s err=%r",
+            (
+                snap.get("mt5_ticket")
+                if isinstance(snap, dict)
+                else None
+            ),
+            exc,
+        )
+        return False
+
+def update_open_trade_snapshot(
+    snap: dict,
+    broker_position: dict,
+    *,
+    now_ms: int | None = None,
+) -> bool:
+    """Update one open ticket's R journey and DXY milestones. Shadow-only."""
+    try:
+        if not isinstance(snap, dict) or not isinstance(broker_position, dict):
+            return False
+
+        now = int(now_ms or _now_ms())
+        history = _ensure_trade_milestone_state(snap)
+        state = history.setdefault("state", {})
+
+        last_update = _safe_int(state.get("last_update_ms"), 0) or 0
+        if last_update and now - last_update < MILESTONE_UPDATE_MIN_INTERVAL_MS:
+            return False
+
+        side = str(snap.get("side") or "").upper().strip()
+        entry = _safe_float(snap.get("entry_price"))
+        sl = _safe_float(snap.get("sl_price"))
+        price = _safe_float(
+            broker_position.get("price_current")
+            or broker_position.get("current_price")
+            or broker_position.get("price")
+        )
+
+        if side not in ("BUY", "SELL") or entry is None or sl is None or price is None:
+            return False
+
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return False
+
+        current_r = (
+            (price - entry) / risk
+            if side == "BUY"
+            else (entry - price) / risk
+        )
+
+        state["current_r"] = round(current_r, 4)
+        state["current_price"] = round(price, 8)
+        state["last_update_ms"] = now
+        # -------------------------------------------------
+        # Analytics-only live M1 excursion accumulator.
+        #
+        # Completed M1 high/low is primary. The broker live
+        # price supplements the currently forming minute.
+        # -------------------------------------------------
+        try:
+            _update_live_m1_excursion_accumulator(
+                snap,
+                broker_position,
+                now_ms=now,
+            )
+        except Exception as _excursion_exc:
+            log.warning(
+                "analytics: live excursion accumulator "
+                "failed ticket=%s err=%r",
+                snap.get("mt5_ticket"),
+                _excursion_exc,
+            )
+
+        previous_max = _safe_float(state.get("max_r_seen"))
+        previous_min = _safe_float(state.get("min_r_seen"))
+
+        if previous_max is None or current_r > previous_max:
+            state["max_r_seen"] = round(current_r, 4)
+            state["max_r_seen_ms"] = now
+            state["max_r_seen_price"] = round(price, 8)
+
+        if previous_min is None or current_r < previous_min:
+            state["min_r_seen"] = round(current_r, 4)
+            state["min_r_seen_ms"] = now
+            state["min_r_seen_price"] = round(price, 8)
+
+        max_r = _safe_float(state.get("max_r_seen"), current_r)
+        state["giveback_from_max_r"] = round(max(0.0, max_r - current_r), 4)
+
+        milestone_rows = history.setdefault("milestones", {})
+        newly_reached: list[str] = []
+        for name, target in MILESTONE_LEVELS:
+            row = milestone_rows.setdefault(name, {
+                "target_r": target,
+                "reached": False,
+                "first_reached_ms": None,
+                "first_reached_price": None,
+                "dxy_snapshot": None,
+            })
+            if not bool(row.get("reached")) and current_r >= target:
+                row["reached"] = True
+                row["first_reached_ms"] = now
+                row["first_reached_price"] = round(price, 8)
+                newly_reached.append(name)
+                state["highest_milestone_reached"] = name
+
+        # Track post-milestone giveback continuously.
+        for milestone_name, field_name in (
+            ("r_050", "lowest_r_after_050"),
+            ("r_075", "lowest_r_after_075"),
+            ("r_100", "lowest_r_after_100"),
+        ):
+            if bool((milestone_rows.get(milestone_name) or {}).get("reached")):
+                old = _safe_float(state.get(field_name))
+                if old is None or current_r < old:
+                    state[field_name] = round(current_r, 4)
+
+        if bool((milestone_rows.get("r_050") or {}).get("reached")) and current_r <= 0:
+            state["returned_to_entry_after_050"] = True
+        if bool((milestone_rows.get("r_075") or {}).get("reached")) and current_r <= 0:
+            state["returned_to_entry_after_075"] = True
+        if bool((milestone_rows.get("r_100") or {}).get("reached")):
+            if current_r <= 0:
+                state["returned_to_entry_after_100"] = True
+            if current_r < 0.50:
+                state["returned_below_050_after_100"] = True
+
+        # Capture DXY once for all milestones reached in this update, and sample
+        # periodically for meaningful state changes.
+        last_dxy_sample = _safe_int(history.get("dxy_last_sample_ms"), 0) or 0
+        need_dxy = bool(newly_reached) or (
+            not last_dxy_sample
+            or now - last_dxy_sample >= MILESTONE_DXY_SAMPLE_INTERVAL_MS
+        )
+        dxy = None
+        if need_dxy:
+            dxy = _compact_live_dxy_snapshot(snap, now)
+            history["dxy_last_sample_ms"] = now
+
+            for name in newly_reached:
+                milestone_rows[name]["dxy_snapshot"] = dxy
+
+            signature = _dxy_milestone_signature(dxy)
+            old_signature = str(history.get("dxy_last_signature") or "")
+            if signature and signature != old_signature:
+                events = history.setdefault("dxy_events", [])
+                events.append({
+                    "ts_ms": now,
+                    "event": "DXY_STATE_CHANGED" if old_signature else "DXY_LIVE_BASELINE",
+                    "trade_r": round(current_r, 4),
+                    "price": round(price, 8),
+                    "snapshot": dxy,
+                    "shadow_only": True,
+                })
+                if len(events) > MILESTONE_MAX_DXY_EVENTS:
+                    del events[:-MILESTONE_MAX_DXY_EVENTS]
+                history["dxy_last_signature"] = signature
+
+        # Analytics-only candidate observations. No order action is taken.
+        alignment = str((dxy or {}).get("trade_alignment") or "").upper()
+        status = str((dxy or {}).get("status") or "").upper()
+        giveback = _safe_float(state.get("giveback_from_max_r"), 0.0) or 0.0
+
+        if current_r >= 1.0 and alignment == "AGAINST":
+            _append_exit_candidate(
+                history, key="R100_DXY_AGAINST", ts_ms=now, price=price,
+                current_r=current_r,
+                reasons=["R_100_REACHED", "DXY_ALIGNMENT_AGAINST"],
+                dxy=dxy,
+            )
+
+        if max_r >= 1.0 and giveback >= 0.50:
+            _append_exit_candidate(
+                history, key="AFTER_R100_GIVEBACK_050", ts_ms=now, price=price,
+                current_r=current_r,
+                reasons=["R_100_PREVIOUSLY_REACHED", "GIVEBACK_FROM_PEAK_GE_0_50R"],
+                dxy=dxy,
+            )
+
+        if current_r >= 1.5 and status in ("REVOKED", "IDLE"):
+            _append_exit_candidate(
+                history, key="R150_DXY_NOT_CONFIRMED", ts_ms=now, price=price,
+                current_r=current_r,
+                reasons=["R_150_REACHED", "DXY_STATUS_NOT_CONFIRMED"],
+                dxy=dxy,
+            )
+
+        snap["trade_milestone_history"] = history
+        snap["milestone_capture_complete"] = True
+        snap["milestone_last_updated_ms"] = now
+        return True
+
+    except Exception as exc:
+        log.warning(
+            "analytics: open milestone update failed ticket=%s err=%r",
+            snap.get("mt5_ticket") if isinstance(snap, dict) else None,
+            exc,
+        )
+        return False
+
+
+def update_open_trade_snapshots() -> dict:
+    """Update all in-flight analytics snapshots from exact broker positions."""
+    stats = {
+        "checked": 0,
+        "updated": 0,
+        "position_missing": 0,
+        "errors": 0,
+    }
+    try:
+        R = from_app_R()
+        now = _now_ms()
+
+        for key in R.scan_iter(SNAP_PREFIX + "*"):
+            stats["checked"] += 1
+            try:
+                raw = R.get(key)
+                snap = _json_load(raw, {})
+                if not isinstance(snap, dict) or snap.get("_status") == "closed":
+                    continue
+
+                broker_position = _load_broker_position_for_snapshot(R, snap)
+                if not broker_position:
+                    stats["position_missing"] += 1
+                    continue
+
+                if update_open_trade_snapshot(
+                    snap,
+                    broker_position,
+                    now_ms=now,
+                ):
+                    ttl = _safe_int(R.ttl(key), -1)
+                    payload = json.dumps(
+                        snap,
+                        default=str,
+                        separators=(",", ":"),
+                    )
+                    if ttl and ttl > 0:
+                        R.set(key, payload, ex=ttl)
+                    else:
+                        R.set(key, payload, ex=SNAP_TTL_SEC)
+                    stats["updated"] += 1
+
+            except Exception as exc:
+                stats["errors"] += 1
+                log.warning(
+                    "analytics: milestone sweep item failed key=%s err=%r",
+                    key,
+                    exc,
+                )
+
+        return stats
+
+    except Exception as exc:
+        stats["errors"] += 1
+        log.warning("analytics: milestone sweep failed err=%r", exc)
+        return stats
+
 
 # -- CLOSE DETECTION + ORPHAN SWEEP -------------------------------------------
 def sweep_closed_trades(fetch_h1_bars=None) -> dict:
@@ -8109,7 +13697,7 @@ def build_synthetic_dxy_m15_bars(
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # build_entry_snapshot — regime degrades to None (no host), drift/session computed
+    # build_entry_snapshot   regime degrades to None (no host), drift/session computed
     clean_pos = {
         "trade_id": "WATCH:XAUUSD:SELL:H1:1782417600000", "symbol": "XAUUSD", "side": "SELL",
         "entry_price": 4008.32, "qty": 0.06, "sl_price": 4044.15, "tp_price": 3936.96,

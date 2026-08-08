@@ -37,6 +37,984 @@ def _bar_f(b: dict, *keys: str) -> Optional[float]:
                 return None
     return None
 
+def _closed_bars_before_or_at(bars: list, cutoff_ms: int, limit: int = 4) -> list:
+    """Return chronological bar snapshots available at prediction time.
+
+    The final row may be the currently forming touch candle. Its OHLC values
+    represent only information available when the prediction was frozen.
+    """
+    rows = []
+    for b in bars or []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("complete") is False:
+            continue
+        om = _to_ms_any(
+            b.get("t_open_ms")
+            or b.get("tOpenMs")
+            or b.get("open_time_ms")
+            or b.get("t")
+            or b.get("time")
+        )
+        cm = _to_ms_any(b.get("t_close_ms"))
+        if not cm and om:
+            cm = om + 3_600_000
+        if cutoff_ms and cm and cm > cutoff_ms:
+            continue
+        if _bar_f(b, "o") is None or _bar_f(b, "h") is None or _bar_f(b, "l") is None or _bar_f(b, "c") is None:
+            continue
+        rows.append((om or cm, b))
+    rows.sort(key=lambda x: x[0])
+    return [b for _, b in rows[-max(1, int(limit or 4)):]]
+
+
+def _build_expected_setup_analysis(
+    watch: dict,
+    zone: dict,
+    direction: str,
+    bars: list | None = None,
+    atr: float | None = None,
+) -> dict:
+    """Freeze a conservative prediction of market behavior at first zone touch.
+
+    This is analytics-only. It does not select, block or modify a trade.
+    The prediction is based only on bars available at/before the initial touch.
+    It must not be rebuilt after REV_OK, because that would leak later evidence.
+    """
+    w = watch if isinstance(watch, dict) else {}
+    z = zone if isinstance(zone, dict) else {}
+    side = str(direction or w.get("direction") or "").upper().strip()
+    zone_side = str(
+        z.get("kind")
+        or ("support" if side == "BUY" else "resistance" if side == "SELL" else "")
+    ).upper().strip()
+
+    zone_low = _bar_f(z, "low", "level")
+    zone_high = _bar_f(z, "high", "level")
+    touch_close_ms = _to_ms_any(w.get("touch_close_ms"))
+    sample = _closed_bars_before_or_at(bars or [], touch_close_ms, 4)
+
+    try:
+        atr_f = float(atr) if atr is not None else None
+    except Exception:
+        atr_f = None
+    if not atr_f or atr_f <= 0:
+        atr_f = None
+    prediction_server_ms = int(time.time() * 1000)
+    evidence = {
+        "zone_side": zone_side or None,
+        "zone_source": z.get("zone_source"),
+        "zone_role": z.get("zone_role"),
+        "source_type": z.get("source_type"),
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "zone_level": _bar_f(z, "level"),
+        "zone_tf": z.get("tf"),
+        "touch_open_ms": _to_ms_any(w.get("touch_open_ms")),
+        "touch_close_ms": touch_close_ms,
+        "bars_used": len(sample),
+        "prediction_basis": "FIRST_LIVE_ZONE_TOUCH",
+        "touch_bar_was_forming": bool(
+            touch_close_ms > prediction_server_ms
+        ),
+        "prediction_server_ms": prediction_server_ms,
+        "arrival_net_atr": None,
+        "arrival_last_range_atr": None,
+        "arrival_last_body_fraction": None,
+        "arrival_direction": None,
+        "directional_bars_toward_zone": 0,
+        "touch_close_location": None,
+    }
+
+    predicted = "UNCLASSIFIED"
+    stage = "OBSERVING"
+    reasons = []
+    continuation = {
+        "momentum_present": False,
+        "pressure_into_zone": False,
+        "zone_break_confirmed": False,
+        "retest_present": False,
+    }
+
+    if len(sample) >= 2 and zone_low is not None and zone_high is not None:
+        first_c = _bar_f(sample[0], "c")
+        last = sample[-1]
+        last_o = _bar_f(last, "o")
+        last_h = _bar_f(last, "h")
+        last_l = _bar_f(last, "l")
+        last_c = _bar_f(last, "c")
+        if None not in (first_c, last_o, last_h, last_l, last_c):
+            net = float(last_c) - float(first_c)
+            rng = max(0.0, float(last_h) - float(last_l))
+            body = abs(float(last_c) - float(last_o))
+            body_frac = body / rng if rng > 0 else 0.0
+            net_atr = net / atr_f if atr_f else None
+            range_atr = rng / atr_f if atr_f else None
+            arrival_dir = "UP" if net > 0 else "DOWN" if net < 0 else "FLAT"
+            toward_sign = -1 if zone_side == "SUPPORT" else 1 if zone_side == "RESISTANCE" else 0
+            directional = 0
+            for b in sample[-3:]:
+                bo = _bar_f(b, "o"); bc = _bar_f(b, "c")
+                if bo is None or bc is None:
+                    continue
+                if toward_sign < 0 and bc < bo:
+                    directional += 1
+                elif toward_sign > 0 and bc > bo:
+                    directional += 1
+
+            if last_c < zone_low:
+                close_loc = "BELOW_ZONE"
+            elif last_c > zone_high:
+                close_loc = "ABOVE_ZONE"
+            else:
+                close_loc = "INSIDE_ZONE"
+
+            evidence.update({
+                "arrival_net_atr": round(net_atr, 3) if net_atr is not None else None,
+                "arrival_last_range_atr": round(range_atr, 3) if range_atr is not None else None,
+                "arrival_last_body_fraction": round(body_frac, 3),
+                "arrival_direction": arrival_dir,
+                "directional_bars_toward_zone": directional,
+                "touch_close_location": close_loc,
+            })
+
+            toward_zone = (
+                (zone_side == "SUPPORT" and net < 0)
+                or (zone_side == "RESISTANCE" and net > 0)
+            )
+            strong_net = bool(net_atr is not None and abs(net_atr) >= 0.75)
+            strong_last = bool(range_atr is not None and range_atr >= 0.90 and body_frac >= 0.50)
+            pressure = bool(toward_zone and directional >= 2)
+            momentum = bool(toward_zone and sum((strong_net, strong_last, pressure)) >= 2)
+            broke = bool(
+                (zone_side == "SUPPORT" and last_c < zone_low)
+                or (zone_side == "RESISTANCE" and last_c > zone_high)
+            )
+            rejected = bool(
+                (zone_side == "SUPPORT" and last_l <= zone_high and last_c > zone_high)
+                or (zone_side == "RESISTANCE" and last_h >= zone_low and last_c < zone_low)
+            )
+
+            continuation.update({
+                "momentum_present": momentum,
+                "pressure_into_zone": pressure,
+                "zone_break_confirmed": broke,
+            })
+
+            if broke and momentum:
+                predicted = "CONTINUATION"
+                stage = "ZONE_BREAK"
+                reasons = ["MOMENTUM_INTO_ZONE", "ZONE_CLOSE_THROUGH"]
+            elif momentum:
+                predicted = "CONTINUATION"
+                stage = "MOMENTUM_APPROACH"
+                reasons = ["MOMENTUM_INTO_ZONE", "PRESSURE_INTO_ZONE"]
+            elif rejected and not momentum:
+                predicted = "REVERSAL"
+                stage = "TOUCH_REJECTION"
+                reasons = ["ZONE_REJECTION_CLOSE", "NO_STRONG_CONTINUATION_PRESSURE"]
+            elif pressure:
+                predicted = "UNCLASSIFIED"
+                stage = "PRESSURE_PENDING"
+                reasons = ["PRESSURE_INTO_ZONE", "MOMENTUM_THRESHOLD_NOT_MET"]
+            else:
+                predicted = "UNCLASSIFIED"
+                stage = "OBSERVING"
+                reasons = ["INSUFFICIENT_DIRECTIONAL_EVIDENCE"]
+
+    if not reasons:
+        reasons = ["INSUFFICIENT_ENTRY_BARS"]
+
+    return {
+        "schema_version": 2,
+        "analytics_only": True,
+        "immutable_prediction": True,
+        "prediction_classifier_version": "market_behavior_prediction_v2",
+        "prediction_frozen_at_ms": prediction_server_ms,
+        "predicted_market_behavior": predicted,
+        "prediction_stage": stage,
+        "predicted_direction": (
+            "SELL" if predicted == "CONTINUATION" and zone_side == "SUPPORT"
+            else "BUY" if predicted == "CONTINUATION" and zone_side == "RESISTANCE"
+            else "BUY" if predicted == "REVERSAL" and zone_side == "SUPPORT"
+            else "SELL" if predicted == "REVERSAL" and zone_side == "RESISTANCE"
+            else None
+        ),
+        "reason_codes": reasons,
+        "continuation_sequence": continuation,
+        "evidence_at_prediction": evidence,
+        "selected_production_strategy": "ZONE_REVERSAL",
+        "selected_production_strategy_version": "zone_reversal_v1",
+    }
+
+def _safe_deepcopy_json(value):
+    """Create an isolated JSON-safe copy for immutable analytics."""
+    try:
+        return json.loads(
+            json.dumps(
+                value,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+    except Exception:
+        return None
+
+
+def _zone_quality_sr_analytics(
+    zone: dict,
+    direction: str,
+    entry_price: float | None,
+    atr: float | None,
+) -> dict:
+    """
+    Analytics-only zone-quality and local-SR opinion.
+
+    This does not block or change a trade.
+    No weighted score is created.
+    """
+    z = zone if isinstance(zone, dict) else {}
+    side = str(direction or "").upper().strip()
+
+    def _float_or_none(value):
+        try:
+            return float(value) if value is not None else None
+        except Exception:
+            return None
+
+    def _int_or_zero(value):
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    zone_low = _float_or_none(z.get("low"))
+    zone_high = _float_or_none(z.get("high"))
+    zone_level = _float_or_none(z.get("level"))
+
+    if zone_low is None:
+        zone_low = zone_level
+
+    if zone_high is None:
+        zone_high = zone_level
+
+    touches = _int_or_zero(z.get("touches"))
+    strength = _int_or_zero(z.get("strength"))
+    sr_score = _float_or_none(z.get("sr_score"))
+    distance_atr = _float_or_none(
+        z.get("distance_atr")
+        if z.get("distance_atr") is not None
+        else z.get("dist_atr")
+    )
+
+    zone_tf = str(
+        z.get("tf")
+        or z.get("source_tf")
+        or ""
+    ).upper().strip()
+
+    zone_role = str(
+        z.get("zone_role")
+        or ""
+    ).upper().strip()
+
+    source_type = str(
+        z.get("source_type")
+        or ""
+    ).upper().strip()
+
+    reason_codes = []
+
+    if z.get("stale") is True:
+        reason_codes.append("ZONE_STALE")
+
+    if z.get("side_ok") is False:
+        reason_codes.append("ZONE_SIDE_INVALID")
+
+    if touches >= 3:
+        reason_codes.append("MULTIPLE_ZONE_TOUCHES")
+    elif touches == 2:
+        reason_codes.append("TWO_ZONE_TOUCHES")
+    elif touches == 1:
+        reason_codes.append("SINGLE_ZONE_TOUCH")
+
+    if strength >= 8:
+        reason_codes.append("HIGH_ZONE_STRENGTH")
+    elif strength >= 6:
+        reason_codes.append("GOOD_ZONE_STRENGTH")
+    elif strength > 0:
+        reason_codes.append("LOW_ZONE_STRENGTH")
+
+    if sr_score is not None:
+        if sr_score >= 10:
+            reason_codes.append("HIGH_SR_QUALITY")
+        elif sr_score >= 7:
+            reason_codes.append("ACCEPTABLE_SR_QUALITY")
+        else:
+            reason_codes.append("LOW_SR_QUALITY")
+
+    if zone_tf == "H4":
+        reason_codes.append("H4_ZONE")
+    elif zone_tf == "H1":
+        reason_codes.append("H1_ZONE")
+
+    if source_type:
+        reason_codes.append(
+            f"SOURCE_{source_type}"
+        )
+
+    invalid = bool(
+        z.get("stale") is True
+        or z.get("side_ok") is False
+        or zone_level is None
+    )
+
+    quality_evidence = bool(
+        touches >= 2
+        or strength >= 6
+        or (
+            sr_score is not None
+            and sr_score >= 7
+        )
+    )
+
+    if invalid:
+        status = "FAIL"
+    elif quality_evidence:
+        status = "PASS"
+    else:
+        status = "NEUTRAL"
+
+    if not reason_codes:
+        reason_codes.append(
+            "ZONE_QUALITY_DATA_LIMITED"
+        )
+
+    return {
+        "schema_version": 1,
+        "analytics_only": True,
+        "status": status,
+        "reason_codes": reason_codes,
+        "snapshot": {
+            "direction": side or None,
+            "zone_side": (
+                "SUPPORT"
+                if side == "BUY"
+                else "RESISTANCE"
+                if side == "SELL"
+                else None
+            ),
+            "zone_source": z.get("zone_source"),
+            "selection_model": z.get(
+                "selection_model"
+            ),
+            "zone_role": zone_role or None,
+            "source_type": source_type or None,
+            "zone_tf": zone_tf or None,
+            "zone_low": zone_low,
+            "zone_high": zone_high,
+            "zone_level": zone_level,
+            "touches": touches,
+            "strength": strength,
+            "sr_score": sr_score,
+            "distance_atr": distance_atr,
+            "entry_price": _float_or_none(
+                entry_price
+            ),
+            "atr": _float_or_none(atr),
+            "stale": bool(
+                z.get("stale") is True
+            ),
+            "side_ok": (
+                None
+                if z.get("side_ok") is None
+                else bool(z.get("side_ok"))
+            ),
+        },
+    }
+
+
+def _dxy_sr_confirmation_analytics(
+    *,
+    device_id: str | None,
+    symbol: str,
+    side: str,
+    entry_ms: int,
+    profile_id: str | None = None,
+) -> dict:
+    """
+    Read the existing unified DXY M15 entry snapshot.
+
+    Analytics only:
+    - no trade blocking
+    - no trade timing change
+    - no score
+    """
+    sym_u = str(symbol or "").upper().strip()
+    side_u = str(side or "").upper().strip()
+
+    try:
+        # Local import avoids changing module startup order.
+        from api.xtl_analytics import (
+            read_dxy_m15_at_entry,
+        )
+
+        dxy = read_dxy_m15_at_entry(
+            device_id=str(device_id or "").strip(),
+            symbol=sym_u,
+            side=side_u,
+            entry_ms=int(entry_ms or 0),
+            trade_profile_id=(
+                str(profile_id or "").strip()
+                or None
+            ),
+        )
+
+    except Exception as exc:
+        return {
+            "schema_version": 1,
+            "analytics_only": True,
+            "status": "UNAVAILABLE",
+            "reason_codes": [
+                "DXY_ENTRY_READ_FAILED",
+            ],
+            "snapshot": {
+                "error": (
+                    f"{type(exc).__name__}:"
+                    f"{exc}"
+                ),
+            },
+        }
+
+    if not isinstance(dxy, dict):
+        return {
+            "schema_version": 1,
+            "analytics_only": True,
+            "status": "UNAVAILABLE",
+            "reason_codes": [
+                "DXY_ENTRY_SNAPSHOT_INVALID",
+            ],
+            "snapshot": {},
+        }
+
+    selected = (
+        dxy.get("selected")
+        if isinstance(
+            dxy.get("selected"),
+            dict,
+        )
+        else {}
+    )
+
+    features = (
+        selected.get("features")
+        if isinstance(
+            selected.get("features"),
+            dict,
+        )
+        else {}
+    )
+
+    sr = (
+        features.get("sr")
+        if isinstance(
+            features.get("sr"),
+            dict,
+        )
+        else {}
+    )
+
+    structure = (
+        sr.get("structure_context")
+        if isinstance(
+            sr.get("structure_context"),
+            dict,
+        )
+        else {}
+    )
+
+    reasoning = (
+        selected.get("reasoning")
+        if isinstance(
+            selected.get("reasoning"),
+            dict,
+        )
+        else {}
+    )
+
+    available = bool(
+        selected.get("available")
+    )
+
+    fresh = bool(
+        selected.get("fresh")
+    )
+
+    direction = str(
+        selected.get("direction")
+        or "NEUTRAL"
+    ).upper().strip()
+
+    lifecycle_status = str(
+        selected.get("status")
+        or "UNAVAILABLE"
+    ).upper().strip()
+
+    alignment = str(
+        selected.get("trade_alignment")
+        or "NEUTRAL"
+    ).upper().strip()
+
+    analysis_direction = str(
+        reasoning.get("analysis_direction")
+        or ""
+    ).upper().strip()
+
+    room_class = str(
+        reasoning.get("room_class")
+        or ""
+    ).upper().strip()
+
+    reversal_risk = str(
+        reasoning.get("reversal_risk")
+        or ""
+    ).upper().strip()
+
+    structure_conflict = bool(
+        reasoning.get("structure_conflict")
+    )
+
+    candidate_qualified = bool(
+        selected.get("candidate_qualified")
+        or (
+            features.get(
+                "candidate_qualified"
+            )
+        )
+    )
+
+    near_h1_support = bool(
+        structure.get("near_h1_support")
+    )
+
+    near_h1_resistance = bool(
+        structure.get(
+            "near_h1_resistance"
+        )
+    )
+
+    inside_h4_support = bool(
+        structure.get("inside_h4_support")
+    )
+
+    inside_h4_resistance = bool(
+        structure.get(
+            "inside_h4_resistance"
+        )
+    )
+
+    required_dxy_direction = None
+
+    # USD relationship for the six current XTL symbols.
+    if sym_u in (
+        "EURUSD",
+        "GBPUSD",
+        "XAUUSD",
+    ):
+        required_dxy_direction = (
+            "BEARISH"
+            if side_u == "BUY"
+            else "BULLISH"
+        )
+
+    elif sym_u in (
+        "USDJPY",
+        "USDCHF",
+        "USDCAD",
+    ):
+        required_dxy_direction = (
+            "BULLISH"
+            if side_u == "BUY"
+            else "BEARISH"
+        )
+
+    favorable_direction = bool(
+        required_dxy_direction
+        and direction
+        == required_dxy_direction
+    )
+
+    opposite_direction = bool(
+        required_dxy_direction
+        and direction
+        in ("BULLISH", "BEARISH")
+        and direction
+        != required_dxy_direction
+    )
+
+    sr_risk = False
+
+    if required_dxy_direction == "BEARISH":
+        sr_risk = bool(
+            near_h1_support
+            or inside_h4_support
+            or (
+                room_class == "LOW"
+                and analysis_direction
+                == "BEARISH"
+            )
+        )
+
+    elif required_dxy_direction == "BULLISH":
+        sr_risk = bool(
+            near_h1_resistance
+            or inside_h4_resistance
+            or (
+                room_class == "LOW"
+                and analysis_direction
+                == "BULLISH"
+            )
+        )
+
+    reason_codes = []
+
+    if not available:
+        reason_codes.append(
+            "DXY_UNAVAILABLE"
+        )
+
+    if available and not fresh:
+        reason_codes.append(
+            "DXY_STALE"
+        )
+
+    if lifecycle_status in (
+        "CONFIRMED",
+        "COMPLETED",
+        "WEAK_COMPLETION",
+    ):
+        reason_codes.append(
+            f"DXY_{lifecycle_status}"
+        )
+    else:
+        reason_codes.append(
+            f"DXY_STATUS_{lifecycle_status}"
+        )
+
+    if favorable_direction:
+        reason_codes.append(
+            "DXY_DIRECTION_FAVORS_TRADE"
+        )
+
+    if opposite_direction:
+        reason_codes.append(
+            "DXY_DIRECTION_OPPOSES_TRADE"
+        )
+
+    if alignment == "ALIGNED":
+        reason_codes.append(
+            "DXY_ALIGNMENT_FAVORS_TRADE"
+        )
+    elif alignment == "AGAINST":
+        reason_codes.append(
+            "DXY_ALIGNMENT_OPPOSES_TRADE"
+        )
+    else:
+        reason_codes.append(
+            "DXY_ALIGNMENT_NEUTRAL"
+        )
+
+    if candidate_qualified:
+        reason_codes.append(
+            "DXY_CANDIDATE_QUALIFIED"
+        )
+    else:
+        reason_codes.append(
+            "DXY_CANDIDATE_NOT_QUALIFIED"
+        )
+
+    if sr_risk:
+        reason_codes.append(
+            "DXY_DIRECTIONAL_SR_RISK"
+        )
+
+    if structure_conflict:
+        reason_codes.append(
+            "DXY_STRUCTURE_CONFLICT"
+        )
+
+    if room_class:
+        reason_codes.append(
+            f"DXY_ROOM_{room_class}"
+        )
+
+    # Analytics opinion only.
+    #
+    # PASS:
+    # qualified/final DXY direction supports trade
+    # and DXY is not moving directly into nearby SR.
+    #
+    # FAIL:
+    # qualified/final DXY direction opposes trade,
+    # or DXY's own SR structure strongly conflicts.
+    #
+    # NEUTRAL:
+    # no qualified directional opinion.
+    qualified_lifecycle = (
+        lifecycle_status
+        in (
+            "CONFIRMED",
+            "COMPLETED",
+            "WEAK_COMPLETION",
+        )
+        and candidate_qualified
+    )
+
+    if not available or not fresh:
+        status = "UNAVAILABLE"
+
+    elif (
+        qualified_lifecycle
+        and favorable_direction
+        and not sr_risk
+        and not structure_conflict
+    ):
+        status = "PASS"
+
+    elif (
+        qualified_lifecycle
+        and opposite_direction
+    ):
+        status = "FAIL"
+
+    elif (
+        sr_risk
+        or structure_conflict
+    ):
+        status = "FAIL"
+
+    else:
+        status = "NEUTRAL"
+
+    return {
+        "schema_version": 1,
+        "analytics_only": True,
+        "status": status,
+        "reason_codes": reason_codes,
+        "snapshot": {
+            "selected_source": dxy.get(
+                "selected_source"
+            ),
+            "selected_device_id": dxy.get(
+                "selected_device_id"
+            ),
+            "fallback_used": bool(
+                dxy.get("fallback_used")
+            ),
+            "fallback_reason": dxy.get(
+                "fallback_reason"
+            ),
+            "available": available,
+            "fresh": fresh,
+            "lifecycle_status": (
+                lifecycle_status
+            ),
+            "direction": direction,
+            "required_direction_for_trade": (
+                required_dxy_direction
+            ),
+            "trade_alignment": alignment,
+            "candidate_qualified": (
+                candidate_qualified
+            ),
+            "analysis_direction": (
+                analysis_direction or None
+            ),
+            "room_class": (
+                room_class or None
+            ),
+            "reversal_risk": (
+                reversal_risk or None
+            ),
+            "structure_conflict": (
+                structure_conflict
+            ),
+            "near_h1_support": (
+                near_h1_support
+            ),
+            "near_h1_resistance": (
+                near_h1_resistance
+            ),
+            "inside_h4_support": (
+                inside_h4_support
+            ),
+            "inside_h4_resistance": (
+                inside_h4_resistance
+            ),
+            "available_downside_atr": (
+                structure.get(
+                    "available_downside_atr"
+                )
+            ),
+            "available_upside_atr": (
+                structure.get(
+                    "available_upside_atr"
+                )
+            ),
+            "reasoning": _safe_deepcopy_json(
+                reasoning
+            ),
+            "selected_state": (
+                _safe_deepcopy_json(
+                    selected
+                )
+            ),
+        },
+    }
+
+
+def _build_entry_validation_analytics(
+    *,
+    watch: dict,
+    zone: dict,
+    direction: str,
+    symbol: str,
+    entry_price: float | None,
+    atr: float | None,
+    device_id: str | None,
+    profile_id: str | None,
+    confirmed_at_ms: int,
+) -> dict:
+    """
+    Freeze the three analytics opinions together:
+
+    1. first-touch market prediction
+    2. zone quality + local SR
+    3. DXY direction + DXY SR
+
+    This remains shadow-only.
+    """
+    w = watch if isinstance(watch, dict) else {}
+
+    setup = (
+        w.get("setup_analysis")
+        if isinstance(
+            w.get("setup_analysis"),
+            dict,
+        )
+        else {}
+    )
+
+    predicted_behavior = str(
+        setup.get(
+            "predicted_market_behavior"
+        )
+        or "UNCLASSIFIED"
+    ).upper().strip()
+
+    predicted_direction = str(
+        setup.get("predicted_direction")
+        or ""
+    ).upper().strip()
+
+    production_direction = str(
+        direction or ""
+    ).upper().strip()
+
+    if (
+        predicted_direction
+        in ("BUY", "SELL")
+        and production_direction
+        in ("BUY", "SELL")
+    ):
+        prediction_relationship = (
+            "AGREES"
+            if predicted_direction
+            == production_direction
+            else "CONFLICTS"
+        )
+    else:
+        prediction_relationship = (
+            "UNCLASSIFIED"
+        )
+
+    zone_confirmation = (
+        _zone_quality_sr_analytics(
+            zone,
+            production_direction,
+            entry_price,
+            atr,
+        )
+    )
+
+    dxy_confirmation = (
+        _dxy_sr_confirmation_analytics(
+            device_id=device_id,
+            symbol=symbol,
+            side=production_direction,
+            entry_ms=int(
+                confirmed_at_ms or 0
+            ),
+            profile_id=profile_id,
+        )
+    )
+
+    return {
+        "schema_version": 1,
+        "analytics_only": True,
+        "immutable_entry_validation": True,
+        "created_at_ms": int(
+            time.time() * 1000
+        ),
+        "validation_stage": (
+            "REVERSAL_CONFIRMED"
+        ),
+        "production_unchanged": True,
+        "prediction": {
+            "predicted_market_behavior": (
+                predicted_behavior
+            ),
+            "predicted_direction": (
+                predicted_direction or None
+            ),
+            "production_direction": (
+                production_direction or None
+            ),
+            "relationship_to_production": (
+                prediction_relationship
+            ),
+            "reason_codes": (
+                _safe_deepcopy_json(
+                    setup.get("reason_codes")
+                )
+                or []
+            ),
+        },
+        "zone_quality_sr": (
+            zone_confirmation
+        ),
+        "dxy_sr": dxy_confirmation,
+        "research_hypothesis": {
+            "all_three_support_reversal": bool(
+                prediction_relationship
+                == "AGREES"
+                and zone_confirmation.get(
+                    "status"
+                )
+                == "PASS"
+                and dxy_confirmation.get(
+                    "status"
+                )
+                == "PASS"
+            ),
+            "prediction_conflict": bool(
+                prediction_relationship
+                == "CONFLICTS"
+            ),
+            "shadow_only": True,
+        },
+    }
+
 def _find_xtl_broker_position(
     R,
     device_id: str,
@@ -778,8 +1756,24 @@ def _watch_key(
         direction,
         tf_tag,
     )
-def _zone_cooldown_key(sym: str, direction: str, tf_tag: str) -> str:
-    return f"xtl:zone:cooldown:{(sym or '').upper().strip()}:{(direction or '').upper().strip()}:{(tf_tag or 'H1').upper().strip()}"
+
+def _zone_cooldown_key(
+    uid: str,
+    profile_id: str,
+    sym: str,
+    direction: str,
+    tf_tag: str,
+) -> str:
+    uid_u = str(uid or "").strip()
+    profile_u = str(profile_id or "").strip().lower()
+    sym_u = str(sym or "").upper().strip()
+    direction_u = str(direction or "").upper().strip()
+    tf_u = str(tf_tag or "H1").upper().strip()
+
+    return (
+        f"xtl:zone:cooldown:"
+        f"{uid_u}:{profile_u}:{sym_u}:{direction_u}:{tf_u}"
+    )
 
 def _json_load(raw):
     try:
@@ -2953,7 +3947,13 @@ def zone_reversal_gate(
         if not _touch_bar_open_ms:
             _touch_bar_open_ms = int(touch_open_ms)
         try:
-            cd_key = _zone_cooldown_key(sym_u, resolved_dir, tfu)
+            cd_key = _zone_cooldown_key(
+                uid,
+                profile_id,
+                sym_u,
+                resolved_dir,
+                tfu,
+            )
             cd_raw = R.get(cd_key) if R is not None else None
             if cd_raw:
                 ttl = R.ttl(cd_key)
@@ -2983,6 +3983,13 @@ def zone_reversal_gate(
             "last_checked_closed_ms": int(now_ms_pick or 0),
             "touch_source": "LIVE_TOUCH",
         }
+        watch["setup_analysis"] = _build_expected_setup_analysis(
+            watch,
+            zone_used,
+            resolved_dir,
+            bars=bars,
+            atr=atr,
+        )
         try:
             zone_watch_set(
                 R,
@@ -3292,6 +4299,139 @@ def zone_reversal_gate(
                 # Refreshed RC closed after old rev_ok_ms, so it can never
                 # be the original touch candle — keep the flag accurate.
                 watch["rc_is_touch_candle"] = False
+                # Preserve the immutable first-touch market prediction.
+                # REV_OK is later evidence and must not rewrite history.
+                # Never reconstruct the first-touch prediction here.
+                # REV_OK contains later evidence and would introduce look-ahead bias.
+                if not isinstance(watch.get("setup_analysis"), dict):
+                    watch["setup_analysis"] = {
+                        "schema_version": 2,
+                        "analytics_only": True,
+                        "immutable_prediction": True,
+                        "prediction_classifier_version": "market_behavior_prediction_v2",
+                        "prediction_frozen_at_ms": None,
+                        "predicted_market_behavior": "UNCLASSIFIED",
+                        "prediction_stage": "MISSING_FIRST_TOUCH_PREDICTION",
+                        "predicted_direction": None,
+                        "reason_codes": [
+                            "FIRST_TOUCH_PREDICTION_NOT_CAPTURED"
+                        ],
+                        "continuation_sequence": {
+                            "momentum_present": False,
+                            "pressure_into_zone": False,
+                            "zone_break_confirmed": False,
+                            "retest_present": False,
+                        },
+                        "evidence_at_prediction": {},
+                        "selected_production_strategy": "ZONE_REVERSAL",
+                        "selected_production_strategy_version": "zone_reversal_v1",
+                    }
+                watch["entry_confirmation"] = {
+                    "schema_version": 1,
+                    "selected_production_strategy": "ZONE_REVERSAL",
+                    "confirmed_at_ms": int(_cur_closed_ms),
+                    "rc_high": float(hi),
+                    "rc_low": float(lo),
+                    "rc_close": float(cl),
+                    "trigger_level": float(watch.get("trigger_level") or 0),
+                    "rc_is_touch_candle": False,
+                }
+                # Freeze analytics-only validation at RC confirmation.
+                #
+                # This records:
+                #   1. first-touch prediction
+                #   2. selected-zone quality + local SR
+                #   3. DXY direction + DXY SR
+                #
+                # It does not block, delay, score or modify execution.
+                if not isinstance(
+                    watch.get("entry_validation"),
+                    dict,
+                ):
+                    try:
+                        watch["entry_validation"] = (
+                            _build_entry_validation_analytics(
+                                watch=watch,
+                                zone=(
+                                    watch.get("zone_used")
+                                    if isinstance(
+                                        watch.get(
+                                            "zone_used"
+                                        ),
+                                        dict,
+                                    )
+                                    else zone_used
+                                ),
+                                direction=_dir_for_trigger,
+                                symbol=sym_u,
+                                entry_price=float(
+                                    live_px
+                                    if live_px is not None
+                                    else cl
+                                ),
+                                atr=float(atr),
+                                device_id=(
+                                    str(
+                                        x_device_id
+                                        or pinned_device
+                                        or ""
+                                    ).strip()
+                                    or None
+                                ),
+                                profile_id=(
+                                    str(
+                                        profile_id
+                                        or ""
+                                    ).strip()
+                                    or None
+                                ),
+                                confirmed_at_ms=int(
+                                    _cur_closed_ms
+                                ),
+                            )
+                        )
+
+                    except Exception as exc:
+                        log.warning(
+                            "[ZONE_GATE] "
+                            "ENTRY_VALIDATION_CAPTURE_FAILED "
+                            "uid=%s sym=%s side=%s "
+                            "err=%r",
+                            uid_u,
+                            sym_u,
+                            _dir_for_trigger,
+                            exc,
+                        )
+
+                        watch["entry_validation"] = {
+                            "schema_version": 1,
+                            "analytics_only": True,
+                            "immutable_entry_validation": True,
+                            "created_at_ms": int(
+                                time.time() * 1000
+                            ),
+                            "validation_stage": (
+                                "REVERSAL_CONFIRMED"
+                            ),
+                            "production_unchanged": True,
+                            "capture_error": (
+                                f"{type(exc).__name__}:"
+                                f"{exc}"
+                            ),
+                        }
+                    log.warning(
+                        "[ZONE_GATE] RC_ANALYTICS_CAPTURE "
+                        "sym=%s side=%s "
+                        "setup=%s "
+                        "confirmation=%s "
+                        "validation=%s",
+                        sym_u,
+                        _dir_for_trigger,
+                        isinstance(watch.get("setup_analysis"), dict),
+                        isinstance(watch.get("entry_confirmation"), dict),
+                        isinstance(watch.get("entry_validation"), dict),
+                    )
+
                 # New/refreshed RC must be allowed to send one new trigger alert.
                 watch["discord_rc_trigger_sent"] = False
                 watch.pop("discord_rc_trigger_sent_ms", None)

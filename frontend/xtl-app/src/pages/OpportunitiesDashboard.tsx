@@ -1360,7 +1360,7 @@ function useOpportunities() {
     profileId: "",
   });
   const LAST_OWNER_KEY =
-    "xtl_opp_last_owner_v2";
+    "xtl_opp_last_owner_v3";
 
   const cacheKeys = React.useCallback(
     (
@@ -1376,15 +1376,15 @@ function useOpportunities() {
 
       return {
         rows:
-          `xtl_opp_rows_cache_v2:` +
+          `xtl_opp_rows_cache_v3:` +
           `${uidKey}:${profileKey}`,
 
         history:
-          `xtl_opp_history_cache_v2:` +
+          `xtl_opp_history_cache_v3:` +
           `${uidKey}:${profileKey}`,
 
         lastAt:
-          `xtl_opp_lastAt_cache_v2:` +
+          `xtl_opp_lastAt_cache_v3:` +
           `${uidKey}:${profileKey}`,
       };
     },
@@ -1495,6 +1495,32 @@ function useOpportunities() {
       );
 
       const rowKey = (r: OppRow) => `${r.symbol}:${r.alertTimeMs ?? 0}`;
+      // A successful non-empty backend response is authoritative for
+      // the current watchlist. Remove old cached/frozen symbols that
+      // are no longer returned by the backend.
+      if (mappedRows.length > 0) {
+        const backendSymbols = new Set(
+          mappedRows.map((r) =>
+            String(r.symbol || "")
+              .toUpperCase()
+              .trim()
+          )
+        );
+
+        for (const symbol of Array.from(
+          frozenRef.current.keys()
+        )) {
+          const normalizedSymbol = String(
+            symbol || ""
+          )
+            .toUpperCase()
+            .trim();
+
+          if (!backendSymbols.has(normalizedSymbol)) {
+            frozenRef.current.delete(symbol);
+          }
+        }
+      }
 
       // 1) Update / insert frozen snapshots from freshly mapped rows
       for (const r of mappedRows) {

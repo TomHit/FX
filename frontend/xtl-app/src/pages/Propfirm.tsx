@@ -36,6 +36,31 @@ type ProfilesResponse = {
   error?: string;
 };
 
+type ConnectedAccount = {
+  login: string;
+  server: string;
+  company: string;
+  account_type: string;
+  is_demo: boolean;
+  device_id: string;
+  account_key: string;
+  balance?: number;
+  equity?: number;
+  leverage?: number;
+  snapshot_ms: number;
+  snapshot_age_ms: number;
+  connected: boolean;
+};
+
+type ConnectedAccountsResponse = {
+  ok: boolean;
+  uid?: string;
+  accounts: ConnectedAccount[];
+  count: number;
+  generated_at_ms?: number;
+  error?: string;
+};
+
 type StatusResponse = {
   ok: boolean;
   profile_id?: string;
@@ -84,9 +109,51 @@ const textOrNA = (value: any) => {
   return String(value);
 };
 
+const normalizeBrokerIdentity = (value: any) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+
+const brokerIdentityMatches = (
+  configured: any,
+  live: any
+) => {
+  const expected = normalizeBrokerIdentity(configured);
+  const actual = normalizeBrokerIdentity(live);
+
+  if (!expected || !actual) {
+    return false;
+  }
+
+  return (
+    expected === actual ||
+    expected.includes(actual) ||
+    actual.includes(expected)
+  );
+};
+
+const accountMatchesProfile = (
+  account: ConnectedAccount,
+  profile: PropConfig
+) =>
+  String(account.login || "").trim() ===
+    String(profile.account_login || "").trim() &&
+  brokerIdentityMatches(
+    profile.account_server,
+    account.server
+  ) &&
+  brokerIdentityMatches(
+    profile.broker_company,
+    account.company
+  );
+
 export default function Propfirm() {
   const [profilesData, setProfilesData] =
     useState<ProfilesResponse | null>(null);
+
+  const [connectedAccounts, setConnectedAccounts] =
+    useState<ConnectedAccount[]>([]);
 
   const [status, setStatus] =
     useState<StatusResponse | null>(null);
@@ -133,15 +200,35 @@ export default function Propfirm() {
     setErr("");
 
     try {
-      const profilesRes = await fetchJson<ProfilesResponse>(
-        "/trend/prop/profiles"
-      );
+      const [profilesRes, connectedRes] = await Promise.all([
+        fetchJson<ProfilesResponse>(
+          "/trend/prop/profiles"
+        ),
+        fetchJson<ConnectedAccountsResponse>(
+          "/trend/prop/connected-accounts"
+        ),
+      ]);
 
       if (!profilesRes?.ok) {
         throw new Error(
           profilesRes?.error || "Failed to load prop profiles"
         );
       }
+
+      if (!connectedRes?.ok) {
+        throw new Error(
+          connectedRes?.error ||
+            "Failed to load connected MT5 accounts"
+        );
+      }
+
+      setConnectedAccounts(
+        Array.isArray(connectedRes.accounts)
+          ? connectedRes.accounts.filter(
+              (account) => account.connected === true
+            )
+          : []
+      );
 
       const backendActiveProfileId = String(
         profilesRes.active_profile_id || ""
@@ -357,39 +444,198 @@ export default function Propfirm() {
     }
   }
   
+  async function rebindProfileAccount(
+    profile: PropConfig,
+    account: ConnectedAccount
+  ) {
+    const profileId = String(
+      profile?.profile_id || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    if (!profileId || saving) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Rebind ${profile.account_name || profileId} ` +
+        `from account ${profile.account_login || "unknown"} ` +
+        `to connected account ${account.login}?`
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setSaving(true);
+    setErr("");
+
+    try {
+      const result = await fetchJson<{
+        ok: boolean;
+        profile_id?: string;
+        old_account_login?: string | null;
+        new_account_login?: string;
+        error?: string;
+      }>(
+        `/trend/prop/profile/rebind-account?profile_id=${encodeURIComponent(
+          profileId
+        )}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            profile_id: profileId,
+            account_login: account.login,
+            account_server: account.server,
+            broker_company: account.company,
+            account_type: account.account_type,
+            device_id: account.device_id,
+          }),
+        }
+      );
+
+      if (!result?.ok) {
+        throw new Error(
+          result?.error ||
+            "Failed to rebind broker account"
+        );
+      }
+
+      await load(profileId);
+    } catch (error: any) {
+      setErr(String(error?.message || error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   const activeProfileId = String(
     profilesData?.active_profile_id || ""
   )
     .trim()
     .toLowerCase();
 
-  const selectValue =
+  const connectedProfiles = useMemo(() => {
+    const profiles = profilesData?.profiles || [];
+
+    return profiles.filter((profile) =>
+      connectedAccounts.some((account) =>
+        accountMatchesProfile(account, profile)
+      )
+    );
+  }, [profilesData, connectedAccounts]);
+
+  const connectedProfileIds = useMemo(
+    () =>
+      new Set(
+        connectedProfiles.map((profile) =>
+          String(profile.profile_id || "")
+            .trim()
+            .toLowerCase()
+        )
+      ),
+    [connectedProfiles]
+  );
+
+  const requestedSelectValue =
     viewedProfileId || activeProfileId;
+
+  const selectValue = connectedProfileIds.has(
+    requestedSelectValue
+  )
+    ? requestedSelectValue
+    : String(
+        connectedProfiles[0]?.profile_id || ""
+      )
+        .trim()
+        .toLowerCase();
 
   const selectedProfile = useMemo(() => {
     return (
-      profilesData?.profiles?.find(
+      connectedProfiles.find(
         (profile) =>
-          profile.profile_id === selectValue
+          String(profile.profile_id || "")
+            .trim()
+            .toLowerCase() === selectValue
       ) || null
     );
-  }, [profilesData, selectValue]);
+  }, [connectedProfiles, selectValue]);
 
-  // Never use status belonging to the previously selected profile.
+  const configuredActiveProfile = useMemo(() => {
+    return (
+      profilesData?.profiles?.find(
+        (profile) =>
+          String(profile.profile_id || "")
+            .trim()
+            .toLowerCase() === activeProfileId
+      ) || null
+    );
+  }, [profilesData, activeProfileId]);
+
+  const displayedProfile =
+    selectedProfile || configuredActiveProfile;
+
+  const replacementCandidates = useMemo(() => {
+    const profile =
+      selectedProfile || configuredActiveProfile;
+
+    if (!profile) {
+      return [];
+    }
+
+    const configuredLogin = String(
+      profile.account_login || ""
+    ).trim();
+
+    return connectedAccounts.filter((account) => {
+      const sameBroker =
+        brokerIdentityMatches(
+          profile.account_server,
+          account.server
+        ) &&
+        brokerIdentityMatches(
+          profile.broker_company,
+          account.company
+        );
+
+      const differentLogin =
+        String(account.login || "").trim() !==
+        configuredLogin;
+
+      return sameBroker && differentLogin;
+    });
+  }, [
+    selectedProfile,
+    configuredActiveProfile,
+    connectedAccounts,
+  ]);
+
+  // When the configured active profile is disconnected, status/risk still
+  // belong to it and are needed to show the rebind panel safely.
+  const displayedProfileId = String(
+    displayedProfile?.profile_id || ""
+  )
+    .trim()
+    .toLowerCase();
+
   const statusMatchesSelection =
     String(status?.profile_id || "")
       .trim()
-      .toLowerCase() === selectValue;
+      .toLowerCase() === displayedProfileId;
 
   const riskMatchesSelection =
     String(risk?.config?.profile_id || "")
       .trim()
-      .toLowerCase() === selectValue;
+      .toLowerCase() === displayedProfileId;
 
   const cfg =
     statusMatchesSelection
-      ? status?.config || selectedProfile || undefined
-      : selectedProfile || undefined;
+      ? status?.config || displayedProfile || undefined
+      : displayedProfile || undefined;
 
   const rs =
     riskMatchesSelection
@@ -400,15 +646,16 @@ export default function Propfirm() {
     statusMatchesSelection
       ? status?.limits
       : undefined;
+
   const activeTitle =
     cfg?.account_name ||
-    selectedProfile?.account_name ||
-    selectedProfile?.profile_id ||
+    displayedProfile?.account_name ||
+    displayedProfile?.profile_id ||
     "No active profile";
 
   const selectedIsActive =
-    Boolean(selectValue) &&
-    selectValue === activeProfileId;
+    Boolean(displayedProfileId) &&
+    displayedProfileId === activeProfileId;
 
   const profileDevice =
     statusMatchesSelection
@@ -425,6 +672,7 @@ export default function Propfirm() {
     selectedIsActive &&
     profileEnabled &&
     deviceConnected;
+
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-6">
@@ -474,17 +722,17 @@ export default function Propfirm() {
               disabled={
                 loading ||
                 saving ||
-                !profilesData?.profiles?.length
+                connectedProfiles.length === 0
               }
             >
               
-              {!profilesData?.profiles?.length ? (
+              {connectedProfiles.length === 0 ? (
                 <option value="">
-                  No profiles available
+                  No connected execution accounts
                 </option>
               ) : null}
 
-              {profilesData?.profiles?.map((profile) => (
+              {connectedProfiles.map((profile) => (
                 
                 <option
                   key={profile.profile_id}
@@ -503,7 +751,7 @@ export default function Propfirm() {
             </select>
 
             <div className="text-xs text-slate-400 mt-2">
-              Select an account to inspect it, then explicitly enable or activate it.
+              Only fresh, connected MT5 accounts are listed. Select one to inspect it, then explicitly enable or activate it.
             </div>
 
             {saving ? (
@@ -513,6 +761,79 @@ export default function Propfirm() {
             ) : null}
           </div>
         </div>
+
+        {configuredActiveProfile &&
+         replacementCandidates.length > 0 ? (
+          <div className="rounded-xl border border-amber-700 bg-amber-950/30 p-4">
+            <div className="text-sm font-semibold text-amber-200">
+              Replacement MT5 account detected
+            </div>
+
+            <div className="mt-1 text-xs text-slate-300">
+              Configured account{" "}
+              <span className="font-mono">
+                {configuredActiveProfile.account_login ||
+                  "unknown"}
+              </span>{" "}
+              does not match the connected replacement account.
+              Select the correct replacement explicitly.
+            </div>
+
+            <div className="mt-3 space-y-2">
+              {replacementCandidates.map((account) => (
+                <div
+                  key={[
+                    account.device_id,
+                    account.login,
+                    account.account_type,
+                  ].join(":")}
+                  className="flex flex-col gap-3 rounded-lg border border-slate-700 bg-slate-950/60 p-3 md:flex-row md:items-center md:justify-between"
+                >
+                  <div>
+                    <div className="font-medium text-slate-100">
+                      {account.company}
+                    </div>
+
+                    <div className="text-xs text-slate-400">
+                      Login {account.login} · {account.server} ·{" "}
+                      {account.account_type}
+                    </div>
+
+                    <div className="text-xs text-slate-500">
+                      Device {account.device_id} · snapshot{" "}
+                      {Math.round(
+                        Number(account.snapshot_age_ms || 0) /
+                          1000
+                      )}{" "}
+                      sec ago
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    disabled={saving}
+                    onClick={() => {
+                      void rebindProfileAccount(
+                        configuredActiveProfile,
+                        account
+                      );
+                    }}
+                    className={[
+                      "rounded-lg border px-4 py-2 text-sm font-medium",
+                      saving
+                        ? "cursor-not-allowed border-slate-700 text-slate-500"
+                        : "border-amber-600 bg-amber-950/50 text-amber-200 hover:bg-amber-900/50",
+                    ].join(" ")}
+                  >
+                    {saving
+                      ? "Rebinding..."
+                      : `Rebind to ${account.login}`}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         {err ? (
           <div className="rounded-xl border border-red-900 bg-red-950/40 p-3 text-sm text-red-200">
@@ -604,7 +925,7 @@ export default function Propfirm() {
                 </div>
               ) : null}
 
-              {selectedProfile ? (
+              {displayedProfile ? (
                 <div className="mt-4 flex flex-wrap gap-3">
                   {!profileEnabled ? (
                     <button
@@ -615,7 +936,7 @@ export default function Propfirm() {
                       }
                       onClick={() => {
                         void enableAndActivateProfile(
-                          selectedProfile
+                          displayedProfile
                         );
                       }}
                       className={[
@@ -638,7 +959,7 @@ export default function Propfirm() {
                       }
                       onClick={() => {
                         void activateProfile(
-                          selectedProfile.profile_id
+                          displayedProfile.profile_id
                         );
                       }}
                       className={[
@@ -676,7 +997,7 @@ export default function Propfirm() {
                 />
 
                 <span className="rounded-full border border-slate-700 px-2 py-1 text-slate-300">
-                  Selected: {selectValue || "NA"}
+                  Selected: {displayedProfileId || "NA"}
                 </span>
 
                 <span className="rounded-full border border-slate-700 px-2 py-1 text-slate-300">

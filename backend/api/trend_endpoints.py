@@ -2654,16 +2654,21 @@ def require_prop_auth(request: Request):
 
 
 # ================================================================
-# Prop Dashboard unified read model (Phase 1 performance)
+# Prop Dashboard unified read model (Phase 2: stale-while-revalidate)
+# Presentation cache only. Trading/risk enforcement must never read these keys.
 # ================================================================
-PROP_DASHBOARD_SNAPSHOT_VERSION = 1
+PROP_DASHBOARD_SNAPSHOT_VERSION = 2
 PROP_DASHBOARD_SNAPSHOT_TTL_S = max(
     1,
-    int(os.getenv("XTL_PROP_DASHBOARD_SNAPSHOT_TTL_SEC", "5")),
+    int(os.getenv("XTL_PROP_DASHBOARD_SNAPSHOT_TTL_SEC", "15")),
 )
 PROP_DASHBOARD_LAST_GOOD_TTL_S = max(
     PROP_DASHBOARD_SNAPSHOT_TTL_S,
     int(os.getenv("XTL_PROP_DASHBOARD_LAST_GOOD_TTL_SEC", "300")),
+)
+PROP_DASHBOARD_REFRESH_LOCK_TTL_S = max(
+    5,
+    int(os.getenv("XTL_PROP_DASHBOARD_REFRESH_LOCK_TTL_SEC", "30")),
 )
 
 
@@ -2678,6 +2683,70 @@ def _prop_dashboard_last_good_key(uid: str, profile_id: str) -> str:
     pid = _norm_prop_profile_id(profile_id)
     return f"xtl:prop:dashboard_snapshot:last_good:{uid_u}:{pid}"
 
+
+def _prop_dashboard_refresh_lock_key(uid: str, profile_id: str) -> str:
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+    return f"xtl:prop:dashboard_snapshot:refresh_lock:{uid_u}:{pid}"
+
+def _invalidate_prop_dashboard_snapshot(
+    uid: str,
+    profile_id: str,
+    event: str = "STATE_CHANGED",
+) -> bool:
+    """
+    Delete only the short-lived dashboard snapshot.
+
+    Keep the last-good snapshot so Phase 2 can serve it immediately
+    while rebuilding the dashboard in the background.
+    """
+    uid_u = str(uid or "").strip()
+    pid = str(profile_id or "").strip().lower()
+    event_u = str(event or "STATE_CHANGED").strip().upper()
+
+    if not uid_u or not pid:
+        log.warning(
+            "[PROP_DASHBOARD] INVALIDATE_SKIP "
+            "event=%s uid_present=%s profile=%s",
+            event_u,
+            bool(uid_u),
+            pid or None,
+        )
+        return False
+
+    try:
+        cache_key = _prop_dashboard_snapshot_key(
+            uid_u,
+            pid,
+        )
+
+        deleted = int(
+            R.delete(cache_key)
+            or 0
+        )
+
+        log.warning(
+            "[PROP_DASHBOARD] INVALIDATED "
+            "event=%s uid=%s profile=%s deleted=%s key=%s",
+            event_u,
+            uid_u,
+            pid,
+            deleted,
+            cache_key,
+        )
+
+        return True
+
+    except Exception as exc:
+        log.exception(
+            "[PROP_DASHBOARD] INVALIDATE_FAILED "
+            "event=%s uid=%s profile=%s err=%r",
+            event_u,
+            uid_u,
+            pid,
+            exc,
+        )
+        return False
 
 def _decode_json_dict(raw) -> dict:
     try:
@@ -2956,37 +3025,309 @@ def _store_prop_dashboard_snapshot(uid: str, profile_id: str, payload: dict) -> 
     pipe.execute()
 
 
+def _release_prop_dashboard_refresh_lock(lock_key: str, token: str) -> None:
+    """Release only the lock created by this worker."""
+    try:
+        R.eval(
+            "if redis.call('get',KEYS[1])==ARGV[1] then "
+            "return redis.call('del',KEYS[1]) else return 0 end",
+            1,
+            lock_key,
+            token,
+        )
+    except Exception:
+        log.exception("[PROP_DASHBOARD] REFRESH_LOCK_RELEASE_FAILED key=%s", lock_key)
+
+
+def _refresh_prop_dashboard_snapshot_background(
+    uid: str,
+    profile_id: str,
+    lock_key: str,
+    lock_token: str,
+    event: str | None = None,
+) -> None:
+    """
+    Build and store one presentation-only dashboard snapshot.
+
+    event is populated for lifecycle-driven Phase 4 warm refreshes.
+    When event is absent, this remains the normal Phase 2
+    stale-while-revalidate background worker.
+
+    Failure here must never affect trading or risk enforcement.
+    """
+    started = time.perf_counter()
+
+    uid_u = str(uid or "").strip()
+    profile_u = str(profile_id or "").strip().lower()
+    event_u = str(event or "").strip().upper()
+
+    try:
+        payload = _build_prop_dashboard_snapshot(
+            uid_u,
+            profile_u,
+        )
+
+        _store_prop_dashboard_snapshot(
+            uid_u,
+            profile_u,
+            payload,
+        )
+
+        elapsed_ms = (
+            time.perf_counter() - started
+        ) * 1000.0
+
+        risk_cache_hit = (
+            payload.get("performance", {})
+            .get("risk_snapshot_cache_hit")
+        )
+
+        if event_u:
+            log.warning(
+                "[PROP_DASHBOARD] WARM_REFRESH_DONE "
+                "event=%s uid=%s profile=%s "
+                "total_ms=%.1f risk_cache_hit=%s",
+                event_u,
+                uid_u,
+                profile_u,
+                elapsed_ms,
+                risk_cache_hit,
+            )
+        else:
+            log.warning(
+                "[PROP_DASHBOARD] BACKGROUND_BUILD_DONE "
+                "uid=%s profile=%s total_ms=%.1f "
+                "risk_cache_hit=%s",
+                uid_u,
+                profile_u,
+                elapsed_ms,
+                risk_cache_hit,
+            )
+
+    except Exception:
+        if event_u:
+            log.exception(
+                "[PROP_DASHBOARD] WARM_REFRESH_FAILED "
+                "event=%s uid=%s profile=%s",
+                event_u,
+                uid_u,
+                profile_u,
+            )
+        else:
+            log.exception(
+                "[PROP_DASHBOARD] BACKGROUND_BUILD_FAILED "
+                "uid=%s profile=%s",
+                uid_u,
+                profile_u,
+            )
+
+    finally:
+        _release_prop_dashboard_refresh_lock(
+            lock_key,
+            lock_token,
+        )
+
+def _start_prop_dashboard_background_refresh(
+    uid: str,
+    profile_id: str,
+    event: str | None = None,
+) -> bool:
+    """
+    Acquire the shared single-flight Redis lock and launch one
+    presentation-only daemon refresh.
+
+    Used by:
+      - Phase 2 stale-while-revalidate
+      - Phase 4 lifecycle warm refresh
+
+    Returns True only when this caller started the worker.
+    """
+    import threading
+
+    uid_u = str(uid or "").strip()
+    profile_u = str(profile_id or "").strip().lower()
+    event_u = str(event or "").strip().upper()
+
+    lock_key = _prop_dashboard_refresh_lock_key(
+        uid_u,
+        profile_u,
+    )
+    lock_token = secrets.token_hex(16)
+
+    try:
+        acquired = bool(
+            R.set(
+                lock_key,
+                lock_token,
+                nx=True,
+                ex=PROP_DASHBOARD_REFRESH_LOCK_TTL_S,
+            )
+        )
+    except Exception:
+        log.exception(
+            "[PROP_DASHBOARD] REFRESH_LOCK_ACQUIRE_FAILED "
+            "event=%s uid=%s profile=%s",
+            event_u or None,
+            uid_u,
+            profile_u,
+        )
+        return False
+
+    if not acquired:
+        if event_u:
+            log.warning(
+                "[PROP_DASHBOARD] WARM_REFRESH_SKIPPED_LOCKED "
+                "event=%s uid=%s profile=%s key=%s",
+                event_u,
+                uid_u,
+                profile_u,
+                lock_key,
+            )
+        return False
+
+    try:
+        worker = threading.Thread(
+            target=_refresh_prop_dashboard_snapshot_background,
+            args=(
+                uid_u,
+                profile_u,
+                lock_key,
+                lock_token,
+                event_u or None,
+            ),
+            name=(
+                f"prop-dashboard-refresh-"
+                f"{profile_u}"
+            ),
+            daemon=True,
+        )
+        worker.start()
+        return True
+
+    except Exception:
+        _release_prop_dashboard_refresh_lock(
+            lock_key,
+            lock_token,
+        )
+
+        log.exception(
+            "[PROP_DASHBOARD] REFRESH_THREAD_START_FAILED "
+            "event=%s uid=%s profile=%s",
+            event_u or None,
+            uid_u,
+            profile_u,
+        )
+        return False
+
+def _schedule_prop_dashboard_warm_refresh(
+    uid: str,
+    profile_id: str,
+    event: str,
+) -> bool:
+    """
+    Schedule a presentation-only dashboard warm refresh after an
+    authoritative writer-side lifecycle transition.
+
+    This helper is strictly best-effort:
+      - it must never raise into executor code;
+      - it must never block trade entry or close;
+      - it must never be consumed by trading/risk enforcement.
+    """
+    uid_u = str(uid or "").strip()
+    profile_u = str(profile_id or "").strip().lower()
+    event_u = str(event or "UNKNOWN").strip().upper()
+
+    if not uid_u or not profile_u:
+        log.warning(
+            "[PROP_DASHBOARD] WARM_REFRESH_SKIP_INVALID "
+            "event=%s uid_present=%s profile=%s",
+            event_u,
+            bool(uid_u),
+            profile_u or None,
+        )
+        return False
+
+    try:
+        started = _start_prop_dashboard_background_refresh(
+            uid_u,
+            profile_u,
+            event=event_u,
+        )
+
+        if started:
+            log.warning(
+                "[PROP_DASHBOARD] WARM_REFRESH_SCHEDULED "
+                "event=%s uid=%s profile=%s",
+                event_u,
+                uid_u,
+                profile_u,
+            )
+
+        return bool(started)
+
+    except Exception:
+        log.exception(
+            "[PROP_DASHBOARD] WARM_REFRESH_SCHEDULE_FAILED "
+            "event=%s uid=%s profile=%s",
+            event_u,
+            uid_u,
+            profile_u,
+        )
+        return False
+
+
+
+def _decorate_prop_dashboard_cached_response(
+    payload: dict,
+    *,
+    source: str,
+    stale: bool,
+    cache_hit: bool,
+    request_started: float,
+) -> dict:
+    out = dict(payload)
+    computed_at_ms = int(out.get("computed_at_ms") or 0)
+    out["snapshot_source"] = source
+    out["snapshot_cache_hit"] = cache_hit
+    out["snapshot_stale"] = stale
+    out["snapshot_age_ms"] = (
+        max(0, int(time.time() * 1000) - computed_at_ms)
+        if computed_at_ms
+        else None
+    )
+    out.setdefault("performance", {})["request_total_ms"] = round(
+        (time.perf_counter() - request_started) * 1000.0,
+        1,
+    )
+    return out
+
+
 @router.get("/prop/snapshot")
 def prop_snapshot(
     profile_id: str | None = None,
     refresh: bool = False,
     user=Depends(require_prop_auth),
 ):
-    """One fast response for the Prop Dashboard UI."""
+    """Fast presentation-only Prop Dashboard snapshot."""
     request_started = time.perf_counter()
     uid = _require_prop_uid(user)
     pid = _resolve_user_prop_profile_id(uid, profile_id)
     cache_key = _prop_dashboard_snapshot_key(uid, pid)
+    last_good_key = _prop_dashboard_last_good_key(uid, pid)
 
     if not refresh:
         try:
             cached = _decode_json_dict(R.get(cache_key))
             if cached:
-                out = dict(cached)
-                computed_at_ms = int(out.get("computed_at_ms") or 0)
-                out["snapshot_source"] = "FRESH_CACHE"
-                out["snapshot_cache_hit"] = True
-                out["snapshot_stale"] = False
-                out["snapshot_age_ms"] = max(
-                    0,
-                    int(time.time() * 1000) - computed_at_ms,
-                ) if computed_at_ms else None
-                out.setdefault("performance", {})["request_total_ms"] = round(
-                    (time.perf_counter() - request_started) * 1000.0,
-                    1,
+                out = _decorate_prop_dashboard_cached_response(
+                    cached,
+                    source="FRESH_CACHE",
+                    stale=False,
+                    cache_hit=True,
+                    request_started=request_started,
                 )
                 log.info(
-                    "[PROP_DASHBOARD_TIMING] uid=%s profile=%s cache_hit=1 total_ms=%.1f",
+                    "[PROP_DASHBOARD_TIMING] uid=%s profile=%s source=FRESH_CACHE total_ms=%.1f",
                     uid,
                     pid,
                     (time.perf_counter() - request_started) * 1000.0,
@@ -2999,6 +3340,36 @@ def prop_snapshot(
                 pid,
             )
 
+        # Fresh cache expired: serve last-good immediately and refresh once.
+        try:
+            last_good = _decode_json_dict(R.get(last_good_key))
+            if last_good:
+                refresh_started = _start_prop_dashboard_background_refresh(uid, pid)
+                out = _decorate_prop_dashboard_cached_response(
+                    last_good,
+                    source="STALE_WHILE_REVALIDATE",
+                    stale=True,
+                    cache_hit=False,
+                    request_started=request_started,
+                )
+                out["snapshot_refresh_started"] = refresh_started
+                out["snapshot_refresh_already_running"] = not refresh_started
+                log.warning(
+                    "[PROP_DASHBOARD_TIMING] uid=%s profile=%s source=STALE_WHILE_REVALIDATE refresh_started=%s total_ms=%.1f",
+                    uid,
+                    pid,
+                    refresh_started,
+                    (time.perf_counter() - request_started) * 1000.0,
+                )
+                return out
+        except Exception:
+            log.exception(
+                "[PROP_DASHBOARD] LAST_GOOD_READ_FAILED uid=%s profile=%s",
+                uid,
+                pid,
+            )
+
+    # Explicit refresh, or true cold start with no fresh/last-good snapshot.
     try:
         payload = _build_prop_dashboard_snapshot(uid, pid)
         _store_prop_dashboard_snapshot(uid, pid, payload)
@@ -3007,9 +3378,10 @@ def prop_snapshot(
             1,
         )
         log.warning(
-            "[PROP_DASHBOARD_TIMING] uid=%s profile=%s cache_hit=0 total_ms=%.1f build_ms=%s risk_cache_hit=%s",
+            "[PROP_DASHBOARD_TIMING] uid=%s profile=%s source=SYNC_BUILD refresh=%s total_ms=%.1f build_ms=%s risk_cache_hit=%s",
             uid,
             pid,
+            refresh,
             (time.perf_counter() - request_started) * 1000.0,
             payload.get("performance", {}).get("total_ms"),
             payload.get("performance", {}).get("risk_snapshot_cache_hit"),
@@ -3019,32 +3391,23 @@ def prop_snapshot(
         raise
     except Exception:
         log.exception(
-            "[PROP_DASHBOARD] BUILD_FAILED uid=%s profile=%s",
+            "[PROP_DASHBOARD] SYNC_BUILD_FAILED uid=%s profile=%s",
             uid,
             pid,
         )
         try:
-            last_good = _decode_json_dict(
-                R.get(_prop_dashboard_last_good_key(uid, pid))
-            )
+            last_good = _decode_json_dict(R.get(last_good_key))
             if last_good:
-                out = dict(last_good)
-                computed_at_ms = int(out.get("computed_at_ms") or 0)
-                out["snapshot_source"] = "LAST_GOOD"
-                out["snapshot_cache_hit"] = False
-                out["snapshot_stale"] = True
-                out["snapshot_age_ms"] = max(
-                    0,
-                    int(time.time() * 1000) - computed_at_ms,
-                ) if computed_at_ms else None
-                out.setdefault("performance", {})["request_total_ms"] = round(
-                    (time.perf_counter() - request_started) * 1000.0,
-                    1,
+                return _decorate_prop_dashboard_cached_response(
+                    last_good,
+                    source="LAST_GOOD_ON_ERROR",
+                    stale=True,
+                    cache_hit=False,
+                    request_started=request_started,
                 )
-                return out
         except Exception:
             log.exception(
-                "[PROP_DASHBOARD] LAST_GOOD_READ_FAILED uid=%s profile=%s",
+                "[PROP_DASHBOARD] LAST_GOOD_ON_ERROR_READ_FAILED uid=%s profile=%s",
                 uid,
                 pid,
             )
@@ -3264,6 +3627,550 @@ def _broker_identity_matches(
         or actual in expected
     )
 
+
+def _list_connected_prop_accounts(
+    uid: str,
+    *,
+    freshness_ms: int = 180_000,
+) -> list[dict]:
+    """
+    Return only fresh MT5 accounts from devices owned by this user.
+
+    Rules:
+      - no global device scan
+      - no stale saved profile accounts
+      - only typed live account snapshots
+      - duplicate device snapshots collapse into one broker account
+      - freshest snapshot wins
+    """
+    try:
+        uid_u = _require_prop_runtime_uid(uid)
+        now_ms = int(time.time() * 1000)
+
+        raw_devices = (
+            R.smembers(
+                f"xtl:user:{uid_u}:devices"
+            )
+            or set()
+        )
+
+        device_ids = []
+
+        for value in raw_devices:
+            if isinstance(
+                value,
+                (bytes, bytearray),
+            ):
+                value = value.decode(
+                    "utf-8",
+                    "ignore",
+                )
+
+            device_id = str(
+                value or ""
+            ).strip()
+
+            if device_id:
+                device_ids.append(
+                    device_id
+                )
+
+        candidates_by_identity = {}
+
+        for device_id in sorted(
+            set(device_ids)
+        ):
+            for account_type in (
+                "demo",
+                "live",
+            ):
+                key = (
+                    f"xtl:mt5:account:"
+                    f"{device_id}:{account_type}"
+                )
+
+                try:
+                    raw = R.get(key)
+                except Exception:
+                    raw = None
+
+                if not raw:
+                    continue
+
+                if isinstance(
+                    raw,
+                    (bytes, bytearray),
+                ):
+                    raw = raw.decode(
+                        "utf-8",
+                        "replace",
+                    )
+
+                try:
+                    account = json.loads(raw)
+                except Exception:
+                    continue
+
+                if not isinstance(
+                    account,
+                    dict,
+                ):
+                    continue
+
+                (
+                    login,
+                    server,
+                    company,
+                ) = _prop_account_identity(
+                    account
+                )
+
+                if (
+                    not login
+                    or not server
+                    or not company
+                ):
+                    continue
+
+                snapshot_ms = _to_ms_any(
+                    account.get(
+                        "server_received_ms"
+                    )
+                    or account.get(
+                        "updated_ts_ms"
+                    )
+                    or 0
+                )
+
+                age_ms = (
+                    max(
+                        0,
+                        now_ms
+                        - snapshot_ms,
+                    )
+                    if snapshot_ms > 0
+                    else None
+                )
+
+                connected = bool(
+                    snapshot_ms > 0
+                    and age_ms is not None
+                    and age_ms
+                    <= int(freshness_ms)
+                )
+
+                if not connected:
+                    continue
+
+                identity = (
+                    str(login),
+                    _norm_broker_identity(
+                        server
+                    ),
+                    _norm_broker_identity(
+                        company
+                    ),
+                    str(account_type),
+                )
+
+                row = {
+                    "login": str(login),
+                    "server": str(server),
+                    "company": str(company),
+
+                    "account_type": (
+                        account_type.upper()
+                    ),
+                    "is_demo": bool(
+                        account_type == "demo"
+                    ),
+
+                    "device_id": device_id,
+                    "account_key": key,
+
+                    "balance": _safe_float(
+                        account.get("balance"),
+                        0.0,
+                    ),
+                    "equity": _safe_float(
+                        account.get("equity"),
+                        0.0,
+                    ),
+                    "leverage": _safe_int(
+                        account.get("leverage"),
+                        0,
+                    ),
+
+                    "snapshot_ms": int(
+                        snapshot_ms
+                    ),
+                    "snapshot_age_ms": int(
+                        age_ms
+                    ),
+                    "connected": True,
+                }
+
+                previous = (
+                    candidates_by_identity.get(
+                        identity
+                    )
+                )
+
+                if (
+                    previous is None
+                    or int(
+                        row["snapshot_ms"]
+                    )
+                    > int(
+                        previous.get(
+                            "snapshot_ms"
+                        )
+                        or 0
+                    )
+                ):
+                    candidates_by_identity[
+                        identity
+                    ] = row
+
+        accounts = list(
+            candidates_by_identity.values()
+        )
+
+        accounts.sort(
+            key=lambda row: (
+                str(
+                    row.get("company")
+                    or ""
+                ).lower(),
+                str(
+                    row.get("server")
+                    or ""
+                ).lower(),
+                str(
+                    row.get("login")
+                    or ""
+                ),
+            )
+        )
+
+        return accounts
+
+    except Exception as exc:
+        log.exception(
+            "[PROP] CONNECTED_ACCOUNTS_LIST_FAILED "
+            "uid=%s err=%r",
+            uid,
+            exc,
+        )
+        return []
+
+
+@router.get("/prop/connected-accounts")
+def prop_connected_accounts(
+    user=Depends(require_prop_auth),
+):
+    uid = _require_prop_uid(user)
+
+    accounts = _list_connected_prop_accounts(
+        uid,
+        freshness_ms=180_000,
+    )
+
+    return {
+        "ok": True,
+        "uid": uid,
+        "accounts": accounts,
+        "count": len(accounts),
+        "generated_at_ms": int(
+            time.time() * 1000
+        ),
+    }
+
+
+@router.post("/prop/profile/rebind-account")
+def prop_profile_rebind_account(
+    payload: dict,
+    profile_id: str | None = None,
+    user=Depends(require_prop_auth),
+):
+    """
+    Rebind an existing prop profile to a currently connected MT5 account.
+
+    Preserves:
+      - profile ID
+      - risk settings
+      - daily records
+      - stats
+      - analytics
+      - historical trades
+
+    Changes only the broker-account binding and resolution metadata.
+    """
+    uid = _require_prop_uid(user)
+
+    pid = _resolve_user_prop_profile_id(
+        uid,
+        profile_id
+        or payload.get("profile_id"),
+    )
+
+    existing = _get_user_prop_config(
+        uid,
+        pid,
+    )
+
+    if not isinstance(existing, dict):
+        raise HTTPException(
+            status_code=404,
+            detail="PROP_PROFILE_NOT_FOUND",
+        )
+
+    requested_login = str(
+        payload.get("account_login")
+        or payload.get("login")
+        or ""
+    ).strip()
+
+    requested_server = str(
+        payload.get("account_server")
+        or payload.get("server")
+        or ""
+    ).strip()
+
+    requested_company = str(
+        payload.get("broker_company")
+        or payload.get("company")
+        or ""
+    ).strip()
+
+    requested_device = str(
+        payload.get("device_id")
+        or ""
+    ).strip()
+
+    requested_account_type = str(
+        payload.get("account_type")
+        or ""
+    ).strip().upper()
+
+    if not requested_login:
+        raise HTTPException(
+            status_code=400,
+            detail="REBIND_ACCOUNT_LOGIN_REQUIRED",
+        )
+
+    connected_accounts = (
+        _list_connected_prop_accounts(
+            uid,
+            freshness_ms=180_000,
+        )
+    )
+
+    matches = []
+
+    for account in connected_accounts:
+        if (
+            str(
+                account.get("login")
+                or ""
+            ).strip()
+            != requested_login
+        ):
+            continue
+
+        if (
+            requested_device
+            and str(
+                account.get("device_id")
+                or ""
+            ).strip()
+            != requested_device
+        ):
+            continue
+
+        if (
+            requested_account_type
+            and str(
+                account.get("account_type")
+                or ""
+            ).strip().upper()
+            != requested_account_type
+        ):
+            continue
+
+        if (
+            requested_server
+            and not _broker_identity_matches(
+                requested_server,
+                account.get("server"),
+            )
+        ):
+            continue
+
+        if (
+            requested_company
+            and not _broker_identity_matches(
+                requested_company,
+                account.get("company"),
+            )
+        ):
+            continue
+
+        matches.append(account)
+
+    if len(matches) == 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "REBIND_TARGET_NOT_CONNECTED"
+            ),
+        )
+
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "REBIND_TARGET_AMBIGUOUS"
+            ),
+        )
+
+    selected = matches[0]
+
+    old_login = str(
+        existing.get("account_login")
+        or ""
+    ).strip()
+
+    old_server = str(
+        existing.get("account_server")
+        or ""
+    ).strip()
+
+    old_company = str(
+        existing.get("broker_company")
+        or ""
+    ).strip()
+
+    # Replacement account must remain on the same
+    # configured broker/company. Cross-firm or cross-broker
+    # rebinding must require a separate profile.
+    if (
+        old_server
+        and not _broker_identity_matches(
+            old_server,
+            selected.get("server"),
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "REBIND_ACCOUNT_SERVER_MISMATCH"
+            ),
+        )
+
+    if (
+        old_company
+        and not _broker_identity_matches(
+            old_company,
+            selected.get("company"),
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "REBIND_BROKER_COMPANY_MISMATCH"
+            ),
+        )
+
+    updated = dict(existing)
+
+    updated["account_login"] = str(
+        selected["login"]
+    )
+    updated["account_server"] = str(
+        selected["server"]
+    )
+    updated["broker_company"] = str(
+        selected["company"]
+    )
+
+    updated["account_type"] = str(
+        selected["account_type"]
+    ).upper()
+
+    updated["is_demo"] = bool(
+        selected.get("is_demo")
+    )
+
+    updated["last_resolved_device_id"] = (
+        selected["device_id"]
+    )
+    updated[
+        "last_resolved_account_login"
+    ] = str(selected["login"])
+    updated[
+        "last_resolved_account_server"
+    ] = str(selected["server"])
+    updated[
+        "last_resolved_broker_company"
+    ] = str(selected["company"])
+    updated["last_resolved_ts_ms"] = int(
+        time.time() * 1000
+    )
+
+    # Audit trail.
+    updated["account_rebound"] = True
+    updated["account_rebound_at_ms"] = int(
+        time.time() * 1000
+    )
+    updated["account_rebound_from_login"] = (
+        old_login or None
+    )
+    updated["account_rebound_to_login"] = str(
+        selected["login"]
+    )
+    updated["account_rebound_device_id"] = (
+        selected["device_id"]
+    )
+    updated["account_rebound_source"] = (
+        "USER_CONFIRMED_CONNECTED_ACCOUNT"
+    )
+
+    saved = _save_prop_config(
+        uid,
+        updated,
+        profile_id=pid,
+    )
+
+    log.warning(
+        "[PROP] PROFILE_ACCOUNT_REBOUND "
+        "uid=%s profile=%s "
+        "old_login=%s new_login=%s "
+        "device=%s server=%s company=%s",
+        uid,
+        pid,
+        old_login,
+        selected["login"],
+        selected["device_id"],
+        selected["server"],
+        selected["company"],
+    )
+
+    return {
+        "ok": True,
+        "profile_id": pid,
+        "old_account_login": (
+            old_login or None
+        ),
+        "new_account_login": str(
+            selected["login"]
+        ),
+        "device_id": (
+            selected["device_id"]
+        ),
+        "account": selected,
+        "config": saved,
+    }
 
 def _resolve_prop_profile_device(
     profile_id: str | None = None,
@@ -3599,7 +4506,35 @@ def _reservation_ticket(j: dict) -> str:
     return str(ticket) if ticket not in (None, "", 0) else ""
 
 
-def _load_zone_watch_rows(uid: str,symbols: list[str] | None = None, tf: str = "H1") -> list[dict]:
+def _display_symbol(sym: str) -> str:
+    sym = str(sym or "").upper().strip()
+
+    for base in (
+        "XAUUSD",
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "USDCHF",
+        "USDCAD",
+    ):
+        if sym == base or sym.startswith(base):
+            return base
+
+    return sym
+
+
+
+#
+# What changed vs. your version:
+#   1. Symbol is canonicalized at the source: sym_raw comes from the Redis key,
+#      sym = _display_symbol(sym_raw). broker_symbol is preserved on the row.
+#   2. sym_filter is checked against the CANONICAL symbol, so callers passing
+#      the 6 canonical names also match agent-written ...C keys.
+#   3. Dedupe per (symbol, direction) with a rank that avoids the side effect:
+#      a C-key row only beats the native canonical row if it has a real ticket.
+#      Ticketless TRADE_ACTIVE from agent watch-state never hijacks the display.
+
+def _load_zone_watch_rows(uid: str, symbols: list[str] | None = None, tf: str = "H1") -> list[dict]:
     out = []
     uid_u = str(uid or "").strip()
 
@@ -3610,8 +4545,9 @@ def _load_zone_watch_rows(uid: str,symbols: list[str] | None = None, tf: str = "
             tf,
         )
         return []
+
     sym_filter = {
-        str(x or "").upper().strip()
+        _display_symbol(str(x or "").upper().strip())
         for x in (symbols or [])
         if str(x or "").strip()
     }
@@ -3629,9 +4565,12 @@ def _load_zone_watch_rows(uid: str,symbols: list[str] | None = None, tf: str = "
                 continue
 
             key_uid = str(parts[3] or "").strip()
-            sym = str(parts[4] or "").upper().strip()
+            sym_raw = str(parts[4] or "").upper().strip()
             side = str(parts[5] or "").upper().strip()
             key_tf = str(parts[6] or "").upper().strip()
+
+            # --- CANONICALIZE AT SOURCE (EURUSDC -> EURUSD) ---
+            sym = _display_symbol(sym_raw)
 
             if key_uid != uid_u:
                 continue
@@ -3663,6 +4602,17 @@ def _load_zone_watch_rows(uid: str,symbols: list[str] | None = None, tf: str = "
             state = str(w.get("state") or "WATCH").upper().strip()
             rev_ok = bool(w.get("rev_ok")) or state == "REV_OK" or state.startswith("ENTRY_BLOCKED")
 
+            # real broker ticket, if the agent stored one in the watch payload
+            ticket = str(
+                w.get("ticket")
+                or w.get("mt5_ticket")
+                or w.get("broker_ticket")
+                or w.get("position_ticket")
+                or ""
+            ).strip()
+            if ticket in ("0", "None", "null"):
+                ticket = ""
+
             if rev_ok:
                 trigger = w.get("trigger_level")
                 if not trigger:
@@ -3680,6 +4630,7 @@ def _load_zone_watch_rows(uid: str,symbols: list[str] | None = None, tf: str = "
 
             out.append({
                 "symbol": sym,
+                "broker_symbol": sym_raw,
                 "direction": side,
                 "dir": side,
                 "opp_dir": "UP" if side == "BUY" else "DOWN",
@@ -3694,6 +4645,7 @@ def _load_zone_watch_rows(uid: str,symbols: list[str] | None = None, tf: str = "
                 "zone_text": zone_text,
                 "market_closed": True,
                 "watch_key": key,
+                "mt5_ticket": ticket or None,
                 "entry_gate": {
                     "watch_key": key,
                     "rev_ok": rev_ok,
@@ -3702,6 +4654,7 @@ def _load_zone_watch_rows(uid: str,symbols: list[str] | None = None, tf: str = "
                     "rev_state": w,
                 },
                 "created_at_ms": int(w.get("started_ms") or w.get("watch_created_ms") or 0),
+                "updated_ms": int(w.get("updated_ms") or w.get("last_update_ms") or 0),
                 "rev_ok_ms": int(w.get("rev_ok_ms") or 0),
             })
     except Exception as e:
@@ -3709,6 +4662,36 @@ def _load_zone_watch_rows(uid: str,symbols: list[str] | None = None, tf: str = "
             log.warning("[WATCHLIST] WEEKEND_WATCH_FALLBACK_EXC err=%r", e)
         except Exception:
             pass
+
+    # --- DEDUPE per (canonical symbol, side): no ticketless-TRADE_ACTIVE hijack ---
+    #
+    # Rank order (highest wins):
+    #   1. ticketed:  TRADE_ACTIVE with a real broker ticket (verifiable trade)
+    #   2. native:    row whose Redis key already used the canonical symbol
+    #                 (its WATCH / REV_OK state is the engine's own state)
+    #   3. state:     REV_OK > everything else (only compared among same origin)
+    #   4. freshness: newest updated_ms / created_at_ms
+    #
+    # Result: agent-written ...C keys with bare state=TRADE_ACTIVE but no ticket
+    # can never override the native row's state. Real trades still display as
+    # TRADE ACTIVE via the ticket here, or via the open-trade overlay downstream.
+    try:
+        def _watch_rank(r: dict):
+            gate_u = str(r.get("gate") or "").upper()
+            ticketed = 1 if (("TRADE_ACTIVE" in gate_u) and r.get("mt5_ticket")) else 0
+            native = 1 if str(r.get("broker_symbol") or "") == str(r.get("symbol") or "") else 0
+            state_rank = 2 if "REV_OK" in gate_u else 1
+            ts = int(r.get("updated_ms") or r.get("created_at_ms") or 0)
+            return (ticketed, native, state_rank, ts)
+
+        best: dict[tuple, dict] = {}
+        for r in out:
+            kk = (str(r.get("symbol") or ""), str(r.get("direction") or ""))
+            if kk not in best or _watch_rank(r) > _watch_rank(best[kk]):
+                best[kk] = r
+        out = list(best.values())
+    except Exception:
+        log.exception("[WATCHLIST] WATCH_ROWS_DEDUPE_FAILED uid=%s", uid_u)
 
     try:
         out.sort(key=lambda r: (str(r.get("symbol") or ""), str(r.get("direction") or "")))
@@ -4047,6 +5030,7 @@ def _prop_eval_alerts(
 
         firm_labels = {
             "ftmo": "FTMO",
+            "cti": "CTI",
             "fundednext": "FundedNext",
             "fundingpips": "FundingPips",
         }
@@ -4119,7 +5103,7 @@ def _prop_eval_alerts(
                     uid_u,
                     pid,
                     f"DRAWDOWN_BAND_{band}",
-                    "**🟡 XTL Drawdown Band Changed**\n"
+                    "**?? XTL Drawdown Band Changed**\n"
                     f"Profile: `{pid}`\n"
                     f"Old Band: `{last_band}`\n"
                     f"New Band: `{band}`\n"
@@ -4133,7 +5117,7 @@ def _prop_eval_alerts(
                 uid_u,
                 pid,
                 "DAILY_LOSS_WARNING_70",
-                f"**🟠 {firm_label} Daily Loss Warning**\n"
+                f"**?? {firm_label} Daily Loss Warning**\n"
                 f"Profile: `{pid}`\n"
                 f"Used: `${daily_used:.2f}` / `${daily_limit:.2f}` "
                 f"({used_pct:.1f}%)\n"
@@ -4158,7 +5142,7 @@ def _prop_eval_alerts(
                 uid_u,
                 pid,
                 emergency_reason,
-                f"**🚨 {firm_label} Emergency Protection Activated**\n"
+                f"**?? {firm_label} Emergency Protection Activated**\n"
                 f"Profile: `{pid}`\n"
                 f"Used: `${daily_used:.2f}` / `${daily_limit:.2f}` "
                 f"({used_pct:.1f}%)\n"
@@ -4171,7 +5155,7 @@ def _prop_eval_alerts(
                 uid_u,
                 pid,
                 "DAILY_LOSS_BLOCK",
-                f"**🔴 {firm_label} Daily Loss Limit Reached**\n"
+                f"**?? {firm_label} Daily Loss Limit Reached**\n"
                 f"Profile: `{pid}`\n"
                 f"Used: `${daily_used:.2f}` / `${daily_limit:.2f}`\n"
                 "Trading should be halted."
@@ -4201,7 +5185,7 @@ def _prop_eval_alerts(
                 uid_u,
                 pid,
                 "MARGIN_WARNING_UTIL_40",
-                "**🟠 Margin Warning**\n"
+                "**?? Margin Warning**\n"
                 f"Profile: `{pid}`\n"
                 f"Margin Level: `{margin_level:.1f}%`\n"
                 f"Used Margin: `${used_margin:.2f}`\n"
@@ -4360,7 +5344,7 @@ def _prop_set_halt(
             )
 
             _discord_post(
-                "**🚨 XTL Trading Halted**\n"
+                "**?? XTL Trading Halted**\n"
                 f"User: `{uid_u}`\n"
                 f"Profile: `{pid}`\n"
                 f"Reason: `{reason_u}`\n"
@@ -5052,13 +6036,14 @@ def _overlay_open_trade_state_for_ui(
         }
 
         matched = False
+        canonical_symbol = _display_symbol(symbol)
 
         for row in result:
-            row_symbol = str(
-                row.get("symbol") or ""
-            ).upper().strip()
+            row_symbol = _display_symbol(
+                row.get("symbol")
+            )
 
-            if row_symbol != symbol:
+            if row_symbol != canonical_symbol:
                 continue
 
             matched = True
@@ -5081,6 +6066,8 @@ def _overlay_open_trade_state_for_ui(
             row["signal_text"] = display_trade_state
             row["reason"] = display_trade_state
             row["opp_reason"] = display_trade_state
+            row["broker_symbol"] = symbol
+            row["symbol"] = canonical_symbol
 
             entry_gate = row.get("entry_gate")
 
@@ -5114,9 +6101,11 @@ def _overlay_open_trade_state_for_ui(
 
             log.warning(
                 "[WATCHLIST] OPEN_TRADE_UI_MATCH "
-                "uid=%s sym=%s side=%s ticket=%s state=%s "
+                "uid=%s canonical_sym=%s broker_sym=%s "
+                "side=%s ticket=%s state=%s "
                 "broker_open=%s deal=%s",
                 uid_s,
+                canonical_symbol,
                 symbol,
                 trade_side,
                 ticket,
@@ -5128,7 +6117,8 @@ def _overlay_open_trade_state_for_ui(
         if not matched:
             result.append(
                 {
-                    "symbol": symbol,
+                    "symbol": canonical_symbol,
+                    "broker_symbol": symbol,
                     "direction": trade_side,
                     "decision": trade_side,
                     "status": display_status,
@@ -5146,9 +6136,75 @@ def _overlay_open_trade_state_for_ui(
                     **overlay,
                 }
             )
+    try:
+        best: dict[str, dict] = {}
+
+        def _overlay_row_rank(row: dict):
+            trade_state = str(
+                row.get("trade_state")
+                or row.get("trade_status")
+                or row.get("signal_text")
+                or row.get("reason")
+                or ""
+            ).upper().strip()
+
+            if "TRADE_ACTIVE" in trade_state:
+                state_rank = 5
+            elif "BROKER_CLOSE_PENDING" in trade_state:
+                state_rank = 4
+            elif "BROKER_RECON_PENDING" in trade_state:
+                state_rank = 3
+            elif "REV_OK" in trade_state:
+                state_rank = 2
+            else:
+                state_rank = 1
+
+            return (
+                state_rank,
+                1 if row.get("mt5_ticket") else 0,
+                int(
+                    row.get("active_trade_opened_at_ms")
+                    or row.get("opp_open_ts")
+                    or 0
+                ),
+            )
+
+        for row in result:
+            if not isinstance(row, dict):
+                continue
+
+            canonical = _display_symbol(
+                row.get("symbol")
+            )
+
+            if not canonical:
+                continue
+
+            candidate = dict(row)
+            candidate["broker_symbol"] = (
+                candidate.get("broker_symbol")
+                or candidate.get("symbol")
+            )
+            candidate["symbol"] = canonical
+
+            if (
+                canonical not in best
+                or _overlay_row_rank(candidate)
+                > _overlay_row_rank(best[canonical])
+            ):
+                best[canonical] = candidate
+
+        result = list(best.values())
+
+    except Exception:
+        log.exception(
+            "[WATCHLIST] OPEN_TRADE_UI_CANONICAL_DEDUPE_FAILED "
+            "uid=%s profile=%s",
+            uid_s,
+            active_pid,
+        )
 
     return result
-
 
 
 
@@ -5844,6 +6900,7 @@ def _get_prop_risk_state(
             and snapshot_valid
             and firm_u in (
                 "ftmo",
+                "cti",
                 "fundednext",
                 "fundingpips",
             )
@@ -6155,7 +7212,7 @@ def _get_prop_risk_state(
                 uid_u,
                 pid,
                 "DAILY_REALIZED_LOSS_3PCT",
-                "**🛑 XTL Daily Trading Stop**\n"
+                "**?? XTL Daily Trading Stop**\n"
                 f"Profile: `{pid}`\n"
                 f"Realized Loss: `${abs(today_closed_pnl):.2f}`\n"
                 f"Limit: `${daily_stop_limit:.2f}`\n"
@@ -6362,6 +7419,110 @@ def _get_prop_risk_state(
             "[PROP_RISK_PERF] profile=%s stage=TOTAL elapsed_ms=%.1f",
             pid,
             _total_risk_ms,
+        )
+    # -------------------------------------------------------------
+    # SAME-DAY DYNAMIC OPEN-RISK HALT RELEASE
+    # -------------------------------------------------------------
+    try:
+        _stored_halted = str(
+            stats.get("trading_halted") or ""
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        _stored_halt_reason = str(
+            stats.get("halt_reason") or ""
+        ).strip().upper()
+
+        _stored_manual_reset = str(
+            stats.get("halt_until_manual_reset") or ""
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        _max_open_risk_pct = float(
+            cfg.get("max_open_risk_pct") or 0.0
+        )
+
+        _open_risk_limit_usd = (
+            float(broker_equity)
+            * (_max_open_risk_pct / 100.0)
+            if float(broker_equity or 0.0) > 0.0
+            else float(cfg.get("account_size") or 0.0)
+            * (_max_open_risk_pct / 100.0)
+        )
+
+        _can_release_open_risk_halt = (
+            _stored_halted
+            and _stored_halt_reason
+            == "PROP_OPEN_RISK_LIMIT_EXCEEDED"
+            and not _stored_manual_reset
+            and bool(snapshot_valid)
+            and bool(broker_values_valid)
+            and _open_risk_limit_usd > 0.0
+            and float(live_open_risk_usd)
+            <= float(_open_risk_limit_usd)
+        )
+
+        if _can_release_open_risk_halt:
+            _halt_fields = [
+                "trading_halted",
+                "halt_reason",
+                "halt_ts",
+                "halt_scope",
+                "halt_day",
+                "halt_until_manual_reset",
+            ]
+
+            _halt_fields.extend(
+                str(key)
+                for key in stats.keys()
+                if str(key).startswith("halt_meta_")
+            )
+
+            R.hdel(
+                stats_key,
+                *sorted(set(_halt_fields)),
+            )
+
+            _open_risk_watchdog_key = (
+                f"xtl:prop:watchdog:openrisk:"
+                f"{uid_u}:{pid}:{day}"
+            )
+            R.delete(_open_risk_watchdog_key)
+
+            for _field in _halt_fields:
+                stats.pop(_field, None)
+
+            log.warning(
+                "[PROP] OPEN_RISK_HALT_AUTO_CLEARED "
+                "uid=%s profile=%s day=%s "
+                "open_risk=%.2f limit=%.2f "
+                "watchdog_key=%s",
+                uid_u,
+                pid,
+                day,
+                float(live_open_risk_usd),
+                float(_open_risk_limit_usd),
+                _open_risk_watchdog_key,
+            )
+
+    except Exception as exc:
+        log.exception(
+            "[PROP] OPEN_RISK_HALT_AUTO_CLEAR_FAILED "
+            "uid=%s profile=%s day=%s "
+            "open_risk=%s err=%r",
+            uid_u,
+            pid,
+            day,
+            live_open_risk_usd,
+            exc,
         )
     result = {
         "profile_id": pid,
@@ -8460,7 +9621,7 @@ def _refresh_dynamic_sr_fields(sym_u: str, row: dict, out: dict) -> dict:
         sr_bundle = _get_sr_bundle(
             sym_u,
             prefer_dev=prefer_dev,
-            display_only=True,  # always recompute for display — never block on frozen watch
+            display_only=True,  # always recompute for display � never block on frozen watch
         )
 
         if not isinstance(sr_bundle, dict) or not sr_bundle:
@@ -8650,7 +9811,7 @@ def _get_sr_bundle(sym: str, prefer_dev=None, return_src: bool = False, display_
         # ------------------------------------------------------------
         # REDISCOVERY GUARD:
         # If a frozen watch exists for this symbol in REV_WATCH or REV_OK state,
-        # ALWAYS return cached SR — never recompute.
+        # ALWAYS return cached SR � never recompute.
         # Recomputing SR during a frozen watch can shift zone bands and
         # corrupt the frozen zone_used that the gate relies on.
         # ------------------------------------------------------------
@@ -8695,7 +9856,7 @@ def _get_sr_bundle(sym: str, prefer_dev=None, return_src: bool = False, display_
                     src = f"cache_frozen_watch:{k}"
                     return (js, src) if return_src else js
 
-        # If frozen watch is active and cache is empty, return empty — do NOT recompute
+        # If frozen watch is active and cache is empty, return empty � do NOT recompute
         # If frozen watch is active and cache is empty:
         # Still try a broader cache fallback before giving up.
         # Never return empty just because cache expired during a frozen watch.
@@ -8715,7 +9876,7 @@ def _get_sr_bundle(sym: str, prefer_dev=None, return_src: bool = False, display_
                 if isinstance(js, dict) and js:
                     src = f"cache_frozen_fallback:{k}"
                     return (js, src) if return_src else js
-            # Truly nothing in cache — return empty, do not recompute
+            # Truly nothing in cache � return empty, do not recompute
             src = "cache_miss_frozen_watch_protected"
             return ({}, src) if return_src else {}
         # display_only=True bypasses the frozen watch guard.
@@ -8982,7 +10143,7 @@ def _get_closed_h1_bars(sym: str, dev: str | None) -> list[dict]:
 
 
 def _get_closed_h4_bars(sym: str, dev: str | None) -> list[dict]:
-    """H4 sibling of _get_closed_h1_bars — same format, for regime confirmation TF."""
+    """H4 sibling of _get_closed_h1_bars - same format, for regime confirmation TF."""
     try:
         sym_u = (sym or "").upper().strip()
         dev = (dev or "").strip()
@@ -10005,7 +11166,7 @@ def _persist_entry_meta_to_snapshot(sym: str, out: dict) -> None:
         if snap_sl is None and out_sl is not None:
             mapping["sl_price"] = out_sl
 
-        # these are “nice to have” and safe to overwrite
+        # these are �nice to have� and safe to overwrite
         if out.get("entry_signal"):
             mapping["entry_signal"] = str(out.get("entry_signal"))
         if out.get("entry_reason"):
@@ -10995,7 +12156,7 @@ def _discord_notify_rc_trigger(
         )
 
         msg = (
-            f"🚨 **RC TRIGGER CROSSED**\n\n"
+            f"?? **RC TRIGGER CROSSED**\n\n"
             f"Symbol : `{sym}`\n"
             f"Direction : `{side}`\n"
             f"TF : `H1`\n\n"
@@ -11277,7 +12438,7 @@ def _invalidate_active_opportunity(sym: str, opp_dir: str, reason: str = "ZONE_I
     else:
         return
 
-    # ── FIX 1: resolve the REAL alert_id from the active pointer ──────────────
+    # -- FIX 1: resolve the REAL alert_id from the active pointer --------------
     active_key = f"xtl:trend:opp:active:{sym_u}:{d}"
     real_id = ""
     try:
@@ -11289,7 +12450,7 @@ def _invalidate_active_opportunity(sym: str, opp_dir: str, reason: str = "ZONE_I
         pass
 
     
-    # ── FIX 1b: fallback — scan index if active_key already gone ──────────────
+    # -- FIX 1b: fallback � scan index if active_key already gone --------------
     if not real_id:
         try:
             ids = R.lrange(ALERT_INDEX_KEY, 0, 50) or []
@@ -11319,7 +12480,7 @@ def _invalidate_active_opportunity(sym: str, opp_dir: str, reason: str = "ZONE_I
         except Exception:
             pass
 
-    # ── FIX 2: mark the REAL hash invalidated ─────────────────────────────────
+    # -- FIX 2: mark the REAL hash invalidated ---------------------------------
     if real_id:
         hkey = f"{ALERT_HASH_PREFIX}{real_id}"
         try:
@@ -11339,21 +12500,21 @@ def _invalidate_active_opportunity(sym: str, opp_dir: str, reason: str = "ZONE_I
         except Exception:
             pass
 
-    # ── FIX 2b: delete ENTRY_CAND claim for this opportunity ────────────────
+    # -- FIX 2b: delete ENTRY_CAND claim for this opportunity ----------------
     try:
         if real_id:
             R.delete(f"xtl:oppt:entry_claim:{real_id}")
     except Exception:
         pass
 
-    # ── FIX 3: delete active pointer ──────────────────────────────────────────
+    # -- FIX 3: delete active pointer ------------------------------------------
     try:
         R.delete(active_key)
     except Exception:
         pass
 
-    # ── FIX 4: delete ALL zone watch keys (H1+H4, both sides) ─────────────────
-    # The original only deleted H1 for one side — leaving stale watch keys that
+    # -- FIX 4: delete ALL zone watch keys (H1+H4, both sides) -----------------
+    # The original only deleted H1 for one side � leaving stale watch keys that
     # lock the REDISCOVERY GUARD and cause permanent ZONE_TOO_FAR stuck state
     try:
         for _side in ("BUY", "SELL"):
@@ -11369,7 +12530,7 @@ def _invalidate_active_opportunity(sym: str, opp_dir: str, reason: str = "ZONE_I
     except Exception:
         pass
 
-    # ── FIX 5: clear SR bundle cache so zone bands recompute fresh ─────────────
+    # -- FIX 5: clear SR bundle cache so zone bands recompute fresh -------------
     # Without this, stale cached SR keeps the zone "too far" even after watch cleared
     try:
         for _sr_key in (
@@ -11380,7 +12541,7 @@ def _invalidate_active_opportunity(sym: str, opp_dir: str, reason: str = "ZONE_I
     except Exception:
         pass
 
-    # ── unchanged: delete snapshot and break state ─────────────────────────────
+    # -- unchanged: delete snapshot and break state -----------------------------
     snap_key = _opp_snapshot_key(sym_u, d)
     try:
         R.delete(snap_key)
@@ -11431,7 +12592,7 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
             existing_id = str(existing_id or "").strip()
         except Exception:
             existing_id = ""
-        # ── GUARD: don't reuse a stale/invalidated pointer ──────────────
+        # -- GUARD: don't reuse a stale/invalidated pointer --------------
         if existing_id:
             existing_status = ""
             try:
@@ -11451,7 +12612,7 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
                 except Exception:
                     pass
                 existing_id = ""  # fall through to mint a fresh ID
-        # ── END GUARD ────────────────────────────────────────────────────
+        # -- END GUARD ----------------------------------------------------
 
         if existing_id:
             alert_id = existing_id
@@ -11459,7 +12620,7 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
             ts = int(payload.get("alert_created_ms") or int(time.time() * 1000))
             candidate_id = f"{ts}:{sym}:{direction}"
 
-            # ── ATOMIC DEDUP FIX: SET NX prevents race condition across workers ──
+            # -- ATOMIC DEDUP FIX: SET NX prevents race condition across workers --
             try:
                 set_ok = R.set(active_key, candidate_id, nx=True, ex=5 * 24 * 3600)
             except Exception:
@@ -11481,7 +12642,7 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
                     "[OPP] DEDUP_RACE_RESOLVED sym=%s dir=%s lost_race_to=%s",
                     sym, direction, alert_id
                 )
-            # ── END ATOMIC DEDUP FIX ─────────────────────────────────────────────
+            # -- END ATOMIC DEDUP FIX ---------------------------------------------
 
         payload["alert_id"] = alert_id
 
@@ -12268,12 +13429,12 @@ def trend_pulse(
     user=Depends(require_auth_optional),
 ):
     """
-    Rich per-symbol “Pulse” payload:
+    Rich per-symbol Pulse payload:
       - SR (H1/H4) summary
       - Fib levels (derived from H1 range, fallback H4)
       - short deterministic pulse_text
 
-    This endpoint is separate from /predict/all by design.
+    This endpoint is separate from predict all by design.
     """
     sym_u = (symbol or "").upper().strip()
     if not sym_u:
@@ -12282,7 +13443,7 @@ def trend_pulse(
     tfu = (tf or "M15").upper().strip()
 
     # ---- 1) reuse your forecast path for prob/decision/target (minimal) ----
-    # If you already have a helper that builds the single “row” like predict_all does,
+    # If you already have a helper that builds the single �row� like predict_all does,
     # call it here. Otherwise: read last row from redis (fast) and use it as forecast snapshot.
     # (You already write lastrow in predict_all) :contentReference[oaicite:5]{index=5}
     row = None
@@ -12426,7 +13587,7 @@ def trend_pulse(
     )
     
     
-    # ---- 3) delegate “pulse composition” to api/pulse.py ----
+    # ---- 3) delegate �pulse composition� to api/pulse.py ----
     pulse = build_pulse(
          symbol=sym_u,
          tf=tfu,
@@ -12731,7 +13892,7 @@ def _oppt_min_move_pct(sym: str, tf: str) -> float:
     thr = max(0.0, frac * tau)
 
     # NEW: safety clamp for metals so you don't get crazy 0.45+ accidentally
-    # (tweak these later, but this fixes your immediate “no opps” problem)
+    # (tweak these later, but this fixes your immediate �no opps� problem)
     if sym.upper() == "XAUUSD" and tfu == "H1":
         thr = min(thr, 0.30)
 
@@ -13984,7 +15145,7 @@ def _normalize_snap_bars_to_ms(bars: Any, tf_ms: int) -> list[dict]:
         if nb["o"] is None:
             nb["o"] = nb["c"]
 
-        # ✅ CRITICAL FIX: ensure t_open_ms is always correct (never 0)
+        # ? CRITICAL FIX: ensure t_open_ms is always correct (never 0)
         nb["t_open_ms"] = int(nb["t_close_ms"] - tf_ms)
 
         out.append(nb)
@@ -14222,7 +15383,7 @@ def predict_all(
 
     def _macro_chips_for_symbol(sym_u_: str, macro_: object | None, p_up_: float | None, extra_: dict | None) -> list[str]:
         """
-        Returns up to 4 compact macro chips like: DXY↓, US10Y↓, VIX↑, RVOL↑
+        Returns up to 4 compact macro chips like: DXY?, US10Y?, VIX?, RVOL?
         Works with both dict macro and MacroSnapshot object.
         """
 
@@ -14258,7 +15419,7 @@ def predict_all(
             return 0
 
         def _arrow(sign: int) -> str:
-            return "↑" if sign > 0 else ("↓" if sign < 0 else "→")
+            return "?" if sign > 0 else ("?" if sign < 0 else "?")
 
         
         # z-scores (support both dict keys and MacroSnapshot attrs)
@@ -14914,7 +16075,7 @@ def build_commentary_payload(row: dict) -> dict:
             "h1": row.get("reasons_h1", []) or [],
             "h4": row.get("reasons_h4", []) or [],
         },
-        # keep this as hint text only until you wire real SR numbers
+        # keep this as ?hint text only? until you wire real SR numbers
         "support_resistance_hint": {
             "support": "near recent intraday lows",
             "resistance": "near prior supply zone",
@@ -15751,10 +16912,10 @@ def trend_opportunities(
     )
 
     # -------------------------------------------------
-    # RESPONSE CACHE (revived) — slim default path only, device-scoped.
+    # RESPONSE CACHE (revived) � slim default path only, device-scoped.
     # Key on the RESOLVED device so header + auto-resolved requests share one
     # entry and never cross device feeds. 2s TTL. Debug / include_sr bypass.
-    # Per-key concurrency ≈ 1 (each agent install = own device_id), so the
+    # Per-key concurrency � 1 (each agent install = own device_id), so the
     # existing anti-stampede lock only needs to cover multi-tab / rapid refresh.
     # -------------------------------------------------
     _is_slim_cacheable = (
@@ -17300,7 +18461,7 @@ def trend_opportunities(
 
     def _run_entry_only_if_armed(r: dict) -> None:
         try:
-            # If already triggered, always show signal from entry (don’t require "armed")
+            # If already triggered, always show signal from entry (don�t require "armed")
             if bool(r.get("entry_triggered")):
                 _set_signal_from_entry(r)
                 return
@@ -17412,7 +18573,7 @@ def trend_opportunities(
                 if not snap:
                     continue
 
-                # ✅ FIX: correct status read (bytes + str hashes)
+                # ? FIX: correct status read (bytes + str hashes)
                 try:
                     status_raw = snap.get(b"status")
                     if status_raw is None:
@@ -17463,7 +18624,7 @@ def trend_opportunities(
 
                     res.append(row)
 
-        # ✅ keep only one active snapshot per symbol (prevents same symbol double-appearing)
+        # ? keep only one active snapshot per symbol (prevents same symbol double-appearing)
         try:
             best: dict[str, dict] = {}
 
@@ -17501,6 +18662,7 @@ def trend_opportunities(
         
         # show only active snapshots + history; do NOT call predict_all (no new creation)
         history = _load_opp_history(limit=50)
+        
         rows = _load_active_snapshots(symbols)
         # DROP null/empty symbol rows (prevents {"symbol": null} in UI)
         rows = [r for r in rows if str((r or {}).get("symbol") or "").strip()]
@@ -17513,8 +18675,79 @@ def trend_opportunities(
                 None,
                 tfu,
             )
+
             try:
-                log.warning("[WATCHLIST] WEEKEND_WATCH_FALLBACK rows=%s tf=%s", len(rows), tfu)
+                _best: dict[str, dict] = {}
+
+                for _row in rows or []:
+                    if not isinstance(_row, dict):
+                        continue
+
+                    _canonical = _display_symbol(
+                        _row.get("symbol")
+                    )
+
+                    if not _canonical:
+                        continue
+
+                    _candidate = dict(_row)
+                    _candidate["broker_symbol"] = (
+                        _candidate.get("broker_symbol")
+                        or _candidate.get("symbol")
+                    )
+                    _candidate["symbol"] = _canonical
+
+                    _state = str(
+                        _candidate.get("state")
+                        or _candidate.get("gate")
+                        or _candidate.get("reason")
+                        or ""
+                    ).upper()
+
+                    _rank = (
+                        3 if "TRADE_ACTIVE" in _state
+                        else 2 if "REV_OK" in _state
+                        else 1
+                    )
+
+                    _old = _best.get(_canonical)
+
+                    if _old is None:
+                        _best[_canonical] = _candidate
+                        continue
+
+                    _old_state = str(
+                        _old.get("state")
+                        or _old.get("gate")
+                        or _old.get("reason")
+                        or ""
+                    ).upper()
+
+                    _old_rank = (
+                        3 if "TRADE_ACTIVE" in _old_state
+                        else 2 if "REV_OK" in _old_state
+                        else 1
+                    )
+
+                    if _rank > _old_rank:
+                        _best[_canonical] = _candidate
+
+                rows = list(_best.values())
+
+            except Exception:
+                log.exception(
+                    "[WATCHLIST] WEEKEND_WATCH_DEDUPE_FAILED "
+                    "uid=%s",
+                    uid_for_entry,
+                )
+
+            try:
+                log.warning(
+                    "[WATCHLIST] WEEKEND_WATCH_FALLBACK "
+                    "rows=%s tf=%s",
+                    len(rows),
+                    tfu,
+                )
             except Exception:
                 pass
         # Weekend: keep watch/zone details when rows came from xtl:zone:watch:*.
@@ -17721,7 +18954,7 @@ def trend_opportunities(
                 }
                 # --- MARKET CLOSED / NO MT5 DATA guard ---
                 # Triggers when: no bars at all, OR latest bar is stale (>3h old).
-                # Redis caches last session's bars — must check age, not just length.
+                # Redis caches last session's bars � must check age, not just length.
                 _H1_MS = 60 * 60 * 1000  # 1 hour in ms
                 _STALE_THRESHOLD_MS = 3 * _H1_MS  # 3 hours = market closed
                 _bars_ok = isinstance(bars_h1, list) and len(bars_h1) >= 2
@@ -17753,7 +18986,7 @@ def trend_opportunities(
                     row_h1["atr"] = float(atr_h1)
                     row["atr_1h"] = float(atr_h1)
                     row["atr14"] = float(atr_h1)
-                # ── BRIDGE (moved above gate): enrich sr with best_support/best_resistance ──
+                # -- BRIDGE (moved above gate): enrich sr with best_support/best_resistance --
                 # Must run BEFORE the gate so the resolver reads scored levels.
                 # Inputs are independent of the liq-detection block below:
                 #   _liq_px/_liq_atr from row, _liq_h4 from Redis H4 snap.
@@ -17794,7 +19027,7 @@ def trend_opportunities(
                 except Exception as _pre_exc:
                     if debug_gate_on:
                         row["dbg_bridge_preglate_exc"] = f"{type(_pre_exc).__name__}:{_pre_exc}"
-                # ── END BRIDGE (pre-gate) ──
+                # -- END BRIDGE (pre-gate) --
                 
                 if debug_gate_on: row["dbg_gate_path"] = "P9203_main_loop"
                 _pt = _oppt_t.now()
@@ -17927,7 +19160,7 @@ def trend_opportunities(
                     _oppt_t.now() - _pt,
                 )
 
-            # ── LIQ STRUCTURE OBSERVATION (Phase 1 — display only) ────────
+            # -- LIQ STRUCTURE OBSERVATION (Phase 1 � display only) --------
             try:
                 if callable(_detect_liq_signals):
                     _liq_px  = float(row.get("last_price") or row.get("price") or 0)
@@ -17960,7 +19193,7 @@ def trend_opportunities(
                     _liq_px  = float(row.get("last_price") or row.get("price") or 0)
                     _liq_atr = float(row.get("atr_1h") or row.get("atr14") or 0)
 
-                    # H4 bars — device-scoped key
+                    # H4 bars � device-scoped key
                     _liq_h4: list[dict] = []
                     try:
                         _h4_raw = R.get(f"xtl:ohlc:snap:{dev_for_gate}:{sym_u}:H4")
@@ -17994,24 +19227,24 @@ def trend_opportunities(
                         )
                    
                     row["liq_signals"]    = _liq.get("signals", [])
-                    row["liq_text"]       = _liq.get("liq_text", "—")
+                    row["liq_text"]       = _liq.get("liq_text", "-")
                     row["regime"]   = _liq.get("regime", None)
-                    row["liq_confidence"] = _liq.get("liq_confidence", "—")
-                    row["range_text"]     = _liq.get("range_text", "—")
+                    row["liq_confidence"] = _liq.get("liq_confidence", "-")
+                    row["range_text"]     = _liq.get("range_text", "-")
                     row["bsl_ssl"]        = _liq.get("bsl_ssl", {})
                     row["liq_detail"]     = _liq.get("liq_detail", {})
             except Exception as _liq_exc:
                 import traceback as _tb; log.error("LIQ_ERR sym=%s err=%s trace=%s", sym_u, _liq_exc, _tb.format_exc())
                 row.setdefault("liq_signals", [])
-                row.setdefault("liq_text", "—")
-                row.setdefault("liq_confidence", "—")
+                row.setdefault("liq_text", "-")
+                row.setdefault("liq_confidence", "-")
                 row.setdefault("regime", None)
-                row.setdefault("range_text", "—")
+                row.setdefault("range_text", "-")
                 row.setdefault("bsl_ssl", {})
                 row.setdefault("liq_detail", {})
-            # ── END LIQ STRUCTURE ─────────────────────────────────────────
+            # -- END LIQ STRUCTURE -----------------------------------------
 
-            # ── BRIDGE: score SR active levels by liquidity evidence ──────
+            # -- BRIDGE: score SR active levels by liquidity evidence ------
             #try:
             #    if callable(_score_sr_with_liquidity):
             #        _sr_b = row.get("sr") if isinstance(row.get("sr"), dict) else {}
@@ -18039,11 +19272,11 @@ def trend_opportunities(
             #except Exception as _br_exc:
             #    import traceback as _tb
             #    log.error("BRIDGE_ERR sym=%s err=%s trace=%s", sym_u, _br_exc, _tb.format_exc())
-            # ── END BRIDGE ────────────────────────────────────────────────
+            # -- END BRIDGE ------------------------------------------------
 
             _sym_side_rows.append(row)
 
-        # ── Source-side mirror row guard: exactly one row per symbol ───────────────
+        # -- Source-side mirror row guard: exactly one row per symbol ---------------
         # The zone-side guard above skips the mirrored side in clear cases.
         # This is the safety net: if the side couldn't be inferred (no zone,
         # stale zone, market-closed) and BOTH sides survived, pick the winner
@@ -18123,7 +19356,7 @@ def trend_opportunities(
                 r.pop("debug_resistance_below_price", None)
                 r.pop("debug_resistance_above_price", None)
     
-    # ── USD strength / bias (broker-independent, honest signal) ──
+    # -- USD strength / bias (broker-independent, honest signal) --
     # Compute the dollar strength ONCE, then attach per-row alignment cheaply.
     usd_block = None
     try:
@@ -18174,7 +19407,7 @@ def trend_opportunities(
         "rows": watch_rows,
         "history": history,
         "mode": "watchlist_no_prediction",
-        "usd_strength": usd_block,   # ← header badge reads this
+        "usd_strength": usd_block,   # ? header badge reads this
     }
    
 
@@ -18938,7 +20171,7 @@ def trend_opportunities(
                        reason=f"m1={m1} m4={m4} thr4={thr4} (strong H4 opp)",
                        meta={"m1": m1, "m4": m4, "thr1": thr1, "thr4": thr4, "strong_h4_opp": True},
                     )
-                    # DO NOT continue — keep evaluating (ZONE_GATE will decide quality)
+                    # DO NOT continue � keep evaluating (ZONE_GATE will decide quality)
                     opp_conf = "low"                     
                  
                 else:
@@ -19672,14 +20905,14 @@ def trend_opportunities(
                     sr_for_gate = s0
             except Exception:
                 sr_for_gate = None
-            # ── DEBUG: what does row["sr"] actually carry at gate-time? ──
+            # -- DEBUG: what does row["sr"] actually carry at gate-time? --
             if debug_gate_on:
                 _s = row.get("sr") if isinstance(row.get("sr"), dict) else {}
                 row["dbg_gate_sr_keys"] = sorted(_s.keys())[:24]
                 row["dbg_gate_has_best_support"] = isinstance(_s.get("best_support"), dict)
                 row["dbg_gate_has_scored"] = isinstance(_s.get("scored_supports"), list)
                 row["dbg_gate_sr_id"] = id(_s)
-            # ── END DEBUG ──
+            # -- END DEBUG --
 
             # 2) If not present, load last_good SR bundle directly from Redis
             if (not isinstance(sr_for_gate, dict)) and R is not None:
@@ -19939,7 +21172,7 @@ def trend_opportunities(
                 gate_meta.setdefault("reason", str(reason or "unknown"))
                 gate_meta["stage"] = "ZONE_GATE"
 
-                # downgrade confidence so UI reflects it's not “clean”
+                # downgrade confidence so UI reflects it's not �clean�
                 opp_conf = "low"
 
                 
@@ -20269,7 +21502,7 @@ def trend_opportunities(
             except Exception:
                 pass
         else:
-            # In debug, NEVER serve frozen/cached opps — always recompute so gate + Redis truth is visible
+            # In debug, NEVER serve frozen/cached opps � always recompute so gate + Redis truth is visible
             if debug_force or debug_gate:
                 try:
                     tfu0 = (out.get("tf") or tfu or "H1").upper()

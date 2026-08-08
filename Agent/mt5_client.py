@@ -210,6 +210,25 @@ def mt5_get_open_positions() -> list[dict] | None:
         return None
 
 
+def _history_deals_get_locked(dt_from, dt_to):
+    """One short serialized MT5 history read; caller sleeps/retries outside lock."""
+    with MT5_API_LOCK:
+        return MT5.history_deals_get(dt_from, dt_to)
+
+
+def _history_deals_get_by_position_locked(position_id: int):
+    """
+    Read complete MT5 deal history for one broker position.
+
+    Position-specific history is the primary recovery source because some
+    terminals may return incomplete results from a broad date-range query
+    even when the closing deal is available by position ID.
+    """
+    with MT5_API_LOCK:
+        return MT5.history_deals_get(
+            position=int(position_id),
+        )
+
 def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
     """
     Passive MT5 deal-history reader.
@@ -220,7 +239,9 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
       - does not change lifecycle
       - caller can write result to Redis later as xtl:mt5:deal:{position_id}
     """
-    if not mt5_init():
+    with MT5_API_LOCK:
+        init_ok = mt5_init()
+    if not init_ok:
         return {
             "ok": False,
             "error": "mt5_init_failed",
@@ -240,53 +261,148 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
         dt_to = datetime.now() + timedelta(days=1)
         dt_from = datetime.now() - timedelta(days=int(days_back or 7))
 
-        deals = MT5.history_deals_get(dt_from, dt_to)
+        # ---------------------------------------------------------
+        # Primary recovery path: direct position-specific lookup.
+        #
+        # Some MT5 terminals can return an incomplete result from
+        # history_deals_get(from, to), while
+        # history_deals_get(position=pid) returns the complete IN/OUT
+        # lifecycle for the same position.
+        # ---------------------------------------------------------
+        deals = _history_deals_get_by_position_locked(pid)
+        history_source = "POSITION_LOOKUP"
+
         if deals is None:
-            return {
-                "ok": False,
-                "error": "history_deals_get_failed",
-                "position_id": pid,
-                "last_error": MT5.last_error(),
-            }
+            position_lookup_error = MT5.last_error()
+
+            # Fallback to the previous broad date-range lookup.
+            deals = _history_deals_get_locked(
+                dt_from,
+                dt_to,
+            )
+            history_source = "DATE_RANGE_FALLBACK"
+
+            if deals is None:
+                return {
+                    "ok": False,
+                    "error": "history_deals_get_failed",
+                    "position_id": pid,
+                    "position_lookup_error": position_lookup_error,
+                    "last_error": MT5.last_error(),
+                }
 
         matched = []
-        for d in deals:
+
+        for d in deals or []:
             try:
+                deal_position_id = int(
+                    getattr(d, "position_id", 0) or 0
+                )
+                deal_order = int(
+                    getattr(d, "order", 0) or 0
+                )
+                deal_ticket = int(
+                    getattr(d, "ticket", 0) or 0
+                )
+
                 if (
-                    int(getattr(d, "position_id", 0) or 0) == pid
-                    or int(getattr(d, "order", 0) or 0) == pid
-                    or int(getattr(d, "ticket", 0) or 0) == pid
+                    deal_position_id == pid
+                    or deal_order == pid
+                    or deal_ticket == pid
                 ):
                     matched.append(d)
+
             except Exception:
                 continue
 
+        
         if not matched:
-            # MT5 history can lag a few seconds immediately after close.
-            # Retry briefly before returning no_deals_found.
+            # MT5 history can lag briefly after a close or reconnect.
+            # Retry the position-specific query first on every attempt.
             for _retry in range(5):
                 time.sleep(1.0)
 
-                deals = MT5.history_deals_get(
-                    dt_from, datetime.now() + timedelta(days=1)
+                retry_deals = _history_deals_get_by_position_locked(
+                    pid
                 )
-                if deals is None:
-                    continue
 
-                matched = []
-                for d in deals:
-                    try:
-                        if (
-                            int(getattr(d, "position_id", 0) or 0) == pid
-                            or int(getattr(d, "order", 0) or 0) == pid
-                            or int(getattr(d, "ticket", 0) or 0) == pid
-                        ):
-                            matched.append(d)
-                    except Exception:
-                        continue
+                if retry_deals is not None:
+                    deals = retry_deals
+                    history_source = "POSITION_LOOKUP_RETRY"
+
+                    matched = []
+
+                    for d in deals or []:
+                        try:
+                            deal_position_id = int(
+                                getattr(
+                                    d,
+                                    "position_id",
+                                    0,
+                                )
+                                or 0
+                            )
+                            deal_order = int(
+                                getattr(d, "order", 0)
+                                or 0
+                            )
+                            deal_ticket = int(
+                                getattr(d, "ticket", 0)
+                                or 0
+                            )
+
+                            if (
+                                deal_position_id == pid
+                                or deal_order == pid
+                                or deal_ticket == pid
+                            ):
+                                matched.append(d)
+
+                        except Exception:
+                            continue
 
                 if matched:
                     break
+
+            # Final fallback to the broad date-range query.
+            if not matched:
+                deals = _history_deals_get_locked(
+                    dt_from,
+                    datetime.now() + timedelta(days=1),
+                )
+                history_source = "DATE_RANGE_RETRY_FALLBACK"
+
+                if deals is not None:
+                    matched = []
+
+                    for d in deals or []:
+                        try:
+                            deal_position_id = int(
+                                getattr(
+                                    d,
+                                    "position_id",
+                                    0,
+                                )
+                                or 0
+                            )
+                            deal_order = int(
+                                getattr(d, "order", 0)
+                                or 0
+                            )
+                            deal_ticket = int(
+                                getattr(d, "ticket", 0)
+                                or 0
+                            )
+
+                            if (
+                                deal_position_id == pid
+                                or deal_order == pid
+                                or deal_ticket == pid
+                            ):
+                                matched.append(d)
+
+                        except Exception:
+                            continue
 
             if not matched:
                 return {
@@ -294,6 +410,8 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
                     "error": "no_deals_found",
                     "position_id": pid,
                     "days_back": int(days_back or 7),
+                    "history_source": history_source,
+                    "last_error": MT5.last_error(),
                 }
         in_deals = []
         out_deals = []
@@ -337,6 +455,20 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
 
         open_deal = in_deals[0] if in_deals else (all_rows[0] if all_rows else {})
         close_deals = out_deals or []
+        # A position is not confirmed closed unless MT5 returned at
+        # least one exit deal. Never construct a broker-close payload
+        # from the opening deal alone.
+        if not close_deals:
+            return {
+                "ok": False,
+                "error": "no_exit_deal_found",
+                "position_id": pid,
+                "history_source": history_source,
+                "deal_count": len(all_rows),
+                "entry_deal_count": len(in_deals),
+                "exit_deal_count": 0,
+                "last_error": MT5.last_error(),
+            }
 
         closed_volume = sum(float(x.get("volume") or 0.0) for x in close_deals)
         if closed_volume > 0:
@@ -391,6 +523,7 @@ def mt5_get_deal_summary(position_id: int, days_back: int = 7) -> dict:
             "ok": True,
             "position_id": pid,
             "position_ticket": pid,
+            "history_source": history_source,
             "broker_reason": broker_reason,
             "close_reason_code": close_reason_code,
             "symbol": str(

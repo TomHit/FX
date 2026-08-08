@@ -27,7 +27,9 @@ from api.trend_endpoints import (
     _release_prop_open_risk,
     _resolve_prop_profile_device,
     _user_active_prop_profile_id,
-    _discord_notify_rc_trigger, 
+    _discord_notify_rc_trigger,
+    _invalidate_prop_dashboard_snapshot, 
+    _schedule_prop_dashboard_warm_refresh,
 )
 
 from api.prop_firms.prop_config import SYMBOL_SPECS
@@ -171,6 +173,8 @@ def _mt5_account_type_from_trade_mode(value) -> str:
         return "demo"
 
     return ""
+
+
 
 
 def _resolve_runtime_mt5_account_type(
@@ -795,18 +799,295 @@ def _reconcile_stale_order_pending(
             continue
 
         if broker_pos:
-            log.error(
-                "[OPPT] MARKET_ACK_TIMEOUT_BUT_BROKER_LIVE "
-                "uid=%s tid=%s sym=%s job_id=%s ticket=%s",
+            # -------------------------------------------------
+            # P0 ACK-LOSS RECOVERY
+            #
+            # Broker position is authoritative. The MARKET order
+            # was filled, but the normal MT5 ACK was lost or was
+            # never persisted. Promote the existing ORDER_PENDING
+            # ledger row to TRADE_ACTIVE using broker truth.
+            # -------------------------------------------------
+            try:
+                broker_ticket = int(
+                    broker_pos.get("ticket")
+                    or broker_pos.get("position_ticket")
+                    or 0
+                )
+            except Exception:
+                broker_ticket = 0
+
+            if broker_ticket <= 0:
+                log.error(
+                    "[OPPT] MARKET_ACK_TIMEOUT_BROKER_LIVE_BAD_TICKET "
+                    "uid=%s tid=%s sym=%s job_id=%s broker_pos=%r",
+                    uid,
+                    trade_id,
+                    pos.get("symbol"),
+                    job_id,
+                    broker_pos,
+                )
+                continue
+
+            try:
+                broker_entry_price = float(
+                    broker_pos.get("price_open")
+                    or broker_pos.get("entry_price")
+                    or pos.get("entry_price")
+                    or 0.0
+                )
+            except Exception:
+                broker_entry_price = float(
+                    pos.get("entry_price")
+                    or 0.0
+                )
+
+            try:
+                broker_volume = float(
+                    broker_pos.get("volume")
+                    or broker_pos.get("qty")
+                    or pos.get("qty")
+                    or 0.0
+                )
+            except Exception:
+                broker_volume = float(
+                    pos.get("qty")
+                    or 0.0
+                )
+
+            try:
+                broker_open_time_ms = int(
+                    broker_pos.get("time_msc")
+                    or broker_pos.get("open_time_ms")
+                    or 0
+                )
+            except Exception:
+                broker_open_time_ms = 0
+
+            repair_ms = now_ms()
+
+            pos["status"] = "filled"
+            pos["trade_state"] = "TRADE_ACTIVE"
+
+            pos["mt5_ticket"] = broker_ticket
+            pos["broker_ticket"] = broker_ticket
+
+            pos["mt5_fill_price"] = broker_entry_price
+            if broker_entry_price > 0:
+                pos["entry_price"] = broker_entry_price
+
+            if broker_volume > 0:
+                pos["qty"] = broker_volume
+
+            pos["broker_current_sl"] = broker_pos.get("sl")
+            pos["broker_current_tp"] = broker_pos.get("tp")
+
+            pos["mt5_account"] = pending_account_type
+            if pending_device_id:
+                pos["device_id"] = pending_device_id
+
+            pos["ack_loss_recovered"] = True
+            pos["ack_loss_recovered_at_ms"] = repair_ms
+            pos["ack_loss_recovery_source"] = (
+                "MARKET_ACK_TIMEOUT_BROKER_LIVE"
+            )
+            pos["broker_position_seen_at_ms"] = repair_ms
+
+            if broker_open_time_ms > 0:
+                pos["broker_open_time_ms"] = broker_open_time_ms
+
+            # The original strategy timestamp remains available,
+            # while broker_open_time_ms records actual broker truth.
+            pos["mt5_acked_at_ms"] = repair_ms
+
+            # Persist the repaired ledger before any secondary work.
+            _open_trade(
+                uid,
+                pos,
+            )
+
+            # Synchronize same-side watch and clear opposite-side watch.
+            try:
+                _sync_watches_for_broker_active_position(
+                    uid,
+                    broker_pos,
+                    "MARKET_ACK_TIMEOUT_RECOVERY",
+                )
+            except Exception as watch_exc:
+                log.warning(
+                    "[OPPT] MARKET_ACK_RECOVERY_WATCH_SYNC_FAILED "
+                    "uid=%s tid=%s sym=%s ticket=%s err=%r",
+                    uid,
+                    trade_id,
+                    pos.get("symbol"),
+                    broker_ticket,
+                    watch_exc,
+                )
+
+            # Preserve the immutable entry zone by broker ticket so
+            # restart/broker-repair close handling can recover it.
+            try:
+                zone_meta = {
+                    "trade_id": str(
+                        pos.get("trade_id")
+                        or ""
+                    ),
+                    "user_id": str(uid or ""),
+                    "profile_id": str(
+                        pos.get("profile_id")
+                        or ""
+                    ),
+                    "device_id": str(
+                        pos.get("device_id")
+                        or ""
+                    ),
+                    "mt5_account": str(
+                        pos.get("mt5_account")
+                        or ""
+                    ).lower().strip(),
+                    "symbol": str(
+                        pos.get("symbol")
+                        or ""
+                    ).upper().strip(),
+                    "side": str(
+                        pos.get("side")
+                        or ""
+                    ).upper().strip(),
+                    "mt5_ticket": broker_ticket,
+                    "entry_zone": pos.get("entry_zone"),
+                    "entry_zone_low": pos.get(
+                        "entry_zone_low"
+                    ),
+                    "entry_zone_high": pos.get(
+                        "entry_zone_high"
+                    ),
+                    "entry_zone_level": pos.get(
+                        "entry_zone_level"
+                    ),
+                    "entry_zone_tf": pos.get(
+                        "entry_zone_tf"
+                    ),
+                    "entry_zone_kind": pos.get(
+                        "entry_zone_kind"
+                    ),
+                    "stored_at_ms": repair_ms,
+                    "stored_source": (
+                        "MARKET_ACK_TIMEOUT_RECOVERY"
+                    ),
+                }
+
+                if zone_meta.get("trade_id"):
+                    R.set(
+                        f"xtl:trade:zone_by_ticket:"
+                        f"{broker_ticket}",
+                        json.dumps(
+                            zone_meta,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+            except Exception as zone_exc:
+                log.warning(
+                    "[OPPT] MARKET_ACK_RECOVERY_ZONE_MAP_FAILED "
+                    "uid=%s tid=%s ticket=%s err=%r",
+                    uid,
+                    trade_id,
+                    broker_ticket,
+                    zone_exc,
+                )
+
+            # The position is a real executed trade, so preserve
+            # normal executor idempotency.
+            try:
+                if trade_id:
+                    executed_key = EXECUTED_KEY.format(
+                        uid=uid
+                    )
+                    R.sadd(
+                        executed_key,
+                        trade_id,
+                    )
+                    R.expire(
+                        executed_key,
+                        7 * 24 * 3600,
+                    )
+            except Exception as executed_exc:
+                log.warning(
+                    "[OPPT] MARKET_ACK_RECOVERY_EXECUTED_MARK_FAILED "
+                    "uid=%s tid=%s ticket=%s err=%r",
+                    uid,
+                    trade_id,
+                    broker_ticket,
+                    executed_exc,
+                )
+
+            # Publish the authoritative risk/dashboard state.
+            try:
+                recovery_profile_id = str(
+                    pos.get("profile_id")
+                    or ""
+                ).strip().lower()
+
+                _refresh_prop_risk_snapshot_after_event(
+                    uid,
+                    recovery_profile_id,
+                    "MT5_ACK_RECOVERED",
+                )
+                _invalidate_prop_dashboard_snapshot(
+                    uid,
+                    recovery_profile_id,
+                    "MT5_ACK_RECOVERED",
+                )
+                _schedule_prop_dashboard_warm_refresh(
+                    uid,
+                    recovery_profile_id,
+                    "MT5_ACK_RECOVERED",
+                )
+            except Exception as risk_exc:
+                log.warning(
+                    "[OPPT] MARKET_ACK_RECOVERY_RISK_REFRESH_FAILED "
+                    "uid=%s tid=%s profile=%s err=%r",
+                    uid,
+                    trade_id,
+                    pos.get("profile_id"),
+                    risk_exc,
+                )
+
+            # Capture the entry snapshot that normal ACK handling
+            # would otherwise have created.
+            try:
+                from api.xtl_analytics import capture_entry
+
+                capture_entry(
+                    pos,
+                    capture_source="ack_loss_recovery",
+                )
+            except Exception as analytics_exc:
+                log.warning(
+                    "[OPPT] MARKET_ACK_RECOVERY_ANALYTICS_FAILED "
+                    "uid=%s tid=%s ticket=%s err=%r",
+                    uid,
+                    trade_id,
+                    broker_ticket,
+                    analytics_exc,
+                )
+
+            log.warning(
+                "[OPPT] MARKET_ACK_TIMEOUT_BROKER_LIVE_REPAIRED "
+                "uid=%s tid=%s sym=%s side=%s "
+                "job_id=%s ticket=%s entry=%s volume=%s "
+                "broker_open_time_ms=%s",
                 uid,
                 trade_id,
                 pos.get("symbol"),
+                pos.get("side"),
                 job_id,
-                broker_pos.get("ticket"),
+                broker_ticket,
+                pos.get("entry_price"),
+                pos.get("qty"),
+                broker_open_time_ms,
             )
 
-            # Existing broker-repair/position reconciliation should attach
-            # the ticket. Never release risk or delete this trade.
             continue
 
         # No ACK, no broker position, and no broker deal is possible
@@ -1005,10 +1286,12 @@ def _tick_prop_watchdog(
         risk = _get_prop_risk_state(uid,pid)
         open_risk = float(risk.get("open_risk_usd") or 0.0)
 
+        # Use live broker values whenever available.
+        # This must match trend_endpoints.py exactly.
         account_size = float(
-            prop_cfg.get("account_size")
-            or risk.get("broker_equity")
+            risk.get("broker_equity")
             or risk.get("broker_balance")
+            or prop_cfg.get("account_size")
             or 0.0
         )
 
@@ -1020,6 +1303,21 @@ def _tick_prop_watchdog(
             account_size * max_open_risk_pct / 100.0
             if account_size > 0
             else 0.0
+        )
+        log.warning(
+            "[PROP] OPEN_RISK_LIMIT_SOURCE "
+            "profile=%s "
+            "account_size=%.2f "
+            "equity=%s "
+            "balance=%s "
+            "cfg_account=%s "
+            "limit=%.2f",
+            pid,
+            account_size,
+            risk.get("broker_equity"),
+            risk.get("broker_balance"),
+            prop_cfg.get("account_size"),
+            max_open_risk_usd,
         )
 
         if not bool(risk.get("snapshot_valid", True)):
@@ -2015,8 +2313,23 @@ def _zone_watch_key(
         tf,
     )
 
-def _zone_cooldown_key(sym: str, side: str, tf: str = "H1") -> str:
-    return f"xtl:zone:cooldown:{(sym or '').upper().strip()}:{(side or '').upper().strip()}:{(tf or 'H1').upper().strip()}"
+def _zone_cooldown_key(
+    uid: str,
+    profile_id: str,
+    sym: str,
+    side: str,
+    tf: str,
+) -> str:
+    uid_u = str(uid or "").strip()
+    profile = str(profile_id or "").strip()
+    sym_u = str(sym or "").upper().strip()
+    side_u = str(side or "").upper().strip()
+    tf_u = str(tf or "H1").upper().strip()
+
+    return (
+        f"xtl:zone:cooldown:"
+        f"{uid_u}:{profile}:{sym_u}:{side_u}:{tf_u}"
+    )
 
 def _clear_zone_watch_on_entry(sym: str, side: str, tf: str = "H1") -> None:
     return
@@ -2191,12 +2504,14 @@ def _enqueue_mt5_market_order(
             if isinstance(resolved_account, dict)
             else ""
         ),
+        
         "profile_account_server": (
             str((resolved_account or {}).get("server") or "")
             if isinstance(resolved_account, dict)
             else ""
         ),
     }
+   
 
     try:
         R.rpush(_mt5_cmdq_key(dev_id), json.dumps(cmd))
@@ -2494,6 +2809,16 @@ def _alert_to_event(row: dict) -> Optional[dict]:
         "entry_zone_source": entry_zone.get("zone_source") if entry_zone else None,
         "entry_zone_selection_model": entry_zone.get("selection_model") if entry_zone else None,
         "entry_gate_reason": eg.get("reason"),
+        "setup_analysis": (
+            eg.get("setup_analysis")
+            or ((eg.get("rev_state") or {}).get("setup_analysis") if isinstance(eg.get("rev_state"), dict) else None)
+            or row.get("setup_analysis")
+        ),
+        "entry_confirmation": (
+            eg.get("entry_confirmation")
+            or ((eg.get("rev_state") or {}).get("entry_confirmation") if isinstance(eg.get("rev_state"), dict) else None)
+            or row.get("entry_confirmation")
+        ),
         "trade_state": "ENTRY_READY",
     }
 
@@ -2828,10 +3153,24 @@ def _open_trade(uid: str, pos: Dict[str, Any]) -> None:
 
     R.hset(OPEN_KEY.format(uid=uid), pos["trade_id"], json.dumps(pos))
 
+
 def _clear_trade_lifecycle_keys(
     uid: str,
     pos: Dict[str, Any],
 ) -> None:
+    """
+    Canonical terminal-trade lifecycle cleanup.
+
+    Called by _close_trade(), therefore applies to:
+      - normal broker close
+      - broker reconciliation
+      - broker repair close
+      - restart/orphan-deal recovery
+
+    Deletes both BUY and SELL lifecycle state for the closed symbol so
+    no stale UID-qualified watch can retain TRADE_ACTIVE or
+    WAIT_EXECUTOR_RECON after the broker position is gone.
+    """
     try:
         uid_u = str(uid or "").strip()
 
@@ -2849,44 +3188,147 @@ def _clear_trade_lifecycle_keys(
         ).upper().strip()
 
         if not sym:
+            log.warning(
+                "[OPPT] SKIP_LIFECYCLE_CLEAR missing_symbol "
+                "uid=%s trade_id=%s",
+                uid_u,
+                pos.get("trade_id"),
+            )
             return
 
-        # Clear both sides because an opposite stale watch may exist.
+        deleted = {}
+
+        # Clear both sides because an opposite stale watch may also exist.
         for side in ("BUY", "SELL"):
-            R.delete(
-                _zone_watch_key(
+            side_result = {
+                "watch_h1": False,
+                "watch_h4": False,
+                "break_h1": False,
+                "entry_claim": False,
+            }
+
+            # Use canonical helper, not bare R.delete:
+            # it removes the UID-qualified watch and keeps the
+            # watch index synchronized.
+            try:
+                zone_watch_delete(
+                    R,
                     uid_u,
                     sym,
                     side,
-                    "H1",
+                    tf="H1",
+                )
+                side_result["watch_h1"] = True
+            except Exception as exc:
+                log.warning(
+                    "[OPPT] TERMINAL_WATCH_DELETE_FAILED "
+                    "uid=%s sym=%s side=%s tf=H1 err=%r",
+                    uid_u,
+                    sym,
+                    side,
+                    exc,
+                )
+
+            try:
+                zone_watch_delete(
+                    R,
+                    uid_u,
+                    sym,
+                    side,
+                    tf="H4",
+                )
+                side_result["watch_h4"] = True
+            except Exception as exc:
+                log.warning(
+                    "[OPPT] TERMINAL_WATCH_DELETE_FAILED "
+                    "uid=%s sym=%s side=%s tf=H4 err=%r",
+                    uid_u,
+                    sym,
+                    side,
+                    exc,
+                )
+
+            try:
+                R.delete(
+                    break_state_key(
+                        uid_u,
+                        sym,
+                        side,
+                        "H1",
+                    )
+                )
+                side_result["break_h1"] = True
+            except Exception as exc:
+                log.warning(
+                    "[OPPT] TERMINAL_BREAK_STATE_DELETE_FAILED "
+                    "uid=%s sym=%s side=%s err=%r",
+                    uid_u,
+                    sym,
+                    side,
+                    exc,
+                )
+
+            try:
+                tenant_delete_latest_entry_claim(
+                    R,
+                    uid_u,
+                    sym,
+                    side,
+                    tf="H1",
+                )
+                side_result["entry_claim"] = True
+            except Exception as exc:
+                log.warning(
+                    "[OPPT] TERMINAL_ENTRY_CLAIM_DELETE_FAILED "
+                    "uid=%s sym=%s side=%s err=%r",
+                    uid_u,
+                    sym,
+                    side,
+                    exc,
+                )
+
+            deleted[side] = side_result
+
+        # Existing global opportunity pointers.
+        # Keep until this key family becomes UID-qualified.
+        try:
+            R.delete(
+                ACTIVE_OPP_KEY.format(
+                    symbol=sym,
+                    direction="UP",
                 )
             )
             R.delete(
-                _zone_watch_key(
-                    uid_u,
-                    sym,
-                    side,
-                    "H4",
+                ACTIVE_OPP_KEY.format(
+                    symbol=sym,
+                    direction="DOWN",
                 )
+            )
+        except Exception as exc:
+            log.warning(
+                "[OPPT] TERMINAL_ACTIVE_OPP_DELETE_FAILED "
+                "uid=%s sym=%s err=%r",
+                uid_u,
+                sym,
+                exc,
             )
 
-        # These active-opportunity pointers are still global today.
-        # Keep current behaviour for now; migrate this key family separately.
-        R.delete(
-            ACTIVE_OPP_KEY.format(
-                symbol=sym,
-                direction="UP",
-            )
-        )
-        R.delete(
-            ACTIVE_OPP_KEY.format(
-                symbol=sym,
-                direction="DOWN",
-            )
+        log.warning(
+            "[OPPT] TRADE_LIFECYCLE_CLEARED "
+            "uid=%s trade_id=%s sym=%s ticket=%s deleted=%s",
+            uid_u,
+            pos.get("trade_id"),
+            sym,
+            (
+                pos.get("mt5_ticket")
+                or pos.get("broker_ticket")
+                or pos.get("position_ticket")
+            ),
+            deleted,
         )
 
     except Exception as exc:
-        log.warning(
+        log.exception(
             "[OPPT] LIFECYCLE_CLEAR_FAILED "
             "uid=%s trade_id=%s symbol=%s err=%r",
             uid,
@@ -2894,6 +3336,7 @@ def _clear_trade_lifecycle_keys(
             pos.get("symbol"),
             exc,
         )
+
 def _remove_open_trade(uid: str, trade_id: str) -> None:
     try:
         R.hdel(OPEN_KEY.format(uid=uid), trade_id)
@@ -3557,6 +4000,62 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
     closed["trade_state"] = "EXITED"
     closed["close_lifecycle_version"] = "2.0"
     closed["close_finalizer"] = "_close_trade"
+    # -------------------------------------------------
+    # Distinguish real broker trades from pre-fill
+    # execution attempts.
+    #
+    # Recoverable ENTRY_FAIL records remain available
+    # for broker diagnostics, but must not be counted as
+    # trades in research, performance, win-rate or R stats.
+    # -------------------------------------------------
+    _meta = meta if isinstance(meta, dict) else {}
+
+    try:
+        _closed_ticket = int(
+            pos.get("mt5_ticket")
+            or pos.get("broker_ticket")
+            or pos.get("position_ticket")
+            or 0
+        )
+    except Exception:
+        _closed_ticket = 0
+
+    _broker_deal = _meta.get("broker_deal")
+    _broker_deal_ok = bool(
+        isinstance(_broker_deal, dict)
+        and _broker_deal.get("ok")
+    )
+
+    _no_real_trade = bool(
+        _meta.get("no_real_trade")
+        or (
+            str(reason or "").upper() == "ENTRY_FAIL"
+            and _closed_ticket <= 0
+            and not _broker_deal_ok
+        )
+    )
+
+    if _no_real_trade:
+        closed["record_type"] = str(
+            _meta.get("record_type")
+            or "EXECUTION_ATTEMPT"
+        )
+        closed["analytics_eligible"] = False
+        closed["no_real_trade"] = True
+        closed["broker_retry_recoverable"] = bool(
+            _meta.get("broker_retry_recoverable", False)
+        )
+        closed["execution_attempt_job_id"] = str(
+            _meta.get("execution_attempt_job_id")
+            or pos.get("mt5_job_id")
+            or pos.get("job_id")
+            or ""
+        )
+    else:
+        closed["record_type"] = "TRADE"
+        closed["analytics_eligible"] = True
+        closed["no_real_trade"] = False
+        closed["broker_retry_recoverable"] = False
     closed["close_origin"] = str(
         pos.get("source")
         or "unknown"
@@ -3606,7 +4105,23 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
             close_profile_id,
             "TRADE_CLOSED",
         )
+        log.warning(
+            "[PROP] PHASE3_INVALIDATE_AFTER_CLOSE "
+            "uid=%s profile=%s",
+            uid,
+            close_profile_id,
+        )
 
+        _invalidate_prop_dashboard_snapshot(
+            uid,
+            close_profile_id,
+            "TRADE_CLOSED",
+        )
+        _schedule_prop_dashboard_warm_refresh(
+            uid,
+            close_profile_id,
+            "TRADE_CLOSED",
+        )
     except Exception as e:
         log.warning(
             "[PROP] RELEASE_FAILED "
@@ -3754,6 +4269,12 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
             and remaining_ttl_sec > 0
         ):
             cooldown_payload = {
+                "uid": uid,
+                "profile_id": close_profile_id,
+                "device_id": (
+                    pos.get("device_id")
+                    or closed.get("device_id")
+                ),
                 "symbol": sym,
                 "side": side0,
                 "tf": "H1",
@@ -3772,20 +4293,27 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
                 "elapsed_sec": elapsed_sec,
                 "ttl_sec": remaining_ttl_sec,
             }
+            cooldown_key = _zone_cooldown_key(
+                uid,
+                close_profile_id,
+                sym,
+                side0,
+                "H1",
+            )
 
             R.setex(
-                _zone_cooldown_key(sym, side0, "H1"),
+                cooldown_key,
                 remaining_ttl_sec,
-                json.dumps(
-                    cooldown_payload,
-                    separators=(",", ":"),
-                ),
+                json.dumps(cooldown_payload, separators=(",", ":")),
+                
             )
 
             log.warning(
                 "[ZONE_COOLDOWN_SET] "
-                "trade_id=%s sym=%s side=%s ticket=%s "
-                "reason=%s source=%s ttl_sec=%s",
+                "uid=%s profile=%s trade_id=%s sym=%s side=%s ticket=%s "
+                "reason=%s source=%s ttl_sec=%s key=%s",
+                uid,
+                close_profile_id,
                 pos.get("trade_id"),
                 sym,
                 side0,
@@ -3793,6 +4321,7 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
                 reason_u,
                 pos.get("source"),
                 remaining_ttl_sec,
+                cooldown_key,
             )
         else:
             log.warning(
@@ -4178,9 +4707,30 @@ def tick_user(uid: str) -> None:
 
                 # Writer-side snapshot publication:
                 # broker ACK is successful and TRADE_ACTIVE has been persisted.
+                _ack_profile_id = str(
+                    pos.get("profile_id")
+                    or ""
+                ).strip().lower()
+
                 _refresh_prop_risk_snapshot_after_event(
                     uid,
                     str(pos.get("profile_id") or ""),
+                    "MT5_ACK_FILLED",
+                )
+                log.warning(
+                    "[PROP] PHASE3_INVALIDATE_AFTER_ACK "
+                    "uid=%s profile=%s",
+                    uid,
+                    _ack_profile_id,
+                )
+                _invalidate_prop_dashboard_snapshot(
+                    uid,
+                    _ack_profile_id,
+                    "MT5_ACK_FILLED",
+                )
+                _schedule_prop_dashboard_warm_refresh(
+                    uid,
+                    _ack_profile_id,
                     "MT5_ACK_FILLED",
                 )
 
@@ -4346,7 +4896,20 @@ def tick_user(uid: str) -> None:
                             pos.get("entry_price") or 0.0
                         ),
                         "ENTRY_FAIL",
-                        meta={"mt5_ack": ack},
+                        meta={
+                            "mt5_ack": ack,
+                            "no_real_trade": True,
+                            "record_type": "EXECUTION_ATTEMPT",
+                            "analytics_eligible": False,
+                            "broker_retry_recoverable": bool(
+                                _recoverable_broker_failure
+                            ),
+                            "execution_attempt_job_id": str(
+                                pos.get("mt5_job_id")
+                                or pos.get("job_id")
+                                or ""
+                            ),
+                        },
                     )
                 finally:
                     _remove_open_trade(
@@ -4868,6 +5431,22 @@ def tick_user(uid: str) -> None:
                                             "profile_id": prop_profile_id,
                                         },
                                         profile_id=prop_profile_id
+                                    )
+                                    _refresh_prop_risk_snapshot_after_event(
+                                        uid,
+                                        prop_profile_id,
+                                        "BROKER_RECON_RISK_RESERVED",
+                                    )
+
+                                    _invalidate_prop_dashboard_snapshot(
+                                        uid,
+                                        prop_profile_id,
+                                        "BROKER_RECON_RISK_RESERVED",
+                                    )
+                                    _schedule_prop_dashboard_warm_refresh(
+                                        uid,
+                                        prop_profile_id,
+                                        "BROKER_RECON_RISK_RESERVED",
                                     )
 
                                     log.warning(
@@ -5416,6 +5995,22 @@ def tick_user(uid: str) -> None:
                                         "profile_id": prop_profile_id,
                                     },
                                     profile_id=prop_profile_id
+                            )
+                            _refresh_prop_risk_snapshot_after_event(
+                                uid,
+                                 prop_profile_id,
+                                 "BROKER_REPAIR_RISK_RESERVED",
+                            )
+
+                            _invalidate_prop_dashboard_snapshot(
+                                uid,
+                                prop_profile_id,
+                                "BROKER_REPAIR_RISK_RESERVED",
+                            )
+                            _schedule_prop_dashboard_warm_refresh(
+                                uid,
+                                prop_profile_id,
+                                "BROKER_REPAIR_RISK_RESERVED",
                             )
 
                             log.warning(
@@ -6565,6 +7160,143 @@ def tick_user(uid: str) -> None:
                    side_w,
                    trade_id,
                 )
+                log.warning(
+                    "[WATCHLIST] ENTRY_ANALYTICS "
+                    "sym=%s side=%s "
+                    "setup=%s confirmation=%s validation=%s",
+                    sym_w,
+                    side_w,
+                    isinstance(watch.get("setup_analysis"), dict),
+                    isinstance(watch.get("entry_confirmation"), dict),
+                    isinstance(watch.get("entry_validation"), dict),
+                )
+                # -------------------------------------------------
+                # P0 FIX:
+                # Ensure immutable RC analytics exist before ENTRY.
+                # Handles reused / older REV_OK watches safely.
+                # -------------------------------------------------
+
+                if (
+                    not isinstance(watch.get("entry_confirmation"), dict)
+                    and watch.get("rev_ok")
+                ):
+                    watch["entry_confirmation"] = {
+                        "schema_version": 1,
+                        "selected_production_strategy": "ZONE_REVERSAL",
+                        "confirmed_at_ms": int(
+                            watch.get("rev_ok_ms") or now_e
+                        ),
+                        "rc_high": watch.get("rc_high"),
+                        "rc_low": watch.get("rc_low"),
+                        "rc_close": watch.get("rc_close"),
+                        "trigger_level": watch.get("trigger_level"),
+                        "rc_is_touch_candle": bool(
+                            watch.get("rc_is_touch_candle", False)
+                        ),
+                        "reconstructed_at_entry": True,
+                    }
+
+                if (
+                    not isinstance(watch.get("entry_validation"), dict)
+                    and isinstance(watch.get("entry_confirmation"), dict)
+                ):
+                    try:
+                        from api.zone_entry_gate import (
+                            _build_entry_validation_analytics,
+                        )
+                        watch["entry_validation"] = (
+                            _build_entry_validation_analytics(
+                                watch=watch,
+                                zone=zone,
+                                direction=side_w,
+                                symbol=sym_w,
+                                entry_price=float(entry_px),
+                                atr=float(
+                                    watch.get("atr") or 0.0
+                                ),
+                                device_id=(
+                                    str(dev_for_px or "").strip()
+                                    or None
+                                ),
+                                profile_id=(
+                                    str(profile_id_px or "").strip()
+                                    or None
+                                ),
+                                confirmed_at_ms=int(
+                                    watch.get("rev_ok_ms") or now_e
+                                ),
+                            )
+                        )
+
+                    except Exception as exc:
+                        log.warning(
+                            "[WATCHLIST] ENTRY_VALIDATION_REBUILD_FAILED "
+                            "sym=%s side=%s err=%r",
+                            sym_w,
+                            side_w,
+                            exc,
+                        )
+                        watch["entry_validation"] = {
+                            "schema_version": 1,
+                            "analytics_only": True,
+                            "immutable_entry_validation": True,
+                            "created_at_ms": int(now_e),
+                            "validation_stage": (
+                                "ENTRY_BOUNDARY_REBUILD_FAILED"
+                            ),
+                            "production_unchanged": True,
+                            "capture_error": (
+                                f"{type(exc).__name__}:{exc}"
+                            ),
+                        }
+                try:
+                    R.set(
+                        str(wkey),
+                        json.dumps(
+                            watch,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[WATCHLIST] ENTRY_ANALYTICS_PERSIST_FAILED "
+                        "sym=%s side=%s watch=%s err=%r",
+                        sym_w,
+                        side_w,
+                        wkey,
+                        exc,
+                    )
+
+                log.warning(
+                    "[WATCHLIST] ENTRY_ANALYTICS_FINAL "
+                    "sym=%s side=%s "
+                    "setup=%s confirmation=%s validation=%s "
+                    "reconstructed=%s",
+                    sym_w,
+                    side_w,
+                    isinstance(
+                        watch.get("setup_analysis"),
+                        dict,
+                    ),
+                    isinstance(
+                        watch.get("entry_confirmation"),
+                        dict,
+                    ),
+                    isinstance(
+                        watch.get("entry_validation"),
+                        dict,
+                    ),
+                    bool(
+                        (
+                            watch.get("entry_confirmation")
+                            or {}
+                        ).get("reconstructed_at_entry")
+                    ),
+                )
+
+                
 
                 events.append({
                     "type": "ENTRY",
@@ -6590,6 +7322,51 @@ def tick_user(uid: str) -> None:
                     "trigger_type": "WATCHLIST_REV_OK_BAR_BREAK",
                     "watch_key": str(wkey),
                     "claim_key": str(claim_key),
+                    # Preserve immutable research context from the
+                    # live watch through ENTRY event -> open ledger
+                    # -> close analytics -> permanent JSONL.
+                    "setup_analysis": (
+                        json.loads(
+                            json.dumps(
+                                watch.get("setup_analysis"),
+                                separators=(",", ":"),
+                                default=str,
+                            )
+                        )
+                        if isinstance(
+                            watch.get("setup_analysis"),
+                            dict,
+                        )
+                        else None
+                    ),
+                    "entry_validation": (
+                        json.loads(
+                            json.dumps(
+                                watch.get("entry_validation"),
+                                separators=(",", ":"),
+                                default=str,
+                            )
+                        )
+                        if isinstance(
+                            watch.get("entry_validation"),
+                            dict,
+                        )
+                        else None
+                    ),
+                    "entry_confirmation": (
+                        json.loads(
+                            json.dumps(
+                                watch.get("entry_confirmation"),
+                                separators=(",", ":"),
+                                default=str,
+                            )
+                        )
+                        if isinstance(
+                            watch.get("entry_confirmation"),
+                            dict,
+                        )
+                        else None
+                    ),
                     "source": "watchlist",
                 })
 
@@ -8122,6 +8899,9 @@ def tick_user(uid: str) -> None:
                 "entry_gate_reason": ev.get("entry_gate_reason"),
                 "trigger_type": ev.get("trigger_type"),
                 "trigger_level": ev.get("trigger_level"),
+                "setup_analysis": ev.get("setup_analysis"),
+                "entry_confirmation": ev.get("entry_confirmation"),
+                "entry_validation": ev.get("entry_validation"),
                 "prop_check": prop_check,
                 "profile_id": prop_profile_id,
                 "prop_firm": prop_check.get("firm") if isinstance(prop_check, dict) else None,
@@ -8206,7 +8986,7 @@ def tick_user(uid: str) -> None:
                 )
                 tenant_delete_latest_entry_claim(
                     R,
-                    uid_u,
+                    uid,
                     sym,
                     opp_side,
                     "H1",
@@ -8249,6 +9029,22 @@ def tick_user(uid: str) -> None:
                             "profile_id": prop_profile_id,
                         },
                         profile_id=prop_profile_id,
+                    )
+                    _refresh_prop_risk_snapshot_after_event(
+                        uid,
+                        prop_profile_id,
+                        "RISK_RESERVED",
+                    )
+
+                    _invalidate_prop_dashboard_snapshot(
+                        uid,
+                        prop_profile_id,
+                        "RISK_RESERVED",
+                    )
+                    _schedule_prop_dashboard_warm_refresh(
+                        uid,
+                        prop_profile_id,
+                        "RISK_RESERVED",
                     )
                     log.warning(
                         "[PROP] RISK_RESERVED uid=%s tid=%s sym=%s risk_usd=%s lots=%s",
