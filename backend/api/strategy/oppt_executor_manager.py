@@ -112,6 +112,14 @@ def start_oppt_executor_manager() -> None:
     _started = True
     _sync_enabled_users_on_startup()
 
+    # Dedicated live position-management engine. This is deliberately separate
+    # from entry/executor logic and continues protecting already-open trades.
+    try:
+        from api.position_manager import start_position_manager
+        start_position_manager(R)
+    except Exception:
+        log.exception("[POSITION_MGR] startup failed")
+
     # Repair unresolved analytics rows before the first close sweep. This is
     # safe when the agent was offline: reconciliation uses broker deal truth,
     # while the later sweep refuses unverified broker snapshots.

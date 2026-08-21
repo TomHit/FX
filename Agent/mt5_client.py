@@ -1598,55 +1598,121 @@ def _mt5_last_error():
     except Exception:
         return (None, "unknown")
 
+# ---------- reconnect throttle / circuit breaker ----------
+# Prevents the per-symbol poll path from hammering MT5 (and therefore the
+# broker) with shutdown+initialize pairs while the terminal is disconnected.
+_RECONNECT_LAST_ATTEMPT   = 0.0     # monotonic timestamp of last attempt
+_RECONNECT_FAIL_COUNT     = 0       # consecutive failures
+_RECONNECT_BACKOFF_S      = 30.0    # current cooldown, doubles on failure
+_RECONNECT_BACKOFF_MIN_S  = 30.0
+_RECONNECT_BACKOFF_MAX_S  = 900.0   # 15 min ceiling
+_RECONNECT_FAIL_LIMIT     = 10      # trip the breaker after this many
+_RECONNECT_TRIPPED        = False
+
+
+def mt5_reconnect_state() -> dict:
+    """Expose breaker state for health endpoints / logging."""
+    return {
+        "tripped":    _RECONNECT_TRIPPED,
+        "fail_count": _RECONNECT_FAIL_COUNT,
+        "backoff_s":  _RECONNECT_BACKOFF_S,
+    }
+
+
+def mt5_reconnect_reset() -> None:
+    """Manually clear the breaker (call after operator intervention)."""
+    global _RECONNECT_LAST_ATTEMPT, _RECONNECT_FAIL_COUNT
+    global _RECONNECT_BACKOFF_S, _RECONNECT_TRIPPED
+    _RECONNECT_LAST_ATTEMPT = 0.0
+    _RECONNECT_FAIL_COUNT   = 0
+    _RECONNECT_BACKOFF_S    = _RECONNECT_BACKOFF_MIN_S
+    _RECONNECT_TRIPPED      = False
+    _log("[mt5] reconnect breaker manually reset")
+
 @mt5_locked
 def _mt5_reconnect():
     """
-    Hard reconnect to terminal:
-    - MT5.shutdown()
-    - MT5.initialize(path=MT5.TerminalPath or MT5Path from registry)
-    - Wait up to ~3s for terminal_info().connected
+    Attach-only hard reconnect.
+
+    NEVER spawns a terminal. MT5.initialize(path=...) launches terminal64.exe
+    when it cannot attach; a terminal spawned from this process inherits our
+    environment, and if APPDATA is absent MT5 builds its data folder at
+    C:\\MetaQuotes\\... which it cannot write to. That produced 5,272
+    auth/sync cycles against the broker on 2026-08-13.
+
+    Guards, in order:
+      1. circuit breaker  -- stop entirely after N consecutive failures
+      2. attach-only      -- refuse unless a terminal is already running
+      3. cooldown         -- one attempt per backoff window, doubling
     """
+    global _RECONNECT_LAST_ATTEMPT, _RECONNECT_FAIL_COUNT
+    global _RECONNECT_BACKOFF_S, _RECONNECT_TRIPPED
+
     import time as _time
     import MetaTrader5 as MT5
+
+    # --- guard 1: circuit breaker -------------------------------------
+    if _RECONNECT_TRIPPED:
+        return False
+
+    # --- guard 2: attach-only -----------------------------------------
+    if not _mt5_running():
+        _log("[mt5] reconnect refused: no terminal64.exe/terminal.exe running. "
+             "Open MT5 manually and keep it logged in.")
+        return False
+
+    # --- guard 3: cooldown --------------------------------------------
+    now = _time.monotonic()
+    if _RECONNECT_LAST_ATTEMPT and (now - _RECONNECT_LAST_ATTEMPT) < _RECONNECT_BACKOFF_S:
+        return False
+    _RECONNECT_LAST_ATTEMPT = now
+
+    def _fail(reason: str) -> bool:
+        global _RECONNECT_FAIL_COUNT, _RECONNECT_BACKOFF_S, _RECONNECT_TRIPPED
+        _RECONNECT_FAIL_COUNT += 1
+        _RECONNECT_BACKOFF_S = min(_RECONNECT_BACKOFF_S * 2.0,
+                                   _RECONNECT_BACKOFF_MAX_S)
+        _log(f"[mt5] reconnect failed ({reason}); "
+             f"attempt={_RECONNECT_FAIL_COUNT} "
+             f"next_wait={_RECONNECT_BACKOFF_S:.0f}s")
+        if _RECONNECT_FAIL_COUNT >= _RECONNECT_FAIL_LIMIT:
+            _RECONNECT_TRIPPED = True
+            _log(f"[mt5] ALERT breaker TRIPPED after {_RECONNECT_FAIL_COUNT} "
+                 f"failures; no further attempts until restart or "
+                 f"mt5_reconnect_reset()")
+        return False
 
     try:
         MT5.shutdown()
     except Exception:
         pass
 
-    # Prefer explicit terminal path from registry
     exe = (reg_get("MT5.TerminalPath") or reg_get("MT5Path") or "").strip()
     ok = False
     try:
-        if exe:
-            ok = MT5.initialize(path=exe)
-        else:
-            ok = MT5.initialize()
-    except Exception:
-        ok = False
+        ok = MT5.initialize(path=exe) if exe else MT5.initialize()
+    except Exception as e:
+        return _fail(f"initialize EXC {e}")
 
     if not ok:
-        _log(f"[mt5] initialize failed (path='{exe}') err={_mt5_last_error()}")
-        return False
+        return _fail(f"initialize False path='{exe}' err={_mt5_last_error()}")
 
-    # Wait for IPC to come up
-    for _ in range(12):  # ~3s (12 * 250ms)
+    # Wait for IPC to come up (~3s)
+    for _ in range(12):
         try:
             ti = MT5.terminal_info()
             ai = MT5.account_info()
             if ti and getattr(ti, "connected", False):
-                _log(
-                    "[mt5] reconnect OK; terminal connected server=%s login=%s"
-                    % (
-                        getattr(ti, "server", None),
-                        getattr(ai, "login", None) if ai else None,
-                    )
-                )
+                _RECONNECT_FAIL_COUNT = 0
+                _RECONNECT_BACKOFF_S  = _RECONNECT_BACKOFF_MIN_S
+                _log("[mt5] reconnect OK; terminal connected server=%s login=%s"
+                     % (getattr(ti, "server", None),
+                        getattr(ai, "login", None) if ai else None))
                 # refresh broker TZ if possible (best effort)
                 try:
                     detect_and_write_broker_tz_any(
-                        ["XAUUSD", "EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDCHF"]
-                    )
+                        ["XAUUSD", "EURUSD", "USDJPY",
+                         "GBPUSD", "USDCAD", "USDCHF"])
                     _ensure_broker_offset_fresh()
                 except Exception:
                     pass
@@ -1655,9 +1721,7 @@ def _mt5_reconnect():
             pass
         _time.sleep(0.25)
 
-    _log(f"[mt5] reconnect timeout; err={_mt5_last_error()}")
-    return False
-
+    return _fail(f"IPC timeout err={_mt5_last_error()}")
 
 def _is_trusted_broker_tz(off: int | None, source: str | None = None) -> bool:
     try:

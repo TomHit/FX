@@ -861,8 +861,47 @@ def _consolidate_zones(levels, atr, merge_atr=0.5, min_sep_atr=1.0):
     if not xs:
         return []
     groups = [[xs[0]]]
+
     for x in xs[1:]:
-        if abs(float(x["level"]) - float(groups[-1][-1]["level"])) <= merge_tol:
+        prev = groups[-1][-1]
+
+        x_level = float(x["level"])
+        p_level = float(prev["level"])
+
+        x_low = float(x.get("low", x_level))
+        x_high = float(x.get("high", x_level))
+
+        p_low = float(prev.get("low", p_level))
+        p_high = float(prev.get("high", p_level))
+
+        center_close = abs(x_level - p_level) <= merge_tol
+
+        overlap_low = max(x_low, p_low)
+        overlap_high = min(x_high, p_high)
+
+        zones_overlap = bool(
+            overlap_low <= overlap_high
+        )
+
+        # -----------------------------------------------------
+        # Do not let a very wide HTF zone swallow a materially
+        # different nearby LTF zone merely because their bands
+        # overlap.
+        #
+        # Overlap is merge-worthy only when the zone centres
+        # are also reasonably close.
+        #
+        # This prevents broad H4 bands such as 99.615-99.772
+        # from absorbing a distinct H1 resistance such as
+        # 99.620-99.688.
+        # -----------------------------------------------------
+        overlap_center_close = bool(
+            zones_overlap
+            and abs(x_level - p_level)
+            <= (1.50 * merge_tol)
+        )
+
+        if center_close or overlap_center_close:
             groups[-1].append(x)
         else:
             groups.append([x])
@@ -939,12 +978,20 @@ def _select_active_levels(levels, price, side, atr, top_n=3, buffer_atr=0.10):
             continue
         try:
             lv = float(z.get("level"))
+            lo = float(z.get("low", lv))
+            hi = float(z.get("high", lv))
         except Exception:
             continue
-        if side == "support" and lv <= price - buf:
-            out.append(z)
-        elif side == "resistance" and lv >= price + buf:
-            out.append(z)
+
+        inside = lo <= float(price) <= hi
+
+        if side == "support":
+            if inside or hi <= float(price) + buf:
+                out.append(z)
+
+        else:
+            if inside or lo >= float(price) - buf:
+                out.append(z)
     out.sort(key=lambda z: abs(price - float(z.get("level"))))
     return out[:top_n]
 
@@ -1102,31 +1149,116 @@ def summarize_sr_multi_tf(
             rr["sr_score"] = round(base + side_bonus + stale_penalty + dist_penalty, 3)
             xs.append(rr)
         return xs
+    
+    def _is_current_structure(x: Dict[str, Any]) -> bool:
+        if not isinstance(x, dict):
+            return False
 
+        st = str(
+            x.get("source_type")
+            or x.get("band_type")
+            or ""
+        ).upper()
+
+        return st in (
+            "CURRENT_STRUCTURE_LOW",
+            "CURRENT_STRUCTURE_HIGH",
+        )
     def _dedupe_levels(xs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Merge entries at the same price so a level detected by multiple
-        sources appears once. Keeps highest score; merges touches/sources."""
-        tol = max(0.05 * float(atr), 3.0 * float(pip_factor))
+        """
+        Merge entries at approximately the same price.
+
+        Keep the highest-score representative zone, but preserve semantic
+        provenance when one of the merged contributors is a validated
+        CURRENT_STRUCTURE_LOW/HIGH.
+
+        This matters because current-structure zones are intentionally
+        one-touch zones; their validity comes from the required post-extreme
+        bounce/drop rather than repeated historical touches.
+        """
+        tol = max(
+            0.05 * float(atr),
+            3.0 * float(pip_factor),
+        )
+
         kept: List[Dict[str, Any]] = []
-        for x in sorted(xs, key=lambda r: -float(r.get("sr_score") or 0.0)):
+
+        for raw_x in sorted(
+            xs,
+            key=lambda r: -float(
+                (r or {}).get("sr_score")
+                or 0.0
+            ),
+        ):
+            if not isinstance(raw_x, dict):
+                continue
+
+            # Do not mutate the original TF/raw object while deduping.
+            x = dict(raw_x)
+
             try:
                 lv = float(x.get("level"))
             except Exception:
                 continue
+
+            if _is_current_structure(x):
+                x["has_current_structure"] = True
+
             merged = False
+
             for k in kept:
                 try:
                     if abs(float(k.get("level")) - lv) <= tol:
-                        k["touches"] = max(int(k.get("touches") or 0), int(x.get("touches") or 0))
-                        srcs = k.get("merged_source_types") or [k.get("source_type") or k.get("band_type")]
-                        srcs.append(x.get("source_type") or x.get("band_type"))
-                        k["merged_source_types"] = [s for s in srcs if s]
+                        k["touches"] = max(
+                            int(k.get("touches") or 0),
+                            int(x.get("touches") or 0),
+                        )
+
+                        srcs = list(
+                            k.get("merged_source_types")
+                            or [
+                                k.get("source_type")
+                                or k.get("band_type")
+                            ]
+                        )
+
+                        src = (
+                            x.get("source_type")
+                            or x.get("band_type")
+                        )
+
+                        if src:
+                            srcs.append(src)
+
+                        # Stable de-duplication while preserving order.
+                        k["merged_source_types"] = list(
+                            dict.fromkeys(
+                                str(s)
+                                for s in srcs
+                                if s
+                            )
+                        )
+
+                        # CRITICAL:
+                        # Preserve current-structure provenance even if a
+                        # different higher-score source remains the
+                        # representative zone.
+                        if (
+                            _is_current_structure(k)
+                            or _is_current_structure(x)
+                            or bool(x.get("has_current_structure"))
+                        ):
+                            k["has_current_structure"] = True
+
                         merged = True
                         break
+
                 except Exception:
-                    pass
+                    continue
+
             if not merged:
                 kept.append(x)
+
         return kept
 
     def _source_side_ok(x: Dict[str, Any], want_kind: str) -> bool:
@@ -1156,6 +1288,33 @@ def summarize_sr_multi_tf(
         ys.sort(key=lambda x: (float(x.get("distance_atr") or 1e9), -float(x.get("sr_score") or 0.0),
                               -float(x.get("strength") or 0.0), -int(x.get("touches") or 0)))
         return ys[:NEAR_TOPK]
+
+    def _major_touch_ok(x: Dict[str, Any]) -> bool:
+        """
+        Historical SR requires repeated touches.
+
+        CURRENT_STRUCTURE_LOW/HIGH is validated differently: the detector
+        requires a material bounce/drop after the current structural extreme,
+        so it is intentionally allowed into canonical inventory with one touch.
+        """
+        st = str(
+            x.get("source_type")
+            or x.get("band_type")
+            or ""
+        ).upper()
+
+        if st in (
+            "CURRENT_STRUCTURE_LOW",
+            "CURRENT_STRUCTURE_HIGH",
+        ):
+            return True
+
+        # A higher-score neighbouring SR may be the dedupe representative,
+        # while CURRENT_STRUCTURE_LOW/HIGH was one of its contributors.
+        if bool(x.get("has_current_structure")):
+            return True
+
+        return int(x.get("touches") or 0) >= 2
     
     def _major(xs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         xs = _dedupe_levels(xs)
@@ -1168,7 +1327,7 @@ def summarize_sr_multi_tf(
             and isinstance(x.get("distance_atr"), (int, float))
             and float(x.get("distance_atr") or 999) <= 5.0
             and float(x.get("sr_score") or 0) >= 3.0
-            and int(x.get("touches") or 0) >= 2
+            and _major_touch_ok(x)
         ]
 
         ys.sort(
@@ -1802,20 +1961,32 @@ def build_market_structure_state(
         if lv is None:
             return None
 
-        dist = abs(px - lv) if px is not None else _f(z.get("distance"))
-
-        dist_atr = (
-            abs(px - lv) / atr
-            if px is not None and atr > 0
-            else _f(z.get("distance_atr"))
-        )
-
         inside = bool(
             px is not None
             and lo is not None
             and hi is not None
             and lo <= px <= hi
         )
+
+        if px is not None:
+            if inside:
+                dist = 0.0
+            elif str(role).lower() == "resistance":
+                dist = max(0.0, float(lo) - float(px))
+            elif str(role).lower() == "support":
+                dist = max(0.0, float(px) - float(hi))
+            else:
+                dist = abs(float(px) - float(lv))
+        else:
+            dist = _f(z.get("distance"))
+
+        dist_atr = (
+            float(dist) / float(atr)
+            if dist is not None and atr > 0
+            else _f(z.get("distance_atr"))
+        )
+
+        
 
         return {
             "role": str(role).upper(),
@@ -2217,4 +2388,744 @@ def build_market_structure_state(
         "cache_state": bundle.get("_cache"),
         "computed_at_ms": bundle.get("_computed_at_ms"),
         
+    }
+
+def build_live_htf_structure_state(
+    sr_bundle: Dict[str, Any],
+    *,
+    live_price: float,
+    required_direction: Optional[str] = None,
+    live_price_ts_ms: Optional[int] = None,
+    now_ms: Optional[int] = None,
+    max_tick_age_ms: int = 10_000,
+    max_zones: int = 5,
+) -> Dict[str, Any]:
+    """
+    Build an execution-time DXY structure view using ONLY canonical H1/H4 SR.
+
+    IMPORTANT:
+      - H1/H4 are the structural drivers.
+      - M15 SR is deliberately ignored.
+      - live_price is used only to locate DXY NOW relative to established
+        H1/H4 zones.
+      - This function does NOT alter, recompute, or persist SR.
+      - This function does NOT block execution. It is safe for shadow use.
+
+    required_direction:
+        BULLISH -> opposing structure is RESISTANCE
+        BEARISH -> opposing structure is SUPPORT
+
+    Expected REAL_DXY provenance:
+        _h1_bar_source == NATIVE_REAL_DXY_H1
+        _h4_bar_source == NATIVE_REAL_DXY_H4
+    """
+
+    def _f(v, default=None):
+        try:
+            x = float(v)
+            return x if math.isfinite(x) else default
+        except Exception:
+            return default
+
+    def _i(v, default=0):
+        try:
+            return int(float(v))
+        except Exception:
+            return default
+
+    bundle = sr_bundle if isinstance(sr_bundle, dict) else {}
+
+    px = _f(live_price)
+    atr = _f(bundle.get("atr"), 0.0) or 0.0
+
+    if px is None or px <= 0:
+        return {
+            "ok": False,
+            "reason": "BAD_LIVE_PRICE",
+        }
+
+    direction = str(required_direction or "NEUTRAL").upper().strip()
+    if direction not in ("BULLISH", "BEARISH", "NEUTRAL"):
+        direction = "NEUTRAL"
+
+    now_i = _i(now_ms, int(time.time() * 1000))
+    tick_i = _i(live_price_ts_ms, 0)
+
+    tick_age_ms = (
+        max(0, now_i - tick_i)
+        if tick_i > 0
+        else None
+    )
+
+    tick_fresh = bool(
+        tick_age_ms is not None
+        and tick_age_ms <= int(max_tick_age_ms)
+    )
+
+    h1_source = str(
+        bundle.get("_h1_bar_source") or ""
+    ).upper().strip()
+
+    h4_source = str(
+        bundle.get("_h4_bar_source") or ""
+    ).upper().strip()
+
+    native_h1 = h1_source == "NATIVE_REAL_DXY_H1"
+    native_h4 = h4_source == "NATIVE_REAL_DXY_H4"
+
+    provenance_ok = bool(native_h1 and native_h4)
+
+    # SR tolerance is used only for merging nearby HTF zones.
+    cross_buf = _f(bundle.get("cross_buf"), 0.0) or 0.0
+
+    merge_gap = max(
+        0.10 * atr if atr > 0 else 0.0,
+        cross_buf,
+        1e-9,
+    )
+
+    # Prevent transitive merging from turning several nearby structures
+    # into one enormous zone.
+    max_cluster_span = max(
+        1.25 * atr if atr > 0 else 0.0,
+        4.0 * merge_gap,
+        1e-9,
+    )
+
+    def _zone_bounds(z):
+        if not isinstance(z, dict):
+            return None, None, None
+
+        lv = _f(z.get("level"))
+        lo = _f(z.get("low"), lv)
+        hi = _f(z.get("high"), lv)
+
+        if lv is None:
+            return None, None, None
+
+        if lo is None:
+            lo = lv
+        if hi is None:
+            hi = lv
+
+        if lo > hi:
+            lo, hi = hi, lo
+
+        return float(lv), float(lo), float(hi)
+
+    def _collect_tf(tf_name: str, role: str) -> list[dict]:
+        tf_obj = bundle.get(tf_name.lower())
+
+        if not isinstance(tf_obj, dict):
+            tf_obj = bundle.get(tf_name.upper())
+
+        if not isinstance(tf_obj, dict):
+            return []
+
+        role_l = role.lower()
+
+        if role_l == "support":
+            keys = (
+                "supports_major",
+                "supports_near",
+                "supports",
+            )
+        else:
+            keys = (
+                "resistances_major",
+                "resistances_near",
+                "resistances",
+            )
+
+        raw: list[dict] = []
+
+        for key in keys:
+            xs = tf_obj.get(key) or []
+            if not isinstance(xs, list):
+                continue
+
+            for z in xs:
+                if isinstance(z, dict):
+                    raw.append(z)
+
+        out: list[dict] = []
+        seen = set()
+
+        for z in raw:
+            lv, lo, hi = _zone_bounds(z)
+            if lv is None:
+                continue
+
+            # Do not use explicitly invalidated structure.
+            if bool(z.get("stale", False)):
+                continue
+
+            if bool(z.get("broken", False)):
+                continue
+
+            # --------------------------------------------------
+            # Re-evaluate the zone against LIVE price.
+            #
+            # Resistance:
+            #   relevant while price is below it or inside it.
+            #   once price is above zone.high, it is behind DXY.
+            #
+            # Support:
+            #   relevant while price is above it or inside it.
+            #   once price is below zone.low, it is behind DXY.
+            # --------------------------------------------------
+            inside = bool(lo <= px <= hi)
+
+            if role_l == "resistance":
+                if px > hi and not inside:
+                    continue
+
+                edge_distance = (
+                    0.0 if inside
+                    else max(0.0, lo - px)
+                )
+
+            else:
+                if px < lo and not inside:
+                    continue
+
+                edge_distance = (
+                    0.0 if inside
+                    else max(0.0, px - hi)
+                )
+
+            edge_distance_atr = (
+                edge_distance / atr
+                if atr > 0
+                else None
+            )
+
+            # Deduplicate repeated representations from
+            # major/near/public lists.
+            dedupe_tol = max(
+                0.02 * atr if atr > 0 else 0.0,
+                1e-9,
+            )
+
+            sig = (
+                str(tf_name).upper(),
+                str(role_l).upper(),
+                int(round(lv / dedupe_tol)),
+                int(round(lo / dedupe_tol)),
+                int(round(hi / dedupe_tol)),
+            )
+
+            if sig in seen:
+                continue
+
+            seen.add(sig)
+
+            out.append({
+                "tf": str(tf_name).upper(),
+                "role": str(role_l).upper(),
+
+                "level": lv,
+                "low": lo,
+                "high": hi,
+
+                "inside": inside,
+
+                "distance_to_edge": float(edge_distance),
+                "distance_to_edge_atr": (
+                    float(edge_distance_atr)
+                    if edge_distance_atr is not None
+                    else None
+                ),
+
+                "touches": _i(z.get("touches"), 0),
+
+                "strength": _f(
+                    z.get("strength"),
+                    0.0,
+                ) or 0.0,
+
+                "sr_score": _f(
+                    z.get("sr_score"),
+                    _f(z.get("strength"), 0.0),
+                ) or 0.0,
+
+                "source_type": (
+                    z.get("source_type")
+                    or z.get("band_type")
+                ),
+
+                "maturity": z.get("maturity"),
+
+                # Preserve audit fields.
+                "broken": bool(z.get("broken", False)),
+                "stale": bool(z.get("stale", False)),
+                "swept": bool(z.get("swept", False)),
+                "reclaimed": bool(z.get("reclaimed", False)),
+            })
+
+        return out
+    def _is_qualified_htf_member(z: dict) -> bool:
+        """
+        Shadow structural-quality filter.
+
+        A zone may remain visible for audit/location purposes without being
+        strong enough to participate in Point-A structural qualification.
+
+        IMPORTANT:
+        RAW_SWING alone must not create H1/H4 confluence.
+        """
+        if not isinstance(z, dict):
+            return False
+
+        tf = str(z.get("tf") or "").upper().strip()
+        src = str(z.get("source_type") or "").upper().strip()
+
+        score = _f(z.get("sr_score"), 0.0) or 0.0
+        strength = _f(z.get("strength"), 0.0) or 0.0
+        touches = _i(z.get("touches"), 0)
+
+        if bool(z.get("broken", False)):
+            return False
+
+        if bool(z.get("stale", False)):
+            return False
+
+        # ------------------------------------------------------
+        # RAW_SWING is useful as audit/local geometry,
+        # but must never establish HTF confluence by itself.
+        # ------------------------------------------------------
+        if src == "RAW_SWING":
+            return False
+
+        # ------------------------------------------------------
+        # H1 qualification:
+        # repeated market interaction OR meaningful scored zone.
+        # ------------------------------------------------------
+        if tf == "H1":
+            if touches >= 6 and score >= 12.0:
+                return True
+
+            if score >= 20.0:
+                return True
+
+            if src in (
+                "BASE_IMPULSE",
+                "REACTION_ZONE",
+                "STRUCTURE_ORIGIN",
+                "CURRENT_STRUCTURE_HIGH",
+                "CURRENT_STRUCTURE_LOW",
+                "RECENT_HIGH_CLUSTER",
+                "RECENT_LOW_CLUSTER",
+            ) and score >= 15.0:
+                return True
+
+            return False
+
+        # ------------------------------------------------------
+        # H4 qualification:
+        # H4 gets structural importance, but still requires
+        # meaningful evidence. One weak swing is not enough.
+        # ------------------------------------------------------
+        if tf == "H4":
+            if touches >= 4 and score >= 12.0:
+                return True
+
+            if score >= 20.0:
+                return True
+
+            if src in (
+                "BASE_IMPULSE",
+                "REACTION_ZONE",
+                "STRUCTURE_ORIGIN",
+                "CURRENT_STRUCTURE_HIGH",
+                "CURRENT_STRUCTURE_LOW",
+                "RECENT_HIGH_CLUSTER",
+                "RECENT_LOW_CLUSTER",
+            ) and score >= 15.0:
+                return True
+
+            return False
+
+        return False
+
+    def _merge_role(role: str) -> list[dict]:
+        rows = (
+            _collect_tf("H1", role)
+            + _collect_tf("H4", role)
+        )
+
+        if not rows:
+            return []
+
+        rows.sort(
+            key=lambda z: (
+                float(z.get("low") or 0.0),
+                float(z.get("high") or 0.0),
+            )
+        )
+
+        groups: list[list[dict]] = []
+
+        for z in rows:
+            zlo = float(z["low"])
+            zhi = float(z["high"])
+
+            placed = False
+
+            for grp in groups:
+                glo = min(float(x["low"]) for x in grp)
+                ghi = max(float(x["high"]) for x in grp)
+
+                proposed_lo = min(glo, zlo)
+                proposed_hi = max(ghi, zhi)
+
+                overlaps_or_near = (
+                    zlo <= ghi + merge_gap
+                    and zhi >= glo - merge_gap
+                )
+
+                span_ok = (
+                    proposed_hi - proposed_lo
+                    <= max_cluster_span
+                )
+
+                if overlaps_or_near and span_ok:
+                    grp.append(z)
+                    placed = True
+                    break
+
+            if not placed:
+                groups.append([z])
+
+        merged: list[dict] = []
+
+        for grp in groups:
+            low = min(float(x["low"]) for x in grp)
+            high = max(float(x["high"]) for x in grp)
+
+            tfs = sorted({
+                str(x.get("tf") or "").upper()
+                for x in grp
+                if str(x.get("tf") or "").strip()
+            })
+
+            h1_rows = [
+                x for x in grp
+                if x.get("tf") == "H1"
+            ]
+
+            h4_rows = [
+                x for x in grp
+                if x.get("tf") == "H4"
+            ]
+
+            qualified_rows = [
+                x for x in grp
+                if _is_qualified_htf_member(x)
+            ]
+
+            qualified_h1_rows = [
+                x for x in qualified_rows
+                if x.get("tf") == "H1"
+            ]
+
+            qualified_h4_rows = [
+                x for x in qualified_rows
+                if x.get("tf") == "H4"
+            ]
+
+            inside = bool(low <= px <= high)
+
+            role_u = str(role).upper()
+
+            if role_u == "RESISTANCE":
+                distance = (
+                    0.0 if inside
+                    else max(0.0, low - px)
+                )
+            else:
+                distance = (
+                    0.0 if inside
+                    else max(0.0, px - high)
+                )
+
+            distance_atr = (
+                distance / atr
+                if atr > 0
+                else None
+            )
+
+            max_score = max(
+                float(x.get("sr_score") or 0.0)
+                for x in grp
+            )
+
+            max_strength = max(
+                float(x.get("strength") or 0.0)
+                for x in grp
+            )
+
+            total_touches = sum(
+                int(x.get("touches") or 0)
+                for x in grp
+            )
+
+            h1_best_score = max(
+                [
+                    float(x.get("sr_score") or 0.0)
+                    for x in qualified_h1_rows
+                ]
+                or [0.0]
+            )
+
+            h4_best_score = max(
+                [
+                    float(x.get("sr_score") or 0.0)
+                    for x in qualified_h4_rows
+                ]
+                or [0.0]
+            )
+
+            # True HTF confluence requires QUALIFIED structure
+            # independently present on H1 and H4.
+            #
+            # Weak/raw H4 swings sitting inside an H1 zone do not count.
+            htf_confluence = bool(
+                qualified_h1_rows
+                and qualified_h4_rows
+            )
+
+            # --------------------------------------------------
+            # SHADOW classification only.
+            #
+            # Do not use these thresholds to block execution yet.
+            # We will replay/tune them before promotion.
+            # --------------------------------------------------
+            qualified_h1 = bool(qualified_h1_rows)
+            qualified_h4 = bool(qualified_h4_rows)
+
+            # --------------------------------------------------
+            # DXY HTF structural classification.
+            #
+            # H1 alone can be a valid strong structural driver.
+            # H4 alone can be a valid strong structural driver.
+            # H1 + H4 overlap is stronger confluence.
+            #
+            # Weak/raw zones stay visible for geometry/audit
+            # but are not promoted into Point-A structure.
+            # --------------------------------------------------
+            if qualified_h1 and qualified_h4:
+                strength_class = "CONFLUENT"
+
+            elif qualified_h1 or qualified_h4:
+                strength_class = "STRONG"
+
+            else:
+                strength_class = "WEAK"
+
+            merged.append({
+                "role": role_u,
+
+                "low": float(low),
+                "high": float(high),
+                "mid": float((low + high) / 2.0),
+
+                "inside": inside,
+
+                "distance_to_edge": float(distance),
+                "distance_to_edge_atr": (
+                    float(distance_atr)
+                    if distance_atr is not None
+                    else None
+                ),
+
+                "timeframes": tfs,
+                "h1_present": bool(h1_rows),
+                "h4_present": bool(h4_rows),
+                "htf_confluence": htf_confluence,
+
+                "member_count": len(grp),
+
+                "max_sr_score": float(max_score),
+                "max_strength": float(max_strength),
+                "total_touches": int(total_touches),
+
+                "h1_best_score": float(h1_best_score),
+                "h4_best_score": float(h4_best_score),
+
+                "strength_class_shadow": strength_class,
+                "structural_confidence_shadow": (
+                    "VERY_HIGH"
+                    if strength_class == "CONFLUENT"
+                    else (
+                         "HIGH"
+                         if strength_class == "STRONG"
+                         else "LOW"
+                    )
+    	 	),
+
+                "members": grp,
+                "qualified_member_count": len(
+                    qualified_rows
+                ),
+
+                "qualified_h1_count": len(
+                    qualified_h1_rows
+                ),
+
+                "qualified_h4_count": len(
+                    qualified_h4_rows
+                ),
+
+                "qualified_htf_confluence": bool(
+                    htf_confluence
+                ),
+            })
+
+        # Execution-time order:
+        # inside first, then nearest zone edge,
+        # then stronger/confluent structure.
+        merged.sort(
+            key=lambda z: (
+                0 if z.get("inside") else 1,
+                (
+                    float(z.get("distance_to_edge_atr"))
+                    if isinstance(
+                        z.get("distance_to_edge_atr"),
+                        (int, float),
+                    )
+                    else 1e18
+                ),
+                0 if z.get("htf_confluence") else 1,
+                -float(z.get("max_sr_score") or 0.0),
+            )
+        )
+
+        return merged
+
+    supports = _merge_role("SUPPORT")
+    resistances = _merge_role("RESISTANCE")
+
+    nearest_support = (
+        supports[0]
+        if supports
+        else None
+    )
+
+    nearest_resistance = (
+        resistances[0]
+        if resistances
+        else None
+    )
+    def _first_qualified(
+        zones: list[dict],
+    ) -> Optional[dict]:
+        """
+        First execution-relevant structural region.
+
+        LOCAL/WEAK remain available for audit, but Point A must not
+        treat them as the primary structural barrier.
+        """
+        for z in zones or []:
+            cls = str(
+                z.get("strength_class_shadow")
+                or ""
+            ).upper().strip()
+
+            if cls in ("STRONG", "CONFLUENT"):
+                return z
+
+        return None
+
+
+    qualified_support = _first_qualified(
+        supports
+    )
+
+    qualified_resistance = _first_qualified(
+        resistances
+    )
+
+    if direction == "BULLISH":
+        opposing_role = "RESISTANCE"
+
+        # Physical nearest remains useful for market geometry.
+        nearest_opposing = nearest_resistance
+
+        # Point-A candidate must be structurally qualified.
+        opposing = qualified_resistance
+        opposing_zones = resistances
+
+    elif direction == "BEARISH":
+        opposing_role = "SUPPORT"
+
+        nearest_opposing = nearest_support
+
+        opposing = qualified_support
+        opposing_zones = supports
+
+    else:
+        opposing_role = None
+        nearest_opposing = None
+        opposing = None
+        opposing_zones = []
+
+
+    return {
+        "schema_version": 1,
+        "shadow_only": True,
+
+        "ok": bool(
+            provenance_ok
+            and tick_fresh
+        ),
+
+        "reason": (
+            "OK"
+            if provenance_ok and tick_fresh
+            else (
+                "NON_NATIVE_HTF"
+                if not provenance_ok
+                else "STALE_LIVE_PRICE"
+            )
+        ),
+
+        "live_price": float(px),
+        "live_price_ts_ms": (
+            int(tick_i)
+            if tick_i > 0
+            else None
+        ),
+        "tick_age_ms": tick_age_ms,
+        "tick_fresh": tick_fresh,
+
+        "atr": (
+            float(atr)
+            if atr > 0
+            else None
+        ),
+
+        "h1_bar_source": h1_source,
+        "h4_bar_source": h4_source,
+        "native_htf_ok": provenance_ok,
+
+        "required_direction": direction,
+        "opposing_role": opposing_role,
+
+        "nearest_support": nearest_support,
+        "nearest_resistance": nearest_resistance,
+        
+        "qualified_support": qualified_support,
+        "qualified_resistance": qualified_resistance,
+
+        "nearest_opposing_structure": nearest_opposing,
+
+        "opposing_structure": opposing,
+
+        "support_zones": supports[:max_zones],
+        "resistance_zones": resistances[:max_zones],
+        "opposing_zones": opposing_zones[:max_zones],
+
+        "merge_gap": float(merge_gap),
+        "max_cluster_span": float(max_cluster_span),
     }

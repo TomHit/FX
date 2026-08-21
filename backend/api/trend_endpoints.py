@@ -108,27 +108,85 @@ OPPT_MAX_LAST_GOOD_AGE_MS = (
 )
 
 
+def _oppt_cache_generation_key(
+    cache_key: str,
+) -> str:
+    """
+    Generation key for one exact slim opportunity cache identity.
+
+    Kept OUTSIDE xtl:oppt:cache:* so legacy/global cache cleanup
+    cannot accidentally reset concurrency protection.
+    """
+    prefix = "xtl:oppt:cache:slim:"
+    key = str(cache_key or "").strip()
+
+    if not key.startswith(prefix):
+        return ""
+
+    suffix = key[len(prefix):]
+
+    return (
+        "xtl:oppt:invalidate:slim:"
+        + suffix
+    )
+
+
+def _read_oppt_cache_generation(
+    cache_key: str,
+) -> int:
+    gen_key = _oppt_cache_generation_key(
+        cache_key
+    )
+
+    if not gen_key:
+        return 0
+
+    try:
+        raw = R.get(gen_key)
+
+        if isinstance(
+            raw,
+            (bytes, bytearray),
+        ):
+            raw = raw.decode(
+                "utf-8",
+                "ignore",
+            )
+
+        return int(raw or 0)
+
+    except Exception:
+        return 0
+
 def _store_opportunity_snapshot(
     *,
     cache_key: str,
     last_good_cache_key: str | None,
     payload: dict,
     fresh_ttl_s: int,
-) -> None:
+    expected_generation: int | None = None,
+) -> bool:
     """
     Store one successful opportunity payload in:
 
-      1. Fresh cache - existing short TTL.
-      2. Last-good cache - retained for recovery/fast serving.
+      1. Fresh cache.
+      2. Last-good cache.
 
-    This helper does not alter opportunity computation or response flow.
+    P0-1:
+    If Point-A released a setup while this producer was computing,
+    the cache generation changes. The stale producer must NOT publish
+    its pre-release payload afterward.
+
+    Returns:
+        True  -> snapshot published
+        False -> skipped/failed
     """
 
     if (
         not cache_key
         or not isinstance(payload, dict)
     ):
-        return
+        return False
 
     try:
         snapshot = dict(payload)
@@ -143,27 +201,90 @@ def _store_opportunity_snapshot(
             default=str,
         )
 
-        pipe = R.pipeline(
-            transaction=False,
+        gen_key = _oppt_cache_generation_key(
+            cache_key
         )
 
-        pipe.setex(
-            cache_key,
-            max(
-                1,
-                int(fresh_ttl_s),
-            ),
-            encoded,
+        # Backward-compatible fallback for a caller that did not
+        # capture producer generation. Normal internal opportunity
+        # producers should always pass expected_generation.
+        if expected_generation is None:
+            expected_generation = (
+                _read_oppt_cache_generation(
+                    cache_key
+                )
+            )
+
+        last_good_key = str(
+            last_good_cache_key or ""
         )
 
-        if last_good_cache_key:
-            pipe.setex(
-                last_good_cache_key,
+        # Atomic:
+        #   compare generation
+        #   + write fresh
+        #   + write lastgood
+        #
+        # This closes the race:
+        # producer checks generation -> Point-A releases -> producer writes.
+        lua = """
+        local current = tonumber(redis.call('GET', KEYS[3]) or '0')
+        local expected = tonumber(ARGV[1] or '0')
+
+        if current ~= expected then
+            return 0
+        end
+
+        redis.call(
+            'SETEX',
+            KEYS[1],
+            tonumber(ARGV[2]),
+            ARGV[4]
+        )
+
+        if KEYS[2] ~= '' then
+            redis.call(
+                'SETEX',
+                KEYS[2],
+                tonumber(ARGV[3]),
+                ARGV[4]
+            )
+        end
+
+        return 1
+        """
+
+        published = int(
+            R.eval(
+                lua,
+                3,
+                cache_key,
+                last_good_key,
+                gen_key,
+                int(expected_generation),
+                max(
+                    1,
+                    int(fresh_ttl_s),
+                ),
                 int(OPPT_LAST_GOOD_TTL_S),
                 encoded,
             )
+            or 0
+        )
 
-        pipe.execute()
+        if published != 1:
+            log.warning(
+                "[OPPT] SNAPSHOT_STORE_STALE_GENERATION_SKIP "
+                "cache_key=%s expected_generation=%s "
+                "current_generation=%s",
+                cache_key,
+                expected_generation,
+                _read_oppt_cache_generation(
+                    cache_key
+                ),
+            )
+            return False
+
+        return True
 
     except Exception:
         log.exception(
@@ -172,6 +293,8 @@ def _store_opportunity_snapshot(
             cache_key,
             last_good_cache_key,
         )
+        return False
+
 
 # --- Zone-only entry gate (new module; single source of truth) ---
 _ZONE_GATE_IMPORT_ERR = None
@@ -1347,7 +1470,118 @@ def _discover_missing_prop_profiles(uid: str) -> None:
             continue
 
         updated_cfg = dict(current_cfg)
+        
+        # -----------------------------------------------------
+        # Replacement-login account-size reconciliation.
+        #
+        # Only perform this because the MT5 login is changing.
+        # Do NOT continuously derive nominal account size from
+        # live balance during normal trading.
+        # -----------------------------------------------------
+        selected_account = (
+            selected.get("account")
+            if isinstance(
+                selected.get("account"),
+                dict,
+            )
+            else {}
+        )
 
+        live_balance = (
+            selected_account.get("balance")
+            or selected.get("balance")
+            or 0.0
+        )
+
+        detected_nominal_size = (
+            _infer_prop_nominal_account_size(
+                live_balance,
+            )
+        )
+
+        old_account_size = 0.0
+
+        try:
+            old_account_size = float(
+                current_cfg.get("account_size")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            old_account_size = 0.0
+
+        if (
+            detected_nominal_size is not None
+            and detected_nominal_size > 0
+        ):
+            updated_cfg["account_size"] = float(
+                detected_nominal_size
+            )
+
+            if (
+                old_account_size <= 0
+                or abs(
+                    detected_nominal_size
+                    - old_account_size
+                ) > 0.01
+            ):
+                updated_cfg["account_name"] = (
+                    _prop_account_size_label(
+                        current_cfg.get("firm"),
+                        detected_nominal_size,
+                        current_cfg.get(
+                            "account_name"
+                        ),
+                    )
+                )
+
+                updated_cfg[
+                    "account_size_reconciled"
+                ] = True
+
+                updated_cfg[
+                    "account_size_reconciled_from"
+                ] = (
+                    old_account_size
+                    if old_account_size > 0
+                    else None
+                )
+
+                updated_cfg[
+                    "account_size_reconciled_to"
+                ] = float(
+                    detected_nominal_size
+                )
+
+                updated_cfg[
+                    "account_size_reconciled_balance"
+                ] = float(
+                    live_balance
+                )
+
+                updated_cfg[
+                    "account_size_reconciled_at_ms"
+                ] = int(now_ms)
+
+                updated_cfg[
+                    "account_size_reconciled_reason"
+                ] = (
+                    "REPLACEMENT_LOGIN_NOMINAL_TIER"
+                )
+
+                log.warning(
+                    "[PROP] PROFILE_ACCOUNT_SIZE_RECONCILED "
+                    "uid=%s profile=%s "
+                    "old_login=%s new_login=%s "
+                    "old_size=%s new_size=%s "
+                    "broker_balance=%s",
+                    uid_u,
+                    pid,
+                    current_login,
+                    selected.get("login"),
+                    old_account_size,
+                    detected_nominal_size,
+                    live_balance,
+                )
         updated_cfg.update({
             "account_login": str(
                 selected.get("login") or ""
@@ -1652,6 +1886,105 @@ DEFAULT_PROP_CFG = {
 }
 
 
+PROP_NOMINAL_ACCOUNT_SIZES = (
+    5000.0,
+    10000.0,
+    15000.0,
+    25000.0,
+    50000.0,
+    100000.0,
+    200000.0,
+    300000.0,
+    400000.0,
+)
+
+def _infer_prop_nominal_account_size(
+    broker_balance,
+    *,
+    tolerance_pct: float = 3.0,
+) -> float | None:
+    """
+    Infer a nominal prop-account tier from a broker balance.
+
+    Used only when binding/rebinding a different MT5 login.
+    Never use this on every heartbeat because trading P/L changes balance.
+
+    Example:
+        100000.00 -> 100000
+        99798.18  -> 100000
+        50000.00  -> 50000
+    """
+    try:
+        balance = float(broker_balance or 0.0)
+    except (TypeError, ValueError):
+        return None
+
+    if balance <= 0:
+        return None
+
+    best = min(
+        PROP_NOMINAL_ACCOUNT_SIZES,
+        key=lambda size: abs(balance - size),
+    )
+
+    diff_pct = (
+        abs(balance - best)
+        / float(best)
+        * 100.0
+    )
+
+    if diff_pct > float(tolerance_pct):
+        return None
+
+    return float(best)
+
+
+def _prop_account_size_label(
+    firm: str,
+    nominal_size: float,
+    old_name: str = "",
+) -> str:
+    """
+    Keep the existing descriptive suffix such as Trial/Demo,
+    while correcting the monetary tier.
+    """
+    firm_u = str(firm or "").strip().lower()
+
+    firm_name = {
+        "fundingpips": "FundingPips",
+        "ftmo": "FTMO",
+        "fundednext": "FundedNext",
+        "cti": "CTI",
+    }.get(
+        firm_u,
+        firm_u.upper() or "Prop",
+    )
+
+    size = float(nominal_size or 0.0)
+
+    if size >= 1000:
+        size_text = (
+            f"{int(size / 1000)}K"
+            if size % 1000 == 0
+            else f"{size:,.0f}"
+        )
+    else:
+        size_text = f"{size:,.0f}"
+
+    old_name_u = str(old_name or "").strip()
+    suffix = ""
+
+    for token in (
+        "Free Trial",
+        "Trial",
+        "Demo",
+        "Challenge",
+    ):
+        if token.lower() in old_name_u.lower():
+            suffix = f" {token}"
+            break
+
+    return f"{firm_name} {size_text}{suffix}".strip()
 
 def _get_prop_config_safe(
     uid: str,
@@ -1891,6 +2224,15 @@ def _safe_int(value: object, default: int = 0) -> int:
         return int(float(value))
     except Exception:
         return default
+
+
+def _safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _normalize_tz_offset_minutes(value: object) -> int | None:
@@ -3883,6 +4225,386 @@ def prop_connected_accounts(
         "count": len(accounts),
         "generated_at_ms": int(
             time.time() * 1000
+        ),
+    }
+
+
+def _reconcile_active_prop_profile(
+    uid: str,
+    *,
+    freshness_ms: int = 180_000,
+) -> dict:
+    """
+    Reconcile a stale/disconnected active prop profile.
+
+    Safety rules:
+      1. Never switch if current active profile is still connected.
+      2. Never switch away while current active profile has an open XTL trade.
+      3. Only enabled profiles are candidates.
+      4. Candidate account must be fresh and connected.
+      5. Candidate must exactly match profile login/server/company.
+      6. Auto-switch only when exactly ONE candidate exists.
+      7. Zero or multiple candidates => no automatic switch.
+    """
+    uid_u = _require_prop_runtime_uid(uid)
+
+    current_active = _user_active_prop_profile_id(
+        uid_u
+    )
+
+    profile_ids = sorted(
+        _user_prop_profile_ids(uid_u)
+    )
+
+    if not profile_ids:
+        return {
+            "changed": False,
+            "reason": "NO_PROP_PROFILES",
+            "active_profile_id": current_active or "",
+        }
+
+    # ---------------------------------------------------------
+    # Fresh connected accounts are the authoritative candidates.
+    # Do NOT use old last_resolved_device_id or stale snapshots.
+    # ---------------------------------------------------------
+    connected_accounts = _list_connected_prop_accounts(
+        uid_u,
+        freshness_ms=int(freshness_ms),
+    )
+
+    # ---------------------------------------------------------
+    # Load profiles once.
+    # ---------------------------------------------------------
+    profiles: dict[str, dict] = {}
+
+    for pid in profile_ids:
+        try:
+            cfg = _get_user_prop_config(
+                uid_u,
+                pid,
+            )
+        except Exception:
+            log.exception(
+                "[PROP] ACTIVE_RECONCILE_PROFILE_READ_FAILED "
+                "uid=%s profile=%s",
+                uid_u,
+                pid,
+            )
+            continue
+
+        if isinstance(cfg, dict):
+            profiles[pid] = cfg
+
+    def _profile_matches_account(
+        cfg: dict,
+        account: dict,
+    ) -> bool:
+        want_login = str(
+            cfg.get("account_login") or ""
+        ).strip()
+
+        live_login = str(
+            account.get("login") or ""
+        ).strip()
+
+        if (
+            not want_login
+            or not live_login
+            or want_login != live_login
+        ):
+            return False
+
+        if not _broker_identity_matches(
+            cfg.get("account_server"),
+            account.get("server"),
+        ):
+            return False
+
+        if not _broker_identity_matches(
+            cfg.get("broker_company"),
+            account.get("company"),
+        ):
+            return False
+
+        return True
+
+    def _matching_account(
+        cfg: dict | None,
+    ) -> dict | None:
+        if not isinstance(cfg, dict):
+            return None
+
+        for account in connected_accounts:
+            if _profile_matches_account(
+                cfg,
+                account,
+            ):
+                return account
+
+        return None
+
+    # ---------------------------------------------------------
+    # Rule 1:
+    # Existing active account is fresh + connected -> NEVER switch.
+    # ---------------------------------------------------------
+    current_cfg = profiles.get(
+        current_active
+    )
+
+    current_account = _matching_account(
+        current_cfg
+    )
+
+    if (
+        current_active
+        and current_account is not None
+    ):
+        return {
+            "changed": False,
+            "reason": "ACTIVE_PROFILE_CONNECTED",
+            "active_profile_id": current_active,
+            "device_id": current_account.get(
+                "device_id"
+            ),
+        }
+
+    # ---------------------------------------------------------
+    # Rule 2:
+    # Never move execution routing away from a profile that still
+    # owns an open XTL trade.
+    # ---------------------------------------------------------
+    if current_active:
+        try:
+            open_rows = (
+                R.hvals(
+                    f"xtl:strategy:oppt:open:{uid_u}"
+                )
+                or []
+            )
+
+            for raw_trade in open_rows:
+                if isinstance(
+                    raw_trade,
+                    (bytes, bytearray),
+                ):
+                    raw_trade = raw_trade.decode(
+                        "utf-8",
+                        "replace",
+                    )
+
+                try:
+                    trade = json.loads(raw_trade)
+                except Exception:
+                    trade = {}
+
+                if not isinstance(trade, dict):
+                    continue
+
+                trade_profile_id = str(
+                    trade.get("profile_id") or ""
+                ).strip().lower()
+
+                trade_state = str(
+                    trade.get("trade_state")
+                    or trade.get("status")
+                    or ""
+                ).strip().upper()
+
+                if (
+                    trade_profile_id
+                    == current_active
+                    and trade_state
+                    not in {
+                        "CLOSED",
+                        "FAILED",
+                        "ORDER_FAILED",
+                        "EXPIRED",
+                    }
+                ):
+                    log.warning(
+                        "[PROP] ACTIVE_RECONCILE_BLOCKED_OPEN_TRADE "
+                        "uid=%s active=%s trade_state=%s",
+                        uid_u,
+                        current_active,
+                        trade_state,
+                    )
+
+                    return {
+                        "changed": False,
+                        "reason": (
+                            "ACTIVE_PROFILE_OPEN_TRADE"
+                        ),
+                        "active_profile_id": (
+                            current_active
+                        ),
+                    }
+
+        except Exception:
+            # Fail closed. Never change execution routing when the
+            # open-trade check itself cannot be trusted.
+            log.exception(
+                "[PROP] ACTIVE_RECONCILE_OPEN_TRADE_CHECK_FAILED "
+                "uid=%s active=%s",
+                uid_u,
+                current_active,
+            )
+
+            return {
+                "changed": False,
+                "reason": (
+                    "OPEN_TRADE_CHECK_FAILED"
+                ),
+                "active_profile_id": (
+                    current_active
+                ),
+            }
+
+    # ---------------------------------------------------------
+    # Find enabled profiles whose exact bound broker account is
+    # currently fresh + connected.
+    # ---------------------------------------------------------
+    candidates: list[dict] = []
+
+    for pid, cfg in profiles.items():
+        if not bool(cfg.get("enabled")):
+            continue
+
+        account = _matching_account(cfg)
+
+        if account is None:
+            continue
+
+        candidates.append({
+            "profile_id": pid,
+            "config": cfg,
+            "account": account,
+        })
+
+    # Defensive dedupe by profile.
+    unique_candidates = {
+        str(row["profile_id"]): row
+        for row in candidates
+        if row.get("profile_id")
+    }
+
+    candidates = list(
+        unique_candidates.values()
+    )
+
+    # ---------------------------------------------------------
+    # Zero connected profiles -> retain stale active pointer.
+    # Execution resolver remains fail-closed.
+    # ---------------------------------------------------------
+    if len(candidates) == 0:
+        log.warning(
+            "[PROP] ACTIVE_RECONCILE_NO_CONNECTED_CANDIDATE "
+            "uid=%s active=%s",
+            uid_u,
+            current_active,
+        )
+
+        return {
+            "changed": False,
+            "reason": "NO_CONNECTED_PROFILE",
+            "active_profile_id": (
+                current_active or ""
+            ),
+        }
+
+    # ---------------------------------------------------------
+    # More than one -> never guess between execution accounts.
+    # ---------------------------------------------------------
+    if len(candidates) != 1:
+        log.warning(
+            "[PROP] ACTIVE_RECONCILE_AMBIGUOUS "
+            "uid=%s active=%s candidates=%s",
+            uid_u,
+            current_active,
+            [
+                {
+                    "profile_id": row["profile_id"],
+                    "login": (
+                        row["account"].get("login")
+                    ),
+                    "server": (
+                        row["account"].get("server")
+                    ),
+                    "device_id": (
+                        row["account"].get("device_id")
+                    ),
+                }
+                for row in candidates
+            ],
+        )
+
+        return {
+            "changed": False,
+            "reason": (
+                "MULTIPLE_CONNECTED_PROFILES"
+            ),
+            "active_profile_id": (
+                current_active or ""
+            ),
+            "candidates": [
+                row["profile_id"]
+                for row in candidates
+            ],
+        }
+
+    # ---------------------------------------------------------
+    # Exactly one safe connected profile.
+    # ---------------------------------------------------------
+    selected = candidates[0]
+
+    new_profile_id = str(
+        selected["profile_id"]
+    ).strip().lower()
+
+    if (
+        current_active
+        and new_profile_id == current_active
+    ):
+        return {
+            "changed": False,
+            "reason": "ACTIVE_PROFILE_CONNECTED",
+            "active_profile_id": current_active,
+        }
+
+    account = selected["account"]
+
+    # Atomic active-pointer change.
+    R.set(
+        prop_active_profile_key(uid_u),
+        new_profile_id,
+    )
+
+    log.warning(
+        "[PROP] ACTIVE_PROFILE_AUTO_RECONCILED "
+        "uid=%s old_profile=%s new_profile=%s "
+        "login=%s server=%s company=%s device=%s",
+        uid_u,
+        current_active,
+        new_profile_id,
+        account.get("login"),
+        account.get("server"),
+        account.get("company"),
+        account.get("device_id"),
+    )
+
+    return {
+        "changed": True,
+        "reason": (
+            "UNIQUE_ENABLED_CONNECTED_PROFILE"
+        ),
+        "old_profile_id": (
+            current_active or ""
+        ),
+        "active_profile_id": new_profile_id,
+        "device_id": account.get(
+            "device_id"
+        ),
+        "account_login": account.get(
+            "login"
         ),
     }
 
@@ -6208,6 +6930,274 @@ def _overlay_open_trade_state_for_ui(
 
 
 
+def _overlay_live_point_a_state_for_ui(
+    rows: list[dict],
+    uid: str,
+    tf: str = "H1",
+) -> list[dict]:
+    """
+    Overlay volatile Point-A lifecycle from the live zone watch onto
+    cached opportunity rows.
+
+    Important:
+      - does NOT recompute zones / trend / SR
+      - does NOT change execution state
+      - only exposes executor-owned Point-A WAIT/BLOCK/EXPIRED state
+      - TRADE_ACTIVE overlay runs after this and remains authoritative
+    """
+    result = [
+        dict(r)
+        for r in (rows or [])
+        if isinstance(r, dict)
+    ]
+
+    uid_u = str(uid or "").strip()
+    tf_u = str(tf or "H1").upper().strip()
+
+    if not uid_u:
+        return result
+
+    point_a_states = {
+        "ENTRY_BLOCKED_POINT_A_WAIT",
+        "ENTRY_BLOCKED_POINT_A_BLOCK",
+        "ENTRY_BLOCKED_POINT_A_EXPIRED",
+    }
+
+    # One authoritative Point-A watch per canonical symbol.
+    # If duplicates exist, newest lifecycle timestamp wins.
+    live_by_symbol: dict[str, dict] = {}
+
+    try:
+        for raw_key in R.scan_iter(
+            zone_watch_pattern(uid_u, tf_u),
+            count=200,
+        ):
+            key = (
+                raw_key.decode("utf-8", "ignore")
+                if isinstance(raw_key, (bytes, bytearray))
+                else str(raw_key)
+            )
+
+            parts = key.split(":")
+            if len(parts) < 7:
+                continue
+
+            key_uid = str(parts[3] or "").strip()
+            sym_raw = str(parts[4] or "").upper().strip()
+            side = str(parts[5] or "").upper().strip()
+            key_tf = str(parts[6] or "").upper().strip()
+
+            if key_uid != uid_u:
+                continue
+
+            if key_tf != tf_u:
+                continue
+
+            if side not in ("BUY", "SELL"):
+                continue
+
+            raw = R.get(key)
+            watch = _json_load_twice(raw)
+
+            if not isinstance(watch, dict):
+                continue
+
+            state = str(
+                watch.get("state")
+                or watch.get("trade_state")
+                or ""
+            ).upper().strip()
+
+            trade_state = str(
+                watch.get("trade_state")
+                or ""
+            ).upper().strip()
+
+            point_a_state = (
+                state
+                if state in point_a_states
+                else trade_state
+                if trade_state in point_a_states
+                else ""
+            )
+
+            if not point_a_state:
+                continue
+
+            symbol = _display_symbol(sym_raw)
+
+            if not symbol:
+                continue
+
+            try:
+                lifecycle_ms = max(
+                    int(watch.get("point_a_last_eval_ms") or 0),
+                    int(watch.get("point_a_cross_ms") or 0),
+                    int(watch.get("updated_at_ms") or 0),
+                    int(watch.get("rev_ok_ms") or 0),
+                )
+            except Exception:
+                lifecycle_ms = 0
+
+            candidate = {
+                "key": key,
+                "symbol": symbol,
+                "broker_symbol": sym_raw,
+                "side": side,
+                "state": point_a_state,
+                "watch": watch,
+                "lifecycle_ms": lifecycle_ms,
+            }
+
+            previous = live_by_symbol.get(symbol)
+
+            if (
+                previous is None
+                or lifecycle_ms
+                >= int(previous.get("lifecycle_ms") or 0)
+            ):
+                live_by_symbol[symbol] = candidate
+
+    except Exception:
+        log.exception(
+            "[POINT_A_UI] WATCH_SCAN_FAILED "
+            "uid=%s tf=%s",
+            uid_u,
+            tf_u,
+        )
+        return result
+
+    for row in result:
+        symbol = _display_symbol(
+            row.get("symbol")
+        )
+
+        live = live_by_symbol.get(symbol)
+
+        if not live:
+            continue
+
+        watch = live["watch"]
+        side = live["side"]
+        state = live["state"]
+
+        reason_code = str(
+            watch.get("point_a_reason")
+            or watch.get("entry_block_reason")
+            or watch.get("point_a_terminal_reason")
+            or "POINT_A"
+        )
+
+        try:
+            wait_bars = int(
+                watch.get("point_a_wait_m15_bars") or 0
+            )
+        except Exception:
+            wait_bars = 0
+
+        try:
+            max_wait_bars = int(
+                watch.get("point_a_max_wait_m15_bars") or 8
+            )
+        except Exception:
+            max_wait_bars = 8
+
+        try:
+            disp_atr = float(
+                watch.get("point_a_displacement_atr") or 0.0
+            )
+        except Exception:
+            disp_atr = 0.0
+
+        if state == "ENTRY_BLOCKED_POINT_A_WAIT":
+            stage = "POINT_A_WAIT"
+            display_reason = (
+                f"POINT-A WAIT | {reason_code} "
+                f"| M15 {wait_bars}/{max_wait_bars} "
+                f"| DISP {disp_atr:.2f} ATR"
+            )
+            gate_rev_ok = True
+
+        elif state == "ENTRY_BLOCKED_POINT_A_BLOCK":
+            stage = "POINT_A_BLOCKED"
+            display_reason = (
+                f"POINT-A BLOCKED | {reason_code}"
+            )
+            gate_rev_ok = False
+
+        else:
+            stage = "POINT_A_EXPIRED"
+            display_reason = (
+                f"POINT-A EXPIRED | {reason_code}"
+            )
+            gate_rev_ok = False
+           
+        if stage == "POINT_A_EXPIRED":
+            expired_ts_ms = (
+                row.get("expired_ts_ms")
+                or row.get("expired_ts")
+                or watch.get("point_a_expired_ms")
+                or watch.get("updated_ms")
+                or watch.get("point_a_evaluated_at_ms")
+            )
+
+            if expired_ts_ms:
+                row["expired_ts_ms"] = expired_ts_ms
+                row["expired_ts"] = expired_ts_ms
+        # Frozen Point-A direction is authoritative while this
+        # lifecycle exists.
+        row["direction"] = side
+        row["decision"] = side
+        row["opp_direction"] = (
+            "UP" if side == "BUY" else "DOWN"
+        )
+
+        row["entry_blocked"] = True
+        row["entry_block_reason"] = reason_code
+        row["trade_state"] = state
+        row["reason"] = display_reason
+        row["opp_reason"] = display_reason
+        row["signal_text"] = display_reason
+        row["gate"] = display_reason
+
+        entry_gate = row.get("entry_gate")
+
+        if not isinstance(entry_gate, dict):
+            entry_gate = {}
+        else:
+            entry_gate = dict(entry_gate)
+
+        entry_gate.update(
+            {
+                "blocked": True,
+                "stage": stage,
+                "state": state,
+                "trade_state": state,
+                "reason": display_reason,
+                "rev_ok": gate_rev_ok,
+                "watch_key": live["key"],
+                "watch_reused": True,
+                "resolved_dir": side,
+                "rev_state": dict(watch),
+            }
+        )
+
+        row["entry_gate"] = entry_gate
+
+        log.warning(
+            "[POINT_A_UI] LIVE_OVERLAY "
+            "uid=%s sym=%s side=%s state=%s "
+            "stage=%s reason=%s",
+            uid_u,
+            symbol,
+            side,
+            state,
+            stage,
+            reason_code,
+        )
+
+    return result
+
 
 def _apply_user_open_trade_overlay_to_payload(
     payload: dict,
@@ -6258,8 +7248,24 @@ def _apply_user_open_trade_overlay_to_payload(
         return out
 
     try:
-        out["rows"] = _overlay_open_trade_state_for_ui(
+        # ---------------------------------------------------------
+        # Volatile execution/watch state must overlay cached
+        # structural opportunity snapshots.
+        #
+        # Order is important:
+        #   1. Point-A live watch
+        #   2. open trade / broker truth
+        #
+        # Therefore TRADE_ACTIVE always wins over Point-A.
+        # ---------------------------------------------------------
+        _live_rows = _overlay_live_point_a_state_for_ui(
             rows=out.get("rows") or [],
+            uid=uid_s,
+            tf=str(out.get("tf") or "H1"),
+        )
+
+        out["rows"] = _overlay_open_trade_state_for_ui(
+            rows=_live_rows,
             uid=uid_s,
             profile_id=resolved_pid,
             mt5_account="demo",
@@ -6485,6 +7491,213 @@ def _read_prop_risk_snapshot(
     out = dict(refreshed)
     out["risk_snapshot_cache_hit"] = False
     return out
+
+
+
+def _cleanup_entry_state_on_daily_reset(
+    uid: str,
+    tf: str = "H1",
+) -> dict:
+    """
+    Daily broker/prop reset cleanup.
+
+    Deletes stale, non-active zone-entry lifecycle state only:
+      - WATCH
+      - REV_WATCH
+      - REV_OK
+      - ENTRY_READY
+      - ENTRY_BLOCKED*
+
+    Also deletes the matching:
+      - latest entry claim
+      - break-state key
+
+    Safety:
+      - TRADE_ACTIVE is preserved
+      - ORDER_PENDING is preserved
+      - any watch carrying a broker/MT5 ticket is preserved
+      - open trade ledger / risk / cooldown / SL / TP / BE are untouched
+    """
+    uid_u = str(uid or "").strip()
+    tf_u = str(tf or "H1").upper().strip()
+
+    result = {
+        "watches_deleted": 0,
+        "claims_deleted": 0,
+        "break_states_deleted": 0,
+        "preserved_active": 0,
+        "errors": 0,
+    }
+
+    if not uid_u:
+        result["errors"] += 1
+        return result
+
+    deletable_states = {
+        "WATCH",
+        "REV_WATCH",
+        "REV_OK",
+        "ENTRY_READY",
+    }
+
+    try:
+        keys = list(
+            R.scan_iter(
+                zone_watch_pattern(uid_u, tf_u),
+                count=200,
+            )
+        )
+    except Exception:
+        log.exception(
+            "[PROP] DAILY_RESET_GATE_CLEANUP_SCAN_FAILED uid=%s tf=%s",
+            uid_u,
+            tf_u,
+        )
+        result["errors"] += 1
+        return result
+
+    for raw_key in keys:
+        try:
+            key = (
+                raw_key.decode("utf-8", "ignore")
+                if isinstance(raw_key, (bytes, bytearray))
+                else str(raw_key)
+            )
+
+            parts = key.split(":")
+            if len(parts) < 7:
+                continue
+
+            key_uid = str(parts[3] or "").strip()
+            sym = str(parts[4] or "").upper().strip()
+            side = str(parts[5] or "").upper().strip()
+            key_tf = str(parts[6] or "").upper().strip()
+
+            if key_uid != uid_u:
+                continue
+
+            if key_tf != tf_u:
+                continue
+
+            if side not in ("BUY", "SELL"):
+                continue
+
+            raw = R.get(key)
+            watch = _json_load_twice(raw)
+
+            if not isinstance(watch, dict):
+                continue
+
+            state = str(
+                watch.get("state")
+                or "WATCH"
+            ).upper().strip()
+
+            ticket = str(
+                watch.get("ticket")
+                or watch.get("mt5_ticket")
+                or watch.get("broker_ticket")
+                or watch.get("position_ticket")
+                or ""
+            ).strip()
+
+            if ticket in ("0", "None", "null"):
+                ticket = ""
+
+            # -------------------------------------------------
+            # SAFETY: never touch active/pending broker lifecycle
+            # -------------------------------------------------
+            if (
+                ticket
+                or state in ("TRADE_ACTIVE", "ORDER_PENDING")
+            ):
+                result["preserved_active"] += 1
+                continue
+
+            if not (
+                state in deletable_states
+                or state.startswith("ENTRY_BLOCKED")
+            ):
+                # Unknown state = fail safe, preserve it.
+                result["preserved_active"] += 1
+                continue
+
+            # Remove canonical watch.
+            zone_watch_delete(
+                R,
+                uid_u,
+                sym,
+                side,
+                tf=tf_u,
+            )
+            result["watches_deleted"] += 1
+
+            # Remove latest entry claim for this gate.
+            try:
+                deleted = delete_latest_entry_claim(
+                    R,
+                    uid_u,
+                    sym,
+                    side,
+                    tf=tf_u,
+                )
+                if deleted:
+                    result["claims_deleted"] += 1
+            except Exception:
+                result["errors"] += 1
+                log.exception(
+                    "[PROP] DAILY_RESET_ENTRY_CLAIM_DELETE_FAILED "
+                    "uid=%s sym=%s side=%s tf=%s",
+                    uid_u,
+                    sym,
+                    side,
+                    tf_u,
+                )
+
+            # Remove stale breakout tracking.
+            try:
+                break_key = break_state_key(
+                    uid_u,
+                    sym,
+                    side,
+                    tf_u,
+                )
+                if R.delete(break_key):
+                    result["break_states_deleted"] += 1
+            except Exception:
+                result["errors"] += 1
+                log.exception(
+                    "[PROP] DAILY_RESET_BREAK_STATE_DELETE_FAILED "
+                    "uid=%s sym=%s side=%s tf=%s",
+                    uid_u,
+                    sym,
+                    side,
+                    tf_u,
+                )
+
+        except Exception:
+            result["errors"] += 1
+            log.exception(
+                "[PROP] DAILY_RESET_GATE_CLEANUP_ITEM_FAILED "
+                "uid=%s key=%r",
+                uid_u,
+                raw_key,
+            )
+
+    log.warning(
+        "[PROP] DAILY_RESET_GATE_CLEANUP "
+        "uid=%s tf=%s watches=%s claims=%s breaks=%s "
+        "preserved=%s errors=%s",
+        uid_u,
+        tf_u,
+        result["watches_deleted"],
+        result["claims_deleted"],
+        result["break_states_deleted"],
+        result["preserved_active"],
+        result["errors"],
+    )
+
+    return result
 
 
 def _get_prop_risk_state(
@@ -6971,6 +8184,25 @@ def _get_prop_risk_state(
                     * daily_loss_pct_cfg
                     / 100.0
                 )
+                # -------------------------------------------------
+                # New prop day: expire yesterday's unexecuted
+                # gate / RC / entry-claim / breakout state.
+                # Active/pending broker lifecycle is preserved.
+                # -------------------------------------------------
+                reset_cleanup = _cleanup_entry_state_on_daily_reset(
+                    uid_u,
+                    tf="H1",
+                )
+
+                cleanup_text = (
+                    "\n\n"
+                    "**Entry-state cleanup**\n"
+                    f"Gates/RC expired: `{int(reset_cleanup.get('watches_deleted') or 0)}`\n"
+                    f"Entry claims cleared: `{int(reset_cleanup.get('claims_deleted') or 0)}`\n"
+                    f"Break states cleared: `{int(reset_cleanup.get('break_states_deleted') or 0)}`\n"
+                    f"Active/pending preserved: `{int(reset_cleanup.get('preserved_active') or 0)}`\n"
+                    f"Cleanup errors: `{int(reset_cleanup.get('errors') or 0)}`"
+                )
 
                 msg = (
                     f"**{firm_label} Daily Reset**\n"
@@ -6983,6 +8215,7 @@ def _get_prop_risk_state(
                     f"Current equity: `${float(broker_equity):.2f}`\n"
                     f"Floating P/L: `${float(floating_pnl):.2f}`\n"
                     f"Daily loss limit: `${daily_loss_limit_notify:.2f}`"
+                    f"{cleanup_text}"
                 )
                 _t_stage = time.perf_counter()
                 _discord_post(msg)
@@ -7788,6 +9021,9 @@ def prop_profiles(
     user=Depends(require_prop_auth),
 ):
     uid = _require_prop_uid(user)
+
+    # Step 1:
+    # Discover/rebind broker account identities first.
     try:
         _discover_missing_prop_profiles(
             uid,
@@ -7799,11 +9035,34 @@ def prop_profiles(
             uid,
         )
 
+    # Step 2:
+    # If the persisted active profile is disconnected,
+    # safely recover to the ONE enabled profile whose exact
+    # broker account is currently fresh + connected.
+    reconcile = None
+
+    try:
+        reconcile = _reconcile_active_prop_profile(
+            uid,
+            freshness_ms=180_000,
+        )
+    except Exception:
+        # Fail closed. A reconciliation failure must never
+        # destroy/change the existing active pointer.
+        log.exception(
+            "[PROP] ACTIVE_PROFILE_RECONCILE_EXC "
+            "uid=%s",
+            uid,
+        )
+
     profile_ids = sorted(
         _user_prop_profile_ids(uid)
     )
 
-    active = _user_active_prop_profile_id(uid)
+    # Read AFTER reconciliation.
+    active = _user_active_prop_profile_id(
+        uid
+    )
 
     profiles = []
 
@@ -7827,6 +9086,10 @@ def prop_profiles(
         "ok": True,
         "active_profile_id": active or None,
         "profiles": profiles,
+
+        # Useful observability; harmless to UI clients that
+        # do not consume it.
+        "active_reconciliation": reconcile,
     }
 
 @router.post("/prop/profile/enable-and-activate")
@@ -12082,20 +13345,30 @@ def _discord_notify_rc_trigger(
             or ""
         ).upper().strip()
 
-        trade_id = str(
+        base_trade_id = str(
             watch.get("trade_id")
             or watch.get("watch_id")
             or watch.get("watch_key")
-            or (
-                f"{sym}:{side}:"
-                f"{watch.get('rev_ok_ms')}"
-            )
+            or f"{sym}:{side}"
         ).strip()
+
+        rc_rev_ok_ms = int(
+            watch.get("rc_trigger_cross_rev_ok_ms")
+            or watch.get("rev_ok_ms")
+            or 0
+        )
+
+        trade_id = (
+            f"{base_trade_id}:{rc_rev_ok_ms}"
+            if rc_rev_ok_ms > 0
+            else base_trade_id
+        )
 
         if (
             not sym
             or side not in ("BUY", "SELL")
-            or not trade_id
+            or not base_trade_id
+            or rc_rev_ok_ms <= 0
         ):
             watch["discord_rc_trigger_sent"] = False
             watch["discord_rc_trigger_error"] = (
@@ -12104,10 +13377,11 @@ def _discord_notify_rc_trigger(
 
             log.warning(
                 "[DISCORD] RC_TRIGGER_INVALID "
-                "sym=%r side=%r trade_id=%r",
+                "sym=%r side=%r trade_id=%r rc=%r",
                 sym,
                 side,
-                trade_id,
+                base_trade_id,
+                rc_rev_ok_ms,
             )
             return False
 
@@ -12118,10 +13392,11 @@ def _discord_notify_rc_trigger(
         ):
             log.warning(
                 "[DISCORD] RC_TRIGGER_DEDUPE_SKIP "
-                "sym=%s side=%s trade_id=%s",
+                "sym=%s side=%s trade_id=%s rc=%s",                
                 sym,
                 side,
                 trade_id,
+                rc_rev_ok_ms,
             )
             return False
 
@@ -12412,6 +13687,8 @@ def _delete_live_snapshot(sym: str, opp_dir: str | None = None):
 
 
 
+
+
 # --------------------------
 # ALERT HISTORY HELPERS (Redis)
 # --------------------------
@@ -12419,6 +13696,358 @@ def _delete_live_snapshot(sym: str, opp_dir: str | None = None):
 
 ALERT_HASH_PREFIX = "xtl:trend:opp:h1:"
 ALERT_INDEX_KEY = "xtl:trend:opp:h1:index"
+
+def _invalidate_point_a_slim_caches(
+    *,
+    uid: str,
+    symbol: str,
+    profile_id: str | None = None,
+    device_id: str | None = None,
+    tf: str = "H1",
+) -> int:
+    """
+    Invalidate only slim opportunity payloads belonging to this UID
+    that contain the released symbol.
+
+    Deletes:
+        BASE
+        BASE:lastgood
+        BASE:meta
+
+    Preserves:
+        BASE:lock
+
+    A generation bump prevents an already-running producer from
+    republishing stale pre-release Point-A state.
+    """
+
+    uid_u = str(uid or "").strip()
+    sym_u = str(symbol or "").upper().strip()
+    pid = str(profile_id or "").strip().lower()
+    dev = str(device_id or "").strip()
+    tf_u = str(tf or "H1").upper().strip()
+
+    if not uid_u or not sym_u:
+        return 0
+
+    prefix = "xtl:oppt:cache:slim:"
+    scan_pattern = (
+        f"{prefix}{uid_u}:*"
+    )
+
+    bases: set[str] = set()
+
+    try:
+        for raw_key in R.scan_iter(
+            scan_pattern,
+            count=200,
+        ):
+            key = (
+                raw_key.decode(
+                    "utf-8",
+                    "ignore",
+                )
+                if isinstance(
+                    raw_key,
+                    (bytes, bytearray),
+                )
+                else str(raw_key)
+            )
+
+            # Convert child cache keys back to BASE.
+            if key.endswith(":lastgood"):
+                base = key[:-len(":lastgood")]
+            elif key.endswith(":meta"):
+                base = key[:-len(":meta")]
+            elif key.endswith(":lock"):
+                # Lock is never deleted, but its BASE may still
+                # need generation invalidation.
+                base = key[:-len(":lock")]
+            else:
+                base = key
+
+            if not base.startswith(prefix):
+                continue
+
+            rest = base[len(prefix):]
+
+            # uid:profile:device:tf:symbol_set
+            parts = rest.split(":", 4)
+
+            if len(parts) != 5:
+                continue
+
+            (
+                key_uid,
+                key_profile,
+                key_device,
+                key_tf,
+                key_symbols,
+            ) = parts
+
+            if key_uid != uid_u:
+                continue
+
+            if (
+                pid
+                and key_profile.strip().lower()
+                != pid
+            ):
+                continue
+
+            if (
+                dev
+                and key_device.strip()
+                != dev
+            ):
+                continue
+
+            if (
+                str(key_tf).upper().strip()
+                != tf_u
+            ):
+                continue
+
+            symbols_in_cache = {
+                str(x).upper().strip()
+                for x in str(
+                    key_symbols or ""
+                ).split(",")
+                if str(x).strip()
+            }
+
+            if sym_u not in symbols_in_cache:
+                continue
+
+            bases.add(base)
+
+    except Exception:
+        log.exception(
+            "[POINT_A] SLIM_CACHE_DISCOVERY_FAILED "
+            "uid=%s profile=%s device=%s "
+            "symbol=%s tf=%s",
+            uid_u,
+            pid,
+            dev,
+            sym_u,
+            tf_u,
+        )
+        return 0
+
+    invalidated = 0
+
+    # Atomic generation bump + payload deletion per BASE.
+    lua = """
+    redis.call('INCR', KEYS[1])
+    redis.call('EXPIRE', KEYS[1], 86400)
+
+    redis.call('DEL', KEYS[2])
+    redis.call('DEL', KEYS[3])
+    redis.call('DEL', KEYS[4])
+
+    return 1
+    """
+
+    for base in sorted(bases):
+        try:
+            gen_key = (
+                _oppt_cache_generation_key(
+                    base
+                )
+            )
+
+            R.eval(
+                lua,
+                4,
+                gen_key,
+                base,
+                base + ":lastgood",
+                base + ":meta",
+            )
+
+            # Intentionally DO NOT delete:
+            #     base + ":lock"
+
+            invalidated += 1
+
+            log.warning(
+                "[POINT_A] SLIM_CACHE_INVALIDATED "
+                "uid=%s symbol=%s base=%s",
+                uid_u,
+                sym_u,
+                base,
+            )
+
+        except Exception:
+            log.exception(
+                "[POINT_A] SLIM_CACHE_INVALIDATE_FAILED "
+                "uid=%s symbol=%s base=%s",
+                uid_u,
+                sym_u,
+                base,
+            )
+
+    return invalidated
+
+
+def _release_point_a_expired_opportunity(
+    *,
+    uid: str,
+    symbol: str,
+    side: str,
+    profile_id: str | None = None,
+    device_id: str | None = None,
+    reason: str = "POINT_A_EXPIRED",
+) -> bool:
+    """
+    Retire opportunity/presentation state belonging to one expired
+    Point-A setup.
+
+    IMPORTANT:
+      - does NOT delete zone watch
+      - does NOT delete SR
+      - does NOT touch opposite direction
+      - does NOT touch producer locks
+
+    Executor remains owner of exact watch/break/tenant-claim cleanup.
+    """
+
+    uid_u = str(uid or "").strip()
+    sym_u = str(symbol or "").upper().strip()
+    side_u = str(side or "").upper().strip()
+
+    if (
+        not uid_u
+        or not sym_u
+        or side_u not in ("BUY", "SELL")
+    ):
+        return False
+
+    opp_dir = (
+        "UP"
+        if side_u == "BUY"
+        else "DOWN"
+    )
+
+    active_key = (
+        f"xtl:trend:opp:active:"
+        f"{sym_u}:{opp_dir}"
+    )
+
+    alert_id = ""
+
+    try:
+        raw = R.get(active_key)
+
+        if isinstance(
+            raw,
+            (bytes, bytearray),
+        ):
+            raw = raw.decode(
+                "utf-8",
+                "ignore",
+            )
+
+        alert_id = str(
+            raw or ""
+        ).strip()
+
+    except Exception:
+        alert_id = ""
+
+    try:
+        # Retire exact alert before removing its pointer.
+        if alert_id:
+            hkey = (
+                f"{ALERT_HASH_PREFIX}"
+                f"{alert_id}"
+            )
+
+            R.hset(
+                hkey,
+                mapping={
+                    "status": json.dumps(
+                        "point_a_expired_released"
+                    ),
+                    "trade_state": json.dumps(
+                        "POINT_A_EXPIRED_RELEASED"
+                    ),
+                    "active": json.dumps(False),
+                    "entry_triggered": json.dumps(False),
+                    "entry_signal": json.dumps(""),
+                    "entry_price": json.dumps(0.0),
+                    "entry_ts_ms": json.dumps(0),
+                    "point_a_release_reason": json.dumps(
+                        str(reason or "POINT_A_EXPIRED")
+                    ),
+                    "updated_ms": json.dumps(
+                        int(time.time() * 1000)
+                    ),
+                },
+            )
+
+            # Keep short audit residue, but it is not executable
+            # and not part of active opportunity index.
+            R.expire(
+                hkey,
+                24 * 3600,
+            )
+
+            R.lrem(
+                ALERT_INDEX_KEY,
+                0,
+                alert_id,
+            )
+
+            # Old per-alert candidate claim, if present.
+            R.delete(
+                f"xtl:oppt:entry_claim:{alert_id}"
+            )
+
+        # Prevent _save_alert_snapshot() from reusing old alert.
+        R.delete(active_key)
+
+        # Delete only this direction's frozen opportunity snapshot.
+        _delete_live_snapshot(
+            sym_u,
+            opp_dir,
+        )
+
+        # Remove stale public payloads and advance generation.
+        _invalidate_point_a_slim_caches(
+            uid=uid_u,
+            symbol=sym_u,
+            profile_id=profile_id,
+            device_id=device_id,
+            tf="H1",
+        )
+
+        log.warning(
+            "[POINT_A] OPPORTUNITY_RELEASED "
+            "uid=%s sym=%s side=%s dir=%s "
+            "alert_id=%s reason=%s",
+            uid_u,
+            sym_u,
+            side_u,
+            opp_dir,
+            alert_id,
+            reason,
+        )
+
+        return True
+
+    except Exception:
+        log.exception(
+            "[POINT_A] OPPORTUNITY_RELEASE_FAILED "
+            "uid=%s sym=%s side=%s "
+            "alert_id=%s",
+            uid_u,
+            sym_u,
+            side_u,
+            alert_id,
+        )
+        return False
+
 def _clear_oppt_cache() -> None:
     try:
         for k in R.scan_iter("xtl:oppt:cache:*"):
@@ -12606,7 +14235,7 @@ def _save_alert_snapshot(symbol: str, payload: dict[str, Any]) -> str:
 
             existing_status = str(existing_status or "").strip().strip('"').lower()
 
-            if existing_status in ("invalidated", "expired", "exit", "exited", "closed"):
+            if existing_status in ("invalidated", "expired", "exit", "exited", "closed","point_a_expired_released",):
                 try:
                     R.delete(active_key)
                 except Exception:
@@ -16930,6 +18559,9 @@ def trend_opportunities(
     cache_ttl_s = 0
     last_good_cache_key = None
     snapshot_meta_key = None
+    # P0-1:
+    # Generation seen by this producer before heavy compute.
+    cache_generation_start = None
     if _is_slim_cacheable:
         _dev_for_key = ((effective_device or dev_for_gate or "").strip() or "nodev")
         _sym_for_key = ",".join(_sym_list(symbols))
@@ -17187,7 +18819,19 @@ def trend_opportunities(
         except Exception:
             inflight_got_lock = False
 
-        
+        if inflight_got_lock:
+            cache_generation_start = (
+                _read_oppt_cache_generation(
+                    cache_key
+                )
+            )
+
+            log.debug(
+                "[OPPT] PRODUCER_GENERATION_START "
+                "cache_key=%s generation=%s",
+                cache_key,
+                cache_generation_start,
+            )
 
         if not inflight_got_lock:
             #
@@ -18802,6 +20446,7 @@ def trend_opportunities(
                 last_good_cache_key=last_good_cache_key,
                 payload=payload,
                 fresh_ttl_s=cache_ttl_s,
+                expected_generation=cache_generation_start,
             )
         try:
             if inflight_lock_key and inflight_got_lock:
@@ -19417,6 +21062,7 @@ def trend_opportunities(
             last_good_cache_key=last_good_cache_key,
             payload=payload,
             fresh_ttl_s=cache_ttl_s,
+            expected_generation=cache_generation_start,
         )
 
     try:
@@ -21684,6 +23330,7 @@ def trend_opportunities(
             last_good_cache_key=last_good_cache_key,
             payload=payload,
             fresh_ttl_s=cache_ttl_s,
+            expected_generation=cache_generation_start,
         )
 
            

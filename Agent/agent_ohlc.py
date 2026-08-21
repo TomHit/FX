@@ -46,6 +46,17 @@ DEAL_RETRY_DELAYS_SEC = (
 
 DEAL_RETRY_OVERDUE_SEC = 24 * 3600
 
+def _warn_ghost_datafolder() -> None:
+    """C:\\MetaQuotes reappearing means a terminal was spawned without APPDATA."""
+    import os
+    ghost = r"C:\MetaQuotes\Terminal"
+    try:
+        if os.path.isdir(ghost):
+            log.error(f"[mt5] ALERT ghost data folder present at {ghost} -- "
+                      f"a terminal was spawned without APPDATA. "
+                      f"Stop the agent and investigate before trading.")
+    except Exception:
+        pass
 
 def _mt5_pos_state_path(dev_id: str, mt5_account: str = "demo") -> Path:
     base = os.environ.get("XTL_AGENT_STATE_DIR")
@@ -1065,6 +1076,56 @@ def push_mt5_account_once(
             pass
         return False
 
+
+@mt5_locked
+def _log_mt5_symbol_specs_once() -> None:
+    try:
+        import MetaTrader5 as mt5
+    except Exception as exc:
+        log.warning(
+            "[MT5_SPEC] IMPORT_FAILED err=%s",
+            exc,
+        )
+        return
+
+    symbols = (
+        "XAUUSD",
+        "EURUSD",
+        "GBPUSD",
+        "USDCAD",
+        "USDCHF",
+        "USDJPY",
+    )
+
+    for symbol in symbols:
+        try:
+            info = mt5.symbol_info(symbol)
+
+            if info is None:
+                log.warning(
+                    "[MT5_SPEC] symbol=%s NOT_FOUND err=%s",
+                    symbol,
+                    mt5.last_error(),
+                )
+                continue
+
+            log.warning(
+                "[MT5_SPEC] symbol=%s "
+                "volume_min=%s volume_step=%s volume_max=%s "
+                "contract_size=%s",
+                symbol,
+                getattr(info, "volume_min", None),
+                getattr(info, "volume_step", None),
+                getattr(info, "volume_max", None),
+                getattr(info, "trade_contract_size", None),
+            )
+
+        except Exception as exc:
+            log.warning(
+                "[MT5_SPEC] symbol=%s FAILED err=%s",
+                symbol,
+                exc,
+            )
 @mt5_locked
 def _mt5_account_meta() -> dict:
     """
@@ -2145,6 +2206,92 @@ def _mt5_send_market_order(cmd: dict) -> dict:
         import MetaTrader5 as mt5
     except Exception as e:
         return {"ok": False, "error": f"mt5_import:{e}"}
+    # ------------------------------------------------------------
+    # P0 MARKET ENTRY ABSOLUTE EXPIRY GUARD
+    #
+    # The API stamps new MARKET ENTRY commands with expires_at_ms.
+    # Once expired, this Agent must NEVER execute that stale entry,
+    # even if the command was dequeued just before server-side
+    # cancellation.
+    #
+    # Applies only to:
+    #   type = market_order
+    #   kind = ENTRY
+    #
+    # It must NOT block close-position or SL/TP management commands.
+    # ------------------------------------------------------------
+    kind_u = str(
+        cmd.get("kind") or ""
+    ).upper().strip()
+
+    if kind_u == "ENTRY":
+        try:
+            expires_at_ms = int(
+                cmd.get("expires_at_ms")
+                or 0
+            )
+        except Exception:
+            expires_at_ms = 0
+
+        now_ms = int(
+            time.time() * 1000
+        )
+
+        # New API-generated ENTRY commands must carry an immutable
+        # expires_at_ms. If present and already expired, reject before
+        # any MT5 order_send / margin / price execution work.
+        if (
+            expires_at_ms > 0
+            and now_ms >= expires_at_ms
+        ):
+            age_ms = None
+
+            try:
+                created_at_ms = int(
+                    cmd.get("created_at_ms")
+                    or 0
+                )
+
+                if created_at_ms > 0:
+                    age_ms = max(
+                        0,
+                        now_ms - created_at_ms,
+                    )
+            except Exception:
+                age_ms = None
+
+            log.error(
+                "[AGENT] MARKET_ENTRY_EXPIRED_REJECT "
+                "job_id=%s trade_id=%s profile=%s "
+                "symbol=%s side=%s "
+                "created_at_ms=%s expires_at_ms=%s "
+                "now_ms=%s age_ms=%s",
+                cmd.get("job_id"),
+                cmd.get("trade_id"),
+                cmd.get("profile_id"),
+                cmd.get("symbol"),
+                cmd.get("side"),
+                cmd.get("created_at_ms"),
+                expires_at_ms,
+                now_ms,
+                age_ms,
+            )
+
+            return {
+                "ok": False,
+                "error": "MARKET_ENTRY_EXPIRED",
+                "expired": True,
+                "execution_blocked": True,
+                "reason": "ABSOLUTE_MARKET_ENTRY_EXPIRY",
+                "job_id": cmd.get("job_id"),
+                "trade_id": cmd.get("trade_id"),
+                "symbol": cmd.get("symbol"),
+                "side": cmd.get("side"),
+                "created_at_ms": cmd.get("created_at_ms"),
+                "expires_at_ms": expires_at_ms,
+                "rejected_at_ms": now_ms,
+                "age_ms": age_ms,
+            }
 
     # -------------------- NEW: demo/live safety guard --------------------
     expected_acct = (cmd.get("mt5_account") or "demo").strip().lower()
@@ -2490,6 +2637,464 @@ def _mt5_send_market_order(cmd: dict) -> dict:
         "margin": margin,
     }
 
+
+@mt5_locked
+def _mt5_modify_position_sltp(cmd: dict) -> dict:
+    """
+    Modify SL/TP for one existing MT5 position by exact broker ticket.
+
+    Used by XTL Position Manager for broker-side break-even protection.
+    This function does not calculate the BE trigger; it only applies the
+    already-approved SL/TP modification.
+
+    Expected command keys:
+      type="modify_position_sltp"
+      ticket=<broker position ticket>
+      sl=<new SL>
+      tp=<optional new TP; when omitted, preserve broker TP>
+      mt5_account="demo"|"live"
+    """
+    try:
+        import MetaTrader5 as mt5
+    except Exception as e:
+        return {"ok": False, "error": f"mt5_import_failed:{e}"}
+
+    # Same demo/live safety boundary used by market-order execution.
+    expected_acct = str(cmd.get("mt5_account") or "demo").strip().lower()
+    try:
+        ai = mt5.account_info()
+    except Exception:
+        ai = None
+
+    if not ai:
+        return {
+            "ok": False,
+            "error": f"account_info_none:{mt5.last_error()}",
+        }
+
+    try:
+        tm_i = int(getattr(ai, "trade_mode", -1))
+    except Exception:
+        tm_i = -1
+
+    if expected_acct == "demo" and tm_i not in (0, 1):
+        return {
+            "ok": False,
+            "error": f"acct_guard_expected_demo_got:{tm_i}",
+        }
+    if expected_acct == "live" and tm_i != 2:
+        return {
+            "ok": False,
+            "error": f"acct_guard_expected_live_got:{tm_i}",
+        }
+
+    try:
+        ticket = int(cmd.get("ticket") or 0)
+    except Exception:
+        ticket = 0
+
+    if ticket <= 0:
+        return {"ok": False, "error": "missing_ticket"}
+
+    try:
+        positions = mt5.positions_get(ticket=ticket)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"positions_get_exc:{type(e).__name__}:{e}",
+            "ticket": ticket,
+        }
+
+    if not positions:
+        return {
+            "ok": False,
+            "error": "position_not_found",
+            "ticket": ticket,
+        }
+
+    pos = positions[0]
+    symbol = str(getattr(pos, "symbol", "") or "").strip()
+    if not symbol:
+        return {
+            "ok": False,
+            "error": "missing_symbol",
+            "ticket": ticket,
+        }
+
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return {
+            "ok": False,
+            "error": f"symbol_info_failed:{symbol}",
+            "ticket": ticket,
+        }
+
+    try:
+        digits = int(getattr(info, "digits", 0) or 0)
+    except Exception:
+        digits = 0
+        
+    try:
+        point = float(
+            getattr(info, "point", 0.0)
+            or 0.0
+        )
+    except Exception:
+        point = 0.0
+
+    try:
+        trade_tick_size = float(
+            getattr(info, "trade_tick_size", 0.0)
+            or 0.0
+        )
+    except Exception:
+        trade_tick_size = 0.0
+
+    if trade_tick_size <= 0:
+        trade_tick_size = point
+
+    def _normalize_broker_price(value: float) -> float:
+        px = float(value)
+
+        if trade_tick_size > 0:
+            px = (
+                round(px / trade_tick_size)
+                * trade_tick_size
+            )
+
+        if digits >= 0:
+            px = round(px, digits)
+        else:
+            px = round(px, 10)
+
+        return float(px)
+
+    try:
+        current_sl = float(getattr(pos, "sl", 0.0) or 0.0)
+        current_tp = float(getattr(pos, "tp", 0.0) or 0.0)
+        price_open = float(getattr(pos, "price_open", 0.0) or 0.0)
+        ptype = int(getattr(pos, "type", -1))
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"position_fields_invalid:{type(e).__name__}:{e}",
+            "ticket": ticket,
+            "symbol": symbol,
+        }
+
+    try:
+        requested_sl = float(cmd.get("sl"))
+    except Exception:
+        requested_sl = 0.0
+
+    if requested_sl <= 0:
+        return {
+            "ok": False,
+            "error": "invalid_sl",
+            "ticket": ticket,
+            "symbol": symbol,
+        }
+
+    raw_tp = cmd.get("tp")
+    if raw_tp in (None, ""):
+        requested_tp = current_tp
+    else:
+        try:
+            requested_tp = float(raw_tp or 0.0)
+        except Exception:
+            return {
+                "ok": False,
+                "error": "invalid_tp",
+                "ticket": ticket,
+                "symbol": symbol,
+            }
+
+    new_sl = _normalize_broker_price(
+        requested_sl
+    )
+
+    new_tp = (
+        _normalize_broker_price(requested_tp)
+        if requested_tp > 0
+        else 0.0
+    )
+    
+    
+
+    # Fail-safe: Position Manager may tighten protection, never loosen it.
+    eps = 10 ** (-(digits or 8)) if digits >= 0 else 1e-8
+    if ptype == mt5.POSITION_TYPE_BUY:
+        if current_sl > 0 and new_sl < current_sl - eps:
+            return {
+                "ok": False,
+                "error": "refuse_loosen_buy_sl",
+                "ticket": ticket,
+                "symbol": symbol,
+                "current_sl": current_sl,
+                "requested_sl": new_sl,
+            }
+    elif ptype == mt5.POSITION_TYPE_SELL:
+        if current_sl > 0 and new_sl > current_sl + eps:
+            return {
+                "ok": False,
+                "error": "refuse_loosen_sell_sl",
+                "ticket": ticket,
+                "symbol": symbol,
+                "current_sl": current_sl,
+                "requested_sl": new_sl,
+            }
+    else:
+        return {
+            "ok": False,
+            "error": f"bad_position_type:{ptype}",
+            "ticket": ticket,
+            "symbol": symbol,
+        }
+
+    # No-op is a successful idempotent result. This prevents duplicate retries
+    # from turning an already-applied BE shift into a failure.
+    if abs(current_sl - new_sl) <= eps and abs(current_tp - new_tp) <= eps:
+        return {
+            "ok": True,
+            "already_applied": True,
+            "ticket": ticket,
+            "symbol": symbol,
+            "price_open": price_open,
+            "old_sl": current_sl,
+            "new_sl": current_sl,
+            "old_tp": current_tp,
+            "new_tp": current_tp,
+            "retcode": None,
+        }
+
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": ticket,
+        "symbol": symbol,
+        "sl": float(new_sl),
+        "tp": float(new_tp),
+        "magic": 20251227,
+        "comment": str(cmd.get("comment") or "XTL BE")[:31],
+    }
+
+    try:
+        result = mt5.order_send(request)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"sltp_order_send_exc:{type(e).__name__}:{e}",
+            "ticket": ticket,
+            "symbol": symbol,
+            "request": request,
+        }
+
+    if not result:
+        return {
+            "ok": False,
+            "error": "sltp_order_send_none",
+            "ticket": ticket,
+            "symbol": symbol,
+            "request": request,
+            "mt5_last_error": mt5.last_error(),
+        }
+
+    retcode = int(getattr(result, "retcode", -1) or -1)
+    no_changes = int(getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025))
+    success_retcodes = {
+        int(mt5.TRADE_RETCODE_DONE),
+        no_changes,
+    }
+    ok = retcode in success_retcodes
+    # ---------------------------------------------------------
+    # SL/TP observability:
+    #
+    # MT5 accepting TRADE_ACTION_SLTP is not the same evidence
+    # as observing the resulting broker position state.
+    #
+    # Re-read the exact position immediately after a successful
+    # modification so the ACK contains:
+    #   requested -> sent -> broker-confirmed
+    #
+    # Verification failure is observational only. A successful
+    # MT5 retcode remains successful; Position Manager still uses
+    # subsequent broker snapshots as the final source of truth.
+    # ---------------------------------------------------------
+    broker_verified = False
+    broker_confirmed_sl = None
+    broker_confirmed_tp = None
+    broker_verify_error = None
+
+    if ok:
+        try:
+            verify_positions = mt5.positions_get(
+                ticket=ticket
+            )
+
+            if verify_positions:
+                verify_pos = verify_positions[0]
+
+                broker_confirmed_sl = float(
+                    getattr(
+                        verify_pos,
+                        "sl",
+                        0.0,
+                    )
+                    or 0.0
+                )
+
+                broker_confirmed_tp = float(
+                    getattr(
+                        verify_pos,
+                        "tp",
+                        0.0,
+                    )
+                    or 0.0
+                )
+
+                verify_eps = max(
+                    (
+                        trade_tick_size * 0.5
+                        if trade_tick_size > 0
+                        else 0.0
+                    ),
+                    (
+                        10 ** (-(digits or 8))
+                        if digits >= 0
+                        else 1e-8
+                    ),
+                    1e-12,
+                )
+
+                broker_verified = bool(
+                    abs(
+                        broker_confirmed_sl
+                        - new_sl
+                    )
+                    <= verify_eps
+                    and abs(
+                        broker_confirmed_tp
+                        - new_tp
+                    )
+                    <= verify_eps
+                )
+
+                if not broker_verified:
+                    broker_verify_error = (
+                        "BROKER_STATE_MISMATCH"
+                    )
+
+            else:
+                broker_verify_error = (
+                    "POSITION_NOT_FOUND_AFTER_SLTP"
+                )
+
+        except Exception as verify_exc:
+            broker_verify_error = (
+                f"{type(verify_exc).__name__}:"
+                f"{verify_exc}"
+            )
+
+    if ok:
+        log.warning(
+            "[AGENT] POSITION_SLTP_MODIFIED "
+            "job_id=%s ticket=%s symbol=%s "
+            "price_open=%s "
+            "old_sl=%s requested_sl=%s sent_sl=%s "
+            "confirmed_sl=%s "
+            "old_tp=%s sent_tp=%s confirmed_tp=%s "
+            "tick_size=%s digits=%s "
+            "retcode=%s broker_verified=%s "
+            "verify_error=%s",
+            cmd.get("job_id"),
+            ticket,
+            symbol,
+            price_open,
+            current_sl,
+            requested_sl,
+            new_sl,
+            broker_confirmed_sl,
+            current_tp,
+            new_tp,
+            broker_confirmed_tp,
+            trade_tick_size,
+            digits,
+            retcode,
+            broker_verified,
+            broker_verify_error,
+        )
+    else:
+        log.warning(
+            "[AGENT] POSITION_SLTP_MODIFY_FAILED "
+            "job_id=%s ticket=%s symbol=%s old_sl=%s new_sl=%s "
+            "old_tp=%s new_tp=%s retcode=%s comment=%s",
+            cmd.get("job_id"),
+            ticket,
+            symbol,
+            current_sl,
+            new_sl,
+            current_tp,
+            new_tp,
+            retcode,
+            str(getattr(result, "comment", "") or ""),
+        )
+    return {
+        "ok": bool(ok),
+        "ticket": ticket,
+        "symbol": symbol,
+        "price_open": price_open,
+
+        # Requested by Position Manager.
+        "requested_sl": float(requested_sl),
+
+        # Broker-grid-normalized value actually sent to MT5.
+        "old_sl": float(current_sl),
+        "new_sl": float(new_sl),
+        "sent_sl": float(new_sl),
+
+        "old_tp": float(current_tp),
+        "new_tp": float(new_tp),
+        "sent_tp": float(new_tp),
+
+        # Immediate broker position read after successful SLTP request.
+        "broker_verified": bool(
+            broker_verified
+        ),
+        "broker_confirmed_sl": (
+            float(broker_confirmed_sl)
+            if broker_confirmed_sl is not None
+            else None
+        ),
+        "broker_confirmed_tp": (
+            float(broker_confirmed_tp)
+            if broker_confirmed_tp is not None
+            else None
+        ),
+        "broker_verify_error": (
+            broker_verify_error
+        ),
+
+        "trade_tick_size": float(
+            trade_tick_size or 0.0
+        ),
+        "point": float(point or 0.0),
+        "digits": int(digits),
+
+        "retcode": retcode,
+        "comment": str(
+            getattr(result, "comment", "")
+            or ""
+        ),
+        "request_id": int(
+            getattr(result, "request_id", 0)
+            or 0
+        ),
+        "mt5_last_error": (
+            mt5.last_error()
+            if not ok
+            else None
+        ),
+    }
+
 @mt5_locked
 def _mt5_close_position(cmd: dict) -> dict:
     """
@@ -2668,6 +3273,15 @@ def _worker_supervisor_loop(check_sec: float = 2.0) -> None:
     while True:
         time.sleep(max(1.0, float(check_sec)))
         now = time.monotonic()
+        # --- MT5 presence: safe, rate-limited relaunch -----------------
+        try:
+            from mt5_launcher import try_launch_mt5
+            from mt5_client import _mt5_running
+            if not _mt5_running():
+                try_launch_mt5()       # internally rate-limited
+                _warn_ghost_datafolder()
+        except Exception as e:
+            log.warning(f"[mt5] supervisor launch check failed: {e}")
 
         with _WORKER_HEALTH_LOCK:
             snapshot = {k: dict(v) for k, v in _WORKER_HEALTH.items()}
@@ -2713,6 +3327,7 @@ def _ensure_worker_supervisor() -> None:
         if _SUPERVISOR_STARTED:
             return
         _SUPERVISOR_STARTED = True
+    _warn_ghost_datafolder()
     threading.Thread(
         target=_worker_supervisor_loop,
         name="agent-worker-supervisor",
@@ -2767,6 +3382,16 @@ def _mt5_account_heartbeat_loop(
     period = max(5.0, min(float(period_sec or 5), 15.0))
     next_run = time.monotonic()
     consecutive_failures = 0
+
+    # One-shot broker symbol specification audit.
+    # Runs once when this MT5 account worker starts.
+    try:
+        _log_mt5_symbol_specs_once()
+    except Exception as exc:
+        log.warning(
+            "[MT5_SPEC] STARTUP_AUDIT_FAILED err=%s",
+            exc,
+        )
 
     while True:
         started = time.monotonic()
@@ -2965,6 +3590,24 @@ def _mt5_cmd_loop(api_base, device_id, token, poll_sec):
                         ),
                     }
 
+            elif cmd_type == "modify_position_sltp":
+                try:
+                    result = _mt5_modify_position_sltp(cmd)
+                except Exception as e:
+                    log.exception(
+                        "MT5 CMD: modify_position_sltp exception "
+                        "job=%s err=%s",
+                        job_id,
+                        e,
+                    )
+                    result = {
+                        "ok": False,
+                        "error": (
+                            f"modify_position_sltp_exception:"
+                            f"{type(e).__name__}:{e}"
+                        ),
+                    }
+
             else:
                 result = {
                     "ok": False,
@@ -3133,9 +3776,11 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
     for sym in syms:
         sym_u = str(sym or "").upper().strip()
 
-        # Phase-1 DXY analytics needs H1 only.
+        
         # All normal trading symbols keep their configured timeframes.
-        symbol_tfs = ["H1"] if sym_u == "DXY" else tflist
+        
+        # DXY now supplies native M15 flow plus H1/H4 structural context.
+        symbol_tfs = [tf for tf in tflist if tf in ("M15", "H1", "H4")] if sym_u == "DXY" else tflist
         for tf in symbol_tfs:
             # --- fetch with guard (closed bars + optional forming tail) ---
             try:
@@ -3514,7 +4159,8 @@ def _push_ohlc_for_tfs(api_base, device_id, token, symbols, only_tfs, bars,
     now_mono = time.monotonic()
     for sym in symbols:
         sym_u = str(sym or "").upper().strip()
-        sym_tfs = ["H1"] if sym_u == "DXY" else only_tfs
+        sym_tfs = [tf for tf in only_tfs if str(tf).upper() in ("M15", "H1", "H4")] \
+            if sym_u == "DXY" else only_tfs
         for tf in sym_tfs:
             tf_u = str(tf).upper()
             key = (sym_u, tf_u)

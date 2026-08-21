@@ -41,6 +41,10 @@ SNAP_TTL_SEC   = 14 * 24 * 3600
 JSONL_PATH     = "/opt/xauapi/api/trend/out/trades.jsonl"
 JSONL_LOCK_PATH = JSONL_PATH + ".lock"
 PENDING_TRUTH_KEY = "xtl:analytics:pending_truth"
+
+# Exact-ticket index for live analytics snapshots.
+# Hot analytics loops must consume this set instead of scanning Redis.
+OPEN_SNAP_TICKETS_KEY = "xtl:analytics:open_tickets"
 ORPHAN_AGE_MS  = 10 * 60 * 1000
 SCHEMA_VERSION = "2.0"
 
@@ -65,6 +69,29 @@ DXY_M15_STATE_PREFIX = "xtl:dxy:turn:state:M15"
 DXY_M15_HISTORY_PREFIX = "xtl:dxy:turn:history:M15"
 DXY_M15_MAX_TRACKED_EVENTS = 200
 DXY_M15_STATE_FRESH_MS = 90 * 60 * 1000
+
+# REAL_DXY canonical source health.
+#
+# Transport freshness:
+# Agent is expected to publish continuously. If the raw DXY snapshot has not
+# reached the API for several minutes, do not keep that device pinned as the
+# canonical REAL_DXY source.
+DXY_REAL_TRANSPORT_FRESH_MS = int(
+    os.getenv(
+        "XTL_DXY_REAL_TRANSPORT_FRESH_MS",
+        str(5 * 60 * 1000),
+    )
+)
+
+# Market-state freshness:
+# M15 advances only on completed 15-minute candles, so allow enough room for
+# one delayed close without treating a healthy feed as dead.
+DXY_REAL_M15_MARKET_FRESH_MS = int(
+    os.getenv(
+        "XTL_DXY_REAL_M15_MARKET_FRESH_MS",
+        str(30 * 60 * 1000),
+    )
+)
 
 # Phase-1 REAL DXY M15 extreme-impulse classification.  Shadow analytics only:
 # it records that a new entry would ideally WAIT during an abnormal directional
@@ -116,6 +143,20 @@ DXY_CANONICAL_SR_FRESH_MS = int(os.getenv(
     "XTL_DXY_CANONICAL_SR_FRESH_MS",
     str(2 * 60 * 60 * 1000),
 ))
+
+# ---------------------------------------------------------
+# DXY POINT-A + ORDER-BLOCK SHADOW ANALYTICS
+#
+# These constants reproduce the production H1 evidence
+# interpretation for analytics only.
+#
+# They MUST NOT be consumed by execution/gates.
+# ---------------------------------------------------------
+DXY_POINT_A_H1_MIN_SCORE = 40
+DXY_POINT_A_H1_MIN_MARGIN = 20
+
+DXY_OB_SHADOW_MAX_BARS = 300
+DXY_OB_SHADOW_MAX_PER_SIDE_TF = 3
 
 # Canonical REAL DXY source shared across all prop-firm trade devices.
 # The publisher remains device-specific; readers resolve this one authoritative
@@ -726,19 +767,60 @@ def _dxy_real_device_health(R, device_id: str, now_ms: int | None = None) -> dic
             h1_raw = {}
 
         # -----------------------------------------
-        # M15 health comes from the derived detector
-        # state because the M15 tracker is already
-        # responsible for confirming REAL_DXY.
+        # Raw broker M15 snapshot.
+        #
+        # Canonical REAL_DXY health must follow the
+        # continuously-pushed broker snapshot, not
+        # the derived M15 tracker lifecycle age.
+        #
+        # The M15 tracker remains important for
+        # market-state / Point-A logic, but it must
+        # not determine whether the FTMO REAL_DXY
+        # transport itself is alive.
         # -----------------------------------------
-        m15_ms = _state_freshness(m15)
+        m15_raw = {}
+
+        try:
+            raw = R.get(
+                f"xtl:ohlc:snap:{dev}:DXY:M15"
+            )
+
+            if raw:
+                m15_raw = _json_load(
+                    raw,
+                    {},
+                )
+
+            if not isinstance(m15_raw, dict):
+                m15_raw = {}
+
+        except Exception:
+            m15_raw = {}
+
+        # -----------------------------------------
+        # Raw M15 transport timestamp.
+        # -----------------------------------------
+        m15_raw_ms = _safe_int(
+            m15_raw.get("server_received_ms")
+            or m15_raw.get("received_at_ms")
+            or m15_raw.get("published_at_ms"),
+            0,
+        ) or 0
+
+        if 0 < m15_raw_ms < 10_000_000_000:
+            m15_raw_ms *= 1000
 
         # -----------------------------------------
         # H1 canonical health must come from the raw
         # broker snapshot, not the derived H1 state.
         #
-        # Requiring the H1 state here creates a
-        # bootstrap deadlock:
+        # Requiring derived H1 state for canonical
+        # eligibility can create a bootstrap loop:
+        #
         #   canonical -> H1 state -> canonical
+        #
+        # Therefore H1 broker transport is the
+        # canonical health source.
         # -----------------------------------------
         h1_raw_ms = _safe_int(
             h1_raw.get("server_received_ms")
@@ -750,16 +832,27 @@ def _dxy_real_device_health(R, device_id: str, now_ms: int | None = None) -> dic
         if 0 < h1_raw_ms < 10_000_000_000:
             h1_raw_ms *= 1000
 
-        # Keep derived H1-state freshness for
-        # diagnostics only. It must not determine
-        # canonical source eligibility.
+        # -----------------------------------------
+        # Derived tracker timestamps.
+        #
+        # Diagnostic only.
+        # They do NOT determine canonical source
+        # eligibility.
+        # -----------------------------------------
+        m15_state_ms = _state_freshness(
+            m15
+        )
+
         h1_state_ms = _state_freshness(
             h1_state
         )
 
+        # -----------------------------------------
+        # Raw broker snapshot ages.
+        # -----------------------------------------
         m15_age = (
-            max(0, now - m15_ms)
-            if m15_ms > 0
+            max(0, now - m15_raw_ms)
+            if m15_raw_ms > 0
             else None
         )
 
@@ -769,17 +862,39 @@ def _dxy_real_device_health(R, device_id: str, now_ms: int | None = None) -> dic
             else None
         )
 
+        # -----------------------------------------
+        # Derived state ages.
+        # Diagnostic only.
+        # -----------------------------------------
+        m15_state_age = (
+            max(0, now - m15_state_ms)
+            if m15_state_ms > 0
+            else None
+        )
+
         h1_state_age = (
             max(0, now - h1_state_ms)
             if h1_state_ms > 0
             else None
         )
 
+        # -----------------------------------------
+        # Market freshness.
+        #
+        # M15:
+        # completed broker candles advance every
+        # 15 minutes, so allow enough time for one
+        # delayed publication without declaring the
+        # REAL_DXY source unhealthy.
+        #
+        # H1:
+        # use existing canonical H1 freshness rule.
+        # -----------------------------------------
         m15_fresh = bool(
-            m15_ms
+            m15_raw_ms
             and m15_age is not None
             and m15_age
-            <= DXY_M15_STATE_FRESH_MS
+            <= DXY_REAL_M15_MARKET_FRESH_MS
         )
 
         h1_raw_fresh = bool(
@@ -789,6 +904,8 @@ def _dxy_real_device_health(R, device_id: str, now_ms: int | None = None) -> dic
             <= DXY_CANONICAL_H1_FRESH_MS
         )
 
+        # Derived H1 freshness is retained only for
+        # diagnostics.
         h1_state_fresh = bool(
             h1_state_ms
             and h1_state_age is not None
@@ -796,14 +913,45 @@ def _dxy_real_device_health(R, device_id: str, now_ms: int | None = None) -> dic
             <= DXY_CANONICAL_H1_FRESH_MS
         )
 
-        out.update({
-            "m15_available": bool(m15),
+        # -----------------------------------------
+        # Transport freshness.
+        #
+        # At least one raw REAL_DXY broker stream
+        # must have reached the API recently.
+        #
+        # Because M15 is continuously pushed by the
+        # FTMO agent, this normally tracks M15.
+        # H1 is also included as a defensive signal.
+        # -----------------------------------------
+        transport_ms = max(
+            int(m15_raw_ms or 0),
+            int(h1_raw_ms or 0),
+        )
 
-            # Canonical H1 availability is based on
-            # the broker snapshot.
+        transport_age = (
+            max(0, now - transport_ms)
+            if transport_ms > 0
+            else None
+        )
+
+        transport_fresh = bool(
+            transport_ms
+            and transport_age is not None
+            and transport_age
+            <= DXY_REAL_TRANSPORT_FRESH_MS
+        )
+
+        out.update({
+            # -------------------------------------
+            # Raw canonical source availability.
+            # -------------------------------------
+            "m15_available": bool(m15_raw),
             "h1_available": bool(h1_raw),
 
-            "m15_freshness_ms": m15_ms,
+            # -------------------------------------
+            # Raw broker freshness.
+            # -------------------------------------
+            "m15_freshness_ms": m15_raw_ms,
             "h1_freshness_ms": h1_raw_ms,
 
             "m15_age_ms": m15_age,
@@ -812,29 +960,78 @@ def _dxy_real_device_health(R, device_id: str, now_ms: int | None = None) -> dic
             "m15_fresh": m15_fresh,
             "h1_fresh": h1_raw_fresh,
 
-            # Additional diagnostics for the derived
-            # H1 tracker state.
+            # -------------------------------------
+            # Transport watchdog.
+            # -------------------------------------
+            "transport_freshness_ms": transport_ms,
+            "transport_age_ms": transport_age,
+            "transport_fresh": transport_fresh,
+
+            # -------------------------------------
+            # Derived tracker diagnostics only.
+            # -------------------------------------
+            "m15_state_available": bool(m15),
+            "m15_state_freshness_ms": (
+                m15_state_ms
+            ),
+            "m15_state_age_ms": (
+                m15_state_age
+            ),
+
             "h1_state_available": bool(
                 h1_state
             ),
             "h1_state_freshness_ms": (
                 h1_state_ms
             ),
-            "h1_state_age_ms": h1_state_age,
-            "h1_state_fresh": h1_state_fresh,
+            "h1_state_age_ms": (
+                h1_state_age
+            ),
+            "h1_state_fresh": (
+                h1_state_fresh
+            ),
 
+            # -------------------------------------
+            # Explicit health-source diagnostics.
+            # -------------------------------------
+            "m15_health_source": (
+                "RAW_BROKER_SNAPSHOT"
+            ),
             "h1_health_source": (
                 "RAW_BROKER_SNAPSHOT"
             ),
 
+            # Old combined diagnostic retained for
+            # backward compatibility.
             "freshness_ms": (
-                min(m15_ms, h1_raw_ms)
-                if m15_ms and h1_raw_ms
+                min(
+                    m15_raw_ms,
+                    h1_raw_ms,
+                )
+                if (
+                    m15_raw_ms
+                    and h1_raw_ms
+                )
                 else 0
             ),
         })
 
+        # -----------------------------------------
+        # -----------------------------------------
+        # FINAL CANONICAL REAL_DXY HEALTH CONTRACT
+        #
+        # 1. Raw M15 broker snapshot is current.
+        # 2. Raw H1 broker snapshot is current.
+        #
+        # Transport freshness remains diagnostic only.
+        #
+        # Tracker lifecycle such as:
+        #   IDLE / CONFIRMED / INVALIDATED
+        #
+        # does NOT make the feed unavailable.
+        # -----------------------------------------
         out["healthy"] = bool(
+            
             m15_fresh
             and h1_raw_fresh
         )
@@ -847,6 +1044,1176 @@ def _dxy_real_device_health(R, device_id: str, now_ms: int | None = None) -> dic
     return out
 
 
+def _dxy_point_a_h1_direction(
+    bull_score,
+    bear_score,
+) -> dict:
+    """
+    Analytics mirror of the production Point-A H1 evidence rule.
+
+    Shadow only:
+      winner >= 40
+      directional margin >= 20
+
+    This function does NOT participate in live execution.
+    """
+    bull = _safe_int(bull_score, 0) or 0
+    bear = _safe_int(bear_score, 0) or 0
+    margin = abs(bull - bear)
+
+    if (
+        bull >= DXY_POINT_A_H1_MIN_SCORE
+        and bull - bear >= DXY_POINT_A_H1_MIN_MARGIN
+    ):
+        direction = "BULLISH"
+        reason = "H1_BULL_EVIDENCE"
+
+    elif (
+        bear >= DXY_POINT_A_H1_MIN_SCORE
+        and bear - bull >= DXY_POINT_A_H1_MIN_MARGIN
+    ):
+        direction = "BEARISH"
+        reason = "H1_BEAR_EVIDENCE"
+
+    else:
+        direction = "NEUTRAL"
+        reason = "H1_EVIDENCE_INSUFFICIENT"
+
+    return {
+        "direction": direction,
+        "reason": reason,
+        "bull_score": bull,
+        "bear_score": bear,
+        "evidence_margin": margin,
+        "min_score": DXY_POINT_A_H1_MIN_SCORE,
+        "min_margin": DXY_POINT_A_H1_MIN_MARGIN,
+    }
+
+
+def _capture_dxy_point_a_shadow_context(
+    *,
+    point_a_entry: dict,
+    dxy_h1_entry: dict,
+    dxy_m15_entry: dict,
+) -> dict:
+    """
+    Freeze the new production DXY model for later analytics:
+
+        Direction = H1 evidence + M15
+        Location  = canonical DXY SR
+
+    Prefer the ACTUAL frozen Point-A DXY snapshot when present.
+    Fall back to already-frozen analytics H1/M15 values only when
+    the production snapshot is unavailable.
+
+    Analytics only. Never changes gates/orders.
+    """
+    out = {
+        "schema_version": 1,
+        "analytics_only": True,
+        "source": None,
+
+        "required_dxy_direction": None,
+
+        "h1_direction": "NEUTRAL",
+        "h1_reason": None,
+        "h1_bull_score": None,
+        "h1_bear_score": None,
+        "h1_evidence_margin": None,
+
+        "m15_direction": "NEUTRAL",
+        "m15_status": None,
+
+        "m15_h1_state": "DEVELOPING",
+        "combined_dxy_direction": "NEUTRAL",
+
+        "canonical_structure_pressure": None,
+        "canonical_structure_pressure_reason": None,
+        "canonical_directional_room_atr": None,
+        "canonical_inside_opposing": None,
+        "canonical_sr_risk": None,
+
+        "canonical_nearest_support": None,
+        "canonical_nearest_resistance": None,
+
+        "point_a_dxy_status": None,
+        "point_a_dxy_reason_codes": [],
+
+        "shadow_only": True,
+    }
+
+    try:
+        pa = (
+            point_a_entry
+            if isinstance(point_a_entry, dict)
+            else {}
+        )
+
+        dxy = (
+            pa.get("dxy")
+            if isinstance(pa.get("dxy"), dict)
+            else {}
+        )
+
+        ps = (
+            dxy.get("snapshot")
+            if isinstance(dxy.get("snapshot"), dict)
+            else {}
+        )
+
+        # -------------------------------------------------
+        # Preferred source: actual production Point-A result.
+        # This is the most valuable analytics snapshot because
+        # it records exactly what the live gate saw.
+        # -------------------------------------------------
+        if ps:
+            out.update({
+                "source": "POINT_A_FROZEN_DXY",
+
+                "required_dxy_direction": (
+                    ps.get("required_direction_for_trade")
+                ),
+
+                "h1_direction": (
+                    ps.get("h1_direction")
+                    or "NEUTRAL"
+                ),
+
+                "h1_reason": (
+                    ps.get("h1_direction_reason")
+                ),
+
+                "h1_bull_score": _safe_int(
+                    ps.get("h1_bull_score"),
+                    0,
+                ),
+
+                "h1_bear_score": _safe_int(
+                    ps.get("h1_bear_score"),
+                    0,
+                ),
+
+                "h1_evidence_margin": _safe_int(
+                    ps.get("h1_evidence_margin"),
+                    0,
+                ),
+
+                "m15_direction": (
+                    ps.get("m15_direction")
+                    or ps.get("direction")
+                    or "NEUTRAL"
+                ),
+
+                "m15_status": (
+                    ps.get("lifecycle_status")
+                    or ps.get("status")
+                ),
+
+                "m15_h1_state": (
+                    ps.get("m15_h1_state")
+                    or "DEVELOPING"
+                ),
+
+                "combined_dxy_direction": (
+                    ps.get("combined_dxy_direction")
+                    or "NEUTRAL"
+                ),
+
+                "canonical_structure_pressure": (
+                    ps.get("canonical_structure_pressure")
+                ),
+
+                "canonical_structure_pressure_reason": (
+                    ps.get(
+                        "canonical_structure_pressure_reason"
+                    )
+                ),
+
+                "canonical_directional_room_atr": (
+                    _safe_float(
+                        ps.get(
+                            "canonical_directional_room_atr"
+                        )
+                    )
+                ),
+
+                "canonical_inside_opposing": (
+                    ps.get("canonical_inside_opposing")
+                ),
+
+                "canonical_sr_risk": (
+                    ps.get("canonical_sr_risk")
+                ),
+
+                "canonical_nearest_support": (
+                    ps.get("nearest_support")
+                    or ps.get("canonical_nearest_support")
+                ),
+
+                "canonical_nearest_resistance": (
+                    ps.get("nearest_resistance")
+                    or ps.get(
+                        "canonical_nearest_resistance"
+                    )
+                ),
+
+                "point_a_dxy_status": (
+                    dxy.get("status")
+                ),
+
+                "point_a_dxy_reason_codes": list(
+                    dxy.get("reason_codes") or []
+                ),
+            })
+
+            return out
+
+        # -------------------------------------------------
+        # Fallback: frozen analytics streams.
+        # Useful for older/repair records, but clearly marked.
+        # -------------------------------------------------
+        h1e = (
+            dxy_h1_entry
+            if isinstance(dxy_h1_entry, dict)
+            else {}
+        )
+
+        h1sel = (
+            h1e.get("selected")
+            if isinstance(h1e.get("selected"), dict)
+            else {}
+        )
+
+        h1feat = (
+            h1sel.get("feature")
+            if isinstance(h1sel.get("feature"), dict)
+            else {}
+        )
+
+        h1c = _dxy_point_a_h1_direction(
+            h1feat.get("bull_evidence_score"),
+            h1feat.get("bear_evidence_score"),
+        )
+
+        m15e = (
+            dxy_m15_entry
+            if isinstance(dxy_m15_entry, dict)
+            else {}
+        )
+
+        m15sel = (
+            m15e.get("selected")
+            if isinstance(m15e.get("selected"), dict)
+            else {}
+        )
+
+        m15_dir = str(
+            m15sel.get("direction")
+            or "NEUTRAL"
+        ).upper().strip()
+
+        if m15_dir not in (
+            "BULLISH",
+            "BEARISH",
+        ):
+            m15_dir = "NEUTRAL"
+
+        h1_dir = h1c["direction"]
+
+        if (
+            h1_dir in ("BULLISH", "BEARISH")
+            and m15_dir in ("BULLISH", "BEARISH")
+            and h1_dir == m15_dir
+        ):
+            state = "AGREE"
+            combined = h1_dir
+
+        elif (
+            h1_dir in ("BULLISH", "BEARISH")
+            and m15_dir in ("BULLISH", "BEARISH")
+        ):
+            state = "CONFLICT"
+            combined = "NEUTRAL"
+
+        else:
+            state = "DEVELOPING"
+            combined = "NEUTRAL"
+
+        out.update({
+            "source": "ANALYTICS_FALLBACK",
+            "h1_direction": h1_dir,
+            "h1_reason": h1c["reason"],
+            "h1_bull_score": h1c["bull_score"],
+            "h1_bear_score": h1c["bear_score"],
+            "h1_evidence_margin": h1c[
+                "evidence_margin"
+            ],
+            "m15_direction": m15_dir,
+            "m15_status": m15sel.get("status"),
+            "m15_h1_state": state,
+            "combined_dxy_direction": combined,
+        })
+
+    except Exception as exc:
+        out["capture_error"] = (
+            f"{type(exc).__name__}:{exc}"
+        )
+
+    return out
+
+
+
+def capture_dxy_order_block_shadow(
+    *,
+    device_id: str,
+    entry_ms: int,
+    dxy_structure: dict | None = None,
+) -> dict:
+    """
+    Observe existing DXY OB detector without trusting it.
+
+    Captures BOTH bullish and bearish OB candidates on H1/H4,
+    plus width/body/wick/age/SR-overlap diagnostics.
+
+    Does NOT:
+      - score a trade
+      - block a trade
+      - modify SR
+      - modify Point-A
+    """
+    out = {
+        "schema_version": 1,
+        "analytics_only": True,
+        "detector": "liq_structure.find_order_blocks",
+        "detector_semantics": "EXISTING_FULL_CANDLE_OB",
+        "device_id": None,
+        "captured_at_ms": int(entry_ms or _now_ms()),
+        "price": None,
+        "atr_h1": None,
+        "candidates": {
+            "H1": {
+                "bullish": [],
+                "bearish": [],
+            },
+            "H4": {
+                "bullish": [],
+                "bearish": [],
+            },
+        },
+        "shadow_only": True,
+    }
+
+    try:
+        R = from_app_R()
+
+        canonical = resolve_canonical_dxy_source(
+            R,
+            str(device_id or "").strip(),
+        )
+
+        real_dev = str(
+            canonical.get("real_device_id") or ""
+        ).strip()
+
+        out["device_id"] = real_dev or None
+
+        if not real_dev:
+            out["capture_error"] = (
+                "CANONICAL_REAL_DXY_DEVICE_MISSING"
+            )
+            return out
+
+        from api.trend_endpoints import (
+            _get_closed_h1_bars,
+            _get_closed_h4_bars,
+        )
+        from api.liq_structure import find_order_blocks
+
+        bars_h1 = (
+            _get_closed_h1_bars("DXY", real_dev)
+            or []
+        )
+
+        bars_h4 = (
+            _get_closed_h4_bars("DXY", real_dev)
+            or []
+        )
+
+        if not bars_h1:
+            out["capture_error"] = (
+                "REAL_DXY_H1_BARS_MISSING"
+            )
+            return out
+
+        atr_h1 = _atr_from_bars(bars_h1)
+        atr_h4 = _atr_from_bars(bars_h4) if bars_h4 else 0.0
+        h1_reference_price = (
+            _safe_float(bars_h1[-1].get("c"))
+            if bars_h1
+            else None
+        )
+
+        h4_reference_price = (
+            _safe_float(bars_h4[-1].get("c"))
+            if bars_h4
+            else None
+        )
+
+        out["h1_reference_price"] = h1_reference_price
+        out["h4_reference_price"] = h4_reference_price
+
+        out["atr_h1"] = (
+            atr_h1 if atr_h1 > 0 else None
+        )
+
+        out["atr_h4"] = (
+            atr_h4 if atr_h4 > 0 else None
+        )
+
+        # Primary diagnostic price remains the latest H1 close,
+        # but keep H1/H4 reference prices separately so the
+        # research record is unambiguous.
+        price = h1_reference_price
+
+        out["price"] = price
+
+        structure = (
+            dxy_structure
+            if isinstance(dxy_structure, dict)
+            else {}
+        )
+
+        def _bar_match_index(bars, ob):
+            """
+            Match detector output back to source candle so we can
+            calculate age without changing liq_structure.py.
+            """
+            try:
+                for i in range(len(bars) - 1, -1, -1):
+                    b = bars[i]
+
+                    if (
+                        abs(float(b.get("o")) -
+                            float(ob.get("open"))) <= 1e-9
+                        and abs(float(b.get("h")) -
+                                float(ob.get("high"))) <= 1e-9
+                        and abs(float(b.get("l")) -
+                                float(ob.get("low"))) <= 1e-9
+                        and abs(float(b.get("c")) -
+                                float(ob.get("close"))) <= 1e-9
+                    ):
+                        return i
+            except Exception:
+                pass
+
+            return None
+
+        def _zone_overlap_metrics(
+            ob_low,
+            ob_high,
+            sr_low,
+            sr_high,
+        ):
+            try:
+                if (
+                    sr_low is None
+                    or sr_high is None
+                ):
+                    return {
+                        "overlaps_sr": False,
+                        "overlap_width": None,
+                        "overlap_ratio_ob": None,
+                    }
+
+                olo = min(float(ob_low), float(ob_high))
+                ohi = max(float(ob_low), float(ob_high))
+                slo = min(float(sr_low), float(sr_high))
+                shi = max(float(sr_low), float(sr_high))
+
+                overlap = max(
+                    0.0,
+                    min(ohi, shi) - max(olo, slo),
+                )
+
+                ob_width = max(
+                    ohi - olo,
+                    1e-12,
+                )
+
+                return {
+                    "overlaps_sr": overlap > 0,
+                    "overlap_width": round(
+                        overlap,
+                        6,
+                    ),
+                    "overlap_ratio_ob": round(
+                        overlap / ob_width,
+                        4,
+                    ),
+                }
+
+            except Exception:
+                return {
+                    "overlaps_sr": False,
+                    "overlap_width": None,
+                    "overlap_ratio_ob": None,
+                }
+
+        def _decorate(
+            ob,
+            bars,
+            tf,
+            role,
+        ):
+            rec = dict(ob)
+
+            low = _safe_float(rec.get("low"))
+            high = _safe_float(rec.get("high"))
+            op = _safe_float(rec.get("open"))
+            cl = _safe_float(rec.get("close"))
+
+            width = (
+                abs(high - low)
+                if None not in (high, low)
+                else None
+            )
+
+            body_low = (
+                min(op, cl)
+                if None not in (op, cl)
+                else None
+            )
+
+            body_high = (
+                max(op, cl)
+                if None not in (op, cl)
+                else None
+            )
+
+            body_width = (
+                body_high - body_low
+                if None not in (
+                    body_high,
+                    body_low,
+                )
+                else None
+            )
+
+            idx = _bar_match_index(
+                bars,
+                rec,
+            )
+
+            age_bars = (
+                len(bars) - 1 - idx
+                if idx is not None
+                else None
+            )
+
+            impulse = (
+                bars[idx + 1]
+                if (
+                    idx is not None
+                    and idx + 1 < len(bars)
+                )
+                else {}
+            )
+
+            imp_o = _safe_float(
+                impulse.get("o")
+            )
+            imp_h = _safe_float(
+                impulse.get("h")
+            )
+            imp_l = _safe_float(
+                impulse.get("l")
+            )
+            imp_c = _safe_float(
+                impulse.get("c")
+            )
+
+            imp_body = (
+                abs(imp_c - imp_o)
+                if None not in (
+                    imp_o,
+                    imp_c,
+                )
+                else None
+            )
+
+            imp_range = (
+                abs(imp_h - imp_l)
+                if None not in (
+                    imp_h,
+                    imp_l,
+                )
+                else None
+            )
+
+            # -------------------------------------------------
+            # ATR diagnostics
+            #
+            # detector_atr:
+            #   preserve the CURRENT liq_structure behavior.
+            #   H1 ATR is supplied to both H1 and H4 OB detection.
+            #
+            # native_tf_atr:
+            #   analytics-only comparison using the OB's own TF.
+            #
+            # Do NOT change detector behavior yet.
+            # -------------------------------------------------
+            detector_atr = (
+                atr_h1
+                if atr_h1 and atr_h1 > 0
+                else None
+            )
+
+            native_tf_atr = (
+                atr_h4
+                if (
+                    tf == "H4"
+                    and atr_h4
+                    and atr_h4 > 0
+                )
+                else atr_h1
+                if (
+                    tf == "H1"
+                    and atr_h1
+                    and atr_h1 > 0
+                )
+                else None
+            )
+            tf_reference_price = (
+                h4_reference_price
+                if tf == "H4"
+                else h1_reference_price
+            )
+
+            detector_impulse_atr = (
+                imp_body / detector_atr
+                if (
+                    imp_body is not None
+                    and detector_atr
+                    and detector_atr > 0
+                )
+                else None
+            )
+
+            native_impulse_atr = (
+                imp_body / native_tf_atr
+                if (
+                    imp_body is not None
+                    and native_tf_atr
+                    and native_tf_atr > 0
+                )
+                else None
+            )
+
+            detector_impulse_qualifies = bool(
+                detector_impulse_atr is not None
+                and detector_impulse_atr >= 1.50
+            )
+
+            native_impulse_qualifies = bool(
+                native_impulse_atr is not None
+                and native_impulse_atr >= 1.50
+            )
+
+            distance_to_edge = None
+            inside = False
+
+            if (
+                tf_reference_price is not None
+                and low is not None
+                and high is not None
+            ):
+                inside = (
+                    low <= tf_reference_price <= high
+                )
+
+                if inside:
+                    distance_to_edge = 0.0
+
+                elif role == "resistance":
+                    # Resistance is above price.
+                    # If price is below the zone, measure to lower edge.
+                    # If price is above the zone, distance is to upper edge.
+                    if tf_reference_price < low:
+                        distance_to_edge = (
+                            low - tf_reference_price
+                        )
+                    else:
+                        distance_to_edge = (
+                            tf_reference_price - high
+                        )
+
+                else:
+                    # Support is below price.
+                    # If price is above the zone, measure to upper edge.
+                    # If price is below the zone, distance is to lower edge.
+                    if tf_reference_price > high:
+                        distance_to_edge = (
+                            tf_reference_price - high
+                        )
+                    else:
+                        distance_to_edge = (
+                            low - tf_reference_price
+                        )
+
+                distance_to_edge = max(
+                    0.0,
+                    float(distance_to_edge),
+                )
+
+            # Compare bearish OB with canonical resistance,
+            # bullish OB with canonical support.
+            if role == "resistance":
+                sr_low = _safe_float(
+                    structure.get(
+                        "resistance_low"
+                    )
+                )
+                sr_high = _safe_float(
+                    structure.get(
+                        "resistance_high"
+                    )
+                )
+            else:
+                sr_low = _safe_float(
+                    structure.get(
+                        "support_low"
+                    )
+                )
+                sr_high = _safe_float(
+                    structure.get(
+                        "support_high"
+                    )
+                )
+
+            overlap = _zone_overlap_metrics(
+                low,
+                high,
+                sr_low,
+                sr_high,
+            )
+
+            rec.update({
+                "tf": tf,
+
+                # ---------------------------------------------
+                # Existing full-candle OB band
+                # ---------------------------------------------
+                "raw_low": low,
+                "raw_high": high,
+                "raw_width": width,
+
+                # What the EXISTING detector effectively sees.
+                "raw_width_atr_detector": (
+                    round(
+                        width / detector_atr,
+                        3,
+                    )
+                    if (
+                        width is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                # Same OB measured with its native TF ATR.
+                "raw_width_atr_native_tf": (
+                    round(
+                        width / native_tf_atr,
+                        3,
+                    )
+                    if (
+                        width is not None
+                        and native_tf_atr
+                    )
+                    else None
+                ),
+
+                # Keep old field for backward compatibility.
+                "raw_width_atr": (
+                    round(
+                        width / detector_atr,
+                        3,
+                    )
+                    if (
+                        width is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                # ---------------------------------------------
+                # Candle-body alternative
+                # ---------------------------------------------
+                "body_low": body_low,
+                "body_high": body_high,
+                "body_width": body_width,
+
+                "body_width_atr_detector": (
+                    round(
+                        body_width / detector_atr,
+                        3,
+                    )
+                    if (
+                        body_width is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                "body_width_atr_native_tf": (
+                    round(
+                        body_width / native_tf_atr,
+                        3,
+                    )
+                    if (
+                        body_width is not None
+                        and native_tf_atr
+                    )
+                    else None
+                ),
+
+                # Keep old field for backward compatibility.
+                "body_width_atr": (
+                    round(
+                        body_width / detector_atr,
+                        3,
+                    )
+                    if (
+                        body_width is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                "wick_width": (
+                    max(
+                        0.0,
+                        width - body_width,
+                    )
+                    if None not in (
+                        width,
+                        body_width,
+                    )
+                    else None
+                ),
+
+                "wick_fraction": (
+                    round(
+                        max(
+                            0.0,
+                            width - body_width,
+                        ) / width,
+                        4,
+                    )
+                    if (
+                        width is not None
+                        and width > 0
+                        and body_width is not None
+                    )
+                    else None
+                ),
+
+                "source_bar_index": idx,
+                "age_bars": age_bars,
+
+                # ---------------------------------------------
+                # Impulse diagnostics
+                # ---------------------------------------------
+                "impulse_body": imp_body,
+                "impulse_range": imp_range,
+
+                "impulse_body_atr_detector": (
+                    round(
+                        imp_body / detector_atr,
+                        3,
+                    )
+                    if (
+                        imp_body is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                "impulse_body_atr_native_tf": (
+                    round(
+                        imp_body / native_tf_atr,
+                        3,
+                    )
+                    if (
+                        imp_body is not None
+                        and native_tf_atr
+                    )
+                    else None
+                ),
+
+                # Existing detector value retained.
+                "impulse_body_atr_recalc": (
+                    round(
+                        imp_body / detector_atr,
+                        3,
+                    )
+                    if (
+                        imp_body is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                "impulse_range_atr_detector": (
+                    round(
+                        imp_range / detector_atr,
+                        3,
+                    )
+                    if (
+                        imp_range is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                "impulse_range_atr_native_tf": (
+                    round(
+                        imp_range / native_tf_atr,
+                        3,
+                    )
+                    if (
+                        imp_range is not None
+                        and native_tf_atr
+                    )
+                    else None
+                ),
+
+                # Keep old field.
+                "impulse_range_atr": (
+                    round(
+                        imp_range / detector_atr,
+                        3,
+                    )
+                    if (
+                        imp_range is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                "impulse_body_ratio": (
+                    round(
+                        imp_body / imp_range,
+                        4,
+                    )
+                    if (
+                        imp_body is not None
+                        and imp_range is not None
+                        and imp_range > 0
+                    )
+                    else None
+                ),
+
+                # ---------------------------------------------
+                # Location
+                # ---------------------------------------------
+                "inside_ob": bool(inside),
+
+                "distance_to_edge": (
+                    distance_to_edge
+                ),
+
+                "distance_to_edge_atr_detector": (
+                    round(
+                        distance_to_edge
+                        / detector_atr,
+                        3,
+                    )
+                    if (
+                        distance_to_edge
+                        is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                "distance_to_edge_atr_native_tf": (
+                    round(
+                        distance_to_edge
+                        / native_tf_atr,
+                        3,
+                    )
+                    if (
+                        distance_to_edge
+                        is not None
+                        and native_tf_atr
+                    )
+                    else None
+                ),
+
+                # Keep old field.
+                "distance_to_edge_atr": (
+                    round(
+                        distance_to_edge
+                        / detector_atr,
+                        3,
+                    )
+                    if (
+                        distance_to_edge
+                        is not None
+                        and detector_atr
+                    )
+                    else None
+                ),
+
+                # ---------------------------------------------
+                # Price provenance
+                # ---------------------------------------------
+                "reference_price": tf_reference_price,
+                "h1_reference_price": h1_reference_price,
+                "h4_reference_price": h4_reference_price,
+
+                # ---------------------------------------------
+                # Qualification comparison
+                # ---------------------------------------------
+                "detector_impulse_qualifies": (
+                    detector_impulse_qualifies
+                ),
+
+                "native_impulse_qualifies": (
+                    native_impulse_qualifies
+                ),
+
+                "qualification_comparison": (
+                    "BOTH"
+                    if (
+                        detector_impulse_qualifies
+                        and native_impulse_qualifies
+                    )
+                    else "CURRENT_DETECTOR_ONLY"
+                    if detector_impulse_qualifies
+                    else "NATIVE_TF_ONLY"
+                    if native_impulse_qualifies
+                    else "NEITHER"
+                ),
+                # ---------------------------------------------
+                # Canonical SR relationship
+                # ---------------------------------------------
+                "canonical_sr_low": sr_low,
+                "canonical_sr_high": sr_high,
+
+                **overlap,
+
+                # ---------------------------------------------
+                # ATR provenance
+                # ---------------------------------------------
+                "detector_atr": detector_atr,
+                "native_tf_atr": native_tf_atr,
+                "atr_basis_detector": "H1_ATR",
+                "atr_basis_native": tf,
+
+                # Research marker only. Still based on current
+                # detector normalization for backward comparability.
+                "wide_ob_shadow": (
+                    bool(
+                        width is not None
+                        and detector_atr
+                        and width / detector_atr >= 1.0
+                    )
+                ),
+
+                "wide_ob_native_tf_shadow": (
+                    bool(
+                        width is not None
+                        and native_tf_atr
+                        and width / native_tf_atr >= 1.0
+                    )
+                ),
+                "native_ob_candidate_shadow": bool(
+                    native_impulse_qualifies
+                    and (
+                        rec.get("impulse_close_break")
+                        is True
+                    )
+                    and (
+                        rec.get("type")
+                        in (
+                            "bullish_OB",
+                            "bearish_OB",
+                        )
+                    )
+                ),
+
+                "analytics_only": True,
+            })
+                
+
+            return rec
+
+        for tf, bars in (
+            ("H1", bars_h1),
+            ("H4", bars_h4),
+        ):
+            if not bars:
+                continue
+
+            bullish = find_order_blocks(
+                bars,
+                "BUY",
+                atr=atr_h1,
+                max_bars=DXY_OB_SHADOW_MAX_BARS,
+            )
+
+            bearish = find_order_blocks(
+                bars,
+                "SELL",
+                atr=atr_h1,
+                max_bars=DXY_OB_SHADOW_MAX_BARS,
+            )
+
+            out["candidates"][tf][
+                "bullish"
+            ] = [
+                _decorate(
+                    ob,
+                    bars,
+                    tf,
+                    "support",
+                )
+                for ob in bullish[
+                    :DXY_OB_SHADOW_MAX_PER_SIDE_TF
+                ]
+            ]
+
+            out["candidates"][tf][
+                "bearish"
+            ] = [
+                _decorate(
+                    ob,
+                    bars,
+                    tf,
+                    "resistance",
+                )
+                for ob in bearish[
+                    :DXY_OB_SHADOW_MAX_PER_SIDE_TF
+                ]
+            ]
+
+        return out
+
+    except Exception as exc:
+        out["capture_error"] = (
+            f"{type(exc).__name__}:{exc}"
+        )
+
+        log.warning(
+            "analytics: DXY OB shadow capture failed "
+            "device=%s err=%r",
+            device_id,
+            exc,
+        )
+
+        return out
 
 def _discover_freshest_real_dxy_device(
     R,
@@ -957,6 +2324,29 @@ def resolve_canonical_dxy_source(
         if pinned_source == "REAL_DXY" and pinned_dev:
             health = _dxy_real_device_health(R, pinned_dev, now)
             if health.get("healthy"):
+                try:
+                    refreshed = dict(pinned_payload)
+                    refreshed.update({
+                        "source": "REAL_DXY",
+                        "device_id": pinned_dev,
+                        "last_verified_ms": int(now),
+                        "selection_reason": "KEEP_HEALTHY_CANONICAL",
+                        "configured_by": "REDIS_PIN_HEALTHY",
+                    })
+
+                    R.set(
+                        DXY_CANONICAL_CONFIG_KEY,
+                        json.dumps(
+                            refreshed,
+                            separators=(",", ":"),
+                        ),
+                        ex=max(
+                            60,
+                            int(DXY_CANONICAL_PIN_TTL_SEC),
+                        ),
+                    )
+                except Exception:
+                   pass
                 return {
                     "source": "REAL_DXY",
 
@@ -2129,6 +3519,62 @@ def read_ftmo_state_at_ack(
         out["open_risk_usd"]           = rs.get("open_risk_usd")
     except Exception as e:
         log.warning("analytics: ftmo_state read failed: %s", e)
+    return out
+
+
+def read_prop_profile_at_ack(
+    uid: str,
+    profile_id: str,
+) -> dict:
+    """
+    Freeze immutable prop-profile metadata at trade entry.
+
+    Read-only analytics:
+      - no config mutation
+      - no fallback account-size guess
+      - no broker-balance substitution
+
+    The configured account_size is the nominal prop account size
+    (e.g. FTMO 25K vs FTMO 100K), not the current broker balance.
+    """
+    out = {
+        "prop_account_size": None,
+        "prop_account_size_source": None,
+    }
+
+    uid_u = str(uid or "").strip()
+    profile_u = str(profile_id or "").strip().lower()
+
+    if not uid_u or not profile_u:
+        return out
+
+    try:
+        from api.trend_endpoints import _get_user_prop_config
+
+        cfg = _get_user_prop_config(
+            uid_u,
+            profile_u,
+        ) or {}
+
+        account_size = _safe_float(
+            cfg.get("account_size")
+        )
+
+        if account_size is not None and account_size > 0:
+            out["prop_account_size"] = account_size
+            out["prop_account_size_source"] = (
+                "PROP_PROFILE_CONFIG_AT_ENTRY"
+            )
+
+    except Exception as exc:
+        log.warning(
+            "analytics: prop profile capture failed "
+            "uid=%s profile=%s err=%s",
+            uid_u,
+            profile_u,
+            exc,
+        )
+
     return out
 
 
@@ -4714,14 +6160,19 @@ def read_dxy_m15_at_entry(device_id: str, symbol: str, side: str, entry_ms: int,
 
         real = result["sources"].get("REAL_DXY") or {}
         synthetic = result["sources"].get("SYNTHETIC_DXY") or {}
+
+        # ---------------------------------------------------------
+        # Execution policy: REAL_DXY ONLY
+        #
+        # Synthetic DXY is retained in result["sources"] for
+        # analytics/shadow inspection only. It must never be
+        # selected for live Point-A entry decisions.
+        #
+        # Fresh REAL_DXY -> use it.
+        # Stale/unavailable REAL_DXY -> no DXY source selected.
+        # ---------------------------------------------------------
         if real.get("available") and real.get("fresh"):
             selected_source = "REAL_DXY"
-        elif synthetic.get("available") and synthetic.get("fresh"):
-            selected_source = "SYNTHETIC_DXY"
-        elif real.get("available"):
-            selected_source = "REAL_DXY"
-        elif synthetic.get("available"):
-            selected_source = "SYNTHETIC_DXY"
         else:
             selected_source = None
 
@@ -4738,16 +6189,22 @@ def read_dxy_m15_at_entry(device_id: str, symbol: str, side: str, entry_ms: int,
                 "real_profile_id"
             )
 
-        elif selected_source == "SYNTHETIC_DXY":
-            result["selected_firm"] = trade_firm_u or None
-            result["selected_profile_id"] = trade_profile or None
-        result["fallback_used"] = selected_source == "SYNTHETIC_DXY"
-        if selected_source == "SYNTHETIC_DXY":
-            result["fallback_reason"] = (
-                "CANONICAL_REAL_DXY_STALE"
-                if real.get("available") and not real.get("fresh")
-                else "CANONICAL_REAL_DXY_UNAVAILABLE"
-            )
+        # Synthetic is never an execution fallback.
+        result["fallback_used"] = False
+
+        if selected_source is None:
+            if not real.get("available"):
+                result["fallback_reason"] = (
+                    "CANONICAL_REAL_DXY_UNAVAILABLE"
+                )
+            elif not real.get("fresh"):
+                result["fallback_reason"] = (
+                    "CANONICAL_REAL_DXY_STALE"
+                )
+            else:
+                result["fallback_reason"] = (
+                    "NO_REAL_DXY_SOURCE_SELECTED"
+                )
 
         elif selected_source is None:
             real_available = bool(real.get("available"))
@@ -4798,12 +6255,7 @@ def read_dxy_m15_at_entry(device_id: str, symbol: str, side: str, entry_ms: int,
             result.get("selected_device_id"),
             result.get("fallback_used"),
         )
-        if selected_source == "SYNTHETIC_DXY":
-            result["fallback_reason"] = (
-                "CANONICAL_REAL_DXY_STALE"
-                if real.get("available") and not real.get("fresh")
-                else "CANONICAL_REAL_DXY_UNAVAILABLE"
-            )
+        
         result["dxy_reasoning"] = (
             _dxy_m15_reasoning(result["selected"])
             if isinstance(result.get("selected"), dict)
@@ -7162,6 +8614,35 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
     OK (clean) and ALLOW (repair) verdicts. Never raises."""
     try:
         p = pos or {}
+        point_a_entry = (
+            json.loads(
+                json.dumps(
+                    p.get("point_a"),
+                    separators=(",", ":"),
+                    default=str,
+                )
+            )
+            if isinstance(
+                p.get("point_a"),
+                dict,
+            )
+            else {}
+        )
+
+        point_a_wait_bars = _safe_int(
+            point_a_entry.get(
+                "wait_m15_bars"
+            ),
+            0,
+        ) or 0
+
+        point_a_entry_lifecycle = (
+            "WAIT_THEN_PASS"
+            if point_a_wait_bars > 0
+            else "PASS_IMMEDIATE"
+            if point_a_entry
+            else "NOT_CAPTURED"
+        )
         trade_device_id = str(
             p.get("device_id")
             or ""
@@ -7213,6 +8694,22 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             or _now_ms()
         )
         session = _session_for_ts_ms(ets, LIVE_TZ_OFFSET_H)
+        # Analytics-only trading-window tag.
+        # 16:00 UTC = 21:30 IST.
+        # This DOES NOT block or modify live execution.
+        entry_utc_hour = (
+            int(ets) // 3_600_000
+        ) % 24
+
+        no_trading_window = bool(
+            16 <= entry_utc_hour < 22
+        )
+
+        no_trading_window_reason = (
+            "AFTER_1600_UTC"
+            if no_trading_window
+            else None
+        )
 
         dist_pips = None
         if entry is not None and zone_level:
@@ -7254,6 +8751,10 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             side,
         )
         ftmo   = read_ftmo_state_at_ack(
+            uid,
+            p.get("profile_id"),
+        )
+        prop_profile = read_prop_profile_at_ack(
             uid,
             p.get("profile_id"),
         )
@@ -7313,10 +8814,101 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "capture_source":   str(capture_source or "normal"),
             "setup_analysis": (dict(p.get("setup_analysis")) if isinstance(p.get("setup_analysis"), dict) else None),
             "entry_confirmation": (dict(p.get("entry_confirmation")) if isinstance(p.get("entry_confirmation"), dict) else None),
+            # -------------------------------------------------
+            # Point-A final pre-entry decision.
+            #
+            # Frozen from the live executor record.
+            # Analytics only; this does not recompute Point-A.
+            # -------------------------------------------------
+            "point_a": (
+                point_a_entry
+                if point_a_entry
+                else None
+            ),
+
+            "point_a_lifecycle": (
+                point_a_entry_lifecycle
+            ),
+
+            "point_a_decision": (
+                str(
+                    point_a_entry.get(
+                        "decision"
+                    )
+                    or ""
+                ).upper().strip()
+                or None
+            ),
+
+            "point_a_action": (
+                str(
+                    point_a_entry.get(
+                        "action"
+                    )
+                    or ""
+                ).upper().strip()
+                or None
+            ),
+
+            "point_a_reason": (
+                point_a_entry.get("reason")
+            ),
+
+            "point_a_reason_codes": list(
+                point_a_entry.get(
+                    "reason_codes"
+                )
+                or []
+            ),
+
+            "point_a_displacement_atr": (
+                _safe_float(
+                    point_a_entry.get(
+                        "displacement_atr"
+                    )
+                )
+            ),
+
+            "point_a_missed_move_r": (
+                _safe_float(
+                    point_a_entry.get(
+                        "missed_move_r"
+                    )
+                )
+            ),
+
+            "point_a_max_missed_r": (
+                _safe_float(
+                    point_a_entry.get(
+                        "max_missed_r"
+                    )
+                )
+            ),
+
+            "point_a_wait_m15_bars": (
+                point_a_wait_bars
+            ),
+
+            "point_a_max_wait_m15_bars": (
+                _safe_int(
+                    point_a_entry.get(
+                        "max_wait_m15_bars"
+                    ),
+                    0,
+                )
+            ),
             "selected_strategy": ((p.get("setup_analysis") or {}).get("selected_production_strategy") if isinstance(p.get("setup_analysis"), dict) else None),
             "predicted_market_behavior": ((p.get("setup_analysis") or {}).get("predicted_market_behavior") if isinstance(p.get("setup_analysis"), dict) else None),
             "enqueue_timestamp": ets,
             "session":          session,
+            # Analytics-only candidate trading window.
+            # No execution behavior is changed by these fields.
+            "no_trading_window": no_trading_window,
+            "no_trading_window_reason": (
+                no_trading_window_reason
+            ),
+            "no_trading_window_start_utc_hour": 16,
+            "no_trading_window_end_utc_hour": 22,
 
             # -- location --
             "entry_price":      entry,
@@ -7533,6 +9125,14 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "lots":             _safe_float(p.get("qty")),
             "risk_usd":         risk_usd,
             "risk_pct":         risk_pct,
+            # Nominal prop-account size frozen at entry.
+            # Do not derive this from current broker balance.
+            "prop_account_size": (
+                prop_profile.get("prop_account_size")
+            ),
+            "prop_account_size_source": (
+                prop_profile.get("prop_account_size_source")
+            ),
             "prop_verdict":     pc.get("verdict"),
             "prop_firm":        pc.get("firm")  or p.get("prop_firm"),
             "prop_phase":       pc.get("phase") or p.get("prop_phase"),
@@ -7988,13 +9588,131 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                 "dxy_h1_real_synthetic_agreement"
             ] = "UNAVAILABLE"
 
-            snap[
-                "dxy_m15_h1_alignment_at_entry"
-            ] = "UNAVAILABLE"
+        # ---------------------------------------------------------
+        # ADD POINT 5 HERE
+        # DXY Point-A + Order Block research snapshot
+        # ---------------------------------------------------------
+        try:
+            snap["dxy_point_a_shadow"] = (
+                _capture_dxy_point_a_shadow_context(
+                    point_a_entry=point_a_entry,
+                    dxy_h1_entry=(
+                        snap.get("dxy_h1_entry")
+                        if isinstance(
+                            snap.get("dxy_h1_entry"),
+                            dict,
+                        )
+                        else {}
+                    ),
+                    dxy_m15_entry=(
+                        snap.get("dxy_m15_entry")
+                        if isinstance(
+                            snap.get("dxy_m15_entry"),
+                            dict,
+                        )
+                        else {}
+                    ),
+                )
+            )
+
+            snap["dxy_order_block_shadow"] = (
+                capture_dxy_order_block_shadow(
+                    device_id=p.get("device_id"),
+                    entry_ms=ets,
+                    dxy_structure=(
+                        snap.get("dxy_structure_entry")
+                        if isinstance(
+                            snap.get("dxy_structure_entry"),
+                            dict,
+                        )
+                        else {}
+                    ),
+                )
+            )
+
+            _pa_shadow = (
+                snap.get("dxy_point_a_shadow")
+                or {}
+            )
 
             snap[
-                "dxy_h1_shadow_only"
+                "dxy_point_a_h1_direction"
+            ] = _pa_shadow.get(
+                "h1_direction"
+            )
+
+            snap[
+                "dxy_point_a_m15_direction"
+            ] = _pa_shadow.get(
+                "m15_direction"
+            )
+
+            snap[
+                "dxy_point_a_m15_h1_state"
+            ] = _pa_shadow.get(
+                "m15_h1_state"
+            )
+
+            snap[
+                "dxy_point_a_combined_direction"
+            ] = _pa_shadow.get(
+                "combined_dxy_direction"
+            )
+
+            snap[
+                "dxy_point_a_structure_pressure"
+            ] = _pa_shadow.get(
+                "canonical_structure_pressure"
+            )
+
+            snap[
+                "dxy_point_a_directional_room_atr"
+            ] = _pa_shadow.get(
+                "canonical_directional_room_atr"
+            )
+
+            snap[
+                "dxy_point_a_sr_risk"
+            ] = _pa_shadow.get(
+                "canonical_sr_risk"
+            )
+
+            snap[
+                "dxy_ob_analytics_only"
             ] = True
+
+            cs = (
+                snap.get("capture_status")
+                if isinstance(
+                    snap.get("capture_status"),
+                    dict,
+                )
+                else {}
+            )
+
+            cs[
+                "dxy_point_a_shadow_captured"
+            ] = bool(
+                snap.get("dxy_point_a_shadow")
+            )
+
+            cs[
+                "dxy_ob_shadow_captured"
+            ] = bool(
+                snap.get("dxy_order_block_shadow")
+            )
+
+            snap["capture_status"] = cs
+
+        except Exception as _dxy_shadow_exc:
+            log.warning(
+                "analytics: DXY Point-A/OB shadow "
+                "capture failed ticket=%s err=%r",
+                ticket,
+                _dxy_shadow_exc,
+            )
+
+            
 
         # -------------------------------------------------------------
         # Final H1 DXY capture-status update
@@ -8176,7 +9894,9 @@ def write_entry_snapshot(snap: dict) -> bool:
         # This is shadow analytics only and never changes SL/TP/orders.
         _ensure_trade_milestone_state(snap)
 
-        R.set(
+        pipe = R.pipeline(transaction=True)
+
+        pipe.set(
             SNAP_PREFIX + ticket,
             json.dumps(
                 snap,
@@ -8186,6 +9906,12 @@ def write_entry_snapshot(snap: dict) -> bool:
             ex=SNAP_TTL_SEC,
         )
 
+        pipe.sadd(
+            OPEN_SNAP_TICKETS_KEY,
+            ticket,
+        )
+
+        pipe.execute()
         return True
 
     except Exception as exc:
@@ -10519,12 +12245,54 @@ def _apply_phase1_close_analytics(snap: dict) -> None:
             ), "analytics_only": True,
         }
 
-        reason = str(snap.get("exit_reason") or "").lower()
-        net = _safe_float(snap.get("net_profit"))
-        rr = _safe_float(snap.get("realized_r"))
-        outcome = ("TP_HIT" if reason == "tp" else "SL_HIT" if reason == "sl" else
-                   "BREAK_EVEN" if (rr is not None and abs(rr) <= 0.05) or (rr is None and net is not None and abs(net) <= 0.01) else
-                   "MANUAL_CLOSE" if reason == "manual" else "BROKER_CLOSE")
+        reason = str(
+            snap.get("exit_reason") or ""
+        ).lower().strip()
+
+        net = _safe_float(
+            snap.get("net_profit")
+        )
+
+        rr = _safe_float(
+            snap.get("realized_r")
+        )
+
+        rr_net = _safe_float(
+            snap.get("realized_r_net")
+        )
+
+        # Economic outcome must take priority over the broker close
+        # mechanism. A BE stop is still reported by MT5 as SL, but
+        # economically the trade finished near 0R.
+        is_break_even = bool(
+            (
+                rr is not None
+                and abs(rr) <= 0.05
+            )
+            or (
+                rr is None
+                and rr_net is not None
+                and abs(rr_net) <= 0.05
+            )
+            or (
+                rr is None
+                and rr_net is None
+                and net is not None
+                and abs(net) <= 0.01
+            )
+        )
+
+        outcome = (
+            "BREAK_EVEN"
+            if is_break_even
+            else "TP_HIT"
+            if reason == "tp"
+            else "SL_HIT"
+            if reason == "sl"
+            else "MANUAL_CLOSE"
+            if reason == "manual"
+            else "BROKER_CLOSE"
+        )
         snap["outcome_classification"] = outcome
         snap["outcome_classification_evidence"] = {
             "exit_reason": reason or None, "exit_reason_source": snap.get("exit_reason_source"),
@@ -10644,7 +12412,16 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
         # idempotent append check and then remove the stale in-flight snapshot.
         if snap.get("_status") == "closed":
             if _append_jsonl(snap):
-                R.delete(SNAP_PREFIX + ticket)
+                pipe = R.pipeline(transaction=True)
+                pipe.delete(
+                    SNAP_PREFIX + ticket,
+                )
+                pipe.srem(
+                    OPEN_SNAP_TICKETS_KEY,
+                    ticket,
+                )
+                pipe.execute()
+
                 try:
                     if snap.get("broker_verified"):
                         R.srem(PENDING_TRUTH_KEY, ticket)
@@ -10908,7 +12685,18 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
         _apply_phase1_close_analytics(snap)
         
         if _append_jsonl(snap):
-            R.delete(SNAP_PREFIX + ticket)
+            # Snapshot finalization and open-ticket index cleanup must be
+            # atomic. Once the in-flight snapshot is gone, this ticket must
+            # no longer remain discoverable through OPEN_SNAP_TICKETS_KEY.
+            pipe = R.pipeline(transaction=True)
+            pipe.delete(
+                SNAP_PREFIX + ticket,
+            )
+            pipe.srem(
+                OPEN_SNAP_TICKETS_KEY,
+                ticket,
+            )
+            pipe.execute()
 
             try:
                 if snap.get("broker_verified"):
@@ -11394,14 +13182,26 @@ def _recover_analytics_uid(
     if not ticket_s:
         return "", "NO_TICKET"
 
+    
     # ---------------------------------------------------------
     # 1. Open strategy ledger   strongest ownership source
+    #
+    # Use the maintained UID index instead of scanning the
+    # entire Redis keyspace for xtl:strategy:oppt:open:*.
     # ---------------------------------------------------------
     try:
-        for ledger_key in R.scan_iter("xtl:strategy:oppt:open:*"):
-            owner_uid = _uid_from_ledger_key(ledger_key)
+        raw_uids = R.smembers("xtl:strategy:oppt:open_uids") or set()
+
+        for raw_uid in raw_uids:
+            if isinstance(raw_uid, (bytes, bytearray)):
+                owner_uid = raw_uid.decode("utf-8", "ignore").strip()
+            else:
+                owner_uid = str(raw_uid or "").strip()
+
             if not owner_uid:
                 continue
+
+            ledger_key = f"xtl:strategy:oppt:open:{owner_uid}"
 
             try:
                 rows = R.hvals(ledger_key) or []
@@ -11412,6 +13212,7 @@ def _recover_analytics_uid(
                 row = _decode_json_value(raw_row)
                 if _ticket_matches(row, ticket_s):
                     return owner_uid, "OPEN_LEDGER"
+
     except Exception as exc:
         log.warning(
             "analytics: UID recovery open-ledger failed "
@@ -11420,14 +13221,23 @@ def _recover_analytics_uid(
             exc,
         )
 
+    
     # ---------------------------------------------------------
     # 2. Closed strategy ledger
     # ---------------------------------------------------------
     try:
-        for ledger_key in R.scan_iter("xtl:strategy:oppt:closed:*"):
-            owner_uid = _uid_from_ledger_key(ledger_key)
+        raw_uids = R.smembers("xtl:strategy:oppt:closed_uids") or set()
+
+        for raw_uid in raw_uids:
+            if isinstance(raw_uid, (bytes, bytearray)):
+                owner_uid = raw_uid.decode("utf-8", "ignore").strip()
+            else:
+                owner_uid = str(raw_uid or "").strip()
+
             if not owner_uid:
                 continue
+
+            ledger_key = f"xtl:strategy:oppt:closed:{owner_uid}"
 
             try:
                 rows = R.lrange(ledger_key, 0, -1) or []
@@ -11438,6 +13248,7 @@ def _recover_analytics_uid(
                 row = _decode_json_value(raw_row)
                 if _ticket_matches(row, ticket_s):
                     return owner_uid, "CLOSED_LEDGER"
+
     except Exception as exc:
         log.warning(
             "analytics: UID recovery closed-ledger failed "
@@ -11446,61 +13257,64 @@ def _recover_analytics_uid(
             exc,
         )
 
+    
     # ---------------------------------------------------------
     # 3. UID-scoped watch records
-    #
-    # New key shape:
-    # xtl:zone:watch:{uid}:{symbol}:{side}:H1
     # ---------------------------------------------------------
     try:
-        trade_id = str(snap.get("trade_id") or "").strip()
+        candidate_uids = set()
 
-        for watch_key in R.scan_iter("xtl:zone:watch:*"):
-            try:
-                if isinstance(watch_key, (bytes, bytearray)):
-                    watch_key_s = watch_key.decode("utf-8", "ignore")
-                else:
-                    watch_key_s = str(watch_key)
+        try:
+            candidate_uids.update(
+                R.smembers("xtl:strategy:oppt:open_uids") or set()
+            )
+        except Exception:
+            pass
 
-                parts = watch_key_s.split(":")
+        try:
+            candidate_uids.update(
+                R.smembers("xtl:strategy:oppt:closed_uids") or set()
+            )
+        except Exception:
+            pass
 
-                # Require UID-scoped format:
-                # xtl zone watch UID SYMBOL SIDE TF
-                if len(parts) < 7:
-                    continue
+        for raw_uid in candidate_uids:
+            if isinstance(raw_uid, (bytes, bytearray)):
+                owner_uid = raw_uid.decode("utf-8", "ignore").strip()
+            else:
+                owner_uid = str(raw_uid or "").strip()
 
-                owner_uid = str(parts[3] or "").strip()
-                if not owner_uid:
-                    continue
-
-                watch = _decode_json_value(R.get(watch_key))
-                if not isinstance(watch, dict):
-                    continue
-
-                if _ticket_matches(watch, ticket_s):
-                    return owner_uid, "WATCH_TICKET"
-
-                watch_trade_id = str(
-                    watch.get("trade_id")
-                    or watch.get("open_trade_id")
-                    or watch.get("entry_trade_id")
-                    or ""
-                ).strip()
-
-                if trade_id and watch_trade_id == trade_id:
-                    return owner_uid, "WATCH_TRADE_ID"
-
-            except Exception:
+            if not owner_uid:
                 continue
+
+            index_key = f"xtl:zone:watch:index:{owner_uid}:H1"
+
+            try:
+                watch_keys = R.smembers(index_key) or set()
+            except Exception:
+                watch_keys = set()
+
+            for watch_key in watch_keys:
+                try:
+                    raw_watch = R.get(watch_key)
+                except Exception:
+                    raw_watch = None
+
+                if not raw_watch:
+                    continue
+
+                row = _decode_json_value(raw_watch)
+
+                if _ticket_matches(row, ticket_s):
+                    return owner_uid, "ZONE_WATCH"
+
     except Exception as exc:
         log.warning(
-            "analytics: UID recovery watch scan failed "
+            "analytics: UID recovery watch failed "
             "ticket=%s err=%s",
             ticket_s,
             exc,
         )
-
-    return "", "NOT_FOUND"
 
 
 
@@ -12927,14 +14741,46 @@ def update_open_trade_snapshots() -> dict:
         R = from_app_R()
         now = _now_ms()
 
-        for key in R.scan_iter(SNAP_PREFIX + "*"):
+        tickets = R.smembers(
+            OPEN_SNAP_TICKETS_KEY
+        ) or set()
+
+        for raw_ticket in tickets:
+            ticket = (
+                raw_ticket.decode("utf-8", "ignore")
+                if isinstance(raw_ticket, (bytes, bytearray))
+                else str(raw_ticket)
+            ).strip()
+
+            if not ticket:
+                continue
+
+            key = SNAP_PREFIX + ticket
+
             stats["checked"] += 1
+
             try:
                 raw = R.get(key)
-                snap = _json_load(raw, {})
-                if not isinstance(snap, dict) or snap.get("_status") == "closed":
+
+                # Self-heal stale index membership.
+                if not raw:
+                    R.srem(
+                        OPEN_SNAP_TICKETS_KEY,
+                        ticket,
+                    )
                     continue
 
+                snap = _json_load(raw, {})
+
+                if (
+                    not isinstance(snap, dict)
+                    or snap.get("_status") == "closed"
+                ):
+                    R.srem(
+                        OPEN_SNAP_TICKETS_KEY,
+                        ticket,
+                    )
+                    continue
                 broker_position = _load_broker_position_for_snapshot(R, snap)
                 if not broker_position:
                     stats["position_missing"] += 1
@@ -13018,12 +14864,35 @@ def sweep_closed_trades(fetch_h1_bars=None) -> dict:
             set,
         ] = {}
 
-        for key in R.scan_iter(SNAP_PREFIX + "*"):
+        tickets = R.smembers(
+            OPEN_SNAP_TICKETS_KEY
+        ) or set()
+
+        for raw_ticket in tickets:
+            ticket = (
+                raw_ticket.decode("utf-8", "ignore")
+                if isinstance(raw_ticket, (bytes, bytearray))
+                else str(raw_ticket)
+            ).strip()
+
+            if not ticket:
+                continue
+
+            key = SNAP_PREFIX + ticket
+
             stats["checked"] += 1
+
             try:
                 raw = R.get(key)
+
+                # Snapshot already finalized/expired: remove stale membership.
                 if not raw:
+                    R.srem(
+                        OPEN_SNAP_TICKETS_KEY,
+                        ticket,
+                    )
                     continue
+
                 snap = json.loads(raw)
                 uid = str(
                     snap.get("uid")
@@ -13038,11 +14907,13 @@ def sweep_closed_trades(fetch_h1_bars=None) -> dict:
                     or ""
                 ).strip().lower()
 
-                ticket = str(
+                snap_ticket = str(
                     snap.get("mt5_ticket")
-                    or str(key).split(":")[-1]
-                    or ""
+                    or ticket
                 ).strip()
+
+                if snap_ticket:
+                    ticket = snap_ticket
 
                 # ---------------------------------------------------------
                 # P0: self-heal ownerless analytics snapshots.
@@ -13227,6 +15098,531 @@ def sweep_closed_trades(fetch_h1_bars=None) -> dict:
 
 REJECTED_JSONL = "/opt/xauapi/api/trend/out/trades_rejected.jsonl"
 
+# -----------------------------------------------------------------------------
+# Point-A lifecycle analytics
+#
+# Permanent shadow-only record of Point-A decisions, including opportunities
+# that never become trades.
+#
+# This file must NEVER influence live trading.
+# -----------------------------------------------------------------------------
+
+POINT_A_JSONL = "/opt/xauapi/api/trend/out/point_a_events.jsonl"
+POINT_A_JSONL_LOCK = POINT_A_JSONL + ".lock"
+
+
+@contextmanager
+def _point_a_jsonl_lock():
+    lf = open(
+        POINT_A_JSONL_LOCK,
+        "a+",
+        encoding="utf-8",
+    )
+    try:
+        fcntl.flock(
+            lf.fileno(),
+            fcntl.LOCK_EX,
+        )
+        yield
+    finally:
+        try:
+            fcntl.flock(
+                lf.fileno(),
+                fcntl.LOCK_UN,
+            )
+        finally:
+            lf.close()
+
+
+def capture_point_a_event(
+    *,
+    event_type: str,
+    uid: str | None,
+    profile_id: str | None,
+    device_id: str | None,
+    symbol: str,
+    side: str,
+    watch: dict | None,
+    point_a: dict | None,
+    live_price: float | None = None,
+    trigger_level: float | None = None,
+    event_ms: int | None = None,
+) -> bool:
+    """
+    Permanently record one meaningful Point-A lifecycle transition.
+
+    Analytics only:
+      - never changes a watch
+      - never changes a gate
+      - never creates/deletes claims
+      - never blocks or releases an entry
+      - failures are swallowed
+
+    Intended event types:
+      PASS_IMMEDIATE
+      WAIT_STARTED
+      WAIT_THEN_PASS
+      WAIT_EXPIRED
+      WAIT_THEN_BLOCK
+      EXPIRED_IMMEDIATE
+      BLOCKED_IMMEDIATE
+    """
+    try:
+        w = watch if isinstance(watch, dict) else {}
+        pa = point_a if isinstance(point_a, dict) else {}
+
+        sym_u = str(
+            symbol or w.get("symbol") or ""
+        ).upper().strip()
+
+        side_u = str(
+            side
+            or w.get("direction")
+            or w.get("side")
+            or ""
+        ).upper().strip()
+
+        ts = int(
+            event_ms
+            or pa.get("evaluated_at_ms")
+            or w.get("point_a_last_eval_ms")
+            or _now_ms()
+        )
+
+        symbol_room = (
+            pa.get("symbol_room")
+            if isinstance(
+                pa.get("symbol_room"),
+                dict,
+            )
+            else {}
+        )
+
+        dxy = (
+            pa.get("dxy")
+            if isinstance(
+                pa.get("dxy"),
+                dict,
+            )
+            else {}
+        )
+
+        dxy_snapshot = (
+            dxy.get("snapshot")
+            if isinstance(
+                dxy.get("snapshot"),
+                dict,
+            )
+            else {}
+        )
+
+        dxy_sr = (
+            dxy_snapshot.get(
+                "opposing_sr_selection"
+            )
+            if isinstance(
+                dxy_snapshot.get(
+                    "opposing_sr_selection"
+                ),
+                dict,
+            )
+            else {}
+        )
+
+        dxy_sr_selected = (
+            dxy_sr.get("selected")
+            if isinstance(
+                dxy_sr.get("selected"),
+                dict,
+            )
+            else {}
+        )
+
+        zone = (
+            w.get("zone_used")
+            if isinstance(
+                w.get("zone_used"),
+                dict,
+            )
+            else {}
+        )
+
+        rc_ms = _safe_int(
+            w.get("point_a_rc_rev_ok_ms")
+            or w.get("rev_ok_ms"),
+            0,
+        ) or 0
+
+        trigger = _safe_float(
+            trigger_level
+            if trigger_level is not None
+            else w.get("point_a_trigger_level")
+            if w.get("point_a_trigger_level") is not None
+            else w.get("trigger_level")
+        )
+
+        # Deterministic identity allows future pandas analysis to
+        # de-duplicate accidental duplicate appends without relying
+        # on mutable Redis lifecycle state.
+        event_id = (
+            f"{str(uid or '').strip()}:"
+            f"{sym_u}:"
+            f"{side_u}:"
+            f"{rc_ms}:"
+            f"{str(event_type or '').upper().strip()}:"
+            f"{ts}"
+        )
+
+        rec = {
+            "schema_version": 1,
+            "analytics_only": True,
+            "dataset": "POINT_A_LIFECYCLE",
+
+            "event_id": event_id,
+            "event_type": str(
+                event_type or "UNKNOWN"
+            ).upper().strip(),
+            "event_ms": ts,
+
+            "uid": str(uid or "").strip() or None,
+            "profile_id": (
+                str(profile_id or "").strip().lower()
+                or None
+            ),
+            "device_id": (
+                str(device_id or "").strip()
+                or None
+            ),
+
+            "symbol": sym_u,
+            "side": side_u,
+
+            # Exact RC / breakout generation.
+            "rc_rev_ok_ms": rc_ms or None,
+            "trigger_level": trigger,
+            "live_price": _safe_float(live_price),
+
+            "watch_key": (
+                w.get("watch_key")
+                or None
+            ),
+
+            # Final Point-A verdict for this transition.
+            "decision": (
+                str(
+                    pa.get("decision")
+                    or w.get("point_a_decision")
+                    or ""
+                ).upper().strip()
+                or None
+            ),
+            "action": (
+                str(
+                    pa.get("action")
+                    or w.get("point_a_action")
+                    or ""
+                ).upper().strip()
+                or None
+            ),
+            "reason": (
+                pa.get("reason")
+                or w.get("point_a_reason")
+                or w.get("point_a_terminal_reason")
+                or None
+            ),
+            "reason_codes": list(
+                pa.get("reason_codes")
+                or w.get("point_a_reason_codes")
+                or []
+            ),
+
+            # Point-A timing / late-entry measurements.
+            "evaluated_at_ms": _safe_int(
+                pa.get("evaluated_at_ms")
+                or w.get("point_a_last_eval_ms")
+            ),
+            "displacement_atr": _safe_float(
+                pa.get("displacement_atr")
+                if pa.get("displacement_atr") is not None
+                else w.get(
+                    "point_a_displacement_atr"
+                )
+            ),
+            "favorable_move": _safe_float(
+                pa.get("favorable_move")
+            ),
+            "missed_move_r": _safe_float(
+                pa.get("missed_move_r")
+                if pa.get("missed_move_r") is not None
+                else w.get(
+                    "point_a_missed_move_r"
+                )
+            ),
+            "max_missed_r": _safe_float(
+                pa.get("max_missed_r")
+                if pa.get("max_missed_r") is not None
+                else w.get(
+                    "point_a_max_missed_r"
+                )
+            ),
+
+            "wait_age_ms": _safe_int(
+                pa.get("wait_age_ms")
+            ),
+            "wait_m15_bars": _safe_int(
+                pa.get("wait_m15_bars"),
+                0,
+            ),
+            "max_wait_m15_bars": _safe_int(
+                pa.get("max_wait_m15_bars"),
+                0,
+            ),
+
+            # Original structural risk used by PRICE_TOO_FAR.
+            "planned_structural_sl": _safe_float(
+                pa.get("planned_structural_sl")
+                if pa.get(
+                    "planned_structural_sl"
+                ) is not None
+                else w.get(
+                    "point_a_planned_structural_sl"
+                )
+            ),
+            "original_risk_distance": _safe_float(
+                pa.get("original_risk_distance")
+                if pa.get(
+                    "original_risk_distance"
+                ) is not None
+                else w.get(
+                    "point_a_original_risk_distance"
+                )
+            ),
+
+            # Frozen XTL zone context.
+            "zone": {
+                "level": _safe_float(
+                    zone.get("level")
+                ),
+                "low": _safe_float(
+                    zone.get("low")
+                ),
+                "high": _safe_float(
+                    zone.get("high")
+                ),
+                "tf": zone.get("tf"),
+                "kind": zone.get("kind"),
+                "strength": _safe_float(
+                    zone.get("strength")
+                ),
+                "touches": _safe_int(
+                    zone.get("touches")
+                ),
+                "sr_score": _safe_float(
+                    zone.get("sr_score")
+                ),
+                "distance_atr": _safe_float(
+                    zone.get("distance_atr")
+                ),
+                "zone_source": (
+                    zone.get("zone_source")
+                ),
+                "selection_model": (
+                    zone.get("selection_model")
+                ),
+            },
+
+            # Symbol obstacle analysis that Point-A actually used.
+            "symbol_room": {
+                "available": (
+                    symbol_room.get("available")
+                ),
+                "class": symbol_room.get("class"),
+                "room_atr": _safe_float(
+                    symbol_room.get("room_atr")
+                ),
+                "opposing_level": _safe_float(
+                    symbol_room.get(
+                        "opposing_level"
+                    )
+                ),
+                "opposing_role": (
+                    symbol_room.get(
+                        "opposing_role"
+                    )
+                ),
+                "opposing_tf": (
+                    symbol_room.get(
+                        "opposing_tf"
+                    )
+                ),
+                "opposing_strength": _safe_float(
+                    symbol_room.get(
+                        "opposing_strength"
+                    )
+                ),
+                "opposing_touches": _safe_float(
+                    symbol_room.get(
+                        "opposing_touches"
+                    )
+                ),
+                "opposing_sr_score": _safe_float(
+                    symbol_room.get(
+                        "opposing_sr_score"
+                    )
+                ),
+                "candidate_count": _safe_int(
+                    symbol_room.get(
+                        "candidate_count"
+                    )
+                ),
+                "source": symbol_room.get(
+                    "source"
+                ),
+                "block_threshold_atr": (
+                    _safe_float(
+                        symbol_room.get(
+                            "block_threshold_atr"
+                        )
+                    )
+                ),
+                "ok_threshold_atr": (
+                    _safe_float(
+                        symbol_room.get(
+                            "ok_threshold_atr"
+                        )
+                    )
+                ),
+            },
+
+            # Compact DXY state actually seen by Point-A.
+            "dxy": {
+                "status": dxy.get("status"),
+                "reason_codes": list(
+                    dxy.get("reason_codes")
+                    or []
+                ),
+                "direction": (
+                    dxy_snapshot.get("direction")
+                ),
+                "required_direction_for_trade": (
+                    dxy_snapshot.get(
+                        "required_direction_for_trade"
+                    )
+                ),
+                "trade_alignment": (
+                    dxy_snapshot.get(
+                        "trade_alignment"
+                    )
+                ),
+                "candidate_qualified": (
+                    dxy_snapshot.get(
+                        "candidate_qualified"
+                    )
+                ),
+                "room_class": (
+                    dxy_snapshot.get(
+                        "room_class"
+                    )
+                ),
+                "structure_conflict": (
+                    dxy_snapshot.get(
+                        "structure_conflict"
+                    )
+                ),
+                "opposing_sr": {
+                    "role": dxy_sr.get(
+                        "opposing_role"
+                    ),
+                    "candidate_count": _safe_int(
+                        dxy_sr.get(
+                            "candidate_count"
+                        )
+                    ),
+                    "selected_level": _safe_float(
+                        dxy_sr_selected.get(
+                            "level"
+                        )
+                    ),
+                    "selected_tf": (
+                        dxy_sr_selected.get("tf")
+                    ),
+                    "selected_strength": (
+                        _safe_float(
+                            dxy_sr_selected.get(
+                                "strength"
+                            )
+                        )
+                    ),
+                    "selected_touches": (
+                        _safe_float(
+                            dxy_sr_selected.get(
+                                "touches"
+                            )
+                        )
+                    ),
+                    "selected_sr_score": (
+                        _safe_float(
+                            dxy_sr_selected.get(
+                                "sr_score"
+                            )
+                        )
+                    ),
+                    "selected_distance_atr": (
+                        _safe_float(
+                            dxy_sr_selected.get(
+                                "distance_atr"
+                            )
+                        )
+                    ),
+                },
+            },
+
+            # Keep complete Point-A result too. This is immutable research
+            # evidence and makes future analysis possible without guessing
+            # which fields existed in an older model version.
+            "point_a_snapshot": json.loads(
+                json.dumps(
+                    pa,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            ),
+        }
+
+        os.makedirs(
+            os.path.dirname(POINT_A_JSONL),
+            exist_ok=True,
+        )
+
+        with _point_a_jsonl_lock():
+            with open(
+                POINT_A_JSONL,
+                "a",
+                encoding="utf-8",
+            ) as f:
+                f.write(
+                    json.dumps(
+                        rec,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                    + "\n"
+                )
+                f.flush()
+                os.fsync(f.fileno())
+
+        return True
+
+    except Exception as exc:
+        log.warning(
+            "analytics: Point-A event capture failed "
+            "event=%s symbol=%s side=%s err=%r",
+            event_type,
+            symbol,
+            side,
+            exc,
+        )
+        return False
 
 def capture_rejection(candidate: dict, reason: str, gate: str = None, enrich: bool = False) -> bool:
     """Log a rejected trade candidate. Light by default (cheap context only);
@@ -13276,12 +15672,15 @@ def load_real_dxy_bars(
 ) -> list:
     """
     Load completed real broker DXY bars from one exact device/timeframe.
+
+    Supported native REAL_DXY timeframes:
+    M15, H1, H4
     Never scans another device and never falls back to synthetic DXY.
     """
     dev = str(device_id or "").strip()
     tf_u = str(tf or "H1").upper().strip()
 
-    if not dev or tf_u not in ("M15", "H1"):
+    if not dev or tf_u not in ("M15", "H1", "H4"):
         return []
 
     try:

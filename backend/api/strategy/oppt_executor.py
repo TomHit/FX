@@ -30,6 +30,7 @@ from api.trend_endpoints import (
     _discord_notify_rc_trigger,
     _invalidate_prop_dashboard_snapshot, 
     _schedule_prop_dashboard_warm_refresh,
+    _release_point_a_expired_opportunity,
 )
 
 from api.prop_firms.prop_config import SYMBOL_SPECS
@@ -41,6 +42,20 @@ import redis
 import uuid
 log = logging.getLogger("uvicorn.error")
 
+_REMOVE_OPEN_TRADE_LUA = """
+redis.call('HDEL', KEYS[1], ARGV[1])
+
+local remaining = redis.call('HLEN', KEYS[1])
+
+if remaining == 0 then
+    redis.call('SREM', KEYS[2], ARGV[2])
+end
+
+return remaining
+"""
+
+CLOSED_KEY = "xtl:strategy:oppt:closed:{uid}"
+CLOSED_UIDS_KEY = "xtl:strategy:oppt:closed_uids"
  
 
 DISCORD_TRADE_WEBHOOK_URL = (
@@ -333,6 +348,156 @@ def _mt5_job_queue_state(
 
     return False, True
 
+def _mt5_cancel_queued_job(
+    device_id: str,
+    job_id: str,
+) -> tuple[int, bool]:
+    """
+    Remove the exact MT5 command identified by job_id.
+
+    Returns:
+        removed_count, queue_operation_reliable
+
+    IMPORTANT:
+    This is used only after a MARKET ENTRY has exceeded its
+    absolute execution deadline.
+
+    A Redis/read failure is never interpreted as successful
+    cancellation.
+    """
+    device_u = str(
+        device_id or ""
+    ).strip()
+
+    job_u = str(
+        job_id or ""
+    ).strip()
+
+    if not device_u or not job_u:
+        return 0, False
+
+    queue_key = _mt5_cmdq_key(
+        device_u
+    )
+
+    try:
+        rows = R.lrange(
+            queue_key,
+            0,
+            -1,
+        ) or []
+
+    except Exception:
+        log.exception(
+            "[OPPT] MT5_CMDQ_CANCEL_READ_FAILED "
+            "device=%s job_id=%s key=%s",
+            device_u,
+            job_u,
+            queue_key,
+        )
+        return 0, False
+
+    matching_raw = []
+
+    for raw in rows:
+        cmd = _sj(
+            raw,
+            {},
+        )
+
+        if not isinstance(
+            cmd,
+            dict,
+        ):
+            continue
+
+        if (
+            str(
+                cmd.get("job_id")
+                or ""
+            ).strip()
+            == job_u
+        ):
+            matching_raw.append(
+                raw
+            )
+
+    if not matching_raw:
+        return 0, True
+
+    removed = 0
+
+    try:
+        for raw in matching_raw:
+            removed += int(
+                R.lrem(
+                    queue_key,
+                    0,
+                    raw,
+                )
+                or 0
+            )
+
+    except Exception:
+        log.exception(
+            "[OPPT] MT5_CMDQ_CANCEL_FAILED "
+            "device=%s job_id=%s key=%s",
+            device_u,
+            job_u,
+            queue_key,
+        )
+        return 0, False
+
+    # Verify that this exact job no longer exists.
+    try:
+        verify_rows = R.lrange(
+            queue_key,
+            0,
+            -1,
+        ) or []
+
+        for raw in verify_rows:
+            cmd = _sj(
+                raw,
+                {},
+            )
+
+            if not isinstance(
+                cmd,
+                dict,
+            ):
+                continue
+
+            if (
+                str(
+                    cmd.get("job_id")
+                    or ""
+                ).strip()
+                == job_u
+            ):
+                log.error(
+                    "[OPPT] MT5_CMDQ_CANCEL_VERIFY_FAILED "
+                    "device=%s job_id=%s key=%s",
+                    device_u,
+                    job_u,
+                    queue_key,
+                )
+
+                return removed, False
+
+    except Exception:
+        log.exception(
+            "[OPPT] MT5_CMDQ_CANCEL_VERIFY_READ_FAILED "
+            "device=%s job_id=%s key=%s",
+            device_u,
+            job_u,
+            queue_key,
+        )
+
+        return removed, False
+
+    return removed, True
+
 def _mt5_ack_key(job_id: str) -> str:
     return f"xtl:mt5:ack:{job_id}"
 def _get_mt5_ack(job_id: str) -> dict | None:
@@ -559,6 +724,405 @@ def _find_broker_position_for_pending(
 
     return None, True
 
+
+def _promote_pending_from_broker_position(
+    *,
+    uid: str,
+    pos: dict,
+    broker_pos: dict,
+    account_type: str,
+    device_id: str | None,
+    recovery_source: str,
+    risk_event: str,
+    analytics_source: str,
+) -> bool:
+    """
+    Promote an existing ORDER_PENDING open-ledger row to TRADE_ACTIVE
+    when broker truth proves that the position is already live.
+
+    Used for:
+      - lost/missing ACK recovery
+      - negative ACK received after broker actually filled the order
+
+    Important:
+      - preserve original trade_id
+      - preserve exec_claim/idempotency
+      - persist broker ticket before secondary work
+      - never create a BROKER_REPAIR trade_id for this path
+    """
+    try:
+        trade_id = str(
+            pos.get("trade_id")
+            or pos.get("tid")
+            or ""
+        ).strip()
+
+        job_id = str(
+            pos.get("mt5_job_id")
+            or pos.get("job_id")
+            or ""
+        ).strip()
+
+        symbol = str(
+            pos.get("symbol")
+            or broker_pos.get("symbol")
+            or ""
+        ).upper().strip()
+
+        side = str(
+            pos.get("side")
+            or broker_pos.get("side")
+            or ""
+        ).upper().strip()
+
+        try:
+            broker_ticket = int(
+                broker_pos.get("ticket")
+                or broker_pos.get("position_ticket")
+                or 0
+            )
+        except Exception:
+            broker_ticket = 0
+
+        if broker_ticket <= 0:
+            log.error(
+                "[OPPT] PENDING_BROKER_PROMOTION_BAD_TICKET "
+                "uid=%s tid=%s sym=%s job_id=%s "
+                "source=%s broker_pos=%r",
+                uid,
+                trade_id,
+                symbol,
+                job_id,
+                recovery_source,
+                broker_pos,
+            )
+            return False
+
+        try:
+            broker_entry_price = float(
+                broker_pos.get("price_open")
+                or broker_pos.get("entry_price")
+                or pos.get("entry_price")
+                or 0.0
+            )
+        except Exception:
+            broker_entry_price = float(
+                pos.get("entry_price")
+                or 0.0
+            )
+
+        try:
+            broker_volume = float(
+                broker_pos.get("volume")
+                or broker_pos.get("qty")
+                or pos.get("qty")
+                or 0.0
+            )
+        except Exception:
+            broker_volume = float(
+                pos.get("qty")
+                or 0.0
+            )
+
+        try:
+            broker_open_time_ms = int(
+                broker_pos.get("time_msc")
+                or broker_pos.get("open_time_ms")
+                or 0
+            )
+        except Exception:
+            broker_open_time_ms = 0
+
+        repair_ms = now_ms()
+
+        # -------------------------------------------------
+        # Broker truth is authoritative.
+        # Promote the EXISTING strategy trade, preserving
+        # its original trade_id and execution ownership.
+        # -------------------------------------------------
+        pos["status"] = "filled"
+        pos["trade_state"] = "TRADE_ACTIVE"
+
+        pos["mt5_ticket"] = broker_ticket
+        pos["broker_ticket"] = broker_ticket
+
+        pos["mt5_fill_price"] = broker_entry_price
+
+        if broker_entry_price > 0:
+            pos["entry_price"] = broker_entry_price
+
+        if broker_volume > 0:
+            pos["qty"] = broker_volume
+
+        pos["broker_current_sl"] = broker_pos.get("sl")
+        pos["broker_current_tp"] = broker_pos.get("tp")
+
+        pos["mt5_account"] = str(
+            account_type
+            or pos.get("mt5_account")
+            or ""
+        ).lower().strip()
+
+        if device_id:
+            pos["device_id"] = str(device_id)
+
+        pos["ack_loss_recovered"] = True
+        pos["ack_loss_recovered_at_ms"] = repair_ms
+        pos["ack_loss_recovery_source"] = str(
+            recovery_source
+            or "BROKER_POSITION_RECOVERY"
+        )
+        pos["broker_position_seen_at_ms"] = repair_ms
+
+        if broker_open_time_ms > 0:
+            pos["broker_open_time_ms"] = broker_open_time_ms
+
+        # This represents the time XTL accepted broker truth,
+        # not necessarily the original ACK timestamp.
+        pos["mt5_acked_at_ms"] = repair_ms
+
+        # -------------------------------------------------
+        # CRITICAL:
+        # Persist TRADE_ACTIVE before watch/risk/analytics.
+        # -------------------------------------------------
+        _open_trade(
+            uid,
+            pos,
+        )
+
+        # -------------------------------------------------
+        # Synchronize watch lifecycle using broker truth.
+        # Same side -> TRADE_ACTIVE.
+        # Opposite side -> removed.
+        # -------------------------------------------------
+        try:
+            _sync_watches_for_broker_active_position(
+                uid,
+                broker_pos,
+                recovery_source,
+            )
+        except Exception as watch_exc:
+            log.warning(
+                "[OPPT] PENDING_BROKER_PROMOTION_WATCH_SYNC_FAILED "
+                "uid=%s tid=%s sym=%s ticket=%s "
+                "source=%s err=%r",
+                uid,
+                trade_id,
+                symbol,
+                broker_ticket,
+                recovery_source,
+                watch_exc,
+            )
+
+        # -------------------------------------------------
+        # Preserve immutable entry-zone ownership by ticket.
+        # -------------------------------------------------
+        try:
+            zone_meta = {
+                "trade_id": str(
+                    pos.get("trade_id")
+                    or ""
+                ),
+                "user_id": str(uid or ""),
+                "profile_id": str(
+                    pos.get("profile_id")
+                    or ""
+                ),
+                "device_id": str(
+                    pos.get("device_id")
+                    or ""
+                ),
+                "mt5_account": str(
+                    pos.get("mt5_account")
+                    or ""
+                ).lower().strip(),
+                "symbol": str(
+                    pos.get("symbol")
+                    or ""
+                ).upper().strip(),
+                "side": str(
+                    pos.get("side")
+                    or ""
+                ).upper().strip(),
+                "mt5_ticket": broker_ticket,
+                "entry_zone": pos.get("entry_zone"),
+                "entry_zone_low": pos.get(
+                    "entry_zone_low"
+                ),
+                "entry_zone_high": pos.get(
+                    "entry_zone_high"
+                ),
+                "entry_zone_level": pos.get(
+                    "entry_zone_level"
+                ),
+                "entry_zone_tf": pos.get(
+                    "entry_zone_tf"
+                ),
+                "entry_zone_kind": pos.get(
+                    "entry_zone_kind"
+                ),
+                "stored_at_ms": repair_ms,
+                "stored_source": str(
+                    recovery_source
+                    or "BROKER_POSITION_RECOVERY"
+                ),
+            }
+
+            if zone_meta.get("trade_id"):
+                R.set(
+                    f"xtl:trade:zone_by_ticket:{broker_ticket}",
+                    json.dumps(
+                        zone_meta,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                    ex=7 * 24 * 3600,
+                )
+
+        except Exception as zone_exc:
+            log.warning(
+                "[OPPT] PENDING_BROKER_PROMOTION_ZONE_MAP_FAILED "
+                "uid=%s tid=%s ticket=%s source=%s err=%r",
+                uid,
+                trade_id,
+                broker_ticket,
+                recovery_source,
+                zone_exc,
+            )
+
+        # -------------------------------------------------
+        # The original strategy trade genuinely executed.
+        # Mark its ORIGINAL trade_id executed.
+        # -------------------------------------------------
+        try:
+            if trade_id:
+                executed_key = EXECUTED_KEY.format(
+                    uid=uid
+                )
+
+                R.sadd(
+                    executed_key,
+                    trade_id,
+                )
+
+                R.expire(
+                    executed_key,
+                    7 * 24 * 3600,
+                )
+
+        except Exception as executed_exc:
+            log.warning(
+                "[OPPT] PENDING_BROKER_PROMOTION_EXECUTED_MARK_FAILED "
+                "uid=%s tid=%s ticket=%s source=%s err=%r",
+                uid,
+                trade_id,
+                broker_ticket,
+                recovery_source,
+                executed_exc,
+            )
+
+        # -------------------------------------------------
+        # Publish authoritative risk/dashboard state.
+        # -------------------------------------------------
+        try:
+            recovery_profile_id = str(
+                pos.get("profile_id")
+                or ""
+            ).strip().lower()
+
+            _refresh_prop_risk_snapshot_after_event(
+                uid,
+                recovery_profile_id,
+                risk_event,
+            )
+
+            _invalidate_prop_dashboard_snapshot(
+                uid,
+                recovery_profile_id,
+                risk_event,
+            )
+
+            _schedule_prop_dashboard_warm_refresh(
+                uid,
+                recovery_profile_id,
+                risk_event,
+            )
+
+        except Exception as risk_exc:
+            log.warning(
+                "[OPPT] PENDING_BROKER_PROMOTION_RISK_REFRESH_FAILED "
+                "uid=%s tid=%s profile=%s source=%s err=%r",
+                uid,
+                trade_id,
+                pos.get("profile_id"),
+                recovery_source,
+                risk_exc,
+            )
+
+        # -------------------------------------------------
+        # Entry analytics corresponding to this real fill.
+        # -------------------------------------------------
+        try:
+            from api.xtl_analytics import capture_entry
+
+            capture_entry(
+                pos,
+                capture_source=analytics_source,
+            )
+
+        except Exception as analytics_exc:
+            log.warning(
+                "[OPPT] PENDING_BROKER_PROMOTION_ANALYTICS_FAILED "
+                "uid=%s tid=%s ticket=%s "
+                "source=%s analytics_source=%s err=%r",
+                uid,
+                trade_id,
+                broker_ticket,
+                recovery_source,
+                analytics_source,
+                analytics_exc,
+            )
+
+        log.warning(
+            "[OPPT] PENDING_BROKER_POSITION_PROMOTED "
+            "uid=%s tid=%s sym=%s side=%s "
+            "job_id=%s ticket=%s entry=%s volume=%s "
+            "broker_open_time_ms=%s source=%s",
+            uid,
+            trade_id,
+            symbol,
+            side,
+            job_id,
+            broker_ticket,
+            pos.get("entry_price"),
+            pos.get("qty"),
+            broker_open_time_ms,
+            recovery_source,
+        )
+
+        return True
+
+    except Exception as exc:
+        log.exception(
+            "[OPPT] PENDING_BROKER_PROMOTION_FAILED "
+            "uid=%s tid=%s sym=%s source=%s err=%r",
+            uid,
+            (
+                pos.get("trade_id")
+                if isinstance(pos, dict)
+                else None
+            ),
+            (
+                pos.get("symbol")
+                if isinstance(pos, dict)
+                else None
+            ),
+            recovery_source,
+            exc,
+        )
+
+        return False
+
 def _reconcile_stale_order_pending(
     uid: str,
     open_trades: list,
@@ -663,25 +1227,44 @@ def _reconcile_stale_order_pending(
             )
             continue
 
+        # -------------------------------------------------
+        # P0 MARKET ENTRY HARD DEADLINE
+        #
+        # MARKET_ACK_TIMEOUT_MS is an ABSOLUTE lifetime from
+        # the original ORDER_PENDING creation time.
+        #
+        # Never extend it because the command is still queued.
+        #
+        # Existing rows may contain an ack_deadline_ms that was
+        # previously extended by the old watchdog. Ignore that
+        # mutable value whenever opened_ms is available.
+        # -------------------------------------------------
         deadline_ms = int(
-            pos.get("ack_deadline_ms")
-            or (
-                opened_ms + MARKET_ACK_TIMEOUT_MS
-                if opened_ms > 0
-                else 0
+            opened_ms + MARKET_ACK_TIMEOUT_MS
+            if opened_ms > 0
+            else (
+                pos.get("ack_deadline_ms")
+                or 0
             )
         )
 
-        if deadline_ms <= 0 or now < deadline_ms:
+        if (
+            deadline_ms <= 0
+            or now < deadline_ms
+        ):
             continue
 
+        
         # -------------------------------------------------
-        # A command still present in the exact device queue has
-        # not failed. The Agent may be offline, delayed or still
-        # processing earlier commands.
+        # MARKET ENTRY queue reconciliation after the hard
+        # execution deadline.
         #
-        # Never remove the UUID open ledger, release risk or mark
-        # MARKET_ACK_TIMEOUT while the command remains queued.
+        # The original MARKET entry lifetime has expired.
+        # Queue state is checked so the exact stale command
+        # can be removed before resolving broker truth.
+        #
+        # A command still present in the queue must NOT
+        # extend the MARKET entry deadline.
         # -------------------------------------------------
         queue_device_id = str(
             pos.get("device_id") or ""
@@ -710,26 +1293,68 @@ def _reconcile_stale_order_pending(
             continue
 
         if job_still_queued:
+            # -------------------------------------------------
+            # P0 MARKET ENTRY ABSOLUTE EXPIRY
+            #
+            # The command has exceeded its original five-minute
+            # execution lifetime but is still waiting in Redis.
+            #
+            # This is NOT permission to extend the entry.
+            #
+            # Remove the exact queued command first so an offline
+            # Agent cannot later wake up and execute a stale trade.
+            # -------------------------------------------------
+            (
+                cancelled_count,
+                cancel_reliable,
+            ) = _mt5_cancel_queued_job(
+                queue_device_id,
+                job_id,
+            )
+
+            if not cancel_reliable:
+                log.error(
+                    "[OPPT] MARKET_ORDER_EXPIRY_CANCEL_DEFER "
+                    "uid=%s tid=%s sym=%s side=%s "
+                    "job_id=%s device_id=%s age_ms=%s",
+                    uid,
+                    trade_id,
+                    pos.get("symbol"),
+                    pos.get("side"),
+                    job_id,
+                    queue_device_id,
+                    age_ms,
+                )
+
+                # Fail closed:
+                # do not close the ledger while queue cancellation
+                # cannot be proven.
+                continue
+
             pos["queue_wait_detected"] = True
             pos["queue_wait_detected_at_ms"] = now
-            pos["queue_wait_age_ms"] = int(age_ms)
-
-            # Extend the watchdog deadline while the command is
-            # demonstrably still waiting in the device queue.
-            pos["ack_deadline_ms"] = int(
-                now + MARKET_ACK_TIMEOUT_MS
+            pos["queue_wait_age_ms"] = int(
+                age_ms
             )
 
-            _open_trade(
-                uid,
-                pos,
+            pos["cancel_requested_at_ms"] = int(
+                now
             )
 
-            log.warning(
-                "[OPPT] MARKET_ORDER_PENDING_STILL_QUEUED "
+            pos["market_entry_expired"] = True
+            pos["market_entry_expired_at_ms"] = int(
+                now
+            )
+
+            pos["market_entry_expiry_reason"] = (
+                "ABSOLUTE_5M_MARKET_TIMEOUT"
+            )
+
+            log.error(
+                "[OPPT] MARKET_ORDER_EXPIRED_QUEUE_CANCELLED "
                 "uid=%s tid=%s sym=%s side=%s "
                 "job_id=%s device_id=%s age_ms=%s "
-                "next_deadline_ms=%s",
+                "cancelled_count=%s deadline_ms=%s",
                 uid,
                 trade_id,
                 pos.get("symbol"),
@@ -737,9 +1362,19 @@ def _reconcile_stale_order_pending(
                 job_id,
                 queue_device_id,
                 age_ms,
-                pos.get("ack_deadline_ms"),
+                cancelled_count,
+                deadline_ms,
             )
-            continue
+
+            # IMPORTANT:
+            # Do NOT continue here.
+            #
+            # Fall through into the existing broker-truth check below.
+            # If a broker position already exists despite a lost ACK,
+            # the existing recovery code promotes it to TRADE_ACTIVE.
+            #
+            # If no position exists, the existing timeout path closes
+            # the orphan as MARKET_ACK_TIMEOUT.
 
         # Critical safety check:
         # the ACK may have been lost after the broker opened a position.
@@ -799,294 +1434,26 @@ def _reconcile_stale_order_pending(
             continue
 
         if broker_pos:
-            # -------------------------------------------------
-            # P0 ACK-LOSS RECOVERY
-            #
-            # Broker position is authoritative. The MARKET order
-            # was filled, but the normal MT5 ACK was lost or was
-            # never persisted. Promote the existing ORDER_PENDING
-            # ledger row to TRADE_ACTIVE using broker truth.
-            # -------------------------------------------------
-            try:
-                broker_ticket = int(
-                    broker_pos.get("ticket")
-                    or broker_pos.get("position_ticket")
-                    or 0
-                )
-            except Exception:
-                broker_ticket = 0
+            repaired = _promote_pending_from_broker_position(
+                uid=uid,
+                pos=pos,
+                broker_pos=broker_pos,
+                account_type=pending_account_type,
+                device_id=pending_device_id,
+                recovery_source="MARKET_ACK_TIMEOUT_RECOVERY",
+                risk_event="MT5_ACK_RECOVERED",
+                analytics_source="ack_loss_recovery",
+            )
 
-            if broker_ticket <= 0:
+            if not repaired:
                 log.error(
-                    "[OPPT] MARKET_ACK_TIMEOUT_BROKER_LIVE_BAD_TICKET "
-                    "uid=%s tid=%s sym=%s job_id=%s broker_pos=%r",
+                    "[OPPT] MARKET_ACK_TIMEOUT_BROKER_PROMOTION_FAILED "
+                    "uid=%s tid=%s sym=%s job_id=%s",
                     uid,
                     trade_id,
                     pos.get("symbol"),
                     job_id,
-                    broker_pos,
                 )
-                continue
-
-            try:
-                broker_entry_price = float(
-                    broker_pos.get("price_open")
-                    or broker_pos.get("entry_price")
-                    or pos.get("entry_price")
-                    or 0.0
-                )
-            except Exception:
-                broker_entry_price = float(
-                    pos.get("entry_price")
-                    or 0.0
-                )
-
-            try:
-                broker_volume = float(
-                    broker_pos.get("volume")
-                    or broker_pos.get("qty")
-                    or pos.get("qty")
-                    or 0.0
-                )
-            except Exception:
-                broker_volume = float(
-                    pos.get("qty")
-                    or 0.0
-                )
-
-            try:
-                broker_open_time_ms = int(
-                    broker_pos.get("time_msc")
-                    or broker_pos.get("open_time_ms")
-                    or 0
-                )
-            except Exception:
-                broker_open_time_ms = 0
-
-            repair_ms = now_ms()
-
-            pos["status"] = "filled"
-            pos["trade_state"] = "TRADE_ACTIVE"
-
-            pos["mt5_ticket"] = broker_ticket
-            pos["broker_ticket"] = broker_ticket
-
-            pos["mt5_fill_price"] = broker_entry_price
-            if broker_entry_price > 0:
-                pos["entry_price"] = broker_entry_price
-
-            if broker_volume > 0:
-                pos["qty"] = broker_volume
-
-            pos["broker_current_sl"] = broker_pos.get("sl")
-            pos["broker_current_tp"] = broker_pos.get("tp")
-
-            pos["mt5_account"] = pending_account_type
-            if pending_device_id:
-                pos["device_id"] = pending_device_id
-
-            pos["ack_loss_recovered"] = True
-            pos["ack_loss_recovered_at_ms"] = repair_ms
-            pos["ack_loss_recovery_source"] = (
-                "MARKET_ACK_TIMEOUT_BROKER_LIVE"
-            )
-            pos["broker_position_seen_at_ms"] = repair_ms
-
-            if broker_open_time_ms > 0:
-                pos["broker_open_time_ms"] = broker_open_time_ms
-
-            # The original strategy timestamp remains available,
-            # while broker_open_time_ms records actual broker truth.
-            pos["mt5_acked_at_ms"] = repair_ms
-
-            # Persist the repaired ledger before any secondary work.
-            _open_trade(
-                uid,
-                pos,
-            )
-
-            # Synchronize same-side watch and clear opposite-side watch.
-            try:
-                _sync_watches_for_broker_active_position(
-                    uid,
-                    broker_pos,
-                    "MARKET_ACK_TIMEOUT_RECOVERY",
-                )
-            except Exception as watch_exc:
-                log.warning(
-                    "[OPPT] MARKET_ACK_RECOVERY_WATCH_SYNC_FAILED "
-                    "uid=%s tid=%s sym=%s ticket=%s err=%r",
-                    uid,
-                    trade_id,
-                    pos.get("symbol"),
-                    broker_ticket,
-                    watch_exc,
-                )
-
-            # Preserve the immutable entry zone by broker ticket so
-            # restart/broker-repair close handling can recover it.
-            try:
-                zone_meta = {
-                    "trade_id": str(
-                        pos.get("trade_id")
-                        or ""
-                    ),
-                    "user_id": str(uid or ""),
-                    "profile_id": str(
-                        pos.get("profile_id")
-                        or ""
-                    ),
-                    "device_id": str(
-                        pos.get("device_id")
-                        or ""
-                    ),
-                    "mt5_account": str(
-                        pos.get("mt5_account")
-                        or ""
-                    ).lower().strip(),
-                    "symbol": str(
-                        pos.get("symbol")
-                        or ""
-                    ).upper().strip(),
-                    "side": str(
-                        pos.get("side")
-                        or ""
-                    ).upper().strip(),
-                    "mt5_ticket": broker_ticket,
-                    "entry_zone": pos.get("entry_zone"),
-                    "entry_zone_low": pos.get(
-                        "entry_zone_low"
-                    ),
-                    "entry_zone_high": pos.get(
-                        "entry_zone_high"
-                    ),
-                    "entry_zone_level": pos.get(
-                        "entry_zone_level"
-                    ),
-                    "entry_zone_tf": pos.get(
-                        "entry_zone_tf"
-                    ),
-                    "entry_zone_kind": pos.get(
-                        "entry_zone_kind"
-                    ),
-                    "stored_at_ms": repair_ms,
-                    "stored_source": (
-                        "MARKET_ACK_TIMEOUT_RECOVERY"
-                    ),
-                }
-
-                if zone_meta.get("trade_id"):
-                    R.set(
-                        f"xtl:trade:zone_by_ticket:"
-                        f"{broker_ticket}",
-                        json.dumps(
-                            zone_meta,
-                            separators=(",", ":"),
-                            default=str,
-                        ),
-                        ex=7 * 24 * 3600,
-                    )
-            except Exception as zone_exc:
-                log.warning(
-                    "[OPPT] MARKET_ACK_RECOVERY_ZONE_MAP_FAILED "
-                    "uid=%s tid=%s ticket=%s err=%r",
-                    uid,
-                    trade_id,
-                    broker_ticket,
-                    zone_exc,
-                )
-
-            # The position is a real executed trade, so preserve
-            # normal executor idempotency.
-            try:
-                if trade_id:
-                    executed_key = EXECUTED_KEY.format(
-                        uid=uid
-                    )
-                    R.sadd(
-                        executed_key,
-                        trade_id,
-                    )
-                    R.expire(
-                        executed_key,
-                        7 * 24 * 3600,
-                    )
-            except Exception as executed_exc:
-                log.warning(
-                    "[OPPT] MARKET_ACK_RECOVERY_EXECUTED_MARK_FAILED "
-                    "uid=%s tid=%s ticket=%s err=%r",
-                    uid,
-                    trade_id,
-                    broker_ticket,
-                    executed_exc,
-                )
-
-            # Publish the authoritative risk/dashboard state.
-            try:
-                recovery_profile_id = str(
-                    pos.get("profile_id")
-                    or ""
-                ).strip().lower()
-
-                _refresh_prop_risk_snapshot_after_event(
-                    uid,
-                    recovery_profile_id,
-                    "MT5_ACK_RECOVERED",
-                )
-                _invalidate_prop_dashboard_snapshot(
-                    uid,
-                    recovery_profile_id,
-                    "MT5_ACK_RECOVERED",
-                )
-                _schedule_prop_dashboard_warm_refresh(
-                    uid,
-                    recovery_profile_id,
-                    "MT5_ACK_RECOVERED",
-                )
-            except Exception as risk_exc:
-                log.warning(
-                    "[OPPT] MARKET_ACK_RECOVERY_RISK_REFRESH_FAILED "
-                    "uid=%s tid=%s profile=%s err=%r",
-                    uid,
-                    trade_id,
-                    pos.get("profile_id"),
-                    risk_exc,
-                )
-
-            # Capture the entry snapshot that normal ACK handling
-            # would otherwise have created.
-            try:
-                from api.xtl_analytics import capture_entry
-
-                capture_entry(
-                    pos,
-                    capture_source="ack_loss_recovery",
-                )
-            except Exception as analytics_exc:
-                log.warning(
-                    "[OPPT] MARKET_ACK_RECOVERY_ANALYTICS_FAILED "
-                    "uid=%s tid=%s ticket=%s err=%r",
-                    uid,
-                    trade_id,
-                    broker_ticket,
-                    analytics_exc,
-                )
-
-            log.warning(
-                "[OPPT] MARKET_ACK_TIMEOUT_BROKER_LIVE_REPAIRED "
-                "uid=%s tid=%s sym=%s side=%s "
-                "job_id=%s ticket=%s entry=%s volume=%s "
-                "broker_open_time_ms=%s",
-                uid,
-                trade_id,
-                pos.get("symbol"),
-                pos.get("side"),
-                job_id,
-                broker_ticket,
-                pos.get("entry_price"),
-                pos.get("qty"),
-                broker_open_time_ms,
-            )
 
             continue
 
@@ -1188,6 +1555,8 @@ ALERT_HASH_PREFIX = "xtl:trend:opp:h1:"  # + alert_id
 
 # Paper trading store
 OPEN_KEY = "xtl:strategy:oppt:open:{uid}"          # HASH: trade_id -> json
+
+OPEN_UIDS_KEY = "xtl:strategy:oppt:open_uids"
 CLOSED_KEY = "xtl:strategy:oppt:closed:{uid}"      # LIST: json closed trades
 EXECUTED_KEY = "xtl:strategy:oppt:executed:{uid}"  # SET: executed trade_id keys
 LOCK_KEY = "xtl:strategy:oppt:lock:{uid}"          # lock per user
@@ -1430,7 +1799,7 @@ def _tick_prop_watchdog(
                )
 
                _discord_trade_post(
-                   f"🚫 **{firm_label} Open Risk Limit Exceeded**\n"
+                   f"?? **{firm_label} Open Risk Limit Exceeded**\n"
                    f"Profile: `{pid}`\n"
                    f"Open Risk: `${open_risk:.2f}` / `${max_open_risk_usd:.2f}` "
                    f"({open_risk_pct:.2f}%)\n"
@@ -1441,7 +1810,7 @@ def _tick_prop_watchdog(
         if used_pct >= 70.0:
             if R.set(alert70_key, "1", nx=True, ex=36 * 3600):
                 _discord_trade_post(
-                    f"⚠ **{firm_label} Daily Loss Warning**\n"
+                    f"? **{firm_label} Daily Loss Warning**\n"
                     f"Profile: `{pid}`\n"
                     f"Used: `${used:.2f}` / `${limit:.2f}` "
                     f"(`{used_pct:.1f}%`)\n"
@@ -1490,7 +1859,7 @@ def _tick_prop_watchdog(
 
             if R.set(alert80_key, "1", nx=True, ex=36 * 3600):
                 _discord_trade_post(
-                    f"🚨 **{firm_label} Emergency Protection Activated**\n"
+                    f"?? **{firm_label} Emergency Protection Activated**\n"
                     f"Profile: `{pid}`\n"
                     f"Used: `${used:.2f}` / `${limit:.2f}` "
                     f"(`{used_pct:.1f}%`)\n"
@@ -2300,6 +2669,1282 @@ from api.tenant_keys import (
    
 )
 
+
+# -----------------------------------------------------------------------------
+# Point-A final pre-entry gate
+# -----------------------------------------------------------------------------
+POINT_A_WAIT_STATE = "ENTRY_BLOCKED_POINT_A_WAIT"
+POINT_A_BLOCK_STATE = "ENTRY_BLOCKED_POINT_A_BLOCK"
+POINT_A_EXPIRED_STATE = "ENTRY_BLOCKED_POINT_A_EXPIRED"
+
+# -------------------------------------------------------------
+# POINT-A PRICE_TOO_FAR threshold.
+#
+# PRICE_TOO_FAR is measured in R, not ATR and not % of price.
+#
+# 1R = distance from the ORIGINAL planned entry/RC trigger
+#      to the structural SL for this setup.
+#
+# If favorable movement from the RC trigger has already consumed
+# 0.40R before XTL enters, the opportunity is considered too late
+# and Point-A expires this RC-cross generation.
+#
+# This intentionally leaves some room before live-position BE:
+#   PRICE_TOO_FAR = 0.40R
+#   XAUUSD BE      = 0.50R
+#   FX BE          = 0.75R
+#
+# Hardcoded for initial production validation. We can tune this
+# later from analytics without changing the meaning of the rule.
+# -------------------------------------------------------------
+POINT_A_MAX_MISSED_R = 0.40
+
+
+def _strategy_sl_buffer(sym: str) -> float:
+    """
+    Single source of truth for XTL structural SL buffer.
+
+    This MUST match the buffer used when the actual ENTRY_CAND
+    SL/TP is constructed, otherwise Point-A's R calculation would
+    differ from the R used by the eventual trade.
+    """
+    sym_u = str(sym or "").upper().strip()
+
+    if sym_u == "XAUUSD":
+        return 0.50
+
+    if sym_u.endswith("JPY"):
+        return 0.03
+
+    return 0.00030
+
+
+def _point_a_planned_risk(
+    *,
+    watch: dict,
+    sym: str,
+    side: str,
+    trigger_level: float,
+) -> tuple[float, float]:
+    """
+    Return:
+        planned_structural_sl,
+        original_risk_distance
+
+    Point-A runs before the final entry event exists, so sl_price
+    has not yet been created.
+
+    Therefore reconstruct the SAME structural SL that the entry
+    path will use:
+
+      BUY  -> zone_low  - symbol SL buffer
+      SELL -> zone_high + symbol SL buffer
+
+    The RC trigger is the original planned entry reference for the
+    pre-entry PRICE_TOO_FAR calculation.
+
+    If structural risk cannot be determined, return (0.0, 0.0).
+    The normal entry path will still fail closed later if no valid
+    structural SL can be constructed.
+    """
+    zone = (
+        watch.get("zone_used")
+        if isinstance(watch.get("zone_used"), dict)
+        else {}
+    )
+
+    z_low = _sf(zone.get("low"), 0.0)
+    z_high = _sf(zone.get("high"), 0.0)
+
+    trigger = _sf(trigger_level, 0.0)
+    sl_buf = _strategy_sl_buffer(sym)
+    side_u = str(side or "").upper().strip()
+
+    if trigger <= 0:
+        return 0.0, 0.0
+
+    if side_u == "BUY" and z_low > 0:
+        planned_sl = float(z_low - sl_buf)
+        risk_distance = float(trigger - planned_sl)
+
+    elif side_u == "SELL" and z_high > 0:
+        planned_sl = float(z_high + sl_buf)
+        risk_distance = float(planned_sl - trigger)
+
+    else:
+        return 0.0, 0.0
+
+    if planned_sl <= 0 or risk_distance <= 0:
+        return 0.0, 0.0
+
+    return float(planned_sl), float(risk_distance)
+
+
+def _point_a_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _point_a_clear_fields(watch: dict) -> None:
+    """Clear only Point-A transient state; preserve zone/RC lifecycle."""
+    if not isinstance(watch, dict):
+        return
+    for key in (
+        "point_a",
+        "point_a_decision",
+        "point_a_action",
+        "point_a_reason",
+        "point_a_reason_codes",
+        "point_a_wait_started_ms",
+        "point_a_last_eval_ms",
+        "point_a_rc_rev_ok_ms",
+        "point_a_trigger_level",
+        "point_a_cross_latched",
+        "point_a_cross_ms",
+        "point_a_cross_price",
+        "point_a_trigger_atr",
+        "point_a_displacement_atr",
+        "point_a_max_displacement_atr",
+        "point_a_wait_start_m15_bucket",
+        "point_a_wait_m15_bars",
+        "point_a_max_wait_m15_bars",
+        "point_a_fallback_max_wait_ms",
+        "point_a_terminal",
+        "point_a_terminal_reason",
+        "point_a_planned_structural_sl",
+        "point_a_original_risk_distance",
+        "point_a_missed_move_r",
+        "point_a_max_missed_r",
+    ):
+        watch.pop(key, None)
+
+
+def _point_a_release_terminal_watch(
+    *,
+    uid: str,
+    sym: str,
+    side: str,
+    wkey: str,
+    rev_ok_ms: int,
+    trigger_level: float,
+    live_price: float,
+    reason: str,
+    terminal_type: str,
+    profile_id: str | None = None,
+    device_id: str | None = None,
+) -> bool:
+    """
+    P0 Point-A terminal non-trade release contract.
+
+    BLOCK / EXPIRED terminate ownership of the current crossed setup.
+
+    A terminal Point-A outcome must:
+      1. retire the old opportunity/cache presentation
+      2. remove the exact break state
+      3. remove the exact latest tenant entry claim
+      4. remove the exact H1 directional watch
+
+    After successful cleanup, normal zone discovery is free to evaluate
+    the market from the CURRENT price and may select a completely new
+    direction / zone / RC.
+
+    Structural SR is never deleted here.
+
+    Fail closed:
+    if any required cleanup step fails, return False so the caller keeps
+    a temporary terminal tombstone and retries next executor cycle.
+    """
+    terminal_u = str(
+        terminal_type or "TERMINAL"
+    ).upper().strip()
+
+    try:
+        # ---------------------------------------------------------
+        # Retire old opportunity / cache ownership first.
+        #
+        # Despite the historical helper name, this is the existing
+        # authoritative opportunity-release path used by Point-A
+        # terminal expiry. Reason carries the actual terminal cause.
+        # ---------------------------------------------------------
+        opportunity_released = (
+            _release_point_a_expired_opportunity(
+                uid=uid,
+                symbol=sym,
+                side=side,
+                profile_id=profile_id,
+                device_id=device_id,
+                reason=reason,
+            )
+        )
+
+        if not opportunity_released:
+            raise RuntimeError(
+                "POINT_A_OPPORTUNITY_RELEASE_FAILED"
+            )
+
+        # ---------------------------------------------------------
+        # Remove exact RC-cross ownership.
+        # ---------------------------------------------------------
+        R.delete(
+            break_state_key(
+                uid,
+                sym,
+                side,
+                "H1",
+            )
+        )
+
+        tenant_delete_latest_entry_claim(
+            R,
+            uid,
+            sym,
+            side,
+            tf="H1",
+        )
+
+        # ---------------------------------------------------------
+        # Remove the old directional watch.
+        #
+        # This is the critical hand-off back to fresh discovery.
+        # ---------------------------------------------------------
+        zone_watch_delete(
+            R,
+            uid,
+            sym,
+            side,
+            tf="H1",
+        )
+
+    except Exception as exc:
+        log.exception(
+            "[POINT_A] TERMINAL_RELEASE_FAILED "
+            "type=%s sym=%s side=%s rc=%s "
+            "trigger=%s live=%s reason=%s key=%s err=%r",
+            terminal_u,
+            sym,
+            side,
+            rev_ok_ms,
+            trigger_level,
+            live_price,
+            reason,
+            wkey,
+            exc,
+        )
+
+        return False
+
+    log.warning(
+        "[POINT_A] TERMINAL_RELEASED_RESET "
+        "type=%s sym=%s side=%s rc=%s "
+        "trigger=%s live=%s reason=%s "
+        "mode=FRESH_DISCOVERY",
+        terminal_u,
+        sym,
+        side,
+        rev_ok_ms,
+        trigger_level,
+        live_price,
+        reason,
+    )
+
+    return True
+
+
+def _point_a_release_blocked_watch(
+    *,
+    uid: str,
+    sym: str,
+    side: str,
+    wkey: str,
+    rev_ok_ms: int,
+    trigger_level: float,
+    live_price: float,
+    reason: str,
+    profile_id: str | None = None,
+    device_id: str | None = None,
+) -> bool:
+    """
+    Compatibility wrapper.
+
+    Point-A BLOCK is terminal for the current crossed setup.
+    Successful release returns ownership to fresh discovery.
+    """
+    return _point_a_release_terminal_watch(
+        uid=uid,
+        sym=sym,
+        side=side,
+        wkey=wkey,
+        rev_ok_ms=rev_ok_ms,
+        trigger_level=trigger_level,
+        live_price=live_price,
+        reason=reason,
+        terminal_type="BLOCK",
+        profile_id=profile_id,
+        device_id=device_id,
+    )
+
+
+def _point_a_release_expired_watch(
+    *,
+    uid: str,
+    sym: str,
+    side: str,
+    wkey: str,
+    rev_ok_ms: int,
+    trigger_level: float,
+    live_price: float,
+    reason: str,
+    profile_id: str | None = None,
+    device_id: str | None = None,
+) -> bool:
+    """
+    Compatibility wrapper.
+
+    Point-A EXPIRED is terminal for the current crossed setup.
+    This covers PRICE_TOO_FAR, WAIT_M15_LIMIT and safety timeout.
+    """
+    return _point_a_release_terminal_watch(
+        uid=uid,
+        sym=sym,
+        side=side,
+        wkey=wkey,
+        rev_ok_ms=rev_ok_ms,
+        trigger_level=trigger_level,
+        live_price=live_price,
+        reason=reason,
+        terminal_type="EXPIRED",
+        profile_id=profile_id,
+        device_id=device_id,
+    )
+
+
+
+def _point_a_atr_from_watch_or_snap(
+    watch: dict,
+    *,
+    sym: str,
+    device_id: str | None,
+) -> float:
+    """Return H1 ATR in price units without depending on UI refresh."""
+    candidates = [watch.get("atr")]
+    try:
+        sa = watch.get("setup_analysis") or {}
+        zq = sa.get("zone_quality") if isinstance(sa, dict) else {}
+        if isinstance(zq, dict):
+            candidates.append(zq.get("atr"))
+    except Exception:
+        pass
+    try:
+        ev = watch.get("entry_validation") or {}
+        zs = ev.get("zone_snapshot") if isinstance(ev, dict) else {}
+        if isinstance(zs, dict):
+            candidates.append(zs.get("atr"))
+    except Exception:
+        pass
+    for value in candidates:
+        try:
+            v = float(value or 0.0)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+
+    dev = str(device_id or "").strip()
+    if not dev:
+        try:
+            raw_dev = R.get(f"xtl:ohlc:latest:{str(sym).upper()}:H1")
+            if isinstance(raw_dev, (bytes, bytearray)):
+                raw_dev = raw_dev.decode("utf-8", "ignore")
+            dev = str(raw_dev or "").strip()
+        except Exception:
+            dev = ""
+    if not dev:
+        return 0.0
+
+    try:
+        snap = _sj(R.get(f"xtl:ohlc:snap:{dev}:{str(sym).upper()}:H1"), {}) or {}
+        bars = snap.get("bars") or []
+        rows = [b for b in bars if isinstance(b, dict) and b.get("complete") is not False]
+        if len(rows) < 15:
+            return 0.0
+        trs = []
+        prev_close = None
+        for b in rows[-30:]:
+            try:
+                h = float(b.get("h")); l = float(b.get("l")); c = float(b.get("c"))
+            except Exception:
+                continue
+            tr = h - l if prev_close is None else max(h-l, abs(h-prev_close), abs(l-prev_close))
+            if tr > 0:
+                trs.append(tr)
+            prev_close = c
+        if len(trs) >= 14:
+            return float(sum(trs[-14:]) / 14.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _point_a_symbol_room(
+    *,
+    sym: str,
+    side: str,
+    live_price: float,
+    atr: float,
+) -> dict:
+    """Current opposing H1/H4 SR room using canonical last-good SR bundle."""
+    out = {
+        "available": False,
+        "class": "UNKNOWN",
+        "room_atr": None,
+        "opposing_level": None,
+        "opposing_role": "RESISTANCE" if str(side).upper() == "BUY" else "SUPPORT",
+        "source": None,
+        "unavailable_reason": None,
+    }
+    if live_price <= 0:
+        out["unavailable_reason"] = "LIVE_PRICE_INVALID"
+        return out
+
+    if atr <= 0:
+        out["unavailable_reason"] = "ATR_INVALID"
+        return out
+    try:
+        try:
+            raw = R.get(
+                f"xtl:sr:bundle:last_good:{str(sym).upper()}"
+            )
+        except Exception as exc:
+            out["unavailable_reason"] = "SR_REDIS_READ_ERROR"
+            out["error"] = f"{type(exc).__name__}:{exc}"
+            return out
+
+        if not raw:
+            out["unavailable_reason"] = "SR_LAST_GOOD_MISSING"
+            return out
+
+        try:
+            sr = _sj(raw, {})
+        except Exception as exc:
+            out["unavailable_reason"] = "SR_LAST_GOOD_DECODE_EXCEPTION"
+            out["error"] = f"{type(exc).__name__}:{exc}"
+            return out
+
+        if not isinstance(sr, dict) or not sr:
+            out["unavailable_reason"] = "SR_LAST_GOOD_DECODE_FAILED"
+            return out
+        # -------------------------------------------------------------
+        # Point-A opposing SR selector
+        #
+        # Rule:
+        #   BUY  -> only resistance strictly ABOVE live price
+        #   SELL -> only support strictly BELOW live price
+        #
+        # From all valid H1/H4 opposing SR ahead of price:
+        #   1. sort by distance from live price
+        #   2. take the immediate NEXT 3 unique levels
+        #   3. choose the STRONGEST of those 3
+        #
+        # Ranking of the next 3:
+        #   strength first
+        #   sr_score second
+        #   touches third
+        #   H4 over H1 only as tie-breaker
+        #   nearer level as final tie-breaker
+        #
+        # IMPORTANT:
+        # Do not use _nearest_levels_from_sr() here. That helper is
+        # intentionally sweep-tolerant and may return an already-crossed
+        # level slightly behind live price. Point-A room must measure a
+        # genuine structural obstacle still AHEAD of the trade.
+        # -------------------------------------------------------------
+
+        side_u = str(side or "").upper().strip()
+        live_f = float(live_price)
+        atr_f = float(atr)
+
+        h1 = sr.get("h1") if isinstance(sr.get("h1"), dict) else {}
+        h4 = sr.get("h4") if isinstance(sr.get("h4"), dict) else {}
+
+        role_key = "resistances" if side_u == "BUY" else "supports"
+
+        candidates = []
+
+        def _collect_point_a_sr(rows, tf_name):
+            for z in rows or []:
+                if not isinstance(z, dict):
+                    continue
+
+                # Ignore explicitly invalid/stale SR.
+                if z.get("stale") is True:
+                    continue
+                if z.get("side_ok") is False:
+                    continue
+
+                try:
+                    lvl = float(z.get("level"))
+                except Exception:
+                    continue
+
+                # Strict directional obstacle.
+                if side_u == "BUY":
+                    # Resistance must still be above BUY price.
+                    if lvl <= live_f:
+                        continue
+                    distance = lvl - live_f
+                else:
+                    # Support must still be below SELL price.
+                    if lvl >= live_f:
+                        continue
+                    distance = live_f - lvl
+
+                try:
+                    strength = float(z.get("strength") or 0.0)
+                except Exception:
+                    strength = 0.0
+
+                try:
+                    sr_score = float(z.get("sr_score") or 0.0)
+                except Exception:
+                    sr_score = 0.0
+
+                try:
+                    touches = float(z.get("touches") or 0.0)
+                except Exception:
+                    touches = 0.0
+
+                candidates.append({
+                    "level": float(lvl),
+                    "tf": str(tf_name),
+                    "strength": float(strength),
+                    "sr_score": float(sr_score),
+                    "touches": float(touches),
+                    "source_type": z.get("source_type"),
+                    "distance": float(distance),
+                })
+
+        _collect_point_a_sr(h1.get(role_key) or [], "H1")
+        _collect_point_a_sr(h4.get(role_key) or [], "H4")
+
+        # -------------------------------------------------------------
+        # Sort by distance first because "next 3" means the immediate
+        # three structural obstacles ahead of current price.
+        # -------------------------------------------------------------
+        candidates.sort(key=lambda x: float(x.get("distance") or 0.0))
+
+        # -------------------------------------------------------------
+        # De-duplicate effectively identical price levels.
+        #
+        # The same structural level can exist in both H1 and H4.
+        # It must consume only ONE of the next-three slots.
+        # If duplicated, preserve the structurally stronger version.
+        # -------------------------------------------------------------
+        unique = []
+
+        for c in candidates:
+            duplicate_idx = None
+
+            for i, existing in enumerate(unique):
+                # Floating-point duplicate tolerance only.
+                tol = max(
+                    1e-10,
+                    abs(float(c["level"])) * 1e-10,
+                )
+
+                if abs(
+                    float(existing["level"]) - float(c["level"])
+                ) <= tol:
+                    duplicate_idx = i
+                    break
+
+            if duplicate_idx is None:
+                unique.append(c)
+                continue
+
+            existing = unique[duplicate_idx]
+
+            existing_rank = (
+                float(existing.get("strength") or 0.0),
+                float(existing.get("sr_score") or 0.0),
+                float(existing.get("touches") or 0.0),
+                1 if str(existing.get("tf")) == "H4" else 0,
+            )
+
+            new_rank = (
+                float(c.get("strength") or 0.0),
+                float(c.get("sr_score") or 0.0),
+                float(c.get("touches") or 0.0),
+                1 if str(c.get("tf")) == "H4" else 0,
+            )
+
+            if new_rank > existing_rank:
+                unique[duplicate_idx] = c
+
+        # Re-sort because replacing a duplicate must not disturb
+        # the meaning of "immediate next 3".
+        unique.sort(
+            key=lambda x: float(x.get("distance") or 0.0)
+        )
+
+        next_three = unique[:3]
+
+        selected = None
+
+        if next_three:
+            # Strongest level from the immediate next 3.
+            #
+            # User-defined Point-A rule:
+            # strength is authoritative.
+            # Other metrics only resolve equal-strength cases.
+            selected = max(
+                next_three,
+                key=lambda x: (
+                    float(x.get("strength") or 0.0),
+                    float(x.get("sr_score") or 0.0),
+                    float(x.get("touches") or 0.0),
+                    1 if str(x.get("tf")) == "H4" else 0,
+                    -float(x.get("distance") or 0.0),
+                ),
+            )
+
+        if selected is None:
+            level = None
+            src = None
+            room = None
+        else:
+            level = float(selected["level"])
+
+            # Keep existing "source" field compatible.
+            src = (
+                selected.get("source_type")
+                or selected.get("tf")
+                or "SR"
+            )
+
+            room = (
+                float(selected["distance"]) / atr_f
+                if atr_f > 0
+                else None
+            )
+
+        # No opposing level ahead means no nearby structural obstacle in the bundle.
+        if level is None:
+            out.update({"available": True, "class": "OK", "room_atr": None, "source": "NO_OPPOSING_LEVEL"})
+            return out
+
+        room = max(0.0, float(room or 0.0))
+        block_thr = _point_a_env_float("XTL_POINT_A_SYMBOL_ROOM_BLOCK_ATR", 0.35)
+        ok_thr = _point_a_env_float("XTL_POINT_A_SYMBOL_ROOM_OK_ATR", 0.75)
+        cls = "POOR" if room < block_thr else "OK" if room >= ok_thr else "BORDERLINE"
+        out.update({
+            "available": True,
+            "class": cls,
+            "room_atr": round(room, 4),
+            "opposing_level": float(level),
+            "source": src,
+            # Diagnostic metadata for the SR actually selected
+            # from the immediate next 3 opposing levels.
+            "opposing_tf": (
+                selected.get("tf")
+                if selected
+                else None
+            ),
+            "opposing_strength": (
+                selected.get("strength")
+                if selected
+                else None
+            ),
+            "opposing_touches": (
+                selected.get("touches")
+                if selected
+                else None
+            ),
+            "opposing_sr_score": (
+                selected.get("sr_score")
+                if selected
+                else None
+            ),
+
+            "candidate_count": len(next_three),
+
+            "next_3_opposing_sr": [
+                {
+                    "level": x.get("level"),
+                    "tf": x.get("tf"),
+                    "strength": x.get("strength"),
+                    "touches": x.get("touches"),
+                    "sr_score": x.get("sr_score"),
+                    "distance_atr": round(
+                        float(x.get("distance") or 0.0) / atr_f,
+                        4,
+                    ) if atr_f > 0 else None,
+                }
+                for x in next_three
+            ],
+            "block_threshold_atr": block_thr,
+            "ok_threshold_atr": ok_thr,
+        })
+        return out
+    except Exception as exc:
+        out["unavailable_reason"] = "SR_EVALUATION_EXCEPTION"
+        out["error"] = f"{type(exc).__name__}:{exc}"
+        return out
+
+
+def _point_a_evaluate(
+    *,
+    watch: dict,
+    sym: str,
+    side: str,
+    live_price: float,
+    trigger_level: float,
+    device_id: str | None,
+    profile_id: str | None,
+    now_e: int,
+) -> dict:
+    """Deterministic final Point-A verdict. No claims, no executor side effects."""
+    side_u = str(side or "").upper().strip()
+    rev_ok_ms = int(watch.get("rev_ok_ms") or 0)
+
+    # ATR remains required by Point-A SR/DXY analytics and is still
+    # recorded as diagnostic information. It no longer defines the
+    # terminal PRICE_TOO_FAR threshold.
+    atr = _point_a_atr_from_watch_or_snap(
+        watch,
+        sym=sym,
+        device_id=device_id,
+    )
+
+    # -------------------------------------------------------------
+    # PRICE_TOO_FAR = 0.40R
+    #
+    # R is reconstructed from the original RC trigger and the same
+    # structural zone SL that the eventual trade will use.
+    #
+    # We intentionally measure favorable movement from trigger,
+    # not from the changing live price, so the threshold is frozen
+    # for the life of this RC-cross opportunity.
+    # -------------------------------------------------------------
+    planned_sl, original_risk_distance = _point_a_planned_risk(
+        watch=watch,
+        sym=sym,
+        side=side_u,
+        trigger_level=float(trigger_level),
+    )
+
+    max_missed_r = float(POINT_A_MAX_MISSED_R)
+
+    # -------------------------------------------------
+    # Point-A WAIT horizon
+    #
+    # Primary age unit = completed M15 candle boundaries.
+    #
+    # Default: 24 completed M15 candles.
+    #
+    # Reason:
+    # DXY M15 alignment can take several candles to develop
+    # after the RC trigger. In live observation, ~7 M15 bars
+    # were consumed before DXY began turning into alignment,
+    # leaving too little useful time under the old 8-bar limit.
+    #
+    # Extending WAIT does NOT permit chasing price:
+    # PRICE_TOO_FAR = 0.40R remains the independent terminal
+    # late-entry protection and is checked BEFORE this horizon.
+    #
+    # Wall-clock timeout remains safety-only and is deliberately
+    # longer than the normal 24-M15 decision horizon.
+    # -------------------------------------------------
+    m15_ms = 15 * 60 * 1000
+
+    max_wait_m15_bars = max(
+        1,
+        int(
+            _point_a_env_float(
+                "XTL_POINT_A_MAX_WAIT_M15_BARS",
+                24,
+            )
+        ),
+    )
+
+    fallback_max_wait_ms = int(
+        _point_a_env_float(
+            "XTL_POINT_A_FALLBACK_MAX_WAIT_SEC",
+            375 * 60,  # 6h15m safety fallback for 24-M15 horizon
+        )
+        * 1000.0
+    )
+
+    if side_u == "BUY":
+        favorable_move = max(0.0, float(live_price) - float(trigger_level))
+    else:
+        favorable_move = max(0.0, float(trigger_level) - float(live_price))
+    displacement_atr = (favorable_move / atr) if atr > 0 else None
+
+    # Actual PRICE_TOO_FAR decision metric.
+    #
+    # Example:
+    #   trigger/planned entry = 1.39284
+    #   structural SL         = 1.39484
+    #   1R                    = 0.00200
+    #
+    #   favorable move 0.00018 = 0.09R -> still eligible
+    #   favorable move 0.00080 = 0.40R -> PRICE_TOO_FAR
+    missed_move_r = (
+        float(favorable_move)
+        / float(original_risk_distance)
+        if original_risk_distance > 0
+        else None
+    )
+    
+
+    wait_started_ms = int(
+        watch.get("point_a_wait_started_ms") or 0
+    )
+
+    wait_age_ms = (
+        max(
+            0,
+            int(now_e) - wait_started_ms,
+        )
+        if wait_started_ms > 0
+        else 0
+    )
+
+    # -------------------------------------------------
+    # Count completed M15 boundaries since WAIT began.
+    #
+    # Example:
+    # WAIT starts 10:07
+    # 10:15 = bar 1
+    # 10:30 = bar 2
+    # ...
+    # 12:00 = bar 8
+    #
+    # This is preferable to simply saying "120 min"
+    # because the lifecycle is aligned to DXY M15 updates.
+    # -------------------------------------------------
+    wait_start_m15_bucket = (
+        int(wait_started_ms // m15_ms)
+        if wait_started_ms > 0
+        else 0
+    )
+
+    current_m15_bucket = int(
+        int(now_e) // m15_ms
+    )
+
+    wait_m15_bars = (
+        max(
+            0,
+            current_m15_bucket
+            - wait_start_m15_bucket,
+        )
+        if wait_start_m15_bucket > 0
+        else 0
+    )
+
+    base = {
+        "schema_version": 1,
+        "evaluated_at_ms": int(now_e),
+        "rc_rev_ok_ms": rev_ok_ms,
+        "trigger_level": float(trigger_level),
+        "live_price": float(live_price),
+        "atr": float(atr or 0.0),
+
+        # ATR displacement remains diagnostic only.
+        "displacement_atr": (
+            round(float(displacement_atr), 4)
+            if displacement_atr is not None
+            else None
+        ),
+
+        # Authoritative PRICE_TOO_FAR calculation.
+        "planned_structural_sl": (
+            float(planned_sl)
+            if planned_sl > 0
+            else None
+        ),
+        "original_risk_distance": (
+            float(original_risk_distance)
+            if original_risk_distance > 0
+            else None
+        ),
+        "favorable_move": float(favorable_move),
+        "missed_move_r": (
+            round(float(missed_move_r), 4)
+            if missed_move_r is not None
+            else None
+        ),
+        "max_missed_r": float(max_missed_r),
+        "wait_age_ms": int(wait_age_ms),
+
+        "wait_start_m15_bucket": int(
+            wait_start_m15_bucket
+        ),
+
+        "wait_m15_bars": int(
+            wait_m15_bars
+        ),
+
+        "max_wait_m15_bars": int(
+            max_wait_m15_bars
+        ),
+
+        "fallback_max_wait_ms": int(
+            fallback_max_wait_ms
+        ),
+    }
+
+    # If volatility cannot be measured, fail safe into WAIT, never ALLOW.
+    if atr <= 0:
+        return {**base, "decision": "WAIT", "action": "HOLD", "reason": "ATR_UNAVAILABLE", "reason_codes": ["POINT_A_ATR_UNAVAILABLE"]}
+
+    # -------------------------------------------------------------
+    # PRICE_TOO_FAR
+    #
+    # Do not use ATR as the expiry threshold anymore.
+    #
+    # Once >= 0.40R of the ORIGINAL opportunity has already moved
+    # favorably from the RC trigger, XTL considers the entry late.
+    #
+    # If structural R cannot be calculated here, do NOT invent one.
+    # Continue normal Point-A evaluation; the existing entry builder
+    # will fail closed later if structural SL is actually unavailable.
+    # -------------------------------------------------------------
+    if (
+        missed_move_r is not None
+        and missed_move_r >= max_missed_r
+    ):
+        return {
+            **base,
+            "decision": "WAIT",
+            "action": "EXPIRE",
+            "reason": "PRICE_TOO_FAR",
+            "reason_codes": [
+                "POINT_A_PRICE_TOO_FAR_040R",
+            ],
+        }
+
+    # -------------------------------------------------
+    # Normal WAIT expiry:
+    # 24 completed M15 decision cycles have passed.
+    # -------------------------------------------------
+    if (
+        wait_started_ms > 0
+        and max_wait_m15_bars > 0
+        and wait_m15_bars >= max_wait_m15_bars
+    ):
+        return {
+            **base,
+            "decision": "WAIT",
+            "action": "EXPIRE",
+            "reason": "WAIT_M15_LIMIT",
+            "reason_codes": [
+                "POINT_A_WAIT_M15_LIMIT"
+            ],
+        }
+
+
+    # -------------------------------------------------
+    # Safety fallback only.
+    #
+    # This should normally never be the reason because
+    # the 24-M15 limit above should fire first.
+    # -------------------------------------------------
+    if (
+        wait_started_ms > 0
+        and fallback_max_wait_ms > 0
+        and wait_age_ms >= fallback_max_wait_ms
+    ):
+        return {
+            **base,
+            "decision": "WAIT",
+            "action": "EXPIRE",
+            "reason": "WAIT_SAFETY_TIMEOUT",
+            "reason_codes": [
+                "POINT_A_WAIT_SAFETY_TIMEOUT"
+            ],
+        }
+
+    symbol_room = _point_a_symbol_room(sym=sym, side=side_u, live_price=float(live_price), atr=float(atr))
+    base["symbol_room"] = symbol_room
+    if not symbol_room.get("available"):
+        return {**base, "decision": "WAIT", "action": "HOLD", "reason": "SYMBOL_SR_UNAVAILABLE", "reason_codes": ["POINT_A_SYMBOL_SR_UNAVAILABLE"]}
+
+    # Symbol SR is an assessment, not a terminal verdict.  DXY must also be
+    # evaluated before Point-A decides whether the obstacle is supported,
+    # unresolved, or has a qualified macro breakout driver.
+    try:
+        from api.zone_entry_gate import _dxy_sr_confirmation_analytics
+        dxy = _dxy_sr_confirmation_analytics(
+            R=R,
+            device_id=str(device_id or "").strip() or None,
+            symbol=str(sym).upper(),
+            side=side_u,
+            entry_ms=int(now_e),
+            profile_id=str(profile_id or "").strip() or None,
+        )
+    except Exception as exc:
+        dxy = {"status": "UNAVAILABLE", "reason_codes": ["POINT_A_DXY_READ_FAILED"], "snapshot": {"error": f"{type(exc).__name__}:{exc}"}}
+
+    base["dxy"] = dxy
+    dxy_status = str((dxy or {}).get("status") or "UNAVAILABLE").upper().strip()
+    dxy_codes = list((dxy or {}).get("reason_codes") or [])
+    snap = (dxy or {}).get("snapshot") if isinstance((dxy or {}).get("snapshot"), dict) else {}
+    symbol_room_class = str(symbol_room.get("class") or "UNKNOWN").upper().strip()
+
+    if dxy_status in ("UNAVAILABLE", "NEUTRAL"):
+        m15_deteriorating = bool(
+            snap.get("m15_deteriorating")
+        )
+
+        if m15_deteriorating:
+            return {
+                **base,
+                "decision": "WAIT",
+                "action": "HOLD",
+                "reason": "DXY_M15_DETERIORATING",
+                "reason_codes": [
+                    "POINT_A_DXY_M15_DETERIORATING",
+                    *dxy_codes,
+                ],
+            }
+
+        return {
+            **base,
+            "decision": "WAIT",
+            "action": "HOLD",
+            "reason": "DXY_NOT_CLEAR",
+            "reason_codes": [
+                "POINT_A_DXY_NOT_CLEAR",
+                *dxy_codes,
+            ],
+        }
+
+    if dxy_status == "FAIL":
+        # -------------------------------------------------
+        # Authoritative DXY direction for Point-A.
+        #
+        # H1+M15 analytics exposes the final directional
+        # opinion as combined_dxy_direction.
+        #
+        # Keep "direction" only as a backward-compatible
+        # fallback for older snapshots.
+        # -------------------------------------------------
+        dxy_direction = str(
+            snap.get("combined_dxy_direction")
+            or snap.get("direction")
+            or "NEUTRAL"
+        ).upper().strip()
+
+        required_direction = str(
+            snap.get("required_direction_for_trade") or ""
+        ).upper().strip()
+
+        alignment = str(
+            snap.get("trade_alignment") or "NEUTRAL"
+        ).upper().strip()
+
+        candidate_qualified = bool(
+            snap.get("candidate_qualified")
+        )
+
+        lifecycle_status = str(
+            snap.get("lifecycle_status")
+            or snap.get("status")
+            or ""
+        ).upper().strip()
+
+        structure_conflict = bool(
+            snap.get("structure_conflict")
+        )
+
+        room_class = str(
+            snap.get("room_class") or ""
+        ).upper().strip()
+
+        # -------------------------------------------------
+        # HARD BLOCK:
+        # Only a genuinely OPPOSITE, qualified DXY opinion
+        # may terminally reject the RC opportunity.
+        #
+        # Structure conflict by itself is NOT enough.
+        # An aligned DXY near its own opposing SR is WAIT.
+        # -------------------------------------------------
+        hard_opposite = bool(
+            required_direction
+            and dxy_direction in ("BULLISH", "BEARISH")
+            and dxy_direction != required_direction
+            and alignment != "ALIGNED"
+            and candidate_qualified
+        )
+
+        if hard_opposite:
+            return {
+                **base,
+                "decision": "BLOCK",
+                "action": "REJECT",
+                "reason": "DXY_HARD_OPPOSITE",
+                "reason_codes": [
+                    "POINT_A_DXY_HARD_OPPOSITE",
+                    *dxy_codes,
+                ],
+            }
+
+        # -------------------------------------------------
+        # WAIT:
+        # - aligned but PENDING
+        # - aligned but not qualified
+        # - aligned near directional SR
+        # - aligned with VERY_LOW room
+        # - structure conflict without qualified opposite
+        # - neutral/developing opinion
+        # -------------------------------------------------
+        if (
+            alignment == "ALIGNED"
+            or (
+                required_direction
+                and dxy_direction == required_direction
+            )
+            or lifecycle_status == "PENDING"
+            or not candidate_qualified
+            or structure_conflict
+            or room_class in ("VERY_LOW", "LOW")
+        ):
+            return {
+                **base,
+                "decision": "WAIT",
+                "action": "HOLD",
+                "reason": "DXY_DEVELOPING_OR_SR_CONSTRAINED",
+                "reason_codes": [
+                    "POINT_A_DXY_WAIT",
+                    *dxy_codes,
+                ],
+            }
+
+        # Anything unresolved fails safely into WAIT.
+        return {
+            **base,
+            "decision": "WAIT",
+            "action": "HOLD",
+            "reason": "DXY_UNRESOLVED_FAIL_STATE",
+            "reason_codes": [
+                "POINT_A_DXY_UNRESOLVED",
+                *dxy_codes,
+            ],
+        }
+
+    if dxy_status == "PASS":
+        if symbol_room_class == "POOR":
+            return {
+                **base,
+                "decision": "ALLOW",
+                "action": "RELEASE",
+                "reason": "SYMBOL_SR_BREAKOUT_SUPPORTED_BY_DXY",
+                "reason_codes": [
+                    "POINT_A_SYMBOL_ROOM_POOR",
+                    "POINT_A_DXY_BREAKOUT_SUPPORT",
+                    *dxy_codes,
+                ],
+            }
+        return {**base, "decision": "ALLOW", "action": "RELEASE", "reason": "POINT_A_CLEAR", "reason_codes": ["POINT_A_ALLOW", *dxy_codes]}
+
+    return {**base, "decision": "WAIT", "action": "HOLD", "reason": "DXY_UNRESOLVED", "reason_codes": ["POINT_A_DXY_UNRESOLVED", *dxy_codes]}
+
+
+def _point_a_persist_wait(
+    *,
+    watch: dict,
+    wkey: str,
+    point_a: dict,
+    live_price: float,
+    trigger_level: float,
+    now_e: int,
+) -> None:
+    first_wait = int(
+        watch.get("point_a_wait_started_ms") or 0
+    ) <= 0
+
+    if first_wait:
+        watch["point_a_wait_started_ms"] = int(now_e)
+
+        watch["point_a_wait_start_m15_bucket"] = int(
+            int(now_e)
+            // (15 * 60 * 1000)
+        )
+
+        # Freeze the exact RC generation that started Point-A.
+        # Subsequent WAIT re-evaluations must never migrate to
+        # a newer RC automatically.
+        watch["point_a_rc_rev_ok_ms"] = int(
+            watch.get("rev_ok_ms") or 0
+        )
+        watch["point_a_trigger_level"] = float(
+            trigger_level
+        )
+    watch["state"] = POINT_A_WAIT_STATE
+    watch["trade_state"] = POINT_A_WAIT_STATE
+    watch["entry_blocked"] = True
+    watch["entry_block_reason"] = str(point_a.get("reason") or "POINT_A_WAIT")
+    watch["point_a"] = point_a
+    watch["point_a_decision"] = "WAIT"
+    watch["point_a_action"] = "HOLD"
+    watch["point_a_reason"] = str(point_a.get("reason") or "")
+    watch["point_a_reason_codes"] = list(point_a.get("reason_codes") or [])
+    watch["point_a_last_eval_ms"] = int(now_e)
+    
+    watch["point_a_cross_latched"] = True
+    watch["point_a_cross_ms"] = int(watch.get("rc_trigger_crossed_ms") or now_e)
+    watch["point_a_cross_price"] = float(watch.get("rc_trigger_cross_price") or live_price)
+    # ATR is retained for diagnostics / later analytics.
+    watch["point_a_trigger_atr"] = float(
+        point_a.get("atr") or 0.0
+    )
+    watch["point_a_displacement_atr"] = (
+        point_a.get("displacement_atr")
+    )
+
+    # Authoritative PRICE_TOO_FAR state.
+    watch["point_a_planned_structural_sl"] = (
+        point_a.get("planned_structural_sl")
+    )
+    watch["point_a_original_risk_distance"] = (
+        point_a.get("original_risk_distance")
+    )
+    watch["point_a_missed_move_r"] = (
+        point_a.get("missed_move_r")
+    )
+    watch["point_a_max_missed_r"] = float(
+        point_a.get("max_missed_r")
+        or POINT_A_MAX_MISSED_R
+    )
+
+    # Keep legacy late_entry_max_move coherent with the new 0.40R
+    # rule. Point-A WAIT itself is evaluated by _point_a_evaluate(),
+    # but this prevents any older retry path from using the former
+    # 0.25-ATR distance.
+    _risk_distance = float(
+        point_a.get("original_risk_distance")
+        or 0.0
+    )
+
+    if _risk_distance > 0:
+        watch["late_entry_max_move"] = (
+            _risk_distance
+            * float(
+                point_a.get("max_missed_r")
+                or POINT_A_MAX_MISSED_R
+            )
+        )
+    else:
+        watch.pop("late_entry_max_move", None)
+    
+    # Fast re-evaluation, but persisted so restart resumes from this exact state.
+    watch["next_retry_ms"] = int(now_e) + int(_point_a_env_float("XTL_POINT_A_RECHECK_SEC", 2.0) * 1000.0)
+    R.set(str(wkey), json.dumps(watch, separators=(",", ":"), default=str), ex=7 * 24 * 3600)
+
 def _zone_watch_key(
     uid: str,
     sym: str,
@@ -2482,6 +4127,11 @@ def _enqueue_mt5_market_order(
         return {"ok": False, "error": "no_device", "profile_id": str(profile_id or ""), "profile_resolve_reason": resolve_reason}
 
     job_id = f"mt5_{uuid.uuid4().hex}"
+
+    _created_at_ms = int(
+        time.time() * 1000
+    )
+
     cmd = {
         "job_id": job_id,
         "type": "market_order",
@@ -2496,7 +4146,21 @@ def _enqueue_mt5_market_order(
         "tp": float(tp) if tp is not None else None,
         "comment": comment,
         "user_id": str(user_id),
-        "created_at_ms": int(time.time() * 1000),
+
+        "created_at_ms": _created_at_ms,
+
+        # Absolute validity of a NEW MARKET ENTRY.
+        #
+        # Agent-side enforcement will be added separately.
+        # Non-entry market commands are not changed by this field.
+        "expires_at_ms": (
+            _created_at_ms
+            + MARKET_ACK_TIMEOUT_MS
+            if str(kind or "").upper().strip()
+            == "ENTRY"
+            else None
+        ),
+
         "profile_id": str(profile_id or ""),
         "profile_resolve_reason": resolve_reason,
         "profile_account_login": (
@@ -2504,7 +4168,6 @@ def _enqueue_mt5_market_order(
             if isinstance(resolved_account, dict)
             else ""
         ),
-        
         "profile_account_server": (
             str((resolved_account or {}).get("server") or "")
             if isinstance(resolved_account, dict)
@@ -2643,6 +4306,396 @@ def _enqueue_mt5_close_position(
         "device_id": dev_id,
         "profile_id": str(profile_id or ""),
         "profile_resolve_reason": resolve_reason,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Generic DXY H1 confirmed-opposite early-loss protection
+#
+# Scope:
+#   - XAUUSD + five supported FX symbols
+#   - MT5 TRADE_ACTIVE only
+#   - trade must currently be adverse (below entry for BUY / above entry for SELL)
+#   - broker SL must NOT already protect entry/profit
+#   - REAL_DXY H1 turn state must be CONFIRMED in the opposite direction
+#   - that confirmation must have been detected after this trade opened
+#
+# Profitable trades remain owned by position_manager.py (BE/profit protection).
+# This executor path only protects a losing trade from waiting for full SL
+# after REAL_DXY H1 has objectively confirmed the adverse macro direction.
+# -----------------------------------------------------------------------------
+DXY_H1_EARLY_EXIT_REASON = "DXY_H1_EARLY_TURN_OPPOSITE"
+DXY_H1_EARLY_EXIT_CLAIM_TTL_SEC = 30 * 60
+DXY_H1_EARLY_EXIT_MAX_STATE_AGE_MS = 2 * 60 * 60 * 1000
+
+# Explicit USD relationship map. Do not infer from symbol text at runtime.
+# Value = REAL_DXY H1 direction that is adverse to the active trade.
+DXY_H1_ADVERSE_DIRECTION: dict[str, dict[str, str]] = {
+    # USD is quote / XAUUSD is conventionally inverse to USD strength.
+    "XAUUSD": {"BUY": "BULLISH", "SELL": "BEARISH"},
+    "EURUSD": {"BUY": "BULLISH", "SELL": "BEARISH"},
+    "GBPUSD": {"BUY": "BULLISH", "SELL": "BEARISH"},
+
+    # USD is base: DXY weakness hurts BUY; DXY strength hurts SELL.
+    "USDJPY": {"BUY": "BEARISH", "SELL": "BULLISH"},
+    "USDCHF": {"BUY": "BEARISH", "SELL": "BULLISH"},
+    "USDCAD": {"BUY": "BEARISH", "SELL": "BULLISH"},
+}
+
+
+def _latest_real_dxy_h1_turn_state(preferred_device_id: str = "") -> dict | None:
+    """Return the freshest REAL_DXY H1 turn-state snapshot, fail-closed."""
+    candidates: list[tuple[int, dict]] = []
+
+    def _load_key(key: str) -> None:
+        try:
+            raw = R.get(key)
+            if not raw:
+                return
+            obj = _sj(raw, {})
+            if not isinstance(obj, dict):
+                return
+            rank = int(
+                obj.get("detected_at_ms")
+                or obj.get("updated_ms")
+                or obj.get("last_evaluated_bar_close_ms")
+                or 0
+            )
+            obj = dict(obj)
+            obj["_redis_key"] = key
+            candidates.append((rank, obj))
+        except Exception:
+            return
+
+    pref = str(preferred_device_id or "").strip()
+    if pref:
+        _load_key(f"xtl:dxy:turn:state:H1:REAL_DXY:{pref}")
+
+    # Global REAL_DXY fallback is intentional. FundingPips/FundedNext devices
+    # may not expose a native DXY symbol while FTMO does; Point-A already treats
+    # REAL_DXY as global macro context.
+    try:
+        for key in R.scan_iter(
+            match="xtl:dxy:turn:state:H1:REAL_DXY:*",
+            count=50,
+        ):
+            key_s = str(key or "")
+            if pref and key_s.endswith(":" + pref):
+                continue
+            _load_key(key_s)
+    except Exception:
+        return candidates[-1][1] if candidates else None
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
+
+
+def _patch_open_trade_fields(uid: str, trade_id: str, patch: dict) -> bool:
+    """Merge audit fields into one current open-ledger row without stale overwrite."""
+    uid_u = str(uid or "").strip()
+    tid_u = str(trade_id or "").strip()
+    if not uid_u or not tid_u or not isinstance(patch, dict):
+        return False
+
+    key = OPEN_KEY.format(uid=uid_u)
+    try:
+        raw = R.hget(key, tid_u)
+        obj = _sj(raw, {}) if raw else {}
+        if not isinstance(obj, dict) or not obj:
+            return False
+        obj.update(patch)
+        R.hset(
+            key,
+            tid_u,
+            json.dumps(obj, separators=(",", ":"), default=str),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _maybe_dxy_h1_early_close_loss(
+    *,
+    uid: str,
+    pos: dict,
+    broker_pos: dict,
+) -> dict:
+    """
+    Enqueue an early close for a supported XTL symbol only when REAL_DXY H1
+    confirms the explicitly mapped adverse direction AFTER entry and the
+    broker position is currently losing.
+
+    Returns a compact audit result. No local trade close is performed here;
+    normal broker/deal reconciliation remains authoritative.
+    """
+    if not isinstance(pos, dict) or not isinstance(broker_pos, dict):
+        return {"action": "SKIP", "reason": "BAD_INPUT"}
+
+    symbol = str(pos.get("symbol") or broker_pos.get("symbol") or "").upper().strip()
+    if symbol not in DXY_H1_ADVERSE_DIRECTION:
+        return {"action": "SKIP", "reason": "SYMBOL_NOT_DXY_MANAGED"}
+
+    if str(pos.get("trade_state") or "").upper().strip() != "TRADE_ACTIVE":
+        return {"action": "SKIP", "reason": "NOT_TRADE_ACTIVE"}
+
+    side = str(pos.get("side") or broker_pos.get("side") or "").upper().strip()
+    if side not in ("BUY", "SELL"):
+        return {"action": "SKIP", "reason": "BAD_SIDE"}
+
+    try:
+        ticket = int(
+            pos.get("mt5_ticket")
+            or pos.get("broker_ticket")
+            or broker_pos.get("ticket")
+            or 0
+        )
+    except Exception:
+        ticket = 0
+    if ticket <= 0:
+        return {"action": "SKIP", "reason": "NO_TICKET"}
+
+    entry = _sf(
+        pos.get("entry_price")
+        or pos.get("mt5_fill_price")
+        or broker_pos.get("price_open"),
+        0.0,
+    )
+    price = _sf(broker_pos.get("price_current"), 0.0)
+    current_sl = _sf(broker_pos.get("sl"), 0.0)
+    step = _broker_price_step(broker_pos)
+
+    if entry <= 0 or price <= 0:
+        return {"action": "SKIP", "reason": "PRICE_UNAVAILABLE"}
+
+    # Strictly losing only. Flat or profitable positions remain under the
+    # existing position-manager BE/profit-protection lifecycle.
+    adverse = (
+        price < entry - max(step * 0.5, 1e-12)
+        if side == "BUY"
+        else price > entry + max(step * 0.5, 1e-12)
+    )
+    if not adverse:
+        return {"action": "SKIP", "reason": "NOT_LOSING"}
+
+    # If broker SL already protects entry/profit, do not race the dedicated
+    # position manager with an executor close command.
+    if current_sl > 0:
+        protected = (
+            current_sl >= entry - max(step * 0.5, 1e-12)
+            if side == "BUY"
+            else current_sl <= entry + max(step * 0.5, 1e-12)
+        )
+        if protected:
+            return {"action": "SKIP", "reason": "BROKER_SL_ALREADY_PROTECTS"}
+
+    dxy = _latest_real_dxy_h1_turn_state(
+        str(pos.get("device_id") or broker_pos.get("device_id") or "")
+    )
+    if not isinstance(dxy, dict):
+        return {"action": "SKIP", "reason": "DXY_H1_UNAVAILABLE"}
+
+    # H1 turn-state schema is produced by api/dxy_tracker.py.
+    # It does NOT publish M15-style status/direction fields. The canonical
+    # directional field is short_state, and last_turn_ms is the bar-close
+    # timestamp at which that directional turn actually began.
+    h1_direction = str(dxy.get("short_state") or "").upper().strip()
+    h1_confidence = int(dxy.get("confidence") or 0)
+    h1_turn_ms = int(dxy.get("last_turn_ms") or 0)
+    h1_bar_close_ms = int(dxy.get("last_evaluated_bar_close_ms") or 0)
+    h1_detected_at_ms = int(dxy.get("detected_at_ms") or 0)
+
+    if h1_direction not in ("BULLISH", "BEARISH"):
+        return {
+            "action": "SKIP",
+            "reason": "DXY_H1_NO_DIRECTIONAL_TURN",
+            "short_state": h1_direction,
+            "confidence": h1_confidence,
+        }
+
+    # Directional H1 short_state is already qualified by dxy_tracker's
+    # 3-H1-bar ATR/steps/bodies/structure-break detector. A missing turn
+    # timestamp is fail-closed because we cannot prove when the state began.
+    if h1_turn_ms <= 0:
+        return {
+            "action": "SKIP",
+            "reason": "DXY_H1_TURN_TIME_MISSING",
+            "short_state": h1_direction,
+            "confidence": h1_confidence,
+        }
+
+    # A stale macro state must never liquidate a live broker position.
+    # H1 may remain CONFIRMED across bars, but its detector timestamp must still
+    # be recent enough to prove that REAL_DXY monitoring is alive.
+    _now = now_ms()
+    if (
+        h1_detected_at_ms <= 0
+        or _now < h1_detected_at_ms
+        or (_now - h1_detected_at_ms) > DXY_H1_EARLY_EXIT_MAX_STATE_AGE_MS
+    ):
+        return {
+            "action": "SKIP",
+            "reason": "DXY_H1_STATE_STALE",
+            "detected_at_ms": h1_detected_at_ms,
+            "age_ms": (_now - h1_detected_at_ms) if h1_detected_at_ms > 0 else None,
+        }
+
+    opposite = str(
+        (DXY_H1_ADVERSE_DIRECTION.get(symbol) or {}).get(side)
+        or ""
+    ).upper().strip()
+    if opposite not in ("BULLISH", "BEARISH"):
+        return {"action": "SKIP", "reason": "DXY_RELATIONSHIP_UNMAPPED"}
+
+    if h1_direction != opposite:
+        return {
+            "action": "SKIP",
+            "reason": "DXY_H1_NOT_OPPOSITE",
+            "direction": h1_direction,
+            "required_opposite": opposite,
+        }
+
+    # The adverse H1 TURN itself must be newer than this trade. Do not use
+    # detected_at_ms here: that field refreshes on every H1 evaluation even
+    # when short_state has not changed, which could make an old turn appear new.
+    opened_at_ms = int(
+        pos.get("opened_at_ms")
+        or pos.get("entry_ts_ms")
+        or pos.get("mt5_acked_at_ms")
+        or 0
+    )
+    if opened_at_ms > 0 and h1_turn_ms <= opened_at_ms:
+        return {
+            "action": "SKIP",
+            "reason": "DXY_H1_TURN_PREDATES_TRADE",
+            "turn_ms": h1_turn_ms,
+            "opened_at_ms": opened_at_ms,
+        }
+
+    initial_sl = _sf(pos.get("original_sl_price") or pos.get("sl_price"), 0.0)
+    initial_risk = abs(entry - initial_sl) if initial_sl > 0 else 0.0
+    current_r = (
+        ((price - entry) / initial_risk if side == "BUY" else (entry - price) / initial_risk)
+        if initial_risk > 0
+        else None
+    )
+
+    trade_id = str(pos.get("trade_id") or "").strip()
+    profile_id = str(pos.get("profile_id") or "").strip().lower()
+    mt5_account = str(pos.get("mt5_account") or "demo").lower().strip()
+    qty = _sf(broker_pos.get("volume") or pos.get("qty"), 0.0)
+
+    if not trade_id or not profile_id or qty <= 0:
+        return {"action": "SKIP", "reason": "TRADE_ROUTE_METADATA_MISSING"}
+
+    generation = h1_turn_ms
+    claim_key = (
+        f"xtl:oppt:dxy_h1_early_close:{uid}:{ticket}:"
+        f"{generation}:{h1_direction}"
+    )
+
+    try:
+        claimed = bool(
+            R.set(
+                claim_key,
+                "1",
+                nx=True,
+                ex=DXY_H1_EARLY_EXIT_CLAIM_TTL_SEC,
+            )
+        )
+    except Exception:
+        return {"action": "SKIP", "reason": "CLAIM_REDIS_ERROR"}
+
+    if not claimed:
+        return {"action": "SKIP", "reason": "DUPLICATE_CLOSE_CLAIM"}
+
+    close_trade_id = f"DXY_H1_EARLY_CLOSE:{ticket}:{generation}"
+    close_res = _enqueue_mt5_close_position(
+        uid=uid,
+        symbol=symbol,
+        ticket=ticket,
+        qty=qty,
+        comment="XTL DXY_H1_OPPOSITE",
+        trade_id=close_trade_id,
+        exit_reason=DXY_H1_EARLY_EXIT_REASON,
+        mt5_account=mt5_account,
+        profile_id=profile_id,
+    )
+
+    if not bool(close_res.get("ok")):
+        try:
+            R.delete(claim_key)
+        except Exception:
+            pass
+        log.error(
+            "[OPPT] DXY_H1_EARLY_CLOSE_ENQUEUE_FAILED "
+            "uid=%s ticket=%s side=%s entry=%s price=%s current_r=%s "
+            "h1_short_state=%s h1_direction=%s h1_turn_ms=%s h1_bar=%s err=%s",
+            uid,
+            ticket,
+            side,
+            entry,
+            price,
+            current_r,
+            h1_direction,
+            h1_direction,
+            h1_turn_ms,
+            h1_bar_close_ms,
+            close_res.get("error"),
+        )
+        return {"action": "ERROR", "reason": "ENQUEUE_FAILED", "close_res": close_res}
+
+    patch = {
+        "requested_exit_reason": DXY_H1_EARLY_EXIT_REASON,
+        "requested_exit_at_ms": now_ms(),
+        "dxy_exit_requested": True,
+        "dxy_exit_action": "EARLY_CLOSE_LOSS",
+        "dxy_exit_job_id": close_res.get("job_id"),
+        "dxy_exit_claim_key": claim_key,
+        "dxy_exit_observed_price": float(price),
+        "dxy_exit_observed_r": round(float(current_r), 4) if current_r is not None else None,
+        "dxy_exit_h1_short_state": h1_direction,
+        "dxy_exit_h1_confidence": h1_confidence,
+        "dxy_exit_h1_turn_ms": h1_turn_ms,
+        "dxy_exit_h1_direction": h1_direction,
+        "dxy_exit_h1_bar_close_ms": h1_bar_close_ms,
+        "dxy_exit_h1_detected_at_ms": h1_detected_at_ms,
+        "dxy_exit_h1_source_key": dxy.get("_redis_key"),
+    }
+    _patch_open_trade_fields(uid, trade_id, patch)
+
+    log.error(
+        "[OPPT] DXY_H1_EARLY_CLOSE_ENQUEUED "
+        "uid=%s tid=%s ticket=%s sym=%s side=%s "
+        "entry=%s price=%s current_r=%s sl=%s "
+        "h1_status=%s h1_direction=%s h1_bar=%s "
+        "h1_detected=%s job_id=%s device_id=%s",
+        uid,
+        trade_id,
+        ticket,
+        symbol,
+        side,
+        entry,
+        price,
+        current_r,
+        current_sl,
+        h1_status,
+        h1_direction,
+        h1_bar_close_ms,
+        h1_detected_at_ms,
+        close_res.get("job_id"),
+        close_res.get("device_id"),
+    )
+
+    return {
+        "action": "ENQUEUED",
+        "reason": DXY_H1_EARLY_EXIT_REASON,
+        "job_id": close_res.get("job_id"),
+        "current_r": current_r,
+        "h1_direction": h1_direction,
+        "h1_bar_close_ms": h1_bar_close_ms,
     }
 
 
@@ -3151,8 +5204,26 @@ def _open_trade(uid: str, pos: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-    R.hset(OPEN_KEY.format(uid=uid), pos["trade_id"], json.dumps(pos))
+    uid_u = str(uid or "").strip()
+    if not uid_u:
+        raise ValueError("UID_REQUIRED_FOR_OPEN_TRADE")
 
+    key = OPEN_KEY.format(uid=uid_u)
+
+    # Keep the open-ledger row and its UID index membership in the same
+    # Redis transaction. Position Manager consumes OPEN_UIDS_KEY and
+    # therefore never needs a global keyspace SCAN in steady state.
+    pipe = R.pipeline(transaction=True)
+    pipe.hset(
+        key,
+        pos["trade_id"],
+        json.dumps(pos),
+    )
+    pipe.sadd(
+        OPEN_UIDS_KEY,
+        uid_u,
+    )
+    pipe.execute()
 
 def _clear_trade_lifecycle_keys(
     uid: str,
@@ -3339,10 +5410,34 @@ def _clear_trade_lifecycle_keys(
 
 def _remove_open_trade(uid: str, trade_id: str) -> None:
     try:
-        R.hdel(OPEN_KEY.format(uid=uid), trade_id)
-    except Exception:
-        pass
+        uid_u = str(uid or "").strip()
+        if not uid_u:
+            return
 
+        key = OPEN_KEY.format(uid=uid_u)
+
+        # Atomically:
+        #   1. remove this trade
+        #   2. check whether any trades remain
+        #   3. remove UID from the open-trade index only when ledger is empty
+        #
+        # This prevents a concurrent new _open_trade() from being indexed
+        # and then accidentally removed by a stale close path.
+        R.eval(
+            _REMOVE_OPEN_TRADE_LUA,
+            2,
+            key,
+            OPEN_UIDS_KEY,
+            trade_id,
+            uid_u,
+        )
+
+    except Exception:
+        log.exception(
+            "[OPPT] OPEN_TRADE_REMOVE_FAILED uid=%s trade_id=%s",
+            uid,
+            trade_id,
+        )
 
 def _closed_ticket_key(ticket: int) -> str:
     return f"xtl:broker:closed_ticket:{int(ticket)}"
@@ -3372,7 +5467,21 @@ def _apply_broker_deal_to_closed(pos: dict, deal: dict, reason_fallback: str = "
     )
 
     broker_reason = str(deal.get("broker_reason") or "").upper().strip()
-    exit_reason = broker_reason if broker_reason in ("TP", "SL", "STOP_OUT", "MANUAL") else reason_fallback
+    requested_exit_reason = str(
+        pos.get("requested_exit_reason") or ""
+    ).upper().strip()
+
+    if broker_reason in ("TP", "SL", "STOP_OUT"):
+        # Broker-native terminal reason always wins.
+        exit_reason = broker_reason
+    elif requested_exit_reason:
+        # Strategy-requested market close is usually reported by MT5 as
+        # MANUAL/client close. Preserve the strategy reason for analytics.
+        exit_reason = requested_exit_reason
+    elif broker_reason in ("MANUAL", "MANUAL_CLOSE"):
+        exit_reason = "MANUAL"
+    else:
+        exit_reason = reason_fallback
 
     broker_reason_u = str(deal.get("broker_reason") or "").upper().strip()
 
@@ -4446,7 +6555,24 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
 
     
 
-    R.lpush(CLOSED_KEY.format(uid=uid), json.dumps(closed))
+    
+    closed_key = CLOSED_KEY.format(uid=uid)
+
+    pipe = R.pipeline(transaction=True)
+    pipe.lpush(
+        closed_key,
+        json.dumps(closed),
+    )
+    pipe.sadd(
+        CLOSED_UIDS_KEY,
+        str(uid).strip(),
+    )
+    pipe.ltrim(
+        closed_key,
+        0,
+        499,
+    )
+    pipe.execute()
     try:
         closed_ticket = int(
             pos.get("mt5_ticket")
@@ -4479,10 +6605,7 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
             pos.get("trade_id"),
             marker_exc,
         )
-    try:
-        R.ltrim(CLOSED_KEY.format(uid=uid), 0, 499)
-    except Exception:
-        pass
+    
 
     _remove_open_trade(uid, str(pos.get("trade_id") or ""))
     _clear_trade_lifecycle_keys(uid,pos)
@@ -4663,47 +6786,114 @@ def tick_user(uid: str) -> None:
             if bool(ack.get("ok")):
                 pos["status"] = "filled"
                 pos["trade_state"] = "TRADE_ACTIVE"
-                try:
-                    sym0 = str(pos.get("symbol") or "").upper().strip()
-                    side0 = str(pos.get("side") or "").upper().strip()
-                    wk = _zone_watch_key(
-                       uid,
-                       sym0,
-                       side0,
-                       "H1",
-                    )
-                    raw_w = R.get(wk)
-                    w = _sj(raw_w, {}) if raw_w else {}
-                    if isinstance(w, dict) and w:
-                        w["state"] = "TRADE_ACTIVE"
-                        w["trade_state"] = "TRADE_ACTIVE"
-                        w["entry_triggered"] = True
-                        w["mt5_ticket"] = pos.get("mt5_ticket")
-                        w["mt5_fill_price"] = pos.get("mt5_fill_price")
-                        w["mt5_acked_at_ms"] = pos.get("mt5_acked_at_ms")
-                        R.set(wk, json.dumps(w))
-                except Exception:
-                    pass
-               
+
+                # IMPORTANT:
+                # Read authoritative MT5 ticket/fill FIRST, before persisting
+                # the trade or publishing TRADE_ACTIVE into the zone watch.
                 try:
                     res = ack.get("result") or {}
-                    # optional: keep MT5 ticket/price if available
+
                     if isinstance(res, dict):
                         if res.get("ticket") is not None:
                             pos["mt5_ticket"] = res.get("ticket")
+
                         if res.get("price") is not None:
-                            pos["mt5_fill_price"] =  res.get("price")
-                            # IMPORTANT: for MT5-filled trades, store real fill as entry
+                            pos["mt5_fill_price"] = res.get("price")
+
+                            # For MT5-filled trades, store real fill as entry.
                             try:
                                 fp = float(res.get("price"))
                                 if fp > 0:
                                     pos["entry_price"] = fp
                             except Exception:
                                 pass
+
                 except Exception:
                     pass
+                
+                # -------------------------------------------------
+                # P0 SAFETY:
+                # A positive ACK without a valid broker ticket is
+                # incomplete broker truth.
+                #
+                # Do NOT persist TRADE_ACTIVE without a ticket.
+                # Keep the existing Redis row ORDER_PENDING and
+                # preserve exec_claim. The pending-order watchdog
+                # can reconcile the actual broker position safely.
+                # -------------------------------------------------
+                try:
+                    _ack_ticket = int(
+                        pos.get("mt5_ticket")
+                        or pos.get("broker_ticket")
+                        or 0
+                    )
+                except Exception:
+                    _ack_ticket = 0
 
-                _open_trade(uid, pos)  # update stored open trade
+                if _ack_ticket <= 0:
+                    log.critical(
+                        "[OPPT] POSITIVE_ACK_MISSING_TICKET "
+                        "uid=%s tid=%s sym=%s side=%s "
+                        "job_id=%s ack=%r "
+                        "action=KEEP_ORDER_PENDING",
+                        uid,
+                        pos.get("trade_id"),
+                        pos.get("symbol"),
+                        pos.get("side"),
+                        job_id,
+                        ack,
+                    )
+
+                    # IMPORTANT:
+                    # Do not _open_trade() this mutated local object.
+                    # Redis must remain ORDER_PENDING until broker
+                    # truth supplies a valid ticket.
+                    continue
+                # Persist TRADE_ACTIVE only after authoritative broker
+                # ticket/fill values have been attached to the trade.
+                _open_trade(uid, pos)
+
+                # Now synchronize the watch using the populated MT5 values.
+                try:
+                    sym0 = str(
+                        pos.get("symbol")
+                        or ""
+                    ).upper().strip()
+
+                    side0 = str(
+                        pos.get("side")
+                        or ""
+                    ).upper().strip()
+
+                    wk = _zone_watch_key(
+                        uid,
+                        sym0,
+                        side0,
+                        "H1",
+                    )
+
+                    raw_w = R.get(wk)
+                    w = _sj(raw_w, {}) if raw_w else {}
+
+                    if isinstance(w, dict) and w:
+                        w["state"] = "TRADE_ACTIVE"
+                        w["trade_state"] = "TRADE_ACTIVE"
+                        w["entry_triggered"] = True
+                        w["mt5_ticket"] = pos.get("mt5_ticket")
+                        w["mt5_fill_price"] = pos.get(
+                            "mt5_fill_price"
+                        )
+                        w["mt5_acked_at_ms"] = pos.get(
+                            "mt5_acked_at_ms"
+                        )
+
+                        R.set(
+                            wk,
+                            json.dumps(w),
+                        )
+
+                except Exception:
+                    pass
 
                 # Writer-side snapshot publication:
                 # broker ACK is successful and TRADE_ACTIVE has been persisted.
@@ -4717,17 +6907,20 @@ def tick_user(uid: str) -> None:
                     str(pos.get("profile_id") or ""),
                     "MT5_ACK_FILLED",
                 )
+
                 log.warning(
                     "[PROP] PHASE3_INVALIDATE_AFTER_ACK "
                     "uid=%s profile=%s",
                     uid,
                     _ack_profile_id,
                 )
+
                 _invalidate_prop_dashboard_snapshot(
                     uid,
                     _ack_profile_id,
                     "MT5_ACK_FILLED",
                 )
+
                 _schedule_prop_dashboard_warm_refresh(
                     uid,
                     _ack_profile_id,
@@ -4737,9 +6930,17 @@ def tick_user(uid: str) -> None:
                 # Analytics runs only after the authoritative snapshot refresh.
                 try:
                     from api.xtl_analytics import capture_entry
-                    capture_entry(pos, capture_source="normal")
+
+                    capture_entry(
+                        pos,
+                        capture_source="normal",
+                    )
+
                 except Exception as _ax:
-                    log.warning("analytics entry-snap skipped: %s", _ax)
+                    log.warning(
+                        "analytics entry-snap skipped: %s",
+                        _ax,
+                    )
 
                 # Durable ticket->zone map: persist entry zone keyed by MT5 ticket so that
                 # broker_repair can recover the zone after an agent restart (when the watch
@@ -4809,6 +7010,105 @@ def tick_user(uid: str) -> None:
 
 
             else:
+                # -------------------------------------------------
+                # P0 NEGATIVE-ACK BROKER-TRUTH GUARD
+                #
+                # A negative/stale ACK is NOT authoritative proof
+                # that no broker position exists.
+                #
+                # Today's FundingPips case proved that MT5 can already
+                # contain the live position while the ACK path reports
+                # failure. Never classify ENTRY_FAIL until broker truth
+                # has been checked reliably.
+                # -------------------------------------------------
+                _ack_profile_id = str(
+                    pos.get("profile_id")
+                    or _user_active_prop_profile_id(uid)
+                    or ""
+                ).strip().lower()
+
+                (
+                    _ack_account_type,
+                    _ack_device_id,
+                ) = _resolve_runtime_mt5_account_type(
+                    uid=uid,
+                    profile_id=_ack_profile_id,
+                    fallback=(
+                        pos.get("mt5_account")
+                        or mt5_account
+                    ),
+                )
+
+                if not _ack_account_type:
+                    log.error(
+                        "[OPPT] NEGATIVE_ACK_DEFER_ACCOUNT_UNKNOWN "
+                        "uid=%s tid=%s sym=%s job_id=%s profile=%s",
+                        uid,
+                        pos.get("trade_id"),
+                        pos.get("symbol"),
+                        job_id,
+                        _ack_profile_id,
+                    )
+
+                    # Fail closed. Do NOT ENTRY_FAIL.
+                    continue
+
+                broker_pos, broker_check_reliable = (
+                    _find_broker_position_for_pending(
+                        uid,
+                        pos,
+                        _ack_account_type,
+                    )
+                )
+
+                if not broker_check_reliable:
+                    log.error(
+                        "[OPPT] NEGATIVE_ACK_DEFER_BROKER_UNKNOWN "
+                        "uid=%s tid=%s sym=%s job_id=%s",
+                        uid,
+                        pos.get("trade_id"),
+                        pos.get("symbol"),
+                        job_id,
+                    )
+
+                    # Broker truth unavailable. Preserve ORDER_PENDING,
+                    # risk reservation and exec_claim.
+                    continue
+
+                if broker_pos:
+                    repaired = _promote_pending_from_broker_position(
+                        uid=uid,
+                        pos=pos,
+                        broker_pos=broker_pos,
+                        account_type=_ack_account_type,
+                        device_id=_ack_device_id,
+                        recovery_source="NEGATIVE_ACK_BROKER_LIVE",
+                        risk_event="MT5_ACK_RECOVERED",
+                        analytics_source="negative_ack_broker_recovery",
+                    )
+
+                    log.warning(
+                        "[OPPT] NEGATIVE_ACK_BROKER_LIVE "
+                        "uid=%s tid=%s sym=%s job_id=%s "
+                        "ticket=%s repaired=%s",
+                        uid,
+                        pos.get("trade_id"),
+                        pos.get("symbol"),
+                        job_id,
+                        (
+                            broker_pos.get("ticket")
+                            or broker_pos.get("position_ticket")
+                        ),
+                        repaired,
+                    )
+
+                    # Broker position wins over negative ACK.
+                    # NEVER execute ENTRY_FAIL below.
+                    continue
+
+                # Broker check was reliable and there is genuinely
+                # no live position. Only now may the existing
+                # ENTRY_FAIL handling execute.
                 pos["status"] = "failed"
 
                 _ack_result = (
@@ -5046,10 +7346,11 @@ def tick_user(uid: str) -> None:
                                 "mt5_fill_price",
                                 None,
                             )
-                            _saved_watch.pop(
-                                "device_id",
-                                None,
-                            )
+
+                            # Keep device_id.
+                            # This is a controlled retry of the same
+                            # frozen setup on the same UID/profile/device
+                            # execution context.
                             _saved_watch.pop(
                                 "entry_price",
                                 None,
@@ -5333,6 +7634,33 @@ def tick_user(uid: str) -> None:
                             ticket,
                             e,
                         )
+
+                    # -------------------------------------------------
+                    # Generic losing-trade DXY H1 macro protection.
+                    #
+                    # Profit/BE protection remains owned by the dedicated
+                    # position manager. This path acts only while a supported
+                    # XTL symbol is adverse and REAL_DXY H1 has CONFIRMED the
+                    # explicitly mapped adverse direction after trade open.
+                    # -------------------------------------------------
+                    try:
+                        if broker_pos:
+                            _maybe_dxy_h1_early_close_loss(
+                                uid=uid,
+                                pos=pos,
+                                broker_pos=broker_pos,
+                            )
+                    except Exception as _dxy_exit_exc:
+                        log.exception(
+                            "[OPPT] DXY_H1_EARLY_CLOSE_CHECK_FAILED "
+                            "uid=%s tid=%s ticket=%s sym=%s err=%r",
+                            uid,
+                            pos.get("trade_id"),
+                            ticket,
+                            pos.get("symbol"),
+                            _dxy_exit_exc,
+                        )
+
                     try:
                         prop_profile_id = str(
                             pos.get("profile_id")
@@ -6383,6 +8711,56 @@ def tick_user(uid: str) -> None:
 
                 state_w = str(watch.get("state") or "").upper().strip()
                 # -------------------------------------------------
+                # P0 REV_OK STATE INTEGRITY
+                #
+                # If lifecycle state says REV_OK, the rev_ok boolean
+                # must agree. This repairs old/partial writes and
+                # prevents readers from seeing:
+                #
+                #   state=REV_OK
+                #   rev_ok=False
+                #
+                # Terminal Point-A states are handled separately and
+                # therefore must never reach this repair as REV_OK.
+                # -------------------------------------------------
+                if (
+                    state_w == "REV_OK"
+                    and not bool(watch.get("rev_ok"))
+                ):
+                    log.warning(
+                        "[WATCHLIST] REV_OK_INTEGRITY_REPAIR "
+                        "sym=%s side=%s rev_ok=%s rc=%s trigger=%s key=%s",
+                        sym_w,
+                        side_w,
+                        watch.get("rev_ok"),
+                        watch.get("rev_ok_ms"),
+                        watch.get("trigger_level"),
+                        wkey,
+                    )
+
+                    watch["rev_ok"] = True
+                    watch["entry_ready"] = False
+                    watch["entry_triggered"] = False
+
+                    try:
+                        R.set(
+                            str(wkey),
+                            json.dumps(
+                                watch,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                            ex=7 * 24 * 3600,
+                        )
+                    except Exception:
+                        log.exception(
+                            "[WATCHLIST] REV_OK_INTEGRITY_REPAIR_PERSIST_FAILED "
+                            "sym=%s side=%s key=%s",
+                            sym_w,
+                            side_w,
+                            wkey,
+                        )
+                # -------------------------------------------------
                 # SELF-HEAL: stale ORDER_PENDING without MT5 job
                 # This means old code marked pending before enqueue.
                 # Do not delete the zone. Re-arm same RC/zone for execution.
@@ -6424,63 +8802,78 @@ def tick_user(uid: str) -> None:
                     )
 
                     if stale_pending_timeout:
-                        watch["state"] = "ORDER_FAILED"
-                        watch["trade_state"] = "ORDER_FAILED"
-                        watch["status"] = "expired"
-                        watch["exit_reason"] = "MARKET_ACK_TIMEOUT"
-                        watch["order_failure_reason"] = (
-                            "NO_ACK_NO_BROKER_POSITION"
-                        )
-                        watch["order_type"] = "MARKET"
-                        watch["closed_at_ms"] = now_ms()
-                        watch["pending_age_ms"] = int(pending_age_ms)
-                        watch["cleanup_source"] = "oppt_executor_watch_recon"
-
-                        R.set(str(wkey), json.dumps(watch), ex=7 * 24 * 3600)
-
+                        # -------------------------------------------------
+                        # Watch reconciliation is NOT authoritative for
+                        # MARKET_ACK_TIMEOUT.
+                        #
+                        # The canonical open-ledger pending-order watchdog
+                        # performs the required safety checks:
+                        #   - exact MT5 queue state
+                        #   - queue-read reliability
+                        #   - broker-position lookup
+                        #   - broker-read reliability
+                        #   - ACK-loss recovery
+                        #
+                        # Therefore this watch must remain ORDER_PENDING.
+                        # Never mark ORDER_FAILED solely because the local
+                        # watch has no ticket after the deadline.
+                        # -------------------------------------------------
                         log.warning(
-                            "[WATCHLIST] MARKET_ORDER_PENDING_TIMEOUT sym=%s side=%s job_id=%s age_ms=%s key=%s",
-                            sym_w, side_w, job_id, pending_age_ms, wkey
+                            "[WATCHLIST] "
+                            "ORDER_PENDING_TIMEOUT_DEFER_TO_LEDGER_WATCHDOG "
+                            "sym=%s side=%s job_id=%s age_ms=%s key=%s",
+                            sym_w,
+                            side_w,
+                            job_id,
+                            pending_age_ms,
+                            wkey,
                         )
-
-                        
 
                         continue
 
+                        
+
+                        
+
                     # Old legacy case: pending without MT5 job. Re-arm same RC/zone.
-                    stale_pending_no_job = (
+                    # -------------------------------------------------
+                    # P0 SAFETY: ORDER_PENDING without watch job_id.
+                    #
+                    # Missing mt5_job_id on the WATCH is not proof that
+                    # no MT5 submission occurred.
+                    #
+                    # The enqueue may already have succeeded while the
+                    # later watch-state persistence failed. In that case
+                    # the authoritative ORDER_PENDING lifecycle may still
+                    # exist in the open ledger and/or be protected by the
+                    # executor exec_claim.
+                    #
+                    # Therefore:
+                    #   - NEVER re-arm this RC based only on age
+                    #   - NEVER change ORDER_PENDING -> ENTRY_READY here
+                    #   - leave broker/order resolution to the canonical
+                    #     open-ledger / ACK watchdog lifecycle
+                    # -------------------------------------------------
+                    stale_pending_no_job = bool(
                         not job_id
                         and entry_ts > 0
                         and pending_age_ms > 120000
                     )
 
                     if stale_pending_no_job:
-                        watch["state"] = "ENTRY_READY"
-                        watch["trade_state"] = "ENTRY_READY"
-                        watch["entry_triggered"] = False
-                        watch.pop("entry_price", None)
-                        watch.pop("entry_ts_ms", None)
-                        watch.pop("mt5_job_id", None)
-                        watch.pop("device_id", None)
-
-                        R.set(str(wkey), json.dumps(watch), ex=7 * 24 * 3600)
-                        state_w = "ENTRY_READY"
-
                         log.warning(
-                            "[WATCHLIST] SELF_HEAL_STALE_PENDING sym=%s side=%s key=%s",
-                            sym_w, side_w, wkey
+                            "[WATCHLIST] "
+                            "ORDER_PENDING_NO_JOB_DEFER_TO_LEDGER "
+                            "sym=%s side=%s age_ms=%s "
+                            "trade_id=%s key=%s",
+                            sym_w,
+                            side_w,
+                            pending_age_ms,
+                            watch.get("trade_id"),
+                            wkey,
                         )
-                if state_w not in (
-                    "REV_OK",
-                    "ENTRY_READY",
-                    "ENTRY_BLOCKED_PROP",
-                    "ENTRY_BLOCKED_MAX_OPEN",
-                    "ENTRY_BLOCKED_SAME_SYMBOL",
-                    "ENTRY_BLOCKED_MARGIN",
-                    "ENTRY_BLOCKED_LOTS",
-                    "ENTRY_BLOCKED_BROKER",
-                ):
-                    continue
+
+                        continue
 
                 if bool(watch.get("entry_triggered")):
                     continue
@@ -6734,7 +9127,981 @@ def tick_user(uid: str) -> None:
                 if trigger_level <= 0:
                     continue
 
+                # -------------------------------------------------
+                # P0 POINT-A STATE INTEGRITY
+                #
+                # state and trade_state are redundant lifecycle fields.
+                # If either still carries Point-A lifecycle truth,
+                # normalize both before any RC ownership checks.
+                # -------------------------------------------------
+                _state_raw = str(
+                    watch.get("state") or ""
+                ).upper().strip()
+
+                _trade_state_raw = str(
+                    watch.get("trade_state") or ""
+                ).upper().strip()
+
+                _point_a_states = {
+                    POINT_A_WAIT_STATE,
+                    POINT_A_BLOCK_STATE,
+                    POINT_A_EXPIRED_STATE,
+                }
+
+                if _state_raw in _point_a_states:
+                    _effective_point_a_state = _state_raw
+                elif _trade_state_raw in _point_a_states:
+                    _effective_point_a_state = _trade_state_raw
+                else:
+                    _effective_point_a_state = ""
+
+                if _effective_point_a_state:
+                    if (
+                        _state_raw != _effective_point_a_state
+                        or _trade_state_raw != _effective_point_a_state
+                    ):
+                        log.warning(
+                            "[POINT_A] STATE_INTEGRITY_REPAIR "
+                            "sym=%s side=%s state=%s trade_state=%s "
+                            "effective=%s key=%s",
+                            sym_w,
+                            side_w,
+                            _state_raw,
+                            _trade_state_raw,
+                            _effective_point_a_state,
+                            wkey,
+                        )
+
+                        watch["state"] = _effective_point_a_state
+                        watch["trade_state"] = _effective_point_a_state
+
+                        if _effective_point_a_state == POINT_A_WAIT_STATE:
+                            watch["rev_ok"] = True
+                        else:
+                            watch["rev_ok"] = False
+                            watch["entry_ready"] = False
+                            watch["entry_triggered"] = False
+
+                        try:
+                            R.set(
+                                str(wkey),
+                                json.dumps(
+                                    watch,
+                                    separators=(",", ":"),
+                                    default=str,
+                                ),
+                                ex=7 * 24 * 3600,
+                            )
+                        except Exception:
+                            log.exception(
+                                "[POINT_A] STATE_INTEGRITY_REPAIR_PERSIST_FAILED "
+                                "sym=%s side=%s key=%s",
+                                sym_w,
+                                side_w,
+                                wkey,
+                            )
+
+                    state_w = _effective_point_a_state
+
+                # -------------------------------------------------
+                # Point-A RC ownership.
+                #
+                # Active WAIT owns the exact RC-cross generation that
+                # started Point-A. A later RC refresh must NOT cancel
+                # or migrate that active WAIT.
+                #
+                # BLOCK / EXPIRED are terminal and may use stale-RC
+                # generation cleanup.
+                # -------------------------------------------------
+                if state_w == POINT_A_WAIT_STATE:
+                    _pa_rc = int(
+                        watch.get("point_a_rc_rev_ok_ms") or 0
+                    )
+                    _pa_trigger = _sf(
+                        watch.get("point_a_trigger_level"),
+                        0.0,
+                    )
+
+                    if _pa_rc > 0 and _pa_trigger > 0:
+                        if (
+                            _pa_rc != int(rev_ok_ms)
+                            or abs(
+                                float(_pa_trigger)
+                                - float(trigger_level)
+                            ) > 1e-12
+                        ):
+                            log.warning(
+                                "[POINT_A] WAIT_RC_REFRESH_IGNORED "
+                                "sym=%s side=%s "
+                                "owned_rc=%s current_rc=%s "
+                                "owned_trigger=%s current_trigger=%s "
+                                "key=%s",
+                                sym_w,
+                                side_w,
+                                _pa_rc,
+                                rev_ok_ms,
+                                _pa_trigger,
+                                trigger_level,
+                                wkey,
+                            )
+
+                        # Restore Point-A's original owned RC.
+                        rev_ok_ms = int(_pa_rc)
+                        trigger_level = float(_pa_trigger)
+
+                        watch["rev_ok_ms"] = int(_pa_rc)
+                        watch["trigger_level"] = float(_pa_trigger)
+
+                        if side_w == "BUY":
+                            watch["rev_ok_bar_hi"] = float(_pa_trigger)
+                        else:
+                            watch["rev_ok_bar_lo"] = float(_pa_trigger)
+
+                        watch["state"] = POINT_A_WAIT_STATE
+                        watch["trade_state"] = POINT_A_WAIT_STATE
+                        watch["rev_ok"] = True
+                        watch["entry_blocked"] = True
+
+                        try:
+                            R.set(
+                                str(wkey),
+                                json.dumps(
+                                    watch,
+                                    separators=(",", ":"),
+                                    default=str,
+                                ),
+                                ex=7 * 24 * 3600,
+                            )
+                        except Exception:
+                            log.exception(
+                                "[POINT_A] WAIT_RC_OWNERSHIP_PERSIST_FAILED "
+                                "sym=%s side=%s key=%s",
+                                sym_w,
+                                side_w,
+                                wkey,
+                            )
+
+                elif state_w in (
+                    POINT_A_BLOCK_STATE,
+                    POINT_A_EXPIRED_STATE,
+                ):
+                    _pa_rc = int(
+                        watch.get("point_a_rc_rev_ok_ms") or 0
+                    )
+                    _pa_trigger = _sf(
+                        watch.get("point_a_trigger_level"),
+                        0.0,
+                    )
+
+                    if (
+                        (
+                            _pa_rc > 0
+                            and _pa_rc != int(rev_ok_ms)
+                        )
+                        or (
+                            _pa_trigger > 0
+                            and abs(
+                                float(_pa_trigger)
+                                - float(trigger_level)
+                            ) > 1e-12
+                        )
+                    ):
+                        log.warning(
+                            "[POINT_A] STALE_RC_STATE_CLEARED "
+                            "sym=%s side=%s "
+                            "stored_rc=%s current_rc=%s "
+                            "stored_trigger=%s current_trigger=%s",
+                            sym_w,
+                            side_w,
+                            _pa_rc,
+                            rev_ok_ms,
+                            _pa_trigger,
+                            trigger_level,
+                        )
+
+                        watch["state"] = "REV_OK"
+                        watch["trade_state"] = ""
+                        watch["entry_blocked"] = False
+                        watch["rev_ok"] = True
+                        watch["entry_ready"] = False
+                        watch["entry_triggered"] = False
+
+                        watch.pop("entry_block_reason", None)
+                        watch.pop("next_retry_ms", None)
+                        watch.pop("late_entry_max_move", None)
+
+                        _point_a_clear_fields(watch)
+
+                        watch["rc_trigger_crossed"] = False
+                        watch.pop("rc_trigger_crossed_ms", None)
+                        watch.pop("rc_trigger_cross_price", None)
+                        watch.pop("rc_trigger_cross_level", None)
+                        watch.pop("rc_trigger_cross_rev_ok_ms", None)
+
+                        try:
+                            R.delete(
+                                break_state_key(
+                                    uid,
+                                    sym_w,
+                                    side_w,
+                                    "H1",
+                                )
+                            )
+                            tenant_delete_latest_entry_claim(
+                                R,
+                                uid,
+                                sym_w,
+                                side_w,
+                                tf="H1",
+                            )
+                        except Exception:
+                            pass
+
+                        R.set(
+                            str(wkey),
+                            json.dumps(
+                                watch,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                            ex=7 * 24 * 3600,
+                        )
+                        continue
+                
+                # -------------------------------------------------
+                # P0-1 Point-A EXPIRED lifecycle.
+                #
+                # New EXPIRED paths release immediately.
+                #
+                # If an EXPIRED watch reaches this block, it is:
+                #   1. legacy state from before P0-1, or
+                #   2. temporary fail-closed state because an earlier
+                #      release attempt failed.
+                #
+                # Do NOT wait for price to reset.
+                # Do NOT re-arm this RC.
+                # Retry release immediately so normal discovery can
+                # select a fresh direction / zone / RC.
+                # -------------------------------------------------
+                point_a_expired = (
+                    state_w == POINT_A_EXPIRED_STATE
+                )
+
+                if point_a_expired:
+                    _expire_reason = str(
+                        watch.get("point_a_reason")
+                        or watch.get("point_a_terminal_reason")
+                        or watch.get("entry_block_reason")
+                        or "POINT_A_EXPIRED"
+                    )
+
+                    _released = (
+                        _point_a_release_expired_watch(
+                            uid=uid,
+                            sym=sym_w,
+                            side=side_w,
+                            wkey=str(wkey),
+                            rev_ok_ms=int(
+                                watch.get("point_a_rc_rev_ok_ms")
+                                or rev_ok_ms
+                                or 0
+                            ),
+                            trigger_level=float(
+                                watch.get("point_a_trigger_level")
+                                or trigger_level
+                                or 0.0
+                            ),
+                            live_price=float(
+                                live_px
+                            ),
+                            reason=_expire_reason,
+                            profile_id=(
+                                str(
+                                    profile_id_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                            device_id=(
+                                str(
+                                    dev_for_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                        )
+                    )
+
+                    if not _released:
+                        # Fail closed and retry next executor cycle.
+                        continue
+
+                    continue
+                   
+
+                # Point-A hard BLOCK rejects the current crossed opportunity.
+                # It may only become eligible again after price resets behind the
+                # trigger (fresh cross) or zone_entry_gate installs a new RC.
+                # -------------------------------------------------
+                # Point-A BLOCK lifecycle.
+                #
+                # BLOCK is a final rejection of THIS opportunity.
+                # It does not wait for price to reset and it does
+                # not use the 8x M15 WAIT lifecycle.
+                #
+                # Release the rejected watch immediately and let
+                # normal discovery select a fresh direction/zone/RC.
+                # -------------------------------------------------
+                point_a_blocked = (
+                    state_w == POINT_A_BLOCK_STATE
+                )
+
+                if point_a_blocked:
+                    _block_reason = str(
+                        watch.get("point_a_reason")
+                        or watch.get("point_a_terminal_reason")
+                        or watch.get("entry_block_reason")
+                        or "POINT_A_BLOCK"
+                    )
+
+                    _released = _point_a_release_blocked_watch(
+                        uid=uid,
+                        sym=sym_w,
+                        side=side_w,
+                        wkey=str(wkey),
+                        rev_ok_ms=int(
+                            watch.get("point_a_rc_rev_ok_ms")
+                            or rev_ok_ms
+                            or 0
+                        ),
+                        trigger_level=float(
+                            watch.get("point_a_trigger_level")
+                            or trigger_level
+                            or 0.0
+                        ),
+                        live_price=float(live_px),
+                        reason=_block_reason,
+                        profile_id=(
+                                str(
+                                    profile_id_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                            device_id=(
+                                str(
+                                    dev_for_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                    )
+
+                    # Cleanup failure must fail closed.
+                    # Keep the terminal BLOCK and retry next cycle.
+                    if not _released:
+                        watch["state"] = POINT_A_BLOCK_STATE
+                        watch["trade_state"] = POINT_A_BLOCK_STATE
+                        watch["rev_ok"] = False
+                        watch["entry_blocked"] = True
+                        watch["entry_ready"] = False
+                        watch["entry_triggered"] = False
+
+                        try:
+                            R.set(
+                                str(wkey),
+                                json.dumps(
+                                    watch,
+                                    separators=(",", ":"),
+                                    default=str,
+                                ),
+                                ex=7 * 24 * 3600,
+                            )
+                        except Exception:
+                            log.exception(
+                                "[POINT_A] BLOCK_FAIL_CLOSED_PERSIST_FAILED "
+                                "sym=%s side=%s key=%s",
+                                sym_w,
+                                side_w,
+                                wkey,
+                            )
+
+                    continue
+
+                    # -------------------------------------------------
+                    # Point-A BLOCK release.
+                    #
+                    # Price has reset behind the old trigger.
+                    # The rejected RC must NOT be re-armed.
+                    #
+                    # Remove this watch and let normal discovery create
+                    # a completely fresh direction / zone / RC.
+                    # -------------------------------------------------
+                    try:
+                        R.delete(
+                            break_state_key(
+                                uid,
+                                sym_w,
+                                side_w,
+                                "H1",
+                            )
+                        )
+
+                        tenant_delete_latest_entry_claim(
+                            R,
+                            uid,
+                            sym_w,
+                            side_w,
+                            tf="H1",
+                        )
+
+                        zone_watch_delete(
+                            R,
+                            uid,
+                            sym_w,
+                            side_w,
+                            tf="H1",
+                        )
+
+                    except Exception as exc:
+                        log.exception(
+                            "[POINT_A] BLOCK_RELEASE_FAILED "
+                            "sym=%s side=%s rc=%s trigger=%s err=%r",
+                            sym_w,
+                            side_w,
+                            rev_ok_ms,
+                            trigger_level,
+                            exc,
+                        )
+                        continue
+
+                    log.warning(
+                        "[POINT_A] BLOCK_RELEASED_RESET "
+                        "sym=%s side=%s rc=%s trigger=%s live=%s",
+                        sym_w,
+                        side_w,
+                        rev_ok_ms,
+                        trigger_level,
+                        live_px,
+                    )
+
+                    continue
+
                 blocked_retry = _is_entry_blocked_state(state_w)
+                point_a_wait_release_allow = False
+                point_a_wait_release_result = None
+
+                # -------------------------------------------------
+                # P0 POINT-A WAIT RE-EVALUATION
+                #
+                # Once WAIT owns an already-crossed RC opportunity,
+                # do NOT require another RC cross.
+                #
+                # Re-evaluate the persisted Point-A opportunity
+                # directly until it resolves to:
+                #   ALLOW
+                #   BLOCK
+                #   EXPIRE (price / M15 time)
+                # -------------------------------------------------
+                if state_w == POINT_A_WAIT_STATE:
+                    try:
+                        nr = _si(
+                            watch.get("next_retry_ms"),
+                            0,
+                        )
+
+                        if nr > 0 and now_ms() < nr:
+                            continue
+
+                    except Exception:
+                        pass
+
+                    now_e = now_ms()
+
+                    point_a = _point_a_evaluate(
+                        watch=watch,
+                        sym=sym_w,
+                        side=side_w,
+                        live_price=float(live_px),
+                        trigger_level=float(trigger_level),
+                        device_id=(
+                            str(dev_for_px or "").strip()
+                            or None
+                        ),
+                        profile_id=(
+                            str(profile_id_px or "").strip()
+                            or None
+                        ),
+                        now_e=int(now_e),
+                    )
+
+                    point_a_decision = str(
+                        point_a.get("decision") or "WAIT"
+                    ).upper().strip()
+
+                    point_a_action = str(
+                        point_a.get("action") or "HOLD"
+                    ).upper().strip()
+                    
+                    _symbol_room = (
+                        point_a.get("symbol_room")
+                        if isinstance(
+                            point_a.get("symbol_room"),
+                            dict,
+                        )
+                        else {}
+                    )
+                    _dxy_dbg = (
+                        point_a.get("dxy")
+                        if isinstance(point_a.get("dxy"), dict)
+                        else {}
+                    )
+
+                    _dxy_snap_dbg = (
+                        _dxy_dbg.get("snapshot")
+                        if isinstance(_dxy_dbg.get("snapshot"), dict)
+                        else {}
+                    )
+
+                    log.warning(
+                        "[POINT_A] WAIT_REEVAL "
+                        "sym=%s side=%s "
+                        "decision=%s action=%s reason=%s "
+                        "disp_atr=%s wait_m15=%s/%s "
+                        "sr_available=%s "
+                        "room_class=%s room_atr=%s "
+                        "opposing_role=%s opposing_level=%s "
+                        "candidate_count=%s sr_source=%s "
+                        "sr_unavailable_reason=%s sr_error=%s "
+                        "dxy_status=%s "
+                        "dxy_lifecycle=%s "
+                        "dxy_m15=%s dxy_h1=%s "
+                        "dxy_h1_reason=%s "
+                        "dxy_h1_scores=%s/%s margin=%s "
+                        "dxy_m15_h1=%s combined=%s required=%s "
+                        "dxy_candidate_qualified=%s "
+                        "dxy_m15_entry_state=%s "
+                        "dxy_m15_deteriorating=%s revoke=%s/%s "
+                        "dxy_mature_move=%s mature_sr_risk=%s "
+                        "dxy_max_favorable_atr=%s recent_net_atr=%s "
+                        "dxy_room_class=%s "
+                        "canonical_pressure=%s canonical_reason=%s "
+                        "canonical_room_atr=%s "
+                        "rc=%s trigger=%s",
+                        sym_w,
+                        side_w,
+                        point_a_decision,
+                        point_a_action,
+                        point_a.get("reason"),
+                        point_a.get("displacement_atr"),
+                        point_a.get("wait_m15_bars"),
+                        point_a.get("max_wait_m15_bars"),
+                        _symbol_room.get("available"),
+                        _symbol_room.get("class"),
+                        _symbol_room.get("room_atr"),
+                        _symbol_room.get("opposing_role"),
+                        _symbol_room.get("opposing_level"),
+                        _symbol_room.get("candidate_count"),
+                        _symbol_room.get("source"),
+                        _symbol_room.get("unavailable_reason"),
+                        _symbol_room.get("error"),
+                        _dxy_dbg.get("status"),
+                        _dxy_snap_dbg.get("lifecycle_status"),
+                        _dxy_snap_dbg.get("m15_direction"),
+                        _dxy_snap_dbg.get("h1_direction"),
+                        _dxy_snap_dbg.get("h1_direction_reason"),
+                        _dxy_snap_dbg.get("h1_bull_score"),
+                        _dxy_snap_dbg.get("h1_bear_score"),
+                        _dxy_snap_dbg.get("h1_evidence_margin"),
+                        _dxy_snap_dbg.get("m15_h1_state"),
+                        _dxy_snap_dbg.get("combined_dxy_direction"),
+                        _dxy_snap_dbg.get("required_direction_for_trade"),
+                        _dxy_snap_dbg.get("candidate_qualified"),
+                        _dxy_snap_dbg.get("m15_entry_state"),
+                        _dxy_snap_dbg.get("m15_deteriorating"),
+                        _dxy_snap_dbg.get("m15_revoke_score"),
+                        _dxy_snap_dbg.get("m15_revoke_wait_threshold"),
+                        _dxy_snap_dbg.get("dxy_mature_move"),
+                        _dxy_snap_dbg.get("dxy_mature_sr_risk"),
+                        _dxy_snap_dbg.get("dxy_max_favorable_atr"),
+                        _dxy_snap_dbg.get("dxy_recent_net_atr"),
+                        _dxy_snap_dbg.get("room_class"),
+                        _dxy_snap_dbg.get("canonical_structure_pressure"),
+                        _dxy_snap_dbg.get("canonical_structure_pressure_reason"),
+                        _dxy_snap_dbg.get("canonical_directional_room_atr"),
+                        watch.get("rev_ok_ms"),
+
+                        trigger_level,
+                    )
+
+                    if point_a_action == "EXPIRE":
+                        # -------------------------------------------------
+                        # P0-1 WAIT -> EXPIRED -> RELEASE
+                        #
+                        # EXPIRED is terminal analytics for THIS setup.
+                        # It is not a persistent gate.
+                        # -------------------------------------------------
+                        watch["state"] = POINT_A_EXPIRED_STATE
+                        watch["trade_state"] = POINT_A_EXPIRED_STATE
+                        watch["entry_blocked"] = True
+                        watch["rev_ok"] = False
+                        watch["entry_ready"] = False
+                        watch["entry_triggered"] = False
+
+                        watch["point_a_terminal"] = True
+                        watch["point_a_terminal_reason"] = str(
+                            point_a.get("reason")
+                            or "POINT_A_EXPIRED"
+                        )
+
+                        watch["entry_block_reason"] = str(
+                            point_a.get("reason")
+                            or "POINT_A_EXPIRED"
+                        )
+
+                        watch["point_a"] = point_a
+                        watch["point_a_decision"] = "WAIT"
+                        watch["point_a_action"] = "EXPIRE"
+                        watch["point_a_reason"] = str(
+                            point_a.get("reason") or ""
+                        )
+                        watch["point_a_reason_codes"] = list(
+                            point_a.get("reason_codes") or []
+                        )
+                        watch["point_a_last_eval_ms"] = int(now_e)
+                        watch["point_a_cross_latched"] = False
+                        watch["point_a_displacement_atr"] = (
+                            point_a.get("displacement_atr")
+                        )
+
+                        watch.pop("next_retry_ms", None)
+                        watch.pop("late_entry_max_move", None)
+
+                        # ---------------------------------------------
+                        # Terminal analytics MUST see the complete
+                        # setup before its operational state is removed.
+                        # ---------------------------------------------
+                        try:
+                            from api.xtl_analytics import (
+                                capture_point_a_event,
+                            )
+
+                            capture_point_a_event(
+                                event_type="WAIT_EXPIRED",
+                                uid=uid,
+                                profile_id=profile_id_px,
+                                device_id=dev_for_px,
+                                symbol=sym_w,
+                                side=side_w,
+                                watch=watch,
+                                point_a=point_a,
+                                live_price=float(live_px),
+                                trigger_level=float(trigger_level),
+                                event_ms=int(now_e),
+                            )
+
+                        except Exception as analytics_exc:
+                            log.warning(
+                                "[POINT_A] ANALYTICS_WAIT_EXPIRE_FAILED "
+                                "sym=%s side=%s err=%r",
+                                sym_w,
+                                side_w,
+                                analytics_exc,
+                            )
+
+                        _expire_reason = str(
+                            point_a.get("reason")
+                            or "POINT_A_EXPIRED"
+                        )
+
+                        _released = (
+                            _point_a_release_expired_watch(
+                                uid=uid,
+                                sym=sym_w,
+                                side=side_w,
+                                wkey=str(wkey),
+                                rev_ok_ms=int(
+                                    watch.get("rev_ok_ms")
+                                    or 0
+                                ),
+                                trigger_level=float(
+                                    trigger_level
+                                ),
+                                live_price=float(
+                                    live_px
+                                ),
+                                reason=_expire_reason,
+                                profile_id=(
+                                    str(
+                                        profile_id_px
+                                        or ""
+                                    ).strip()
+                                    or None
+                                ),
+                                device_id=(
+                                    str(
+                                        dev_for_px
+                                        or ""
+                                    ).strip()
+                                    or None
+                                ),
+                            )
+                        )
+
+                        # Cleanup failure fails closed.
+                        # Persist EXPIRED only as a temporary retry
+                        # tombstone, NOT as normal lifecycle behavior.
+                        if not _released:
+                            try:
+                                R.set(
+                                    str(wkey),
+                                    json.dumps(
+                                        watch,
+                                        separators=(",", ":"),
+                                        default=str,
+                                    ),
+                                    ex=7 * 24 * 3600,
+                                )
+                            except Exception:
+                                log.exception(
+                                    "[POINT_A] "
+                                    "WAIT_EXPIRE_FAIL_CLOSED_PERSIST_FAILED "
+                                    "sym=%s side=%s key=%s",
+                                    sym_w,
+                                    side_w,
+                                    wkey,
+                                )
+
+                        continue
+
+                    if point_a_decision == "WAIT":
+                        try:
+                            _point_a_persist_wait(
+                                watch=watch,
+                                wkey=str(wkey),
+                                point_a=point_a,
+                                live_price=float(live_px),
+                                trigger_level=float(trigger_level),
+                                now_e=int(now_e),
+                            )
+                        except Exception:
+                            log.exception(
+                                "[POINT_A] WAIT_REPERSIST_FAILED "
+                                "sym=%s side=%s key=%s",
+                                sym_w,
+                                side_w,
+                                wkey,
+                            )
+
+                        continue
+
+                    if point_a_decision == "BLOCK":
+                        watch["state"] = POINT_A_BLOCK_STATE
+                        watch["trade_state"] = POINT_A_BLOCK_STATE
+                        watch["entry_blocked"] = True
+                        watch["rev_ok"] = False
+                        watch["entry_ready"] = False
+                        watch["entry_triggered"] = False
+
+                        watch["point_a_terminal"] = True
+                        watch["point_a_terminal_reason"] = str(
+                            point_a.get("reason")
+                            or "POINT_A_BLOCK"
+                        )
+
+                        watch["entry_block_reason"] = str(
+                            point_a.get("reason")
+                            or "POINT_A_BLOCK"
+                        )
+
+                        watch["point_a"] = point_a
+                        watch["point_a_decision"] = "BLOCK"
+                        watch["point_a_action"] = "REJECT"
+                        watch["point_a_reason"] = str(
+                            point_a.get("reason") or ""
+                        )
+                        watch["point_a_reason_codes"] = list(
+                            point_a.get("reason_codes") or []
+                        )
+                        watch["point_a_last_eval_ms"] = int(now_e)
+                        watch["point_a_cross_latched"] = False
+
+                        # -----------------------------------------
+                        # Analytics only: WAIT resolved to BLOCK.
+                        # -----------------------------------------
+                        try:
+                            from api.xtl_analytics import (
+                                capture_point_a_event,
+                            )
+
+                            capture_point_a_event(
+                                event_type="WAIT_THEN_BLOCK",
+                                uid=uid,
+                                profile_id=profile_id_px,
+                                device_id=dev_for_px,
+                                symbol=sym_w,
+                                side=side_w,
+                                watch=watch,
+                                point_a=point_a,
+                                live_price=float(live_px),
+                                trigger_level=float(trigger_level),
+                                event_ms=int(now_e),
+                            )
+                        except Exception as analytics_exc:
+                            log.warning(
+                                "[POINT_A] ANALYTICS_WAIT_BLOCK_FAILED "
+                                "sym=%s side=%s err=%r",
+                                sym_w,
+                                side_w,
+                                analytics_exc,
+                            )
+
+                        _released = _point_a_release_blocked_watch(
+                            uid=uid,
+                            sym=sym_w,
+                            side=side_w,
+                            wkey=str(wkey),
+                            rev_ok_ms=int(
+                                watch.get("point_a_rc_rev_ok_ms")
+                                or watch.get("rev_ok_ms")
+                                or 0
+                            ),
+                            trigger_level=float(
+                                watch.get("point_a_trigger_level")
+                                or trigger_level
+                                or 0.0
+                            ),
+                            live_price=float(live_px),
+                            reason=str(
+                                point_a.get("reason")
+                                or "POINT_A_BLOCK"
+                            ),
+                            profile_id=(
+                                str(
+                                    profile_id_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                            device_id=(
+                                str(
+                                    dev_for_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                        )
+
+                        # Fail closed if release itself failed.
+                        if not _released:
+                            try:
+                                R.set(
+                                    str(wkey),
+                                    json.dumps(
+                                        watch,
+                                        separators=(",", ":"),
+                                        default=str,
+                                    ),
+                                    ex=7 * 24 * 3600,
+                                )
+                            except Exception:
+                                log.exception(
+                                    "[POINT_A] BLOCK_FAIL_CLOSED_PERSIST_FAILED "
+                                    "sym=%s side=%s key=%s",
+                                    sym_w,
+                                    side_w,
+                                    wkey,
+                                )
+
+                        continue
+
+                   
+
+                    # ALLOW continues into the normal post-Point-A
+                    # entry path below.
+                    if point_a_decision == "ALLOW":
+                        watch["point_a"] = point_a
+                        watch["point_a_decision"] = "ALLOW"
+                        watch["point_a_action"] = "RELEASE"
+                        watch["point_a_reason"] = str(
+                            point_a.get("reason") or ""
+                        )
+                        watch["point_a_reason_codes"] = list(
+                            point_a.get("reason_codes") or []
+                        )
+                        watch["point_a_last_eval_ms"] = int(now_e)
+
+                        watch["state"] = "REV_OK"
+                        watch["trade_state"] = ""
+                        watch["entry_blocked"] = False
+
+                        watch.pop(
+                            "entry_block_reason",
+                            None,
+                        )
+                        watch.pop(
+                            "next_retry_ms",
+                            None,
+                        )
+                        watch.pop(
+                            "late_entry_max_move",
+                            None,
+                        )
+
+                        R.set(
+                            str(wkey),
+                            json.dumps(
+                                watch,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                            ex=7 * 24 * 3600,
+                        )
+                        # -----------------------------------------
+                        # Analytics only: WAIT resolved to PASS.
+                        # -----------------------------------------
+                        try:
+                            from api.xtl_analytics import (
+                                capture_point_a_event,
+                            )
+
+                            capture_point_a_event(
+                                event_type="WAIT_THEN_PASS",
+                                uid=uid,
+                                profile_id=profile_id_px,
+                                device_id=dev_for_px,
+                                symbol=sym_w,
+                                side=side_w,
+                                watch=watch,
+                                point_a=point_a,
+                                live_price=float(live_px),
+                                trigger_level=float(trigger_level),
+                                event_ms=int(now_e),
+                            )
+                        except Exception as analytics_exc:
+                            log.warning(
+                                "[POINT_A] ANALYTICS_WAIT_PASS_FAILED "
+                                "sym=%s side=%s err=%r",
+                                sym_w,
+                                side_w,
+                                analytics_exc,
+                            )
+                        # This cycle has already received authoritative
+                        # Point-A ALLOW from WAIT reevaluation.
+                        #
+                        # Preserve the exact RC/cross and continue into
+                        # normal entry processing without evaluating
+                        # Point-A a second time.
+                        point_a_wait_release_allow = True
+                        point_a_wait_release_result = point_a
+
+                        state_w = "REV_OK"
+                        blocked_retry = False
+                        
+
+                        # Persisted cross remains valid. The normal
+                        # cross-recovery path below can now continue
+                        # this exact crossed RC into entry.
                 if blocked_retry:
                     try:
                         nr = _si(watch.get("next_retry_ms"), 0)
@@ -6753,10 +10120,14 @@ def tick_user(uid: str) -> None:
                         beyond_trigger = bool(live_px <= trigger_level)
                         late_move = max(0.0, float(trigger_level) - float(live_px))
 
-                    if not beyond_trigger:
+                    if (
+                        not beyond_trigger
+                        and state_w != POINT_A_WAIT_STATE
+                    ):
                         watch["state"] = "REV_OK"
                         watch["trade_state"] = ""
                         watch["entry_blocked"] = False
+
                         watch.pop("entry_block_reason", None)
                         watch.pop("next_retry_ms", None)
                         watch.pop(
@@ -6783,14 +10154,71 @@ def tick_user(uid: str) -> None:
                             "broker_error_ms",
                             None,
                         )
-                        R.set(str(wkey), json.dumps(watch, separators=(",", ":")), ex=7 * 24 * 3600)
+
+                        # Only Point-A WAIT may re-arm the same RC here.
+                        # BLOCK / EXPIRED are terminal and are handled
+                        # earlier by their dedicated release/reset paths.
+                        if state_w == POINT_A_WAIT_STATE:
+                            watch["rev_ok"] = True
+                            watch["entry_ready"] = False
+                            watch["entry_triggered"] = False
+
+                            watch.pop("late_entry_max_move", None)
+                            _point_a_clear_fields(watch)
+
+                            watch["rc_trigger_crossed"] = False
+                            watch.pop("rc_trigger_crossed_ms", None)
+                            watch.pop("rc_trigger_cross_price", None)
+                            watch.pop("rc_trigger_cross_level", None)
+                            watch.pop("rc_trigger_cross_rev_ok_ms", None)
+
+                            try:
+                                R.delete(
+                                    break_state_key(
+                                        uid,
+                                        sym_w,
+                                        side_w,
+                                        "H1",
+                                    )
+                                )
+                                tenant_delete_latest_entry_claim(
+                                    R,
+                                    uid,
+                                    sym_w,
+                                    side_w,
+                                    tf="H1",
+                                )
+                            except Exception:
+                                pass
+
+                        R.set(
+                            str(wkey),
+                            json.dumps(
+                                watch,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                            ex=7 * 24 * 3600,
+                        )
                         continue
 
-                    if late_move > float(max_move):
-                        log.warning(
-                            "[WATCHLIST] MISSED_PROP_DELAY sym=%s side=%s trigger=%s live=%s late_move=%s max_move=%s key=%s",
-                            sym_w, side_w, trigger_level, live_px, late_move, max_move, wkey
-                        )
+                    # Point-A WAIT owns its crossed opportunity.
+                    # Let _point_a_evaluate() decide PRICE_TOO_FAR and
+                    # persist the proper EXPIRED tombstone.
+                    if (
+                        late_move > float(max_move)
+                        and state_w != POINT_A_WAIT_STATE
+                    ):
+                        if state_w.startswith("ENTRY_BLOCKED_POINT_A"):
+                            log.warning(
+                                "[POINT_A] EXPIRE_PRICE sym=%s side=%s trigger=%s live=%s late_move=%s max_move=%s key=%s",
+                                sym_w, side_w, trigger_level, live_px, late_move, max_move, wkey
+                            )
+                        else:
+                            log.warning(
+                                "[WATCHLIST] MISSED_PROP_DELAY sym=%s side=%s trigger=%s live=%s late_move=%s max_move=%s key=%s",
+                                sym_w, side_w, trigger_level, live_px, late_move, max_move, wkey
+                            )
                         try:
                             zone_watch_delete(
                                 R,
@@ -6836,20 +10264,101 @@ def tick_user(uid: str) -> None:
                 except Exception:
                     pass
 
-                prev_fresh = prev_px > 0 and prev_ts > 0 and (now_ms() - prev_ts) <= 120000
+                prev_fresh = (
+                    prev_px > 0
+                    and prev_ts > 0
+                    and (now_ms() - prev_ts) <= 120000
+                )
+
+                
+                # -------------------------------------------------
+                # Restart-safe RC cross recovery.
+                #
+                # 1) If this exact RC generation already has durable
+                #    cross evidence on the watch, trust that evidence
+                #    and resume Point-A after restart.
+                #
+                # 2) If there is no durable cross evidence and the
+                #    previous tick is missing/stale, being beyond the
+                #    trigger is NOT proof of a fresh cross.
+                #    Do not chase and do not terminally invalidate.
+                # -------------------------------------------------
+                _cross_rev_ms = int(watch.get("rev_ok_ms") or 0)
+
+                _persisted_same_cross = bool(
+                    watch.get("rc_trigger_crossed")
+                    and int(
+                        watch.get(
+                            "rc_trigger_cross_rev_ok_ms"
+                        )
+                        or 0
+                    ) == _cross_rev_ms
+                    and abs(
+                        float(
+                            watch.get(
+                                "rc_trigger_cross_level"
+                            )
+                            or 0.0
+                        )
+                        - float(trigger_level)
+                    ) <= 1e-12
+                )
 
                 if side_w == "BUY":
-                    crossed = bool(live_px > trigger_level)
-                    
-                else:
-                    crossed = bool(live_px < trigger_level)
-                already_beyond = False
-                    
+                    _live_beyond = bool(
+                        live_px > trigger_level
+                    )
+
+                    _fresh_cross = bool(
+                        prev_fresh
+                        and prev_px <= trigger_level
+                        and live_px > trigger_level
+                    )
+
+                else:  # SELL
+                    _live_beyond = bool(
+                        live_px < trigger_level
+                    )
+
+                    _fresh_cross = bool(
+                        prev_fresh
+                        and prev_px >= trigger_level
+                        and live_px < trigger_level
+                    )
+
+                # Persisted exact-RC evidence survives service restart.
+                cross_recovered = bool(
+                    _persisted_same_cross
+                    and _live_beyond
+                )
+
+                crossed = bool(
+                    _fresh_cross
+                    or cross_recovered
+                )
+
+                # Unknown-cross restart state:
+                # current price is already beyond, but there is no
+                # trustworthy previous tick and no persisted proof
+                # that this RC crossed.
+                recovery_beyond = bool(
+                    not crossed
+                    and not prev_fresh
+                    and _live_beyond
+                )
+
+                # Keep this only for existing debug payload compatibility.
+                # It no longer means terminal MISSED_BREAKOUT.
+                already_beyond = bool(recovery_beyond)
                 # -------------------------------------------------
                 # DEBUG: breakout decision
                 # -------------------------------------------------
                 log.warning(
-                    "[WATCHLIST] BREAK_CHECK sym=%s side=%s trigger=%s live=%s prev=%s prev_fresh=%s crossed=%s already_beyond=%s key=%s",
+                    "[WATCHLIST] BREAK_CHECK "
+                    "sym=%s side=%s trigger=%s live=%s "
+                    "prev=%s prev_fresh=%s crossed=%s "
+                    "fresh_cross=%s cross_recovered=%s "
+                    "recovery_beyond=%s persisted_cross=%s key=%s",
                     sym_w,
                     side_w,
                     trigger_level,
@@ -6857,7 +10366,10 @@ def tick_user(uid: str) -> None:
                     prev_px,
                     prev_fresh,
                     crossed,
-                    already_beyond,
+                    _fresh_cross,
+                    cross_recovered,
+                    recovery_beyond,
+                    _persisted_same_cross,
                     wkey,
                 )
 
@@ -6880,43 +10392,118 @@ def tick_user(uid: str) -> None:
                 except Exception:
                     pass
 
-                if already_beyond:
+                if recovery_beyond:
+                    # -------------------------------------------------
+                    # Restart / stale-tick recovery.
+                    #
+                    # Price is already beyond the RC trigger, but we do
+                    # NOT have a trustworthy previous tick proving a
+                    # fresh cross and we do NOT have persisted exact-RC
+                    # cross evidence.
+                    #
+                    # Safety:
+                    #   - do not chase
+                    #   - do not mark MISSED_BREAKOUT
+                    #   - do not run Point-A yet
+                    #   - keep the same RC alive
+                    #   - seed current price as new baseline
+                    #   - require reset behind trigger + fresh cross
+                    # -------------------------------------------------
                     try:
-                        watch["state"] = "MISSED_BREAKOUT"
-                        watch["trade_state"] = "MISSED_BREAKOUT"
-                        watch["missed_breakout"] = True
-                        watch["missed_breakout_ms"] = now_ms()
-                        watch["missed_breakout_reason"] = "NO_FRESH_CROSS_PRICE_ALREADY_BEYOND_TRIGGER"
-                        watch["missed_breakout_trigger_level"] = float(trigger_level)
-                        watch["missed_breakout_live_price"] = float(live_px)
-                        watch["missed_breakout_prev_price"] = float(prev_px or 0.0)
-                        watch["missed_breakout_prev_fresh"] = bool(prev_fresh)
+                        watch["rc_cross_recovery_wait"] = True
 
-                        if side_w == "BUY":
-                            watch["missed_breakout_distance"] = float(live_px - trigger_level)
-                        else:
-                            watch["missed_breakout_distance"] = float(trigger_level - live_px)
+                        watch["rc_cross_recovery_started_ms"] = int(
+                            watch.get("rc_cross_recovery_started_ms")
+                            or now_ms()
+                        )
 
+                        watch["rc_cross_recovery_reason"] = (
+                            "NO_FRESH_PREV_PRICE_ALREADY_BEYOND_TRIGGER"
+                        )
+
+                        watch["rc_cross_recovery_live_price"] = float(
+                            live_px
+                        )
+
+                        watch["rc_cross_recovery_trigger_level"] = float(
+                            trigger_level
+                        )
+
+                        watch["rc_cross_recovery_rev_ok_ms"] = int(
+                            watch.get("rev_ok_ms") or 0
+                        )
+
+                        # Same RC remains valid, but is NOT executable
+                        # until price resets and crosses freshly.
+                        watch["state"] = "REV_OK"
+                        watch["trade_state"] = ""
+                        watch["entry_blocked"] = False
                         watch["entry_triggered"] = False
-                        watch["entry_blocked"] = True
-                        watch["entry_block_reason"] = "MISSED_BREAKOUT"
+                        watch["rev_ok"] = True
 
-                        R.set(str(wkey), json.dumps(watch), ex=7 * 24 * 3600)
+                        R.set(
+                            str(wkey),
+                            json.dumps(
+                                watch,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                            ex=7 * 24 * 3600,
+                        )
 
                         log.warning(
-                            "[WATCHLIST] MISSED_BREAKOUT sym=%s side=%s trigger=%s live=%s prev=%s prev_fresh=%s key=%s",
-                            sym_w, side_w, trigger_level, live_px, prev_px, prev_fresh, wkey
+                            "[WATCHLIST] RC_CROSS_RECOVERY_WAIT "
+                            "sym=%s side=%s rc=%s trigger=%s "
+                            "live=%s prev=%s prev_fresh=%s key=%s",
+                            sym_w,
+                            side_w,
+                            watch.get("rev_ok_ms"),
+                            trigger_level,
+                            live_px,
+                            prev_px,
+                            prev_fresh,
+                            wkey,
                         )
-                    except Exception as e:
-                        log.warning("[WATCHLIST] MISSED_BREAKOUT_MARK_FAILED key=%s err=%r", wkey, e)
+
+                    except Exception as exc:
+                        log.warning(
+                            "[WATCHLIST] "
+                            "RC_CROSS_RECOVERY_WAIT_PERSIST_FAILED "
+                            "sym=%s side=%s key=%s err=%r",
+                            sym_w,
+                            side_w,
+                            wkey,
+                            exc,
+                        )
 
                     continue
-
                        
 
                 if not crossed:
                     continue
-
+                # We now have authoritative cross evidence.
+                # Recovery-wait metadata is no longer applicable.
+                watch.pop("rc_cross_recovery_wait", None)
+                watch.pop(
+                    "rc_cross_recovery_started_ms",
+                    None,
+                )
+                watch.pop(
+                    "rc_cross_recovery_reason",
+                    None,
+                )
+                watch.pop(
+                    "rc_cross_recovery_live_price",
+                    None,
+                )
+                watch.pop(
+                    "rc_cross_recovery_trigger_level",
+                    None,
+                )
+                watch.pop(
+                    "rc_cross_recovery_rev_ok_ms",
+                    None,
+                )
                 # -------------------------------------------------
                 # P0: RC trigger-cross Discord alert.
                 #
@@ -6933,16 +10520,18 @@ def tick_user(uid: str) -> None:
                     watch["direction"] = str(side_w).upper()
                     watch["watch_key"] = str(wkey)
 
-                    watch["rc_trigger_crossed"] = True
-                    if not watch.get("rc_trigger_crossed"):
+                    _cross_rev_ms = int(watch.get("rev_ok_ms") or 0)
+                    _same_recorded_cross = bool(
+                        watch.get("rc_trigger_crossed")
+                        and int(watch.get("rc_trigger_cross_rev_ok_ms") or 0) == _cross_rev_ms
+                        and abs(float(watch.get("rc_trigger_cross_level") or 0.0) - float(trigger_level)) <= 1e-12
+                    )
+                    if not _same_recorded_cross:
                         watch["rc_trigger_crossed_ms"] = int(now_e)
                         watch["rc_trigger_cross_price"] = float(live_px)
-
                     watch["rc_trigger_crossed"] = True
+                    watch["rc_trigger_cross_rev_ok_ms"] = int(_cross_rev_ms)
                     watch["rc_trigger_cross_level"] = float(trigger_level)
-                    watch["rc_trigger_cross_level"] = float(
-                        trigger_level
-                    )
 
                     # Preserve the cross evidence on the live watch.
                     try:
@@ -7035,6 +10624,590 @@ def tick_user(uid: str) -> None:
                         exc,
                     )
 
+                # -------------------------------------------------
+                # Point-A final pre-entry gate.
+                # Runs only after a valid RC trigger is beyond/crossed and
+                # before any watchlist entry claim or executor event exists.
+                # -------------------------------------------------
+                # -------------------------------------------------
+                # Point-A final pre-entry gate.
+                # Runs only after a valid RC trigger is beyond/crossed and
+                # before any watchlist entry claim or executor event exists.
+                # -------------------------------------------------
+                if (
+                    point_a_wait_release_allow
+                    and isinstance(
+                        point_a_wait_release_result,
+                        dict,
+                    )
+                ):
+                    # WAIT was already re-evaluated and resolved to
+                    # ALLOW in this same executor cycle.
+                    #
+                    # Reuse that exact decision. Do not sample DXY /
+                    # symbol room again before dispatch.
+                    point_a = point_a_wait_release_result
+
+                    log.warning(
+                        "[POINT_A] WAIT_ALLOW_REUSED "
+                        "sym=%s side=%s rc=%s trigger=%s "
+                        "live=%s reason=%s",
+                        sym_w,
+                        side_w,
+                        watch.get("rev_ok_ms"),
+                        trigger_level,
+                        live_px,
+                        point_a.get("reason"),
+                    )
+
+                else:
+                    point_a = _point_a_evaluate(
+                        watch=watch,
+                        sym=sym_w,
+                        side=side_w,
+                        live_price=float(live_px),
+                        trigger_level=float(trigger_level),
+                        device_id=(
+                            str(dev_for_px or "").strip()
+                            or None
+                        ),
+                        profile_id=(
+                            str(profile_id_px or "").strip()
+                            or None
+                        ),
+                        now_e=int(now_e),
+                    )
+
+                point_a_decision = str(
+                    point_a.get("decision") or "WAIT"
+                ).upper().strip()
+
+                point_a_action = str(
+                    point_a.get("action") or "HOLD"
+                ).upper().strip()
+                _symbol_room = (
+                    point_a.get("symbol_room")
+                    if isinstance(point_a.get("symbol_room"), dict)
+                    else {}
+                )
+                _dxy = (
+                    point_a.get("dxy")
+                    if isinstance(point_a.get("dxy"), dict)
+                    else {}
+                )
+                _dxy_snap = (
+                    _dxy.get("snapshot")
+                    if isinstance(_dxy.get("snapshot"), dict)
+                    else {}
+                )
+                _dxy_sr = (
+                    _dxy_snap.get("opposing_sr_selection")
+                    if isinstance(_dxy_snap.get("opposing_sr_selection"), dict)
+                    else {}
+                )
+                _dxy_sr_selected = (
+                    _dxy_sr.get("selected")
+                    if isinstance(_dxy_sr.get("selected"), dict)
+                    else {}
+                )
+                log.warning(
+                    "[POINT_A] EVAL "
+                    "sym=%s side=%s "
+                    "decision=%s action=%s reason=%s "
+                    "live=%s trigger=%s "
+                    "disp_atr=%s missed_r=%s/%s "
+                    "wait_m15=%s/%s "
+                    "room_class=%s room_atr=%s "
+                    "opposing_role=%s opposing_level=%s "
+                    "opposing_tf=%s "
+                    "opposing_strength=%s "
+                    "opposing_touches=%s "
+                    "opposing_sr_score=%s "
+                    "candidate_count=%s "
+                    "sr_source=%s "
+                    "room_block_thr=%s room_ok_thr=%s "
+                    "dxy_status=%s dxy_direction=%s dxy_required=%s "
+                    "dxy_alignment=%s dxy_qualified=%s dxy_room=%s "
+                    "dxy_opposing_role=%s dxy_opposing_level=%s "
+                    "dxy_opposing_tf=%s dxy_opposing_strength=%s "
+                    "dxy_opposing_touches=%s dxy_opposing_sr_score=%s "
+                    "dxy_candidate_count=%s "
+                    "rc=%s",
+                    sym_w,
+                    side_w,
+                    point_a_decision,
+                    point_a_action,
+                    point_a.get("reason"),
+
+                    live_px,
+                    trigger_level,
+
+                    point_a.get("displacement_atr"),
+                    point_a.get("missed_move_r"),
+                    point_a.get("max_missed_r"),
+
+                    point_a.get("wait_m15_bars"),
+                    point_a.get("max_wait_m15_bars"),
+
+                    _symbol_room.get("class"),
+                    _symbol_room.get("room_atr"),
+                    _symbol_room.get("opposing_role"),
+                    _symbol_room.get("opposing_level"),
+                    _symbol_room.get("opposing_tf"),
+                    _symbol_room.get("opposing_strength"),
+                    _symbol_room.get("opposing_touches"),
+                    _symbol_room.get("opposing_sr_score"),
+                    _symbol_room.get("candidate_count"),
+                    _symbol_room.get("source"),
+                    _symbol_room.get("block_threshold_atr"),
+                    _symbol_room.get("ok_threshold_atr"),
+
+                    _dxy.get("status"),
+                    _dxy_snap.get("direction"),
+                    _dxy_snap.get("required_direction_for_trade"),
+                    _dxy_snap.get("trade_alignment"),
+                    _dxy_snap.get("candidate_qualified"),
+                    _dxy_snap.get("room_class"),
+                    _dxy_sr.get("opposing_role"),
+                    _dxy_sr_selected.get("level"),
+                    _dxy_sr_selected.get("tf"),
+                    _dxy_sr_selected.get("strength"),
+                    _dxy_sr_selected.get("touches"),
+                    _dxy_sr_selected.get("sr_score"),
+                    _dxy_sr.get("candidate_count"),
+
+                    watch.get("rev_ok_ms"),
+                )
+
+                if point_a_action == "EXPIRE":
+                    # -------------------------------------------------
+                    # P0-1 IMMEDIATE EXPIRED -> RELEASE
+                    #
+                    # Point-A expiry is a terminal analytical outcome.
+                    # Do not keep the old RC/zone lifecycle operational.
+                    # -------------------------------------------------
+                    watch["state"] = POINT_A_EXPIRED_STATE
+                    watch["trade_state"] = POINT_A_EXPIRED_STATE
+                    watch["entry_blocked"] = True
+                    watch["rev_ok"] = False
+                    watch["entry_ready"] = False
+                    watch["entry_triggered"] = False
+
+                    watch["point_a_terminal"] = True
+                    watch["point_a_terminal_reason"] = str(
+                        point_a.get("reason")
+                        or "POINT_A_EXPIRED"
+                    )
+
+                    watch["entry_block_reason"] = str(
+                        point_a.get("reason")
+                        or "POINT_A_EXPIRED"
+                    )
+
+                    watch["point_a"] = point_a
+                    watch["point_a_decision"] = "WAIT"
+                    watch["point_a_action"] = "EXPIRE"
+                    watch["point_a_reason"] = str(
+                        point_a.get("reason") or ""
+                    )
+                    watch["point_a_reason_codes"] = list(
+                        point_a.get("reason_codes") or []
+                    )
+
+                    watch["point_a_last_eval_ms"] = int(
+                        now_e
+                    )
+
+                    watch["point_a_rc_rev_ok_ms"] = int(
+                        watch.get("rev_ok_ms") or 0
+                    )
+
+                    watch["point_a_trigger_level"] = float(
+                        trigger_level
+                    )
+
+                    watch["point_a_cross_latched"] = False
+
+                    watch["point_a_displacement_atr"] = (
+                        point_a.get("displacement_atr")
+                    )
+
+                    watch["point_a_planned_structural_sl"] = (
+                        point_a.get("planned_structural_sl")
+                    )
+
+                    watch["point_a_original_risk_distance"] = (
+                        point_a.get("original_risk_distance")
+                    )
+
+                    watch["point_a_missed_move_r"] = (
+                        point_a.get("missed_move_r")
+                    )
+
+                    watch["point_a_max_missed_r"] = float(
+                        point_a.get("max_missed_r")
+                        or POINT_A_MAX_MISSED_R
+                    )
+
+                    watch.pop(
+                        "point_a_max_displacement_atr",
+                        None,
+                    )
+
+                    watch.pop("next_retry_ms", None)
+                    watch.pop("late_entry_max_move", None)
+
+                    # ---------------------------------------------
+                    # Analytics before lifecycle destruction.
+                    # ---------------------------------------------
+                    try:
+                        from api.xtl_analytics import (
+                            capture_point_a_event,
+                        )
+
+                        capture_point_a_event(
+                            event_type="EXPIRED_IMMEDIATE",
+                            uid=uid,
+                            profile_id=profile_id_px,
+                            device_id=dev_for_px,
+                            symbol=sym_w,
+                            side=side_w,
+                            watch=watch,
+                            point_a=point_a,
+                            live_price=float(live_px),
+                            trigger_level=float(trigger_level),
+                            event_ms=int(now_e),
+                        )
+
+                    except Exception as analytics_exc:
+                        log.warning(
+                            "[POINT_A] ANALYTICS_EXPIRE_FAILED "
+                            "sym=%s side=%s err=%r",
+                            sym_w,
+                            side_w,
+                            analytics_exc,
+                        )
+
+                    _expire_reason = str(
+                        point_a.get("reason")
+                        or "POINT_A_EXPIRED"
+                    )
+
+                    _released = (
+                        _point_a_release_expired_watch(
+                            uid=uid,
+                            sym=sym_w,
+                            side=side_w,
+                            wkey=str(wkey),
+                            rev_ok_ms=int(
+                                watch.get("rev_ok_ms")
+                                or 0
+                            ),
+                            trigger_level=float(
+                                trigger_level
+                            ),
+                            live_price=float(
+                                live_px
+                            ),
+                            reason=_expire_reason,
+                            profile_id=(
+                                str(
+                                    profile_id_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                            device_id=(
+                                str(
+                                    dev_for_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                        )
+                    )
+
+                    if not _released:
+                        # Fail closed only when release itself failed.
+                        # Executor retries this tombstone next cycle.
+                        try:
+                            R.set(
+                                str(wkey),
+                                json.dumps(
+                                    watch,
+                                    separators=(",", ":"),
+                                    default=str,
+                                ),
+                                ex=7 * 24 * 3600,
+                            )
+
+                        except Exception:
+                            log.exception(
+                                "[POINT_A] "
+                                "EXPIRE_FAIL_CLOSED_PERSIST_FAILED "
+                                "sym=%s side=%s key=%s",
+                                sym_w,
+                                side_w,
+                                wkey,
+                            )
+
+                    continue
+
+                    
+
+                    
+
+                if point_a_decision == "WAIT":
+                    try:
+                        _point_a_persist_wait(
+                            watch=watch,
+                            wkey=str(wkey),
+                            point_a=point_a,
+                            live_price=float(live_px),
+                            trigger_level=float(trigger_level),
+                            now_e=int(now_e),
+                        )
+
+                        # -----------------------------------------
+                        # Analytics only: initial Point-A WAIT.
+                        # -----------------------------------------
+                        try:
+                            from api.xtl_analytics import (
+                                capture_point_a_event,
+                            )
+
+                            capture_point_a_event(
+                                event_type="WAIT_STARTED",
+                                uid=uid,
+                                profile_id=profile_id_px,
+                                device_id=dev_for_px,
+                                symbol=sym_w,
+                                side=side_w,
+                                watch=watch,
+                                point_a=point_a,
+                                live_price=float(live_px),
+                                trigger_level=float(trigger_level),
+                                event_ms=int(now_e),
+                            )
+                        except Exception as analytics_exc:
+                            log.warning(
+                                "[POINT_A] ANALYTICS_WAIT_FAILED "
+                                "sym=%s side=%s err=%r",
+                                sym_w,
+                                side_w,
+                                analytics_exc,
+                            )
+
+                    except Exception as exc:
+                        # Point-A persistence failure must fail closed.
+                        log.exception(
+                            "[POINT_A] WAIT_PERSIST_FAILED "
+                            "sym=%s side=%s rc=%s err=%r",
+                            sym_w,
+                            side_w,
+                            watch.get("rev_ok_ms"),
+                            exc,
+                        )
+
+                    continue
+
+                if point_a_decision == "BLOCK":
+                    watch["state"] = POINT_A_BLOCK_STATE
+                    watch["trade_state"] = POINT_A_BLOCK_STATE
+                    watch["entry_blocked"] = True
+                    # This RC opportunity is terminally rejected.
+                    # Do not expose it as an actionable REV_OK gate.
+                    watch["rev_ok"] = False
+                    watch["entry_ready"] = False
+                    watch["entry_triggered"] = False
+
+                    watch["point_a_terminal"] = True
+                    watch["point_a_terminal_reason"] = str(
+                        point_a.get("reason")
+                        or "POINT_A_BLOCK"
+                    )
+                    watch["entry_block_reason"] = str(point_a.get("reason") or "POINT_A_BLOCK")
+                    watch["point_a"] = point_a
+                    watch["point_a_decision"] = "BLOCK"
+                    watch["point_a_action"] = "REJECT"
+                    watch["point_a_reason"] = str(point_a.get("reason") or "")
+                    watch["point_a_reason_codes"] = list(point_a.get("reason_codes") or [])
+                    watch["point_a_last_eval_ms"] = int(now_e)
+                    watch["point_a_rc_rev_ok_ms"] = int(watch.get("rev_ok_ms") or 0)
+                    watch["point_a_trigger_level"] = float(trigger_level)
+                    watch["point_a_cross_latched"] = False
+                    R.set(
+                        str(wkey),
+                        json.dumps(
+                            watch,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+
+                    # ---------------------------------------------
+                    # Analytics only: initial Point-A hard block.
+                    # ---------------------------------------------
+                    try:
+                        from api.xtl_analytics import (
+                            capture_point_a_event,
+                        )
+
+                        capture_point_a_event(
+                            event_type="BLOCKED_IMMEDIATE",
+                            uid=uid,
+                            profile_id=profile_id_px,
+                            device_id=dev_for_px,
+                            symbol=sym_w,
+                            side=side_w,
+                            watch=watch,
+                            point_a=point_a,
+                            live_price=float(live_px),
+                            trigger_level=float(trigger_level),
+                            event_ms=int(now_e),
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "[POINT_A] ANALYTICS_BLOCK_FAILED "
+                            "sym=%s side=%s err=%r",
+                            sym_w,
+                            side_w,
+                            exc,
+                        )
+
+                    # ---------------------------------------------
+                    # BLOCK is terminal for this crossed opportunity.
+                    #
+                    # Analytics has already captured the complete
+                    # terminal BLOCK snapshot above. Now release the
+                    # rejected watch immediately so normal discovery
+                    # can select a fresh direction / zone / RC.
+                    #
+                    # If release fails, keep the persisted BLOCK
+                    # tombstone above. The executor recovery path will
+                    # retry the release next cycle.
+                    # ---------------------------------------------
+                    _released = _point_a_release_blocked_watch(
+                        uid=uid,
+                        sym=sym_w,
+                        side=side_w,
+                        wkey=str(wkey),
+                        rev_ok_ms=int(
+                            watch.get("point_a_rc_rev_ok_ms")
+                            or watch.get("rev_ok_ms")
+                            or 0
+                        ),
+                        trigger_level=float(
+                            watch.get("point_a_trigger_level")
+                            or trigger_level
+                            or 0.0
+                        ),
+                        live_price=float(live_px),
+                        reason=str(
+                            point_a.get("reason")
+                            or "POINT_A_BLOCK"
+                        ),
+                        profile_id=(
+                                str(
+                                    profile_id_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                            device_id=(
+                                str(
+                                    dev_for_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                    )
+
+                    # Fail closed on cleanup failure.
+                    # The BLOCK tombstone was already persisted above,
+                    # so the recovery path can retry next cycle.
+                    if not _released:
+                        continue
+
+                    continue
+
+                if point_a_decision != "ALLOW":
+                    # Unknown verdict = fail closed.
+                    point_a["decision"] = "WAIT"
+                    point_a["action"] = "HOLD"
+                    point_a["reason"] = "UNKNOWN_POINT_A_VERDICT"
+                    _point_a_persist_wait(
+                        watch=watch, wkey=str(wkey), point_a=point_a,
+                        live_price=float(live_px), trigger_level=float(trigger_level), now_e=int(now_e),
+                    )
+                    continue
+
+                # ALLOW: preserve the final gate snapshot for event/open/close analytics.
+                watch["point_a"] = point_a
+                watch["point_a_decision"] = "ALLOW"
+                watch["point_a_action"] = "RELEASE"
+                watch["point_a_reason"] = str(point_a.get("reason") or "")
+                watch["point_a_reason_codes"] = list(point_a.get("reason_codes") or [])
+                watch["point_a_last_eval_ms"] = int(now_e)
+                watch["entry_blocked"] = False
+                if str(watch.get("state") or "").upper().startswith("ENTRY_BLOCKED_POINT_A"):
+                    watch["state"] = "REV_OK"
+                    watch["trade_state"] = ""
+                watch.pop("entry_block_reason", None)
+                watch.pop("next_retry_ms", None)
+                watch.pop("late_entry_max_move", None)
+                try:
+                    R.set(str(wkey), json.dumps(watch, separators=(",", ":"), default=str), ex=7 * 24 * 3600)
+                except Exception:
+                    pass
+
+                # ---------------------------------------------
+                # Analytics only: initial Point-A immediate pass.
+                # ---------------------------------------------
+                # ---------------------------------------------
+                # Analytics only: true initial Point-A pass.
+                #
+                # WAIT -> ALLOW already recorded WAIT_THEN_PASS
+                # and must not also be classified PASS_IMMEDIATE.
+                # ---------------------------------------------
+                if not point_a_wait_release_allow:
+                    try:
+                        from api.xtl_analytics import (
+                            capture_point_a_event,
+                        )
+
+                        capture_point_a_event(
+                        event_type="PASS_IMMEDIATE",
+                        uid=uid,
+                        profile_id=profile_id_px,
+                        device_id=dev_for_px,
+                        symbol=sym_w,
+                        side=side_w,
+                        watch=watch,
+                        point_a=point_a,
+                        live_price=float(live_px),
+                        trigger_level=float(trigger_level),
+                        event_ms=int(now_e),
+                    )
+
+                    except Exception as exc:
+                        log.warning(
+                            "[POINT_A] ANALYTICS_PASS_FAILED "
+                            "sym=%s side=%s err=%r",
+                            sym_w,
+                            side_w,
+                            exc,
+                        )
+
+                log.warning(
+                    "[WATCHLIST] AFTER_CROSS sym=%s side=%s entry_triggered=%s state=%s",
+                    sym_w,
+                    side_w,
+                    watch.get("entry_triggered"),
+                    watch.get("state"),
+                )
+
                 log.warning(
                     "[WATCHLIST] AFTER_CROSS sym=%s side=%s entry_triggered=%s state=%s",
                     sym_w,
@@ -7103,12 +11276,9 @@ def tick_user(uid: str) -> None:
                 entry_px = float(live_px)
 
                 # small symbol-aware SL buffer
-                if sym_w == "XAUUSD":
-                    sl_buf = 0.50
-                elif sym_w.endswith("JPY"):
-                    sl_buf = 0.03
-                else:
-                    sl_buf = 0.00030
+                # Use the same structural SL buffer used by Point-A's
+                # pre-entry 0.40R PRICE_TOO_FAR calculation.
+                sl_buf = _strategy_sl_buffer(sym_w)
 
                 sl_price = 0.0
                 tp_price = 0.0
@@ -7206,6 +11376,7 @@ def tick_user(uid: str) -> None:
                         )
                         watch["entry_validation"] = (
                             _build_entry_validation_analytics(
+                                R=R,
                                 watch=watch,
                                 zone=zone,
                                 direction=side_w,
@@ -7366,6 +11537,10 @@ def tick_user(uid: str) -> None:
                             dict,
                         )
                         else None
+                    ),
+                    "point_a": (
+                        json.loads(json.dumps(watch.get("point_a"), separators=(",", ":"), default=str))
+                        if isinstance(watch.get("point_a"), dict) else None
                     ),
                     "source": "watchlist",
                 })
@@ -8086,57 +12261,19 @@ def tick_user(uid: str) -> None:
                     or _matching_ticket
                 )
 
-            # Five minutes matches the market-order pending timeout.
-            # During this grace period, preserve the claim even when the
-            # open record is temporarily unavailable.
-            _orphan_grace_ms = 5 * 60 * 1000
+            # -------------------------------------------------
+            # Existing exec_claim remains authoritative.
+            #
+            # Missing open-ledger state is NOT proof that the
+            # MT5 submission never reached the broker/agent.
+            #
+            # Never auto-delete/reacquire this claim based only
+            # on age. It is released only by:
+            #   - explicit pre-enqueue failure paths, or
+            #   - canonical terminal trade lifecycle cleanup.
+            # -------------------------------------------------
 
-            if (
-                not _matching_lifecycle_active
-                and _claim_created_ms > 0
-                and _claim_age_ms >= _orphan_grace_ms
-            ):
-                try:
-                    R.delete(exec_claim_key)
-
-                    log.warning(
-                        "[OPPT] ORPHAN_EXEC_CLAIM_CLEARED "
-                        "uid=%s sym=%s side=%s tid=%s "
-                        "age_ms=%s key=%s",
-                        uid,
-                        sym,
-                        side,
-                        tid,
-                        _claim_age_ms,
-                        exec_claim_key,
-                    )
-
-                    # Reacquire atomically. If another worker wins this race,
-                    # this worker must still skip.
-                    _exec_claim_now_ms = now_ms()
-
-                    claimed = R.set(
-                        exec_claim_key,
-                        str(_exec_claim_now_ms),
-                        nx=True,
-                        ex=24 * 3600,
-                    )
-
-                except Exception as _claim_repair_exc:
-                    claimed = False
-
-                    log.warning(
-                        "[OPPT] ORPHAN_EXEC_CLAIM_REPAIR_FAILED "
-                        "uid=%s sym=%s side=%s tid=%s "
-                        "age_ms=%s key=%s err=%r",
-                        uid,
-                        sym,
-                        side,
-                        tid,
-                        _claim_age_ms,
-                        exec_claim_key,
-                        _claim_repair_exc,
-                    )
+            
 
             if not claimed:
                 log.warning(
@@ -8659,10 +12796,34 @@ def tick_user(uid: str) -> None:
                 log.warning(
                     "[OPPT] BLOCK_ENTRY uid=%s tid=%s sym=%s side=%s "
                     "reason=SAME_SYMBOL_COOLDOWN ttl_sec=%s",
-                    uid, tid, sym, side, _ttl,
+                    uid,
+                    tid,
+                    sym,
+                    side,
+                    _ttl,
                 )
 
-                _clear_watchlist_entry_block(ev, "SAME_SYMBOL_COOLDOWN")
+                # No broker/order lifecycle was created.
+                # Release executor placement ownership immediately.
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    log.exception(
+                        "[OPPT] EXEC_CLAIM_CLEANUP_FAILED "
+                        "uid=%s tid=%s sym=%s side=%s "
+                        "reason=SAME_SYMBOL_COOLDOWN key=%s",
+                        uid,
+                        tid,
+                        sym,
+                        side,
+                        exec_claim_key,
+                    )
+
+                _clear_watchlist_entry_block(
+                    ev,
+                    "SAME_SYMBOL_COOLDOWN",
+                )
+
                 continue
 
         except Exception:
@@ -8748,20 +12909,62 @@ def tick_user(uid: str) -> None:
             ) 
         if float(qty_use or 0.0) <= 0:
             log.error(
-                "[PROP] BLOCK_ENTRY_QTY_ZERO uid=%s sym=%s side=%s tid=%s qty_use=%s reason=PROP_QTY_NOT_SET",
+                "[PROP] BLOCK_ENTRY_QTY_ZERO "
+                "uid=%s sym=%s side=%s tid=%s "
+                "qty_use=%s reason=PROP_QTY_NOT_SET",
                 uid,
                 sym,
                 side,
                 tid,
                 qty_use,
             )
+
             try:
                 from api.xtl_analytics import capture_rejection
-                capture_rejection(ev, "prop_block:PROP_QTY_ZERO", gate="PROP", enrich=True)
+
+                capture_rejection(
+                    ev,
+                    "prop_block:PROP_QTY_ZERO",
+                    gate="PROP",
+                    enrich=True,
+                )
             except Exception:
                 pass
-            _clear_watchlist_entry_block(ev, "PROP_QTY_ZERO")
-            continue   
+
+            # No broker lifecycle exists yet.
+            # Release executor placement ownership immediately.
+            try:
+                R.delete(exec_claim_key)
+            except Exception:
+                log.exception(
+                    "[OPPT] EXEC_CLAIM_CLEANUP_FAILED "
+                    "uid=%s tid=%s sym=%s side=%s "
+                    "reason=PROP_QTY_ZERO key=%s",
+                    uid,
+                    tid,
+                    sym,
+                    side,
+                    exec_claim_key,
+                )
+
+            if is_watchlist_event:
+                try:
+                    tenant_delete_latest_entry_claim(
+                        R,
+                        uid,
+                        sym,
+                        side,
+                        "H1",
+                    )
+                except Exception:
+                    pass
+
+            _clear_watchlist_entry_block(
+                ev,
+                "PROP_QTY_ZERO",
+            )
+
+            continue  
 
         if exec_mode == "mt5":
             log.warning(
@@ -8902,6 +13105,7 @@ def tick_user(uid: str) -> None:
                 "setup_analysis": ev.get("setup_analysis"),
                 "entry_confirmation": ev.get("entry_confirmation"),
                 "entry_validation": ev.get("entry_validation"),
+                "point_a": ev.get("point_a"),
                 "prop_check": prop_check,
                 "profile_id": prop_profile_id,
                 "prop_firm": prop_check.get("firm") if isinstance(prop_check, dict) else None,
@@ -8910,22 +13114,80 @@ def tick_user(uid: str) -> None:
                 "prop_risk_pct": prop_check.get("risk_pct") if isinstance(prop_check, dict) else None,
             }
 
+          
             # -------------------------------------------------
-            # CRITICAL: persist ORDER_PENDING immediately after
-            # successful MT5 enqueue.
+            # CRITICAL POST-ENQUEUE PERSISTENCE BOUNDARY
             #
-            # This must happen before risk reserve / watch updates /
-            # analytics, because broker may already place the order.
-            # If Redis open ledger misses this write, gate can create
-            # opposite-side REV_OK while broker position is active.
+            # MT5 enqueue has already returned ok=True.
+            # From this point onward the broker/agent may already
+            # be processing or may already have placed the order.
+            #
+            # Therefore:
+            #   - persist ORDER_PENDING immediately
+            #   - verify the open-ledger write
+            #   - NEVER release exec_claim merely because Redis
+            #     persistence/verification fails after enqueue
+            #
+            # Preserving exec_claim is fail-closed protection
+            # against duplicate broker placement.
             # -------------------------------------------------
-            
-            _open_trade(uid, pos)
+            try:
+                _open_trade(
+                    uid,
+                    pos,
+                )
 
-            # Refresh in-memory state immediately so the next
-            # event in this same executor cycle sees this
-            # ORDER_PENDING trade.
+                _saved_raw = R.hget(
+                    OPEN_KEY.format(uid=uid),
+                    tid,
+                )
+
+                if not _saved_raw:
+                    log.critical(
+                        "[OPPT] OPEN_TRADE_SAVE_VERIFY_FAILED_AFTER_ENQUEUE "
+                        "uid=%s tid=%s sym=%s side=%s "
+                        "job_id=%s device_id=%s "
+                        "exec_claim_preserved=1",
+                        uid,
+                        tid,
+                        sym,
+                        side,
+                        enq.get("job_id"),
+                        enq.get("device_id"),
+                    )
+                    continue
+
+                log.warning(
+                    "[OPPT] OPEN_TRADE_SAVED "
+                    "uid=%s tid=%s sym=%s side=%s "
+                    "state=%s job_id=%s device_id=%s",
+                    uid,
+                    tid,
+                    sym,
+                    side,
+                    pos.get("trade_state"),
+                    enq.get("job_id"),
+                    enq.get("device_id"),
+                )
+
+            except Exception as e:
+                log.exception(
+                    "[OPPT] OPEN_TRADE_PERSIST_FAILED_AFTER_ENQUEUE "
+                    "uid=%s tid=%s sym=%s side=%s "
+                    "job_id=%s device_id=%s "
+                    "exec_claim_preserved=1 err=%r",
+                    uid,
+                    tid,
+                    sym,
+                    side,
+                    enq.get("job_id"),
+                    enq.get("device_id"),
+                    e,
+                )
+                continue
+
             open_trades = _list_open_trades(uid)
+
             open_by_id = {
                 t.get("trade_id"): t
                 for t in open_trades
@@ -8933,33 +13195,9 @@ def tick_user(uid: str) -> None:
                 and t.get("trade_id")
             }
 
-            try:
-                _saved_raw = R.hget(OPEN_KEY.format(uid=uid), tid)
-                if not _saved_raw:
-                    log.error(
-                        "[OPPT] OPEN_TRADE_SAVE_VERIFY_FAILED uid=%s tid=%s sym=%s side=%s job_id=%s",
-                        uid, tid, sym, side, enq.get("job_id"),
-                    )
-                    try:
-                        R.delete(exec_claim_key)
-                    except Exception:
-                        pass
-                    continue
+           
 
-                log.warning(
-                    "[OPPT] OPEN_TRADE_SAVED uid=%s tid=%s sym=%s side=%s state=%s job_id=%s device_id=%s",
-                    uid, tid, sym, side, pos.get("trade_state"), enq.get("job_id"), enq.get("device_id"),
-                )
-            except Exception as e:
-                log.exception(
-                    "[OPPT] OPEN_TRADE_SAVE_VERIFY_EXC uid=%s tid=%s sym=%s side=%s err=%r",
-                    uid, tid, sym, side, e,
-                )
-                try:
-                    R.delete(exec_claim_key)
-                except Exception:
-                    pass
-                continue
+               
 
             # -------------------------------------------------
             # CRITICAL: same-symbol lifecycle guard.

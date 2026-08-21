@@ -434,8 +434,537 @@ def _zone_quality_sr_analytics(
     }
 
 
+def _dxy_float_or_none(value):
+    try:
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+def _dxy_opposing_sr_next_three(
+    sr: dict,
+    *,
+    required_direction: str | None,
+    current_price: float | None = None,
+    atr: float | None = None,
+) -> dict:
+    """Select the nearest meaningful opposing DXY SR from the immediate next three."""
+    direction = str(required_direction or "").upper().strip()
+    role = "supports" if direction == "BEARISH" else "resistances" if direction == "BULLISH" else None
+    out = {
+        "available": False,
+        "required_direction": direction or None,
+        "opposing_role": role[:-1].upper() if role else None,
+        "candidate_count": 0,
+        "selected": None,
+        "next_3_opposing_sr": [],
+    }
+    if not isinstance(sr, dict) or not role:
+        return out
+
+    candidates = []
+
+    # ---------------------------------------------------------
+    # LIVE REAL_DXY tracker structure
+    #
+    # Current structure contains:
+    #   support_path / resistance_path
+    #   active_supports / active_resistances
+    #
+    # For required BEARISH DXY movement:
+    #   supports below price are opposing SR.
+    #
+    # For required BULLISH DXY movement:
+    #   resistances above price are opposing SR.
+    # ---------------------------------------------------------
+    live_rows = []
+
+    if direction == "BEARISH":
+        if isinstance(sr.get("support_path"), list):
+            live_rows = sr.get("support_path") or []
+        elif isinstance(sr.get("active_supports"), list):
+            live_rows = sr.get("active_supports") or []
+
+    elif direction == "BULLISH":
+        if isinstance(sr.get("resistance_path"), list):
+            live_rows = sr.get("resistance_path") or []
+        elif isinstance(sr.get("active_resistances"), list):
+            live_rows = sr.get("active_resistances") or []
+
+    for z in live_rows:
+        if not isinstance(z, dict):
+            continue
+
+        if z.get("stale") is True:
+            continue
+
+        if z.get("side_ok") is False:
+            continue
+
+        try:
+            level = float(
+                z.get("level")
+                if z.get("level") is not None
+                else z.get("price")
+            )
+        except Exception:
+            continue
+
+        # Keep only SR in the direction DXY must travel.
+        if current_price is not None:
+            if (
+                direction == "BEARISH"
+                and level >= float(current_price)
+            ):
+                continue
+
+            if (
+                direction == "BULLISH"
+                and level <= float(current_price)
+            ):
+                continue
+
+        distance_atr = _dxy_float_or_none(
+            z.get("distance_atr")
+            if z.get("distance_atr") is not None
+            else z.get("dist_atr")
+        )
+
+        if (
+            distance_atr is None
+            and current_price is not None
+            and atr
+            and atr > 0
+        ):
+            distance_atr = (
+                abs(float(current_price) - level)
+                / float(atr)
+            )
+
+        if distance_atr is None:
+            continue
+
+        candidates.append({
+            "level": level,
+            "tf": str(
+                z.get("tf") or ""
+            ).upper().strip(),
+            "strength": (
+                _dxy_float_or_none(
+                    z.get("strength")
+                )
+                or 0.0
+            ),
+            "sr_score": (
+                _dxy_float_or_none(
+                    z.get("sr_score")
+                )
+                or 0.0
+            ),
+            "touches": (
+                _dxy_float_or_none(
+                    z.get("touches")
+                )
+                or 0.0
+            ),
+            "distance_atr": max(
+                0.0,
+                float(distance_atr),
+            ),
+            "room_class": (
+                str(
+                    z.get("room_class") or ""
+                ).upper().strip()
+                or None
+            ),
+        })
+
+    # ---------------------------------------------------------
+    # Backward-compatible old SR schema.
+    #
+    # Keep this so analytics/older snapshots using:
+    #   h1.supports / h4.resistances etc.
+    # still work.
+    # ---------------------------------------------------------
+    containers = [sr]
+
+    structure_context = sr.get(
+        "structure_context"
+    )
+
+    if isinstance(
+        structure_context,
+        dict,
+    ):
+        containers.append(
+            structure_context
+        )
+
+    for container in containers:
+        for tf_name in ("H1", "H4"):
+            tf = container.get(
+                tf_name.lower()
+            )
+
+            if not isinstance(tf, dict):
+                continue
+
+            rows = []
+
+            for key in (
+                role,
+                f"{role}_near",
+                f"{role}_major",
+            ):
+                if isinstance(
+                    tf.get(key),
+                    list,
+                ):
+                    rows.extend(
+                        tf.get(key) or []
+                    )
+
+            for z in rows:
+                if not isinstance(z, dict):
+                    continue
+
+                if z.get("stale") is True:
+                    continue
+
+                if z.get("side_ok") is False:
+                    continue
+
+                try:
+                    level = float(
+                        z.get("level")
+                    )
+                except Exception:
+                    continue
+
+                if current_price is not None:
+                    if (
+                        direction == "BEARISH"
+                        and level >= float(
+                            current_price
+                        )
+                    ):
+                        continue
+
+                    if (
+                        direction == "BULLISH"
+                        and level <= float(
+                            current_price
+                        )
+                    ):
+                        continue
+
+                distance_atr = (
+                    _dxy_float_or_none(
+                        z.get("distance_atr")
+                        if z.get(
+                            "distance_atr"
+                        ) is not None
+                        else z.get("dist_atr")
+                    )
+                )
+
+                if (
+                    distance_atr is None
+                    and current_price is not None
+                    and atr
+                    and atr > 0
+                ):
+                    distance_atr = (
+                        abs(
+                            float(current_price)
+                            - level
+                        )
+                        / float(atr)
+                    )
+
+                if distance_atr is None:
+                    continue
+
+                candidates.append({
+                    "level": level,
+                    "tf": tf_name,
+                    "strength": (
+                        _dxy_float_or_none(
+                            z.get("strength")
+                        )
+                        or 0.0
+                    ),
+                    "sr_score": (
+                        _dxy_float_or_none(
+                            z.get("sr_score")
+                        )
+                        or 0.0
+                    ),
+                    "touches": (
+                        _dxy_float_or_none(
+                            z.get("touches")
+                        )
+                        or 0.0
+                    ),
+                    "distance_atr": max(
+                        0.0,
+                        float(distance_atr),
+                    ),
+                    "room_class": (
+                        str(
+                            z.get(
+                                "room_class"
+                            )
+                            or ""
+                        ).upper().strip()
+                        or None
+                    ),
+                })
+
+    candidates.sort(key=lambda x: float(x["distance_atr"]))
+    unique = []
+    for candidate in candidates:
+        duplicate = next(
+            (
+                i for i, existing in enumerate(unique)
+                if abs(float(existing["level"]) - float(candidate["level"]))
+                <= max(1e-10, abs(float(candidate["level"])) * 1e-10)
+            ),
+            None,
+        )
+        rank = lambda x: (
+            float(x.get("strength") or 0.0),
+            float(x.get("sr_score") or 0.0),
+            float(x.get("touches") or 0.0),
+            1 if x.get("tf") == "H4" else 0,
+        )
+        if duplicate is None:
+            unique.append(candidate)
+        elif rank(candidate) > rank(unique[duplicate]):
+            unique[duplicate] = candidate
+
+    unique.sort(
+        key=lambda x: float(
+            x["distance_atr"]
+        )
+    )
+
+    next_three = unique[:3]
+
+    # ---------------------------------------------------------
+    # Point-A entry-room authority:
+    #
+    # The immediate obstacle in DXY's required direction must
+    # be the NEAREST MEANINGFUL opposing SR.
+    #
+    # Previously we selected the strongest SR among the next 3.
+    # That could skip a nearer valid support/resistance and make
+    # Point-A believe DXY had more room than it actually had.
+    #
+    # Example seen 17-08-2026:
+    # a farther 99.2225 support was selected over nearer support
+    # because its strength / score was higher.
+    #
+    # Keep the same "meaningful SR" definition already used by
+    # the downstream sr_risk calculation:
+    #   strength >= 8
+    #   OR sr_score >= 10
+    #   OR touches >= 3
+    #   OR H4
+    # ---------------------------------------------------------
+    def _is_meaningful_opposing_sr(
+        candidate: dict,
+    ) -> bool:
+        return bool(
+            float(
+                candidate.get(
+                    "strength"
+                )
+                or 0.0
+            )
+            >= 8.0
+            or float(
+                candidate.get(
+                    "sr_score"
+                )
+                or 0.0
+            )
+            >= 10.0
+            or float(
+                candidate.get(
+                    "touches"
+                )
+                or 0.0
+            )
+            >= 3.0
+            or str(
+                candidate.get(
+                    "tf"
+                )
+                or ""
+            ).upper().strip()
+            == "H4"
+        )
+
+    meaningful_next_three = [
+        candidate
+        for candidate in next_three
+        if _is_meaningful_opposing_sr(
+            candidate
+        )
+    ]
+
+    # Because next_three is already ordered by distance,
+    # index 0 is the nearest meaningful obstacle.
+    selected = (
+        meaningful_next_three[0]
+        if meaningful_next_three
+        else (
+            next_three[0]
+            if next_three
+            else None
+        )
+    )
+
+    # Retain strongest-of-next-three separately for diagnostics
+    # and later analytics. It must NOT control Point-A room.
+    strongest_next_three = (
+        max(
+            next_three,
+            key=lambda x: (
+                float(
+                    x.get(
+                        "strength"
+                    )
+                    or 0.0
+                ),
+                float(
+                    x.get(
+                        "sr_score"
+                    )
+                    or 0.0
+                ),
+                float(
+                    x.get(
+                        "touches"
+                    )
+                    or 0.0
+                ),
+                1
+                if str(
+                    x.get(
+                        "tf"
+                    )
+                    or ""
+                ).upper().strip()
+                == "H4"
+                else 0,
+                -float(
+                    x.get(
+                        "distance_atr"
+                    )
+                    or 0.0
+                ),
+            ),
+        )
+        if next_three
+        else None
+    )
+
+    out.update({
+        "available": bool(
+            selected
+        ),
+        "candidate_count": len(
+            next_three
+        ),
+        "selected": selected,
+        "next_3_opposing_sr": (
+            next_three
+        ),
+        "strongest_next_three": (
+            strongest_next_three
+        ),
+        "selection_model": (
+            "NEAREST_MEANINGFUL_OPPOSING_SR"
+        ),
+    })
+    return out
+
+# ---------------------------------------------------------
+# Point-A DXY M15 entry-health threshold.
+#
+# The DXY tracker remains the authority for directional
+# confirmation/revocation.
+#
+# This threshold does NOT revoke or flip DXY direction.
+# It only prevents a NEW trade from entering while an
+# otherwise-confirmed DXY direction is materially
+# deteriorating.
+#
+# Existing tracker evidence:
+#   >= 0.50 ATR adverse move = 30 revoke points
+#
+# Historical Point-A replay:
+#   healthy confirmed cases remained below 30;
+#   Friday 14-08-2026 EURUSD BUY deterioration was 42.
+# ---------------------------------------------------------
+DXY_M15_ENTRY_REVOKE_WAIT_THRESHOLD = 30
+
+# ---------------------------------------------------------
+# Point-A DXY mature-move / opposing-SR protection.
+#
+# A confirmed DXY direction can still be correct while being
+# a poor place for a NEW correlated trade if:
+#
+#   1. DXY has already travelled materially in that direction
+#   2. a meaningful opposing SR is now close
+#
+# This is NOT directional revocation.
+# It temporarily routes new entries to WAIT.
+#
+# 1.50 ATR:
+#   requires a clearly developed directional move.
+#
+# 0.75 ATR:
+#   same practical "good room" boundary already used by
+#   Point-A symbol-room classification.
+# ---------------------------------------------------------
+DXY_M15_MATURE_MOVE_ATR = 1.50
+DXY_M15_MATURE_SR_WAIT_ATR = 0.75
+
+# ---------------------------------------------------------
+# POINT-A DXY H1 MARKET-FLOW AUTHORITY
+#
+# H1 uses broad evidence, not the strict M15-style
+# candidate lifecycle.
+#
+# Production audit over 380 REAL_DXY H1 bars:
+#   winning evidence score >= 40
+#   directional margin      >= 20
+#
+# Anything weaker is treated as H1 NEUTRAL / developing.
+# ---------------------------------------------------------
+DXY_H1_FLOW_MIN_SCORE = 40
+DXY_H1_FLOW_MIN_MARGIN = 20
+
+# H1 entry snapshot freshness already uses a 2-hour window.
+DXY_H1_FLOW_FRESH_MS = 2 * 60 * 60 * 1000
+
+DXY_M15_MATURE_MOVE_ATR = 1.50
+
+# Strong recent displacement itself can identify an already
+# extended move even if lifecycle excursion history is missing
+# or has just been reset.
+DXY_M15_EXTENDED_RECENT_MOVE_ATR = 1.80
+
+# Once the DXY move is mature/extended, require materially
+# more room before allowing a fresh correlated entry.
+DXY_M15_MATURE_SR_WAIT_ATR = 0.75
+
+
 def _dxy_sr_confirmation_analytics(
     *,
+    R,
     device_id: str | None,
     symbol: str,
     side: str,
@@ -452,31 +981,98 @@ def _dxy_sr_confirmation_analytics(
     """
     sym_u = str(symbol or "").upper().strip()
     side_u = str(side or "").upper().strip()
+    
+    
 
+    # ---------------------------------------------------------
+    # POINT-A LIVE DXY SOURCE
+    #
+    # Live strategy must consume canonical REAL_DXY only.
+    # Do NOT use the per-trade analytics snapshot here and
+    # do NOT fall back to SYNTHETIC_DXY.
+    # ---------------------------------------------------------
     try:
-        # Local import avoids changing module startup order.
-        from api.xtl_analytics import (
-            read_dxy_m15_at_entry,
+        from api.dxy_m15_tracker import read_dxy_m15_state
+
+        
+
+        raw_canonical = R.get("xtl:dxy:canonical")
+        canonical = {}
+
+        if raw_canonical:
+            if isinstance(raw_canonical, (bytes, bytearray)):
+                raw_canonical = raw_canonical.decode(
+                    "utf-8",
+                    "replace",
+                )
+
+            canonical = json.loads(raw_canonical)
+
+            if not isinstance(canonical, dict):
+                canonical = {}
+
+        canonical_source = str(
+            canonical.get("source") or ""
+        ).upper().strip()
+
+        real_dev = str(
+            canonical.get("device_id")
+            or canonical.get("real_device_id")
+            or ""
+        ).strip()
+
+        if canonical_source != "REAL_DXY" or not real_dev:
+            return {
+                "schema_version": 1,
+                "analytics_only": False,
+                "status": "UNAVAILABLE",
+                "reason_codes": [
+                    "DXY_CANONICAL_REAL_DEVICE_MISSING",
+                ],
+                "snapshot": {
+                    "selected_source": None,
+                    "selected_device_id": None,
+                    "canonical": canonical,
+                },
+            }
+
+        selected = read_dxy_m15_state(
+            R,
+            "REAL_DXY",
+            real_dev,
         )
 
-        dxy = read_dxy_m15_at_entry(
-            device_id=str(device_id or "").strip(),
-            symbol=sym_u,
-            side=side_u,
-            entry_ms=int(entry_ms or 0),
-            trade_profile_id=(
-                str(profile_id or "").strip()
-                or None
-            ),
-        )
+        if not isinstance(selected, dict) or not selected:
+            return {
+                "schema_version": 1,
+                "analytics_only": False,
+                "status": "UNAVAILABLE",
+                "reason_codes": [
+                    "DXY_REAL_M15_STATE_MISSING",
+                ],
+                "snapshot": {
+                    "selected_source": "REAL_DXY",
+                    "selected_device_id": real_dev,
+                },
+            }
+
+        # Normalize into the small structure expected by the
+        # existing code below this block.
+        dxy = {
+            "selected_source": "REAL_DXY",
+            "selected_device_id": real_dev,
+            "fallback_used": False,
+            "fallback_reason": None,
+            "selected": selected,
+        }
 
     except Exception as exc:
         return {
             "schema_version": 1,
-            "analytics_only": True,
+            "analytics_only": False,
             "status": "UNAVAILABLE",
             "reason_codes": [
-                "DXY_ENTRY_READ_FAILED",
+                "DXY_LIVE_REAL_READ_FAILED",
             ],
             "snapshot": {
                 "error": (
@@ -484,8 +1080,117 @@ def _dxy_sr_confirmation_analytics(
                     f"{exc}"
                 ),
             },
-        }
+         }
 
+    # ---------------------------------------------------------
+    # POINT-A CANONICAL REAL_DXY H1 MARKET FLOW
+    #
+    # H1 direction is evidence-based:
+    #
+    #   winner >= 40 AND margin >= 20
+    #
+    # We intentionally do NOT require H1 candidate_direction
+    # or candidate_confidence. Those fields identify unusually
+    # strong impulse/reversal events and were NEUTRAL on ~87%
+    # of stored H1 bars.
+    #
+    # No synthetic fallback here. Point-A must use the same
+    # canonical REAL_DXY device as M15.
+    # ---------------------------------------------------------
+    h1_feature = {}
+
+    try:
+        h1_key = (
+            "xtl:dxy:features:latest:H1:"
+            f"REAL_DXY:{real_dev}"
+        )
+
+        raw_h1 = R.get(h1_key)
+
+        if isinstance(raw_h1, (bytes, bytearray)):
+            raw_h1 = raw_h1.decode(
+                "utf-8",
+                "replace",
+            )
+
+        if raw_h1:
+            _h1_obj = json.loads(raw_h1)
+
+            if isinstance(_h1_obj, dict):
+                h1_feature = _h1_obj
+
+    except Exception:
+        h1_feature = {}
+
+    h1_close_ms = int(
+        h1_feature.get("bar_close_ms")
+        or h1_feature.get("broker_bar_close_ms")
+        or 0
+    )
+
+    h1_age_ms = (
+        max(
+            0,
+            int(entry_ms) - int(h1_close_ms),
+        )
+        if h1_close_ms > 0
+        else None
+    )
+
+    h1_fresh = bool(
+        h1_close_ms > 0
+        and h1_close_ms <= int(entry_ms)
+        and h1_age_ms is not None
+        and h1_age_ms <= DXY_H1_FLOW_FRESH_MS
+    )
+
+    h1_bull_score = int(
+        h1_feature.get("bull_evidence_score")
+        or 0
+    )
+
+    h1_bear_score = int(
+        h1_feature.get("bear_evidence_score")
+        or 0
+    )
+
+    h1_evidence_margin = abs(
+        h1_bull_score - h1_bear_score
+    )
+
+    if not h1_fresh:
+        h1_direction = "NEUTRAL"
+        h1_direction_reason = (
+            "H1_UNAVAILABLE_OR_STALE"
+        )
+
+    elif (
+        h1_bull_score >= DXY_H1_FLOW_MIN_SCORE
+        and (
+            h1_bull_score - h1_bear_score
+        ) >= DXY_H1_FLOW_MIN_MARGIN
+    ):
+        h1_direction = "BULLISH"
+        h1_direction_reason = (
+            "H1_BULL_EVIDENCE"
+        )
+
+    elif (
+        h1_bear_score >= DXY_H1_FLOW_MIN_SCORE
+        and (
+            h1_bear_score - h1_bull_score
+        ) >= DXY_H1_FLOW_MIN_MARGIN
+    ):
+        h1_direction = "BEARISH"
+        h1_direction_reason = (
+            "H1_BEAR_EVIDENCE"
+        )
+
+    else:
+        h1_direction = "NEUTRAL"
+        h1_direction_reason = (
+            "H1_EVIDENCE_INSUFFICIENT"
+        )
     if not isinstance(dxy, dict):
         return {
             "schema_version": 1,
@@ -515,40 +1220,38 @@ def _dxy_sr_confirmation_analytics(
         else {}
     )
 
-    sr = (
-        features.get("sr")
+    # LIVE REAL_DXY tracker schema.
+    #
+    # Current tracker structure is:
+    #
+    #   selected["features"]["market_flow"]["structure"]
+    #
+    # Do NOT use features["sr"]; that belongs to the old analytics
+    # snapshot schema.
+    market_flow = (
+        features.get("market_flow")
         if isinstance(
-            features.get("sr"),
+            features.get("market_flow"),
             dict,
         )
         else {}
     )
 
     structure = (
-        sr.get("structure_context")
+        market_flow.get("structure")
         if isinstance(
-            sr.get("structure_context"),
+            market_flow.get("structure"),
             dict,
         )
         else {}
     )
 
-    reasoning = (
-        selected.get("reasoning")
-        if isinstance(
-            selected.get("reasoning"),
-            dict,
-        )
-        else {}
-    )
+    # _dxy_opposing_sr_next_three() expects the SR container.
+    # The live structure already contains active_supports,
+    # active_resistances, support_path, resistance_path, etc.
+    sr = structure
 
-    available = bool(
-        selected.get("available")
-    )
-
-    fresh = bool(
-        selected.get("fresh")
-    )
+    reasoning = {}
 
     direction = str(
         selected.get("direction")
@@ -560,6 +1263,56 @@ def _dxy_sr_confirmation_analytics(
         or "UNAVAILABLE"
     ).upper().strip()
 
+    # ---------------------------------------------------------
+    # REAL_DXY observation availability
+    #
+    # Availability means:
+    #   "Do we have a usable tracker observation?"
+    #
+    # It must NOT depend on whether the current directional
+    # opinion is BULLISH/BEARISH.
+    #
+    # NEUTRAL is a valid observed state and is handled later as
+    # DEVELOPING / WAIT by the H1+M15 direction contract.
+    #
+    # COMPLETED / WEAK_COMPLETION are also valid observations.
+    #
+    # Freshness remains a separate check below.
+    # ---------------------------------------------------------
+    available = bool(
+        selected
+        and lifecycle_status not in (
+            "",
+            "UNAVAILABLE",
+        )
+    )
+
+    # Freshness is based on the latest evaluated REAL_DXY M15 bar.
+    last_bar_ms = _to_ms_any(
+        selected.get("last_evaluated_bar_close_ms")
+        or selected.get("broker_bar_close_ms")
+        or features.get("broker_bar_close_ms")
+        or features.get("bar_close_ms")
+    )
+
+    now_ms = int(time.time() * 1000)
+
+    # Allow 2 completed M15 intervals.
+    fresh = bool(
+        last_bar_ms
+        and now_ms >= last_bar_ms
+        and (now_ms - last_bar_ms) <= 30 * 60 * 1000
+    )
+
+    # Current feature qualification describes whether the latest M15
+    # feature is itself a new qualifying directional candidate.
+    # It must NOT invalidate an already CONFIRMED tracker direction.
+    latest_feature_qualified = bool(
+        selected.get("latest_feature_qualified")
+        or features.get("candidate_qualified")
+    )
+
+    
     alignment = str(
         selected.get("trade_alignment")
         or "NEUTRAL"
@@ -585,32 +1338,168 @@ def _dxy_sr_confirmation_analytics(
     )
 
     candidate_qualified = bool(
-        selected.get("candidate_qualified")
+        lifecycle_status == "CONFIRMED"
         or (
+            lifecycle_status == "PENDING"
+            and latest_feature_qualified
+            
+        )
+    )
+    # ---------------------------------------------------------
+    # Point-A M15 entry-health state.
+    #
+    # Important:
+    # revoke_score is evidence AGAINST the currently tracked
+    # DXY direction. It is NOT an independent direction signal.
+    #
+    # Therefore:
+    #   CONFIRMED + score < 30
+    #       -> confirmed direction remains executable
+    #
+    #   CONFIRMED + score >= 30
+    #       -> direction remains confirmed, but NEW entries WAIT
+    #
+    # Actual tracker revocation / opposite confirmation remains
+    # authoritative for directional invalidation.
+    # ---------------------------------------------------------
+    try:
+        m15_revoke_score = int(
+            selected.get("revoke_score") or 0
+        )
+    except Exception:
+        m15_revoke_score = 0
+
+    m15_revoke_reasons = (
+        list(selected.get("revoke_reasons") or [])
+        if isinstance(
+            selected.get("revoke_reasons"),
+            list,
+        )
+        else []
+    )
+
+    m15_revoke_wait_threshold = int(
+        DXY_M15_ENTRY_REVOKE_WAIT_THRESHOLD
+    )
+
+    # ---------------------------------------------------------
+    # DXY directional maturity inputs.
+    #
+    # Final maturity classification is intentionally delayed
+    # until required_dxy_direction / favorable_direction are
+    # known below.
+    # ---------------------------------------------------------
+    dxy_directional_move_atr = (
+        _dxy_float_or_none(
+            selected.get(
+                "directional_move_atr"
+            )
+        )
+        or 0.0
+    )
+
+    dxy_max_favorable_atr = (
+        _dxy_float_or_none(
+            selected.get(
+                "max_favorable_atr"
+            )
+        )
+        or 0.0
+    )
+
+    dxy_recent_net_atr = (
+        _dxy_float_or_none(
             features.get(
-                "candidate_qualified"
+                "recent_net_atr"
+            )
+        )
+        or 0.0
+    )
+
+    inside_support = (
+        structure.get("inside_support")
+        if isinstance(
+            structure.get("inside_support"),
+            dict,
+        )
+        else {}
+    )
+
+    inside_resistance = (
+        structure.get("inside_resistance")
+        if isinstance(
+            structure.get("inside_resistance"),
+            dict,
+        )
+        else {}
+    )
+
+    nearest_support = (
+        structure.get("nearest_support")
+        if isinstance(
+            structure.get("nearest_support"),
+            dict,
+        )
+        else {}
+    )
+
+    nearest_resistance = (
+        structure.get("nearest_resistance")
+        if isinstance(
+            structure.get("nearest_resistance"),
+            dict,
+        )
+        else {}
+    )
+
+    near_h1_support = bool(
+        nearest_support
+        and str(
+            nearest_support.get("tf") or ""
+        ).upper() == "H1"
+        and (
+            bool(nearest_support.get("inside"))
+            or (
+                _dxy_float_or_none(
+                    nearest_support.get("distance_atr")
+                ) is not None
+                and _dxy_float_or_none(
+                    nearest_support.get("distance_atr")
+                ) <= 0.5
             )
         )
     )
 
-    near_h1_support = bool(
-        structure.get("near_h1_support")
-    )
-
     near_h1_resistance = bool(
-        structure.get(
-            "near_h1_resistance"
+        nearest_resistance
+        and str(
+            nearest_resistance.get("tf") or ""
+        ).upper() == "H1"
+        and (
+            bool(nearest_resistance.get("inside"))
+            or (
+                _dxy_float_or_none(
+                    nearest_resistance.get("distance_atr")
+                ) is not None
+                and _dxy_float_or_none(
+                    nearest_resistance.get("distance_atr")
+                ) <= 0.5
+            )
         )
     )
 
     inside_h4_support = bool(
-        structure.get("inside_h4_support")
+        inside_support
+        and str(
+            inside_support.get("tf") or ""
+        ).upper() == "H4"
     )
 
     inside_h4_resistance = bool(
-        structure.get(
-            "inside_h4_resistance"
-        )
+        inside_resistance
+        and str(
+            inside_resistance.get("tf") or ""
+        ).upper() == "H4"
     )
 
     required_dxy_direction = None
@@ -638,45 +1527,329 @@ def _dxy_sr_confirmation_analytics(
             else "BEARISH"
         )
 
+    # ---------------------------------------------------------
+    # CANONICAL TREND_SR DIRECTIONAL-ROOM SAFETY
+    # ---------------------------------------------------------
+    canonical_structure_pressure = str(
+        structure.get("structure_pressure") or ""
+    ).upper().strip()
+
+    canonical_structure_reason = str(
+        structure.get("structure_pressure_reason") or ""
+    ).upper().strip()
+
+    canonical_directional_room_atr = _dxy_float_or_none(
+        structure.get("directional_room_atr")
+    )
+
+    canonical_inside_opposing = bool(
+        (
+            required_dxy_direction == "BULLISH"
+            and canonical_structure_reason == "INSIDE_RESISTANCE"
+        )
+        or (
+            required_dxy_direction == "BEARISH"
+            and canonical_structure_reason == "INSIDE_SUPPORT"
+        )
+    )
+
+    canonical_extreme_pressure = bool(
+        canonical_structure_pressure == "EXTREME"
+    )
+
+    canonical_very_low_room = bool(
+        canonical_directional_room_atr is not None
+        and canonical_directional_room_atr <= 0.20
+    )
+
+    canonical_sr_risk = bool(
+        canonical_inside_opposing
+        or canonical_extreme_pressure
+        or canonical_very_low_room
+    )
+
+    # Use the same Point-A SR philosophy on DXY: immediate next three
+    # opposing levels in the direction DXY must move, de-duplicate them,
+    # then choose by strength, sr_score, touches, H4, and distance.
+
+    dxy_sr_current_price = _dxy_float_or_none(
+        structure.get("price")
+        if structure.get("price") is not None
+        else selected.get("candidate_start_price")
+    )
+
+   
+    opposing_sr = _dxy_opposing_sr_next_three(
+        sr,
+        required_direction=required_dxy_direction,
+        current_price=dxy_sr_current_price,
+        atr=_dxy_float_or_none(
+            structure.get("atr")
+            if structure.get("atr") is not None
+            else features.get("atr")
+        ),
+    )
+    selected_opposing_sr = (
+        opposing_sr.get("selected")
+        if isinstance(opposing_sr.get("selected"), dict)
+        else {}
+    )
+    selected_room_class = str(
+        selected_opposing_sr.get("room_class") or room_class or ""
+    ).upper().strip()
+
+    # ---------------------------------------------------------
+    # POINT-A M15 + H1 DIRECTION CONTRACT
+    #
+    # AGREE:
+    #   M15 BULLISH + H1 BULLISH
+    #   M15 BEARISH + H1 BEARISH
+    #
+    # CONFLICT:
+    #   directional M15 and H1 disagree
+    #
+    # DEVELOPING:
+    #   either timeframe is NEUTRAL / unavailable / stale
+    #
+    # Only AGREE creates a confirmed DXY direction.
+    # ---------------------------------------------------------
+    m15_direction = (
+        direction
+        if direction in ("BULLISH", "BEARISH")
+        else "NEUTRAL"
+    )
+
+    if (
+        m15_direction in ("BULLISH", "BEARISH")
+        and h1_direction in ("BULLISH", "BEARISH")
+        and m15_direction == h1_direction
+    ):
+        dxy_m15_h1_state = "AGREE"
+        combined_dxy_direction = m15_direction
+
+    elif (
+        m15_direction in ("BULLISH", "BEARISH")
+        and h1_direction in ("BULLISH", "BEARISH")
+        and m15_direction != h1_direction
+    ):
+        dxy_m15_h1_state = "CONFLICT"
+        combined_dxy_direction = "NEUTRAL"
+
+    else:
+        dxy_m15_h1_state = "DEVELOPING"
+        combined_dxy_direction = "NEUTRAL"
+
     favorable_direction = bool(
-        required_dxy_direction
-        and direction
+        dxy_m15_h1_state == "AGREE"
+        and required_dxy_direction
+        and combined_dxy_direction
         == required_dxy_direction
     )
-
-    opposite_direction = bool(
-        required_dxy_direction
-        and direction
-        in ("BULLISH", "BEARISH")
-        and direction
-        != required_dxy_direction
+    # ---------------------------------------------------------
+    # Direction-aware DXY move maturity.
+    #
+    # A large move matters only if it occurred in the same
+    # direction required by the proposed XTL trade.
+    #
+    # Examples:
+    #
+    # required BEARISH:
+    #     recent_net_atr <= -1.80
+    #
+    # required BULLISH:
+    #     recent_net_atr >= +1.80
+    #
+    # max_favorable_atr remains the preferred lifecycle metric
+    # when available.
+    # ---------------------------------------------------------
+    dxy_recent_move_extended = bool(
+        (
+            required_dxy_direction == "BEARISH"
+            and dxy_recent_net_atr
+            <= -DXY_M15_EXTENDED_RECENT_MOVE_ATR
+        )
+        or (
+            required_dxy_direction == "BULLISH"
+            and dxy_recent_net_atr
+            >= DXY_M15_EXTENDED_RECENT_MOVE_ATR
+        )
     )
 
-    sr_risk = False
-
-    if required_dxy_direction == "BEARISH":
-        sr_risk = bool(
-            near_h1_support
-            or inside_h4_support
-            or (
-                room_class == "LOW"
-                and analysis_direction
-                == "BEARISH"
-            )
+    dxy_mature_move = bool(
+        lifecycle_status == "CONFIRMED"
+        and favorable_direction
+        and (
+            dxy_max_favorable_atr
+            >= DXY_M15_MATURE_MOVE_ATR
+            or dxy_recent_move_extended
         )
+    )
 
-    elif required_dxy_direction == "BULLISH":
-        sr_risk = bool(
-            near_h1_resistance
-            or inside_h4_resistance
-            or (
-                room_class == "LOW"
-                and analysis_direction
-                == "BULLISH"
-            )
+    # Hard opposite is valid ONLY when H1 and M15 agree.
+    #
+    # M15 opposite + H1 conflicting/neutral must WAIT,
+    # never terminally BLOCK the setup.
+    opposite_direction = bool(
+        dxy_m15_h1_state == "AGREE"
+        and required_dxy_direction
+        and combined_dxy_direction
+        in ("BULLISH", "BEARISH")
+        and combined_dxy_direction
+        != required_dxy_direction
+    )
+    # ---------------------------------------------------------
+    # Entry-facing M15 classification.
+    #
+    # Symmetric for all XTL symbols:
+    # it applies whenever the currently CONFIRMED DXY direction
+    # is the direction required by the proposed trade.
+    # ---------------------------------------------------------
+    confirmed_required_direction = bool(
+        lifecycle_status == "CONFIRMED"
+        and favorable_direction
+    )
+
+    m15_deteriorating = bool(
+        confirmed_required_direction
+        and m15_revoke_score
+        >= m15_revoke_wait_threshold
+    )
+
+    if m15_deteriorating:
+        m15_entry_state = "DETERIORATING"
+
+    elif confirmed_required_direction:
+        m15_entry_state = "ALIGNED"
+
+    elif (
+        lifecycle_status == "CONFIRMED"
+        and opposite_direction
+    ):
+        m15_entry_state = "OPPOSITE_CONFIRMED"
+
+    elif lifecycle_status == "PENDING":
+        m15_entry_state = "PENDING"
+
+    else:
+        m15_entry_state = "NEUTRAL"
+
+    selected_sr_distance_atr = _dxy_float_or_none(
+        selected_opposing_sr.get("distance_atr")
+    )
+
+    selected_sr_strength = (
+        _dxy_float_or_none(
+            selected_opposing_sr.get("strength")
         )
+        or 0.0
+    )
+
+    selected_sr_score = (
+        _dxy_float_or_none(
+            selected_opposing_sr.get("sr_score")
+        )
+        or 0.0
+    )
+
+    selected_sr_touches = (
+        _dxy_float_or_none(
+            selected_opposing_sr.get("touches")
+        )
+        or 0.0
+    )
+
+    selected_sr_tf = str(
+        selected_opposing_sr.get("tf") or ""
+    ).upper().strip()
+
+    # Selected strongest SR among the immediate next 3
+    # must be both meaningful and genuinely too close
+    # before DXY structure blocks the direction.
+    selected_sr_strong = bool(
+        selected_sr_strength >= 8.0
+        or selected_sr_score >= 10.0
+        or selected_sr_touches >= 3.0
+        or selected_sr_tf == "H4"
+    )
+
+    selected_sr_too_close = bool(
+        selected_sr_distance_atr is not None
+        and selected_sr_distance_atr <= 0.35
+    )
+
+    sr_risk = bool(
+        (
+            selected_opposing_sr
+            and selected_sr_strong
+            and selected_sr_too_close
+        )
+        or canonical_sr_risk
+    )
+    # ---------------------------------------------------------
+    # Mature directional move approaching opposing SR.
+    #
+    # Example:
+    #
+    #   DXY CONFIRMED BEARISH
+    #   max favorable move already >= 1.50 ATR
+    #   nearest meaningful SUPPORT <= 0.75 ATR
+    #
+    # The bearish thesis may still be correct, but initiating a
+    # new XAUUSD BUY / EURUSD BUY / GBPUSD BUY / USDCAD SELL
+    # here is late-cycle continuation risk.
+    #
+    # Symmetric logic applies to mature bullish DXY approaching
+    # meaningful resistance.
+    # ---------------------------------------------------------
+    dxy_mature_sr_risk = bool(
+        confirmed_required_direction
+        and dxy_mature_move
+        and selected_opposing_sr
+        and selected_sr_strong
+        and selected_sr_distance_atr is not None
+        and selected_sr_distance_atr
+        <= DXY_M15_MATURE_SR_WAIT_ATR
+    )
 
     reason_codes = []
+    if canonical_extreme_pressure:
+        reason_codes.append(
+            "DXY_CANONICAL_STRUCTURE_EXTREME"
+        )
+
+    if canonical_very_low_room:
+        reason_codes.append(
+            "DXY_CANONICAL_ROOM_LE_0_20_ATR"
+        )
+
+    if canonical_inside_opposing:
+        reason_codes.append(
+            "DXY_CANONICAL_INSIDE_OPPOSING_SR"
+        )
+    # ---------------------------------------------------------
+    # H1 / M15 direction diagnostics
+    # ---------------------------------------------------------
+    reason_codes.append(
+        f"DXY_H1_DIRECTION_{h1_direction}"
+    )
+
+    reason_codes.append(
+        f"DXY_H1_REASON_{h1_direction_reason}"
+    )
+
+    reason_codes.append(
+        f"DXY_M15_H1_{dxy_m15_h1_state}"
+    )
+
+    if dxy_m15_h1_state == "CONFLICT":
+        reason_codes.append(
+            "DXY_DIRECTION_TIMEFRAME_CONFLICT"
+        )
+
+    elif dxy_m15_h1_state == "DEVELOPING":
+        reason_codes.append(
+            "DXY_DIRECTION_TIMEFRAME_DEVELOPING"
+        )
 
     if not available:
         reason_codes.append(
@@ -732,6 +1905,28 @@ def _dxy_sr_confirmation_analytics(
         reason_codes.append(
             "DXY_CANDIDATE_NOT_QUALIFIED"
         )
+    if m15_deteriorating:
+        reason_codes.append(
+            "DXY_M15_DETERIORATING"
+        )
+    
+    if dxy_recent_move_extended:
+        reason_codes.append(
+            "DXY_M15_EXTENDED_RECENT_MOVE"
+        )
+    if dxy_mature_move:
+        reason_codes.append(
+            "DXY_M15_MATURE_MOVE"
+        )
+
+    if dxy_mature_sr_risk:
+        reason_codes.append(
+            "DXY_M15_MATURE_MOVE_NEAR_OPPOSING_SR"
+        )
+
+    reason_codes.append(
+        f"DXY_M15_ENTRY_STATE_{m15_entry_state}"
+    )
 
     if sr_risk:
         reason_codes.append(
@@ -767,7 +1962,7 @@ def _dxy_sr_confirmation_analytics(
             "COMPLETED",
             "WEAK_COMPLETION",
         )
-        and candidate_qualified
+        
     )
 
     if not available or not fresh:
@@ -776,10 +1971,47 @@ def _dxy_sr_confirmation_analytics(
     elif (
         qualified_lifecycle
         and favorable_direction
+        and not m15_deteriorating
         and not sr_risk
+        and not dxy_mature_sr_risk
         and not structure_conflict
     ):
         status = "PASS"
+
+    elif (
+        qualified_lifecycle
+        and favorable_direction
+        and m15_deteriorating
+    ):
+        # Direction itself remains valid.
+        # Entry timing is temporarily unhealthy.
+        #
+        # NEUTRAL deliberately routes Point-A to WAIT,
+        # never to terminal BLOCK.
+        status = "NEUTRAL"
+
+    elif (
+        qualified_lifecycle
+        and favorable_direction
+        and dxy_mature_sr_risk
+    ):
+        # DXY still supports the trade direction, but the
+        # move is already mature/extended and is approaching
+        # the nearest meaningful opposing SR.
+        #
+        # This is late-continuation timing risk, not a
+        # directional invalidation, therefore Point-A WAITs
+        # instead of terminally blocking the setup.
+        status = "NEUTRAL"
+
+    elif dxy_m15_h1_state != "AGREE":
+        # H1/M15 conflict or one timeframe is neutral.
+        #
+        # This is incomplete directional confirmation,
+        # not terminal invalidation.
+        #
+        # Point-A must WAIT/HOLD.
+        status = "NEUTRAL"
 
     elif (
         qualified_lifecycle
@@ -792,6 +2024,7 @@ def _dxy_sr_confirmation_analytics(
         or structure_conflict
     ):
         status = "FAIL"
+
 
     else:
         status = "NEUTRAL"
@@ -820,6 +2053,57 @@ def _dxy_sr_confirmation_analytics(
                 lifecycle_status
             ),
             "direction": direction,
+            "m15_direction": (
+                m15_direction
+            ),
+            "h1_direction": (
+                h1_direction
+            ),
+            "h1_direction_reason": (
+                h1_direction_reason
+            ),
+            "h1_fresh": bool(
+                h1_fresh
+            ),
+            "h1_close_ms": (
+                int(h1_close_ms)
+                if h1_close_ms > 0
+                else None
+            ),
+            "h1_age_ms": (
+                int(h1_age_ms)
+                if h1_age_ms is not None
+                else None
+            ),
+            "h1_bull_score": int(
+                h1_bull_score
+            ),
+            "h1_bear_score": int(
+                h1_bear_score
+            ),
+            "h1_evidence_margin": int(
+                h1_evidence_margin
+            ),
+            "h1_raw_candidate_direction": (
+                str(
+                    h1_feature.get(
+                        "candidate_direction"
+                    )
+                    or "NEUTRAL"
+                ).upper()
+            ),
+            "h1_candidate_confidence": int(
+                h1_feature.get(
+                    "candidate_confidence"
+                )
+                or 0
+            ),
+            "m15_h1_state": (
+                dxy_m15_h1_state
+            ),
+            "combined_dxy_direction": (
+                combined_dxy_direction
+            ),
             "required_direction_for_trade": (
                 required_dxy_direction
             ),
@@ -827,14 +2111,71 @@ def _dxy_sr_confirmation_analytics(
             "candidate_qualified": (
                 candidate_qualified
             ),
+            "m15_entry_state": (
+                m15_entry_state
+            ),
+            "m15_deteriorating": bool(
+                m15_deteriorating
+            ),
+            "m15_revoke_score": int(
+                m15_revoke_score
+            ),
+            "m15_revoke_reasons": (
+                list(m15_revoke_reasons)
+            ),
+            "m15_revoke_wait_threshold": int(
+                m15_revoke_wait_threshold
+            ),
+            "dxy_directional_move_atr": (
+                float(dxy_directional_move_atr)
+            ),
+            "dxy_max_favorable_atr": (
+                float(dxy_max_favorable_atr)
+            ),
+            "dxy_recent_net_atr": (
+                float(dxy_recent_net_atr)
+            ),
+            "dxy_recent_move_extended": bool(
+                dxy_recent_move_extended
+            ),
+            "dxy_mature_move": bool(
+                dxy_mature_move
+            ),
+            "dxy_mature_sr_risk": bool(
+                dxy_mature_sr_risk
+            ),
+            "dxy_mature_move_atr_threshold": float(
+                DXY_M15_MATURE_MOVE_ATR
+            ),
+            "dxy_extended_recent_move_atr_threshold": float(
+                DXY_M15_EXTENDED_RECENT_MOVE_ATR
+            ),
+            "dxy_mature_sr_wait_atr_threshold": float(
+                DXY_M15_MATURE_SR_WAIT_ATR
+            ),
             "analysis_direction": (
                 analysis_direction or None
             ),
             "room_class": (
-                room_class or None
+                selected_room_class or None
             ),
             "reversal_risk": (
                 reversal_risk or None
+            ),
+            "canonical_structure_pressure": (
+                canonical_structure_pressure or None
+            ),
+            "canonical_structure_pressure_reason": (
+                canonical_structure_reason or None
+            ),
+            "canonical_directional_room_atr": (
+                canonical_directional_room_atr
+            ),
+            "canonical_inside_opposing": (
+                canonical_inside_opposing
+            ),
+            "canonical_sr_risk": (
+                canonical_sr_risk
             ),
             "structure_conflict": (
                 structure_conflict
@@ -851,15 +2192,29 @@ def _dxy_sr_confirmation_analytics(
             "inside_h4_resistance": (
                 inside_h4_resistance
             ),
+            "opposing_sr_selection": (
+                _safe_deepcopy_json(opposing_sr)
+            ),
+            "dxy_opposing_sr_distance_atr": (
+                selected_sr_distance_atr
+            ),
+            "dxy_opposing_sr_strength": (
+                selected_sr_strength
+            ),
+            "dxy_opposing_sr_score": (
+                selected_sr_score
+            ),
+            "dxy_opposing_sr_touches": (
+                selected_sr_touches
+            ),
+            "dxy_opposing_sr_tf": (
+                selected_sr_tf or None
+            ),
             "available_downside_atr": (
-                structure.get(
-                    "available_downside_atr"
-                )
+                structure.get("room_down_atr")
             ),
             "available_upside_atr": (
-                structure.get(
-                    "available_upside_atr"
-                )
+                structure.get("room_up_atr")
             ),
             "reasoning": _safe_deepcopy_json(
                 reasoning
@@ -875,6 +2230,7 @@ def _dxy_sr_confirmation_analytics(
 
 def _build_entry_validation_analytics(
     *,
+    R,
     watch: dict,
     zone: dict,
     direction: str,
@@ -949,6 +2305,7 @@ def _build_entry_validation_analytics(
 
     dxy_confirmation = (
         _dxy_sr_confirmation_analytics(
+            R=R,
             device_id=device_id,
             symbol=symbol,
             side=production_direction,
@@ -1140,8 +2497,8 @@ def _pick_last_closed_bar_from_bars(
 ) -> Tuple[Optional[dict], Optional[dict]]:
     """
     Pick the last CLOSED bar.
-    Priority: complete=True > clock fallback
-    MT5 sends future bars complete=True — filter by open_ms <= sys_now.
+    Priority: complete=True ,then clock fallback
+    MT5 sends future bars complete=True  filter by open_ms <= system time.
     """
     import time as _t
     try:
@@ -2945,16 +4302,272 @@ def zone_reversal_gate(
         w_trade_state = str(watch.get("trade_state") or "").upper()
         w_missed = bool(watch.get("missed_breakout"))
 
+        # ------------------------------------------------------------
+        # Point-A terminal states.
+        # ------------------------------------------------------------
+        point_a_terminal_state = (
+            w_state
+            if w_state in (
+                "ENTRY_BLOCKED_POINT_A_BLOCK",
+                "ENTRY_BLOCKED_POINT_A_EXPIRED",
+            )
+            else w_trade_state
+            if w_trade_state in (
+                "ENTRY_BLOCKED_POINT_A_BLOCK",
+                "ENTRY_BLOCKED_POINT_A_EXPIRED",
+            )
+            else ""
+        )
+
+        if point_a_terminal_state:
+            # --------------------------------------------------------
+            # P0 POINT-A TERMINAL STATE NORMALIZATION
+            #
+            # state / trade_state are redundant lifecycle fields.
+            # If either says BLOCK/EXPIRED, persist one authoritative
+            # terminal state so executor and gate cannot oscillate
+            # between REV_OK and Point-A terminal state.
+            # --------------------------------------------------------
+            _terminal_changed = bool(
+                w_state != point_a_terminal_state
+                or w_trade_state != point_a_terminal_state
+                or bool(watch.get("rev_ok"))
+                or not bool(watch.get("entry_blocked"))
+            )
+
+            watch["state"] = point_a_terminal_state
+            watch["trade_state"] = point_a_terminal_state
+            watch["rev_ok"] = False
+            watch["entry_ready"] = False
+            watch["entry_triggered"] = False
+            watch["entry_blocked"] = True
+
+            if _terminal_changed:
+                try:
+                    R.set(
+                        wkey,
+                        json.dumps(
+                            watch,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+
+                    log.warning(
+                        "[POINT_A] GATE_TERMINAL_STATE_NORMALIZED "
+                        "sym=%s state=%s key=%s",
+                        sym_u,
+                        point_a_terminal_state,
+                        wkey,
+                    )
+
+                except Exception:
+                    log.exception(
+                        "[POINT_A] GATE_TERMINAL_STATE_NORMALIZE_FAILED "
+                        "sym=%s state=%s key=%s",
+                        sym_u,
+                        point_a_terminal_state,
+                        wkey,
+                    )
+            gate["blocked"] = True
+            gate["stage"] = (
+                "POINT_A_BLOCKED"
+                if point_a_terminal_state == "ENTRY_BLOCKED_POINT_A_BLOCK"
+                else "POINT_A_EXPIRED"
+            )
+            gate["reason"] = str(
+                watch.get("point_a_reason")
+                or watch.get("entry_block_reason")
+                or gate["stage"]
+            )
+            gate["watch_key"] = str(wkey)
+            gate["watch_reused"] = True
+            gate["resolved_dir"] = str(
+                watch.get("direction")
+                or resolved_dir
+                or ""
+            ).upper()
+            gate["rev_ok"] = False
+            gate["zone"] = dict(watch.get("zone_used") or {})
+            gate["planned_zone"] = dict(watch.get("zone_used") or {})
+            gate["zone_used"] = dict(watch.get("zone_used") or {})
+            gate["rev_state"] = dict(watch)
+
+            
+            # --------------------------------------------------------
+            # P0 POINT-A TERMINAL OWNERSHIP CONTRACT
+            #
+            # BLOCK and EXPIRED are both terminal for THIS frozen
+            # direction / zone / RC-cross opportunity.
+            #
+            # They are retained here only as temporary fail-closed
+            # tombstones while the executor completes terminal cleanup.
+            #
+            # IMPORTANT:
+            #   - never restore REV_OK
+            #   - never refresh/re-arm RC
+            #   - never migrate to a newer RC on this frozen setup
+            #   - never change direction inside this terminal watch
+            #
+            # Once executor cleanup removes this watch, the next gate
+            # evaluation performs normal fresh discovery from current
+            # price / SR structure.
+            # --------------------------------------------------------
+            watch.pop(
+                "_point_a_terminal_rc_refresh",
+                None,
+            )
+
+            gate["rev_state"] = dict(watch)
+
+            return False, gate
+        # ------------------------------------------------------------
+        # Point-A WAIT presentation.
+        #
+        # Executor owns the WAIT lifecycle. The gate must preserve and
+        # expose that state instead of repairing it back to REV_OK.
+        # ------------------------------------------------------------
+        point_a_wait_state = (
+            w_state == "ENTRY_BLOCKED_POINT_A_WAIT"
+            or w_trade_state == "ENTRY_BLOCKED_POINT_A_WAIT"
+        )
+
+        if point_a_wait_state:
+            # --------------------------------------------------------
+            # P0 POINT-A WAIT STATE NORMALIZATION
+            #
+            # An active WAIT owns its crossed opportunity.
+            # Persist both lifecycle fields consistently and keep RC
+            # confirmed while the executor re-evaluates Point-A.
+            # --------------------------------------------------------
+            _wait_changed = bool(
+                w_state != "ENTRY_BLOCKED_POINT_A_WAIT"
+                or w_trade_state != "ENTRY_BLOCKED_POINT_A_WAIT"
+                or not bool(watch.get("rev_ok"))
+                or not bool(watch.get("entry_blocked"))
+            )
+
+            watch["state"] = "ENTRY_BLOCKED_POINT_A_WAIT"
+            watch["trade_state"] = "ENTRY_BLOCKED_POINT_A_WAIT"
+            watch["rev_ok"] = True
+            watch["entry_ready"] = False
+            watch["entry_triggered"] = False
+            watch["entry_blocked"] = True
+
+            if _wait_changed:
+                try:
+                    R.set(
+                        wkey,
+                        json.dumps(
+                            watch,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+
+                    log.warning(
+                        "[POINT_A] GATE_WAIT_STATE_NORMALIZED "
+                        "sym=%s key=%s",
+                        sym_u,
+                        wkey,
+                    )
+
+                except Exception:
+                    log.exception(
+                        "[POINT_A] GATE_WAIT_STATE_NORMALIZE_FAILED "
+                        "sym=%s key=%s",
+                        sym_u,
+                        wkey,
+                    )
+            _pa_reason = str(
+                watch.get("point_a_reason")
+                or watch.get("entry_block_reason")
+                or "POINT_A_WAIT"
+            )
+
+            try:
+                _pa_wait_bars = int(
+                    watch.get("point_a_wait_m15_bars") or 0
+                )
+            except Exception:
+                _pa_wait_bars = 0
+
+            try:
+                _pa_max_wait_bars = int(
+                    watch.get("point_a_max_wait_m15_bars") or 16
+                )
+            except Exception:
+                _pa_max_wait_bars = 16
+
+            try:
+                _pa_disp = float(
+                    watch.get("point_a_displacement_atr") or 0.0
+                )
+            except Exception:
+                _pa_disp = 0.0
+
+            gate["blocked"] = True
+            gate["stage"] = "POINT_A_WAIT"
+
+            gate["reason"] = (
+                f"POINT-A WAIT | {_pa_reason} "
+                f"| M15 {_pa_wait_bars}/{_pa_max_wait_bars} "
+                f"| DISP {_pa_disp:.2f} ATR"
+            )
+
+            gate["watch_key"] = str(wkey)
+            gate["watch_reused"] = True
+
+            gate["resolved_dir"] = str(
+                watch.get("direction")
+                or resolved_dir
+                or ""
+            ).upper()
+
+            # RC itself remains valid while Point-A is waiting.
+            gate["rev_ok"] = True
+
+            gate["zone"] = dict(
+                watch.get("zone_used") or {}
+            )
+            gate["planned_zone"] = dict(
+                watch.get("zone_used") or {}
+            )
+            gate["zone_used"] = dict(
+                watch.get("zone_used") or {}
+            )
+
+            gate["rev_state"] = dict(watch)
+
+            return False, gate
         if (
-            w_state in ("MISSED_BREAKOUT", "ORDER_FAILED", "ZONE_INVALIDATED")
-            or w_trade_state in ("MISSED_BREAKOUT", "ORDER_FAILED", "ZONE_INVALIDATED")
+            w_state in (
+                "MISSED_BREAKOUT",
+                "ORDER_FAILED",
+                "ZONE_INVALIDATED",
+            )
+            or w_trade_state in (
+                "MISSED_BREAKOUT",
+                "ORDER_FAILED",
+                "ZONE_INVALIDATED",
+            )
             or w_missed
         ):
             terminal_state = (
                 w_trade_state
-                if w_trade_state in ("MISSED_BREAKOUT", "ORDER_FAILED", "ZONE_INVALIDATED")
+                if w_trade_state in (
+                    "MISSED_BREAKOUT",
+                    "ORDER_FAILED",
+                    "ZONE_INVALIDATED",
+                )
                 else w_state
-                if w_state in ("MISSED_BREAKOUT", "ORDER_FAILED", "ZONE_INVALIDATED")
+                if w_state in (
+                    "MISSED_BREAKOUT",
+                    "ORDER_FAILED",
+                    "ZONE_INVALIDATED",
+                )
                 else "MISSED_BREAKOUT"
             )
 
@@ -2964,7 +4577,10 @@ def zone_reversal_gate(
             try:
                 R.set(
                     wkey,
-                    json.dumps(watch, separators=(",", ":")),
+                    json.dumps(
+                        watch,
+                        separators=(",", ":"),
+                    ),
                     ex=7 * 24 * 3600,
                 )
             except Exception:
@@ -2972,23 +4588,59 @@ def zone_reversal_gate(
 
             gate["blocked"] = True
             gate["stage"] = terminal_state
-            gate["reason"] = str(watch.get("missed_breakout_reason") or terminal_state)
+            gate["reason"] = str(
+                watch.get("missed_breakout_reason")
+                or terminal_state
+            )
             gate["watch_key"] = str(wkey)
             gate["watch_reused"] = True
-            gate["resolved_dir"] = str(watch.get("direction") or resolved_dir or "").upper()
+            gate["resolved_dir"] = str(
+                watch.get("direction")
+                or resolved_dir
+                or ""
+            ).upper()
             gate["zone"] = None
             gate["planned_zone"] = None
-            gate["zone_used"] = dict(watch.get("zone_used")) if isinstance(watch.get("zone_used"), dict) else None
+            gate["zone_used"] = (
+                dict(watch.get("zone_used"))
+                if isinstance(
+                    watch.get("zone_used"),
+                    dict,
+                )
+                else None
+            )
             gate["rev_state"] = dict(watch)
-            return False, gate	
-        if w_rev_ok and w_state != "REV_OK":
+
+            return False, gate
+
+        _point_a_terminal_rc_refresh = bool(
+            isinstance(watch, dict)
+            and watch.get("_point_a_terminal_rc_refresh")
+        )
+
+        if (
+            not _point_a_terminal_rc_refresh
+            and w_rev_ok
+            and w_state != "REV_OK"
+        ):
             watch["state"] = "REV_OK"
-        if w_state == "REV_OK" and not w_rev_ok:
+
+        if (
+            not _point_a_terminal_rc_refresh
+            and w_state == "REV_OK"
+            and not w_rev_ok
+        ):
             watch["rev_ok"] = True
-        # Also ensure rev_ok_bar_hi/lo exist if state is REV_OK
-        if w_state == "REV_OK" or w_rev_ok:
+
+        # Also ensure rev_ok_bar_hi/lo exist if state is REV_OK.
+        # Do not touch the old expired RC while terminal re-arm scanning is active.
+        if (
+            not _point_a_terminal_rc_refresh
+            and (w_state == "REV_OK" or w_rev_ok)
+        ):
             if not watch.get("rev_ok_bar_hi") and watch.get("last_checked_high"):
                 watch["rev_ok_bar_hi"] = float(watch["last_checked_high"])
+
             if not watch.get("rev_ok_bar_lo") and watch.get("last_checked_low"):
                 watch["rev_ok_bar_lo"] = float(watch["last_checked_low"])
         # ------------------------------------------------------------
@@ -3972,11 +5624,12 @@ def zone_reversal_gate(
             "started_ms": int(now_ms_pick),
             "touch_open_ms": int(touch_open_ms),
             "touch_close_ms": int(touch_close_ms),
-            "touch_candle_open_ms": int(_touch_bar_open_ms),  # ← NEW: RC boundary
+            "touch_candle_open_ms": int(_touch_bar_open_ms),  # ? NEW: RC boundary
             "min_reclaim_close_ms": int(touch_close_ms),
             "direction": resolved_dir,
             "tf": tfu,
             "zone_used": zone_used,
+            "atr": float(atr or 0.0),
             # Set to now_ms_pick so only FUTURE closed candles are evaluated
             # Prevents old closed candles from being used as RC on fresh watch
             "watch_created_ms": int(now_ms_pick or 0),
@@ -4050,12 +5703,25 @@ def zone_reversal_gate(
     # This prevents stale/yesterday RC from staying locked forever.
     # ------------------------------------------------------------
     _watch_state_u = str((watch or {}).get("state") or "").upper()
+
+    _point_a_terminal_rc_refresh = bool(
+        isinstance(watch, dict)
+        and watch.get("_point_a_terminal_rc_refresh")
+        and _watch_state_u
+        == "ENTRY_BLOCKED_POINT_A_BLOCK"
+    )
+
     _is_rc_locked_state = (
         isinstance(watch, dict)
-        and bool(watch.get("rev_ok"))
         and (
-            _watch_state_u == "REV_OK"
-            or _watch_state_u.startswith("ENTRY_BLOCKED")
+            (
+                bool(watch.get("rev_ok"))
+                and (
+                    _watch_state_u == "REV_OK"
+                    or _watch_state_u.startswith("ENTRY_BLOCKED")
+                )
+            )
+            or _point_a_terminal_rc_refresh
         )
     )
     if _is_rc_locked_state:
@@ -4273,13 +5939,51 @@ def zone_reversal_gate(
 
                 except Exception:
                     pass
-                watch["state"] = _prev_state_for_rc_refresh if _prev_state_for_rc_refresh.startswith("ENTRY_BLOCKED") else "REV_OK"
+                if _prev_state_for_rc_refresh.startswith("ENTRY_BLOCKED_POINT_A"):
+                    watch["state"] = "REV_OK"
+                    watch["trade_state"] = ""
+                    watch["entry_blocked"] = False
+                    watch.pop("entry_block_reason", None)
+                    watch.pop("next_retry_ms", None)
+                    watch.pop("late_entry_max_move", None)
+                    for _pa_key in (
+                        "point_a",
+                        "point_a_decision",
+                        "point_a_action",
+                        "point_a_reason",
+                        "point_a_reason_codes",
+                        "point_a_wait_started_ms",
+                        "point_a_last_eval_ms",
+                        "point_a_rc_rev_ok_ms",
+                        "point_a_trigger_level",
+                        "point_a_cross_latched",
+                        "point_a_cross_ms",
+                        "point_a_cross_price",
+                        "point_a_trigger_atr",
+                        "point_a_displacement_atr",
+                        "point_a_max_displacement_atr",
+
+                        # M15 WAIT lifecycle
+                        "point_a_wait_start_m15_bucket",
+                        "point_a_wait_m15_bars",
+                        "point_a_max_wait_m15_bars",
+                        "point_a_fallback_max_wait_ms",
+
+                        # Terminal BLOCK / EXPIRE markers
+                        "point_a_terminal",
+                        "point_a_terminal_reason",
+                    ):
+                        watch.pop(_pa_key, None)
+                else:
+                    watch["state"] = _prev_state_for_rc_refresh if _prev_state_for_rc_refresh.startswith("ENTRY_BLOCKED") else "REV_OK"
+                watch.pop("_point_a_terminal_rc_refresh", None)
                 watch["rev_ok"] = True
                 watch["rev_ok_ms"] = int(_cur_closed_ms)
                 watch["last_checked_closed_ms"] = int(_cur_closed_ms)
                 watch["last_checked_close"] = float(cl)
                 watch["last_checked_high"] = float(hi)
                 watch["last_checked_low"] = float(lo)
+                watch["atr"] = float(atr or watch.get("atr") or 0.0)
 
                 watch["rev_ok_bar_hi"] = float(hi)
                 watch["rev_ok_bar_lo"] = float(lo)
@@ -4351,6 +6055,7 @@ def zone_reversal_gate(
                     try:
                         watch["entry_validation"] = (
                             _build_entry_validation_analytics(
+                                R=R,
                                 watch=watch,
                                 zone=(
                                     watch.get("zone_used")
@@ -4481,6 +6186,11 @@ def zone_reversal_gate(
                     )
                     watch["entry_triggered"] = False
                     watch["entry_ready"] = False
+                    watch["rc_trigger_crossed"] = False
+                    watch.pop("rc_trigger_crossed_ms", None)
+                    watch.pop("rc_trigger_cross_price", None)
+                    watch.pop("rc_trigger_cross_level", None)
+                    watch.pop("rc_trigger_cross_rev_ok_ms", None)
                     watch.pop("entry_ready_price", None)
                     watch.pop("entry_ready_ts_ms", None)
                     watch.pop("entry_price", None)
@@ -4521,7 +6231,7 @@ def zone_reversal_gate(
         # ------------------------------------------------------------
         # RE-VALIDATE STORED RC CANDLE
         # Even though REV_OK is locked, verify the stored RC actually
-        # touched the zone. If not → auto-rollback to REV_WATCH.
+        # touched the zone. If not ? auto-rollback to REV_WATCH.
         # This runs on every tick so bad RCs are self-healing without
         # needing Redis deletes.
         # ------------------------------------------------------------
@@ -4980,7 +6690,7 @@ def zone_reversal_gate(
             if _sb_cl is None:
                 continue
             _sb_cl = float(_sb_cl)
-            # ── RC TOUCH GATE (strict, additive) ───────────────────
+            # -- RC TOUCH GATE (strict, additive) -------------------
             # RC candle must have REACHED the zone before closing beyond it.
             # SELL: high must reach zone low (rejection off resistance).
             # BUY:  low must reach zone high (rejection off support).
@@ -4992,7 +6702,7 @@ def zone_reversal_gate(
             else:
                 if _sb_lo is None or float(_sb_lo) > float(zh):
                     continue
-            # ── END RC TOUCH GATE ──────────────────────────────────
+            # -- END RC TOUCH GATE ----------------------------------
             if resolved_dir == "BUY" and _sb_cl > float(zh):
                 _rc_bar = _sb
                 _rc_bar_close = _sb_cl

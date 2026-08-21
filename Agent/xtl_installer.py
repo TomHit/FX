@@ -24,6 +24,30 @@ if not LOGGER.handlers:
 BOOTLOG = Path(os.environ.get("TEMP", r"C:\Windows\Temp")) / "xtl_install_bootstrap.log"
 
 
+def _repair_appdata(env: dict) -> str:
+    """
+    CreateEnvironmentBlock only supplies APPDATA when the user profile is
+    loaded. Without it, MT5 expands %APPDATA%\\MetaQuotes\\Terminal\\<hash> to
+    \\MetaQuotes\\Terminal\\<hash>, which resolves to C:\\MetaQuotes\\... --
+    a folder it cannot write to. That caused 5,547 broker auth/sync cycles
+    on 2026-08-13. Returns the resolved APPDATA, or "" if unresolvable.
+    """
+    import os as _os
+    appdata = (env.get("APPDATA") or "").strip()
+    if not appdata:
+        prof = (env.get("USERPROFILE") or "").strip()
+        if prof:
+            appdata = _os.path.join(prof, "AppData", "Roaming")
+            env["APPDATA"] = appdata
+            env.setdefault("LOCALAPPDATA",
+                           _os.path.join(prof, "AppData", "Local"))
+            alog(f"bridge: APPDATA was empty; reconstructed -> {appdata}")
+        else:
+            alog("bridge: WARNING APPDATA and USERPROFILE both empty; "
+                 "child cannot resolve an MT5 data folder")
+    alog(f"bridge: child APPDATA={appdata or '<MISSING>'}")
+    return appdata
+
 def blog(msg: str) -> None:
     try:
         BOOTLOG.parent.mkdir(parents=True, exist_ok=True)
@@ -778,7 +802,7 @@ def _launch_user_session_ctypes(exe_path, args="run", workdir=None, hidden=True)
                 alog(f"bridge: CA bundle {chosen_ca} size={sz} bytes")
             except Exception:
                 pass
-
+        _repair_appdata(env)
         # Encode dict → MULTI_SZ (wide) for CreateProcessAsUserW
         items = [f"{k}={v}" for k, v in env.items()]
         env_w = "\x00".join(items) + "\x00\x00"
@@ -1128,6 +1152,7 @@ def launch_in_active_user_session(exe_path, args="run", workdir=None, hidden=Tru
     # Optional: let the agent know where to log
     if log_file:
         env["XTL_LOG_FILE"] = log_file
+    _repair_appdata(env)
     # 5) startup info and flags
     si = win32process.STARTUPINFO()
     if hidden:

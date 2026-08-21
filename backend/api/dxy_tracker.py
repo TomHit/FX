@@ -140,15 +140,12 @@ def _broker_ms_to_utc_ms(
 ) -> int:
     try:
         value = int(broker_ms or 0)
-        offset = int(offset_minutes or 0)
-
         if value <= 0:
             return 0
-
-        return int(
-            value
-            - offset * 60 * 1000
-        )
+        # MT5 OHLC timestamps are Unix epochs and therefore already UTC.
+        # broker_tz_offset_min is retained only for broker-chart display.
+        del offset_minutes
+        return value
 
     except Exception:
         return 0

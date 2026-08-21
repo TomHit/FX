@@ -99,6 +99,28 @@ DXY_SR_GOOD_TTL_SEC = int(os.getenv("XTL_DXY_SR_GOOD_TTL_SEC", "900"))
 DXY_SR_LAST_PREFIX = "xtl:dxy:sr:bundle:last:M15"
 DXY_SR_GOOD_PREFIX = "xtl:dxy:sr:bundle:last_good:M15"
 
+# Native REAL_DXY higher-timeframe bars used by the canonical trend_sr engine.
+#
+# IMPORTANT:
+# M15 remains the fast flow/turn timeframe.
+# H1/H4 SR for live REAL_DXY must come from native broker bars whenever
+# available. M15 aggregation is retained only as an explicitly-labelled
+# fallback and for causal historical replay.
+DXY_NATIVE_H1_MAX_BARS = int(
+    os.getenv("XTL_DXY_NATIVE_H1_MAX_BARS", "1500")
+)
+DXY_NATIVE_H4_MAX_BARS = int(
+    os.getenv("XTL_DXY_NATIVE_H4_MAX_BARS", "500")
+)
+
+# Do not trust a tiny native HTF sample for canonical SR.
+DXY_NATIVE_H1_MIN_BARS = int(
+    os.getenv("XTL_DXY_NATIVE_H1_MIN_BARS", "50")
+)
+DXY_NATIVE_H4_MIN_BARS = int(
+    os.getenv("XTL_DXY_NATIVE_H4_MIN_BARS", "30")
+)
+
 
 def _json_load(value: Any, default=None):
     if default is None:
@@ -212,6 +234,212 @@ def _load_source_bars(source: str, device_id: str) -> list[dict]:
     if source == "REAL_DXY":
         return load_real_dxy_bars(device_id=device_id, tf="M15", max_bars=MAX_BARS) or []
     return build_synthetic_dxy_m15_bars(device_id=device_id, max_bars=MAX_BARS) or []
+
+
+
+def _completed_bars_at_or_before(
+    bars: list[dict],
+    *,
+    cutoff_ms: int,
+) -> list[dict]:
+    """
+    Return only completed OHLC bars whose close is causally known at cutoff_ms.
+
+    This protects the M15 evaluation from accidentally consuming a forming
+    native H1/H4 candle or an HTF candle closing after the current M15
+    evaluation bar.
+    """
+    out: list[dict] = []
+    cutoff_i = int(cutoff_ms or 0)
+
+    for bar in bars or []:
+        if not isinstance(bar, dict):
+            continue
+
+        # Explicitly forming candle must never enter production structure.
+        if bar.get("complete") is False:
+            continue
+
+        close_ms = _bar_close_ms(bar)
+        if close_ms <= 0:
+            continue
+
+        if cutoff_i > 0 and close_ms > cutoff_i:
+            continue
+
+        o = _safe_float(bar.get("o"))
+        h = _safe_float(bar.get("h"))
+        l = _safe_float(bar.get("l"))
+        c = _safe_float(bar.get("c"))
+
+        if None in (o, h, l, c):
+            continue
+
+        out.append(bar)
+
+    out.sort(key=lambda b: _bar_open_ms(b))
+    return out
+
+
+def _load_native_real_dxy_htf_bars(
+    *,
+    device_id: str,
+    tf: str,
+    cutoff_ms: int,
+    max_bars: int,
+) -> list[dict]:
+    """
+    Load native broker REAL_DXY H1/H4 bars from the same selected DXY device.
+
+    No synthetic construction and no M15 aggregation happens in this helper.
+    """
+    tf_u = str(tf or "").upper().strip()
+    if tf_u not in ("H1", "H4"):
+        return []
+
+    try:
+        from api.xtl_analytics import load_real_dxy_bars
+
+        bars = (
+            load_real_dxy_bars(
+                device_id=device_id,
+                tf=tf_u,
+                max_bars=int(max_bars),
+            )
+            or []
+        )
+
+        return _completed_bars_at_or_before(
+            bars,
+            cutoff_ms=int(cutoff_ms or 0),
+        )
+
+    except Exception:
+        log.exception(
+            "[DXY_M15] NATIVE_HTF_LOAD_FAILED "
+            "source=REAL_DXY device=%s tf=%s cutoff_ms=%s",
+            device_id,
+            tf_u,
+            cutoff_ms,
+        )
+        return []
+
+
+def _dxy_sr_htf_bars(
+    *,
+    source: str,
+    device_id: str,
+    prefix: list[dict],
+    close_ms: int,
+    historical: bool,
+) -> tuple[list[dict], list[dict], str, str]:
+    """
+    Resolve the H1/H4 bars used by canonical trend_sr.
+
+    Historical:
+        Preserve existing causal M15 aggregation so replay behavior does not
+        change.
+
+    Live REAL_DXY:
+        Prefer native broker H1/H4 bars from the SAME DXY device.
+
+    Live SYNTHETIC_DXY:
+        Preserve current causal aggregation until native synthetic HTF
+        construction is separately validated.
+
+    Returns:
+        h1_bars, h4_bars, h1_source, h4_source
+    """
+    source_u = str(source or "").upper().strip()
+
+    # ----------------------------------------------------------
+    # Historical replay:
+    # preserve today's exact causal behavior.
+    # ----------------------------------------------------------
+    if historical:
+        return (
+            _aggregate_bars_causal(prefix, 4 * TF_MS),
+            _aggregate_bars_causal(prefix, 16 * TF_MS),
+            "M15_CAUSAL_AGGREGATION_H1_REPLAY",
+            "M15_CAUSAL_AGGREGATION_H4_REPLAY",
+        )
+
+    # ----------------------------------------------------------
+    # Synthetic:
+    # deliberately unchanged in this patch.
+    # ----------------------------------------------------------
+    if source_u != "REAL_DXY":
+        return (
+            _aggregate_bars_causal(prefix, 4 * TF_MS),
+            _aggregate_bars_causal(prefix, 16 * TF_MS),
+            "M15_CAUSAL_AGGREGATION_H1_SYNTHETIC",
+            "M15_CAUSAL_AGGREGATION_H4_SYNTHETIC",
+        )
+
+    # ----------------------------------------------------------
+    # Live REAL_DXY:
+    # native broker HTF bars are canonical.
+    # ----------------------------------------------------------
+    native_h1 = _load_native_real_dxy_htf_bars(
+        device_id=device_id,
+        tf="H1",
+        cutoff_ms=close_ms,
+        max_bars=DXY_NATIVE_H1_MAX_BARS,
+    )
+
+    native_h4 = _load_native_real_dxy_htf_bars(
+        device_id=device_id,
+        tf="H4",
+        cutoff_ms=close_ms,
+        max_bars=DXY_NATIVE_H4_MAX_BARS,
+    )
+
+    h1_ok = len(native_h1) >= DXY_NATIVE_H1_MIN_BARS
+    h4_ok = len(native_h4) >= DXY_NATIVE_H4_MIN_BARS
+
+    if h1_ok:
+        h1_bars = native_h1
+        h1_source = "NATIVE_REAL_DXY_H1"
+    else:
+        h1_bars = _aggregate_bars_causal(
+            prefix,
+            4 * TF_MS,
+        )
+        h1_source = "M15_CAUSAL_AGGREGATION_H1_FALLBACK"
+
+    if h4_ok:
+        h4_bars = native_h4
+        h4_source = "NATIVE_REAL_DXY_H4"
+    else:
+        h4_bars = _aggregate_bars_causal(
+            prefix,
+            16 * TF_MS,
+        )
+        h4_source = "M15_CAUSAL_AGGREGATION_H4_FALLBACK"
+
+    if not h1_ok or not h4_ok:
+        log.warning(
+            "[DXY_M15] NATIVE_HTF_FALLBACK "
+            "source=%s device=%s close_ms=%s "
+            "native_h1=%d min_h1=%d h1_source=%s "
+            "native_h4=%d min_h4=%d h4_source=%s",
+            source_u,
+            device_id,
+            close_ms,
+            len(native_h1),
+            DXY_NATIVE_H1_MIN_BARS,
+            h1_source,
+            len(native_h4),
+            DXY_NATIVE_H4_MIN_BARS,
+            h4_source,
+        )
+
+    return (
+        h1_bars,
+        h4_bars,
+        h1_source,
+        h4_source,
+    )
 
 
 def _atr(bars: list[dict], n: int = 14) -> float:
@@ -1476,6 +1704,34 @@ def _persist_dxy_sr_bundle(R, *, source: str, device_id: str, bundle: dict) -> N
         payload["_dxy_source"] = source
         payload["_device_id"] = device_id
         payload["_structure_engine"] = "trend_sr.py"
+
+        # Explicit provenance is critical before this structure is ever
+        # promoted from shadow analytics into an execution veto.
+        payload.setdefault(
+            "_h1_bar_source",
+            "UNKNOWN",
+        )
+        payload.setdefault(
+            "_h4_bar_source",
+            "UNKNOWN",
+        )
+        payload.setdefault(
+            "_h1_bars_used",
+            0,
+        )
+        payload.setdefault(
+            "_h4_bars_used",
+            0,
+        )
+        payload.setdefault(
+            "_structure_cutoff_ms",
+            0,
+        )
+        payload.setdefault(
+            "_structure_time_basis",
+            "UTC_EPOCH",
+        )
+
         payload["_published_at_ms"] = int(time.time() * 1000)
         raw = json.dumps(payload, separators=(",", ":"), default=str)
         R.set(
@@ -1880,10 +2136,35 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
         "NEUTRAL"
     )
 
-    # Build causal completed H1/H4 bars from this evaluation prefix, then ask
-    # the canonical XTL SR engine for structure.
-    h1_bars = _aggregate_bars_causal(prefix, 4 * TF_MS)
-    h4_bars = _aggregate_bars_causal(prefix, 16 * TF_MS)
+    # ------------------------------------------------------------
+    # Canonical DXY higher-timeframe structure.
+    #
+    # LIVE REAL_DXY:
+    #   M15 = flow / turn timing
+    #   native H1 = H1 structure
+    #   native H4 = H4 major structure
+    #
+    # HISTORICAL:
+    #   retain causal M15 aggregation so existing replay semantics
+    #   remain unchanged.
+    #
+    # SYNTHETIC:
+    #   retain existing aggregation until native synthetic HTF
+    #   construction is separately validated.
+    # ------------------------------------------------------------
+    (
+        h1_bars,
+        h4_bars,
+        h1_bar_source,
+        h4_bar_source,
+    ) = _dxy_sr_htf_bars(
+        source=source,
+        device_id=device_id,
+        prefix=prefix,
+        close_ms=close_ms,
+        historical=historical,
+    )
+
     h1_df = _bars_to_sr_frame(h1_bars)
     h4_df = _bars_to_sr_frame(h4_bars)
 
@@ -1895,6 +2176,15 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
         pip_factor=DXY_SR_PIP_FACTOR,
         cache=None,
     )
+
+    # Preserve exact structure provenance alongside the bundle.
+    if isinstance(bundle, dict):
+        bundle["_h1_bar_source"] = h1_bar_source
+        bundle["_h4_bar_source"] = h4_bar_source
+        bundle["_h1_bars_used"] = int(len(h1_bars))
+        bundle["_h4_bars_used"] = int(len(h4_bars))
+        bundle["_structure_cutoff_ms"] = int(close_ms)
+        bundle["_structure_time_basis"] = "UTC_EPOCH"
     if not historical:
         _persist_dxy_sr_bundle(
             R,
@@ -1944,6 +2234,15 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
     features["market_flow"] = market_flow
     features["structure"] = structure
     features["structure_source"] = "trend_sr"
+    features["structure_bar_sources"] = {
+        "h1": h1_bar_source,
+        "h4": h4_bar_source,
+    }
+    features["structure_bars_used"] = {
+        "h1": int(len(h1_bars)),
+        "h4": int(len(h4_bars)),
+    }
+    features["structure_cutoff_ms"] = int(close_ms)
 
     # ------------------------------------------------------------
     # Shadow analytics: track both directional SR candidates.
