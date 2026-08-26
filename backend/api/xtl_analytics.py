@@ -3142,19 +3142,143 @@ def read_reversal_candle(symbol: str, device_id: str, pos: dict) -> dict:
     records WHERE it came from (rc_source), then reconstructs OHLC from the H1 bar
     at that timestamp if the source didn't already carry high/low/open/close.
     Never assumes rc_open_ms exists; on total miss returns rc_source='missing'."""
-    rc = {"rc_found": False, "rc_source": "missing", "rc_open_ms": None,
-          "rc_open": None, "rc_high": None, "rc_low": None, "rc_close": None,
-          "rc_body_pct": None, "rc_size_pips": None, "rc_direction": None,
-          "rc_capture_note": "missing"}
+    rc = {
+        "rc_found": False,
+        "rc_source": "missing",
+        "rc_open_ms": None,
+        "rc_close_ms": None,
+        "rev_ok_ms": None,
+        "rc_open": None,
+        "rc_high": None,
+        "rc_low": None,
+        "rc_close": None,
+        "rc_body_pct": None,
+        "rc_size_pips": None,
+        "rc_direction": None,
+        "rc_capture_note": "missing",
+
+        # Point-A / RC-generation lifecycle frozen at broker entry.
+        # These fields are intentionally sourced only from the entry payload
+        # (entry_confirmation -> position record), never from a later live watch.
+        "rc_trigger": None,
+        "rc_generation": "INITIAL_OR_NOT_CAPTURED",
+        "rc_rearm_reason": None,
+        "rc_rearm_at_ms": None,
+        "rc_previous_rev_ok_ms": None,
+        "rc_previous_trigger": None,
+        "rc_previous_cross_ms": None,
+        "rc_age_at_entry_ms": None,
+        "rc_lifecycle_source": "missing",
+    }
     try:
         p = pos if isinstance(pos, dict) else {}
+
+        # -------------------------------------------------------------
+        # Freeze RC lifecycle identity independently of OHLC recovery.
+        # Priority is entry_confirmation because it is the broker-entry
+        # payload. Position-level fields are a compatibility fallback.
+        # Do NOT read these lifecycle fields from the current Redis watch:
+        # that watch may already have advanced to a newer RC generation.
+        # -------------------------------------------------------------
+        ec = p.get("entry_confirmation")
+        ec = ec if isinstance(ec, dict) else {}
+
+        lifecycle_sources = (
+            ("entry_confirmation", ec),
+            ("pos", p),
+        )
+
+        def _first_lifecycle_value(*names):
+            for src_name, src in lifecycle_sources:
+                for name in names:
+                    value = src.get(name)
+                    if value not in (None, ""):
+                        return value, src_name
+            return None, None
+
+        _rev_ok_raw, _rev_src = _first_lifecycle_value(
+            "rev_ok_ms",
+            "rc_close_ms",
+        )
+        _rc_close_raw, _rc_close_src = _first_lifecycle_value(
+            "rc_close_ms",
+            "rev_ok_ms",
+        )
+        _trigger_raw, _trigger_src = _first_lifecycle_value(
+            "trigger_level",
+            "rc_trigger",
+        )
+        _retired_ms_raw, _retired_src = _first_lifecycle_value(
+            "point_a_last_retired_rc_ms",
+            "rc_previous_rev_ok_ms",
+        )
+        _retired_trigger_raw, _ = _first_lifecycle_value(
+            "point_a_last_retired_trigger",
+            "rc_previous_trigger",
+        )
+        _retired_cross_raw, _ = _first_lifecycle_value(
+            "point_a_last_retired_cross_ms",
+            "rc_previous_cross_ms",
+        )
+        _rearm_reason_raw, _rearm_src = _first_lifecycle_value(
+            "point_a_rc_rearm_reason",
+            "rc_rearm_reason",
+        )
+        _rearm_at_raw, _ = _first_lifecycle_value(
+            "point_a_rc_rearm_at_ms",
+            "rc_rearm_at_ms",
+        )
+
+        rc["rev_ok_ms"] = _safe_int(_rev_ok_raw)
+        rc["rc_close_ms"] = _safe_int(_rc_close_raw)
+        rc["rc_trigger"] = _safe_float(_trigger_raw)
+        rc["rc_previous_rev_ok_ms"] = _safe_int(_retired_ms_raw)
+        rc["rc_previous_trigger"] = _safe_float(_retired_trigger_raw)
+        rc["rc_previous_cross_ms"] = _safe_int(_retired_cross_raw)
+        rc["rc_rearm_reason"] = (
+            str(_rearm_reason_raw).upper().strip()
+            if _rearm_reason_raw not in (None, "")
+            else None
+        )
+        rc["rc_rearm_at_ms"] = _safe_int(_rearm_at_raw)
+
+        if rc["rc_previous_rev_ok_ms"]:
+            rc["rc_generation"] = "REARMED_AFTER_PRICE_TOO_FAR"
+        elif rc["rc_rearm_reason"]:
+            rc["rc_generation"] = "REARMED"
+
+        rc["rc_lifecycle_source"] = (
+            _rev_src
+            or _rc_close_src
+            or _trigger_src
+            or _retired_src
+            or _rearm_src
+            or "missing"
+        )
+
+        _entry_ms = _safe_int(
+            p.get("broker_open_time_ms")
+            or p.get("opened_at_ms")
+            or p.get("enqueue_timestamp")
+        )
+        _rc_identity_ms = (
+            rc.get("rev_ok_ms")
+            or rc.get("rc_close_ms")
+        )
+        if (
+            _entry_ms
+            and _rc_identity_ms
+            and int(_entry_ms) >= int(_rc_identity_ms)
+        ):
+            rc["rc_age_at_entry_ms"] = (
+                int(_entry_ms) - int(_rc_identity_ms)
+            )
 
         # The broker-entry payload is the only authoritative description of the
         # RC that actually triggered this trade.  Use it only when complete;
         # older/incomplete payloads continue through the pre-existing fallback
         # chain below.  This is analytics-only and never changes gate state.
-        ec = p.get("entry_confirmation")
-        if isinstance(ec, dict):
+        if isinstance(ec, dict) and ec:
             ec_rc = {
                 "rc_open_ms": ec.get("rc_open_ms") or ec.get("open_ms"),
                 "rc_open": _safe_float(ec.get("rc_open") if ec.get("rc_open") is not None else ec.get("open")),
@@ -8994,6 +9118,92 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                 else None
             ),
 
+            # -- Shadow Bias V2 prediction collection (analytics only) --
+            #
+            # The complete immutable prediction stays nested under
+            # shadow_bias_snapshot["prediction"]. These flat fields exist
+            # only to make JSONL/pandas analysis cheap and deterministic.
+            # expected_move_atr intentionally remains None until calibrated
+            # from forward MFE distributions.
+            "shadow_prediction": (
+                dict(shadow_bias_snapshot.get("prediction"))
+                if isinstance(shadow_bias_snapshot, dict)
+                and isinstance(shadow_bias_snapshot.get("prediction"), dict)
+                else None
+            ),
+            "shadow_predicted_direction": (
+                (shadow_bias_snapshot.get("prediction") or {}).get("direction")
+                if isinstance(shadow_bias_snapshot, dict)
+                else None
+            ),
+            "shadow_expected_path": (
+                (shadow_bias_snapshot.get("prediction") or {}).get("expected_path")
+                if isinstance(shadow_bias_snapshot, dict)
+                else None
+            ),
+            "shadow_prediction_confidence": (
+                _safe_float(
+                    (shadow_bias_snapshot.get("prediction") or {}).get(
+                        "confidence_score"
+                    )
+                )
+                if isinstance(shadow_bias_snapshot, dict)
+                else None
+            ),
+            "shadow_move_model": (
+                (shadow_bias_snapshot.get("prediction") or {}).get("move_model")
+                if isinstance(shadow_bias_snapshot, dict)
+                else None
+            ),
+            "shadow_structural_room_atr": (
+                _safe_float(
+                    (
+                        (shadow_bias_snapshot.get("prediction") or {}).get("h1")
+                        or {}
+                    ).get("structural_room_atr")
+                )
+                if isinstance(shadow_bias_snapshot, dict)
+                else None
+            ),
+            "shadow_first_target_price": (
+                _safe_float(
+                    (
+                        (shadow_bias_snapshot.get("prediction") or {}).get("h1")
+                        or {}
+                    ).get("first_structural_target")
+                )
+                if isinstance(shadow_bias_snapshot, dict)
+                else None
+            ),
+            "shadow_first_target_atr": (
+                _safe_float(
+                    (
+                        (shadow_bias_snapshot.get("prediction") or {}).get("h1")
+                        or {}
+                    ).get("first_structural_target_atr")
+                )
+                if isinstance(shadow_bias_snapshot, dict)
+                else None
+            ),
+            "shadow_expected_move_atr": (
+                _safe_float(
+                    (
+                        (shadow_bias_snapshot.get("prediction") or {}).get("h1")
+                        or {}
+                    ).get("expected_move_atr")
+                )
+                if isinstance(shadow_bias_snapshot, dict)
+                else None
+            ),
+            "shadow_move_calibration_status": (
+                (
+                    (shadow_bias_snapshot.get("prediction") or {}).get("h1")
+                    or {}
+                ).get("calibration_status")
+                if isinstance(shadow_bias_snapshot, dict)
+                else None
+            ),
+
             # -- support / resistance (cheap read from cached SR bundle) --
             "best_resistance":   sr.get("best_resistance"),
             "best_support":      sr.get("best_support"),
@@ -9064,6 +9274,19 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "rc_found":     rc.get("rc_found"),
             "rc_source":    rc.get("rc_source"),
             "rc_capture_note": rc.get("rc_capture_note"),
+
+            # -- RC / Point-A lifecycle identity (analytics only) --
+            "rev_ok_ms": rc.get("rev_ok_ms"),
+            "rc_close_ms": rc.get("rc_close_ms"),
+            "rc_trigger": rc.get("rc_trigger"),
+            "rc_generation": rc.get("rc_generation"),
+            "rc_rearm_reason": rc.get("rc_rearm_reason"),
+            "rc_rearm_at_ms": rc.get("rc_rearm_at_ms"),
+            "rc_previous_rev_ok_ms": rc.get("rc_previous_rev_ok_ms"),
+            "rc_previous_trigger": rc.get("rc_previous_trigger"),
+            "rc_previous_cross_ms": rc.get("rc_previous_cross_ms"),
+            "rc_age_at_entry_ms": rc.get("rc_age_at_entry_ms"),
+            "rc_lifecycle_source": rc.get("rc_lifecycle_source"),
 
             # -- full liquidity breakdown ( 14) --
             "equal_highs":        liqdet.get("equal_highs"),

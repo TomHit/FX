@@ -1136,6 +1136,30 @@ def mt5_positions(
 
     return {"ok": True, "count": len(positions), "key": key, "deals": stored_deals}
 
+class Mt5CalendarAccount(BaseModel):
+    login: int | str
+    server: str
+    company: str = ""
+    model_config = ConfigDict(extra="ignore")
+
+
+class Mt5CalendarPayload(BaseModel):
+    schema_version: int = 1
+    source: str
+    account: Mt5CalendarAccount
+
+    collected_at_ms: int
+    broker_tz_offset_minutes: int
+    broker_timezone: str = ""
+    broker_timezone_source: str
+
+    coverage_from_utc_ms: int
+    coverage_to_utc_ms: int
+
+    events: list[dict] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore")
+
 class Mt5AccountPayload(BaseModel):
     account: dict = {}
     mt5_account: str = "demo"
@@ -1235,6 +1259,418 @@ def mt5_account(
         "key": key,
         "equity": account.get("equity"),
         "balance": account.get("balance"),
+    }
+
+
+@r.post("/{dev_id}/mt5/calendar")
+def mt5_calendar(
+    dev_id: str,
+    payload: Mt5CalendarPayload,
+    authorization: Optional[str] = Header(default=None),
+):
+    # ---------------------------------------------------------
+    # 1. Authenticate device and resolve authoritative owner.
+    # ---------------------------------------------------------
+    token = ""
+    if authorization:
+        parts = authorization.split()
+        token = parts[-1] if parts else authorization.strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="missing token")
+
+    owner_id, auth_source = _authenticate_device_cached(
+        dev_id,
+        token,
+    )
+
+    # ---------------------------------------------------------
+    # 2. Basic protocol validation.
+    # ---------------------------------------------------------
+    if int(payload.schema_version or 0) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="unsupported_calendar_schema",
+        )
+
+    if str(payload.source or "").upper().strip() != "MT5_CALENDAR":
+        raise HTTPException(
+            status_code=400,
+            detail="invalid_calendar_source",
+        )
+
+    incoming_login = str(
+        payload.account.login or ""
+    ).strip()
+
+    incoming_server = str(
+        payload.account.server or ""
+    ).strip()
+
+    incoming_company = str(
+        payload.account.company or ""
+    ).strip()
+
+    if not incoming_login or not incoming_server:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_account_identity_missing",
+        )
+
+    # ---------------------------------------------------------
+    # 3. Require trusted XTL broker timezone.
+    #
+    # Never hard-code FTMO/FundingPips offsets.
+    # ---------------------------------------------------------
+    tz_source = str(
+        payload.broker_timezone_source or ""
+    ).strip().lower()
+
+    if tz_source != "auto_detected":
+        raise HTTPException(
+            status_code=409,
+            detail="calendar_timezone_not_trusted",
+        )
+
+    try:
+        offset_min = int(
+            payload.broker_tz_offset_minutes
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_timezone_invalid",
+        )
+
+    # Defensive sanity bound only.
+    if offset_min < -14 * 60 or offset_min > 14 * 60:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_timezone_out_of_range",
+        )
+
+    # ---------------------------------------------------------
+    # 4. Cross-check against the CURRENT MT5 account published
+    #    by this device.
+    #
+    # Prevent stale local snapshot from account A being
+    # uploaded after Agent has switched to account B.
+    # ---------------------------------------------------------
+    try:
+        current_raw = R.get(
+            f"xtl:mt5:account:last_user:{dev_id}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"redis_error:{type(e).__name__}",
+        )
+
+    if not current_raw:
+        raise HTTPException(
+            status_code=409,
+            detail="calendar_current_account_unavailable",
+        )
+
+    try:
+        current_account = json.loads(current_raw)
+    except Exception:
+        raise HTTPException(
+            status_code=409,
+            detail="calendar_current_account_invalid",
+        )
+
+    current_login = str(
+        current_account.get("login") or ""
+    ).strip()
+
+    current_server = str(
+        current_account.get("server") or ""
+    ).strip()
+
+    current_company = str(
+        current_account.get("company") or ""
+    ).strip()
+
+    if (
+        incoming_login != current_login
+        or incoming_server.casefold()
+        != current_server.casefold()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="calendar_account_mismatch",
+        )
+
+    # Company is useful validation, but server+login are the
+    # authoritative broker-account identity. Some broker
+    # terminals can vary company display text between builds.
+    if (
+        incoming_company
+        and current_company
+        and incoming_company.casefold()
+        != current_company.casefold()
+    ):
+        log.warning(
+            "[MT5_CALENDAR] COMPANY_MISMATCH "
+            "dev=%s owner=%s login=%s "
+            "incoming=%r current=%r",
+            dev_id,
+            owner_id,
+            incoming_login,
+            incoming_company,
+            current_company,
+        )
+
+    # ---------------------------------------------------------
+    # 5. Freshness / coverage validation.
+    #
+    # Receipt time and collection time are intentionally
+    # different concepts.
+    # ---------------------------------------------------------
+    server_received_ms = int(time.time() * 1000)
+
+    try:
+        collected_at_ms = int(payload.collected_at_ms or 0)
+        coverage_from_ms = int(
+            payload.coverage_from_utc_ms or 0
+        )
+        coverage_to_ms = int(
+            payload.coverage_to_utc_ms or 0
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_timestamp_invalid",
+        )
+
+    if collected_at_ms <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_collected_at_missing",
+        )
+
+    # Do not accept obviously future collection timestamps.
+    if collected_at_ms > server_received_ms + 5 * 60_000:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_collected_at_future",
+        )
+
+    if (
+        coverage_from_ms <= 0
+        or coverage_to_ms <= coverage_from_ms
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_coverage_invalid",
+        )
+
+    coverage_ms = coverage_to_ms - coverage_from_ms
+
+    # We expect approximately 7 days.
+    # Allow 6-8 days defensively.
+    if not (
+        6 * 86_400_000
+        <= coverage_ms
+        <= 8 * 86_400_000
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_coverage_not_7d",
+        )
+
+    # ---------------------------------------------------------
+    # 6. Validate normalized events.
+    # ---------------------------------------------------------
+    allowed_ccy = {
+        "USD", "EUR", "GBP",
+        "JPY", "CAD", "CHF",
+    }
+
+    allowed_importance = {
+        "NONE", "LOW", "MODERATE", "HIGH",
+    }
+
+    events_in = (
+        payload.events
+        if isinstance(payload.events, list)
+        else []
+    )
+
+    # Hard defensive bound. Normal snapshots are tiny.
+    if len(events_in) > 5000:
+        raise HTTPException(
+            status_code=413,
+            detail="calendar_too_many_events",
+        )
+
+    events_out: list[dict] = []
+
+    for ev in events_in:
+        if not isinstance(ev, dict):
+            continue
+
+        currency = str(
+            ev.get("currency") or ""
+        ).upper().strip()
+
+        if currency not in allowed_ccy:
+            continue
+
+        importance = str(
+            ev.get("importance") or "NONE"
+        ).upper().strip()
+
+        if importance not in allowed_importance:
+            importance = "NONE"
+
+        try:
+            event_time_utc_ms = int(
+                ev.get("event_time_utc_ms") or 0
+            )
+        except Exception:
+            event_time_utc_ms = 0
+
+        if event_time_utc_ms <= 0:
+            continue
+
+        event_id = str(
+            ev.get("event_id") or ""
+        ).strip()
+
+        value_id = str(
+            ev.get("value_id") or ""
+        ).strip()
+
+        event_name = str(
+            ev.get("event_name") or ""
+        ).strip()
+
+        if not event_id or not value_id or not event_name:
+            continue
+
+        # Preserve normalized Agent event, but force the
+        # authoritative common fields.
+        clean = dict(ev)
+
+        clean["event_id"] = event_id
+        clean["value_id"] = value_id
+        clean["event_name"] = event_name
+        clean["currency"] = currency
+        clean["importance"] = importance
+        clean["event_time_utc_ms"] = event_time_utc_ms
+        clean["source"] = "MT5_CALENDAR"
+
+        events_out.append(clean)
+
+    # Empty can be legitimate for a period, so don't treat
+    # zero events as transport failure.
+
+    # ---------------------------------------------------------
+    # 7. Stable broker-account ownership.
+    #
+    # device_id is intentionally NOT part of owner identity.
+    # ---------------------------------------------------------
+    owner_material = (
+        f"{owner_id}|"
+        f"{incoming_server.casefold()}|"
+        f"{incoming_login}"
+    )
+
+    calendar_owner_id = hashlib.sha256(
+        owner_material.encode("utf-8")
+    ).hexdigest()[:32]
+
+    redis_key = (
+        f"xtl:news:calendar:mt5:"
+        f"{calendar_owner_id}"
+    )
+
+    snapshot = {
+        "schema_version": 1,
+        "source": "MT5_CALENDAR",
+
+        "calendar_owner_id": calendar_owner_id,
+
+        "owner": {
+            "uid": owner_id,
+            "account_login": incoming_login,
+            "account_server": incoming_server,
+            "broker_company": incoming_company,
+
+            # Provenance only; not ownership.
+            "published_by_device_id": dev_id,
+        },
+
+        "timezone": {
+            "broker_tz_offset_minutes": offset_min,
+            "broker_timezone": str(
+                payload.broker_timezone or ""
+            ),
+            "broker_timezone_source": tz_source,
+        },
+
+        "collected_at_ms": collected_at_ms,
+        "server_received_ms": server_received_ms,
+
+        "coverage_from_utc_ms": coverage_from_ms,
+        "coverage_to_utc_ms": coverage_to_ms,
+
+        "event_count": len(events_out),
+        "events": events_out,
+    }
+
+    # ---------------------------------------------------------
+    # 8. ONE broker-scoped Redis SET.
+    #
+    # Retention != freshness.
+    # Keep evidence longer than daily refresh interval.
+    # ---------------------------------------------------------
+    try:
+        R.setex(
+            redis_key,
+            10 * 86_400,
+            json.dumps(
+                snapshot,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"redis_error:{type(e).__name__}",
+        )
+
+    log.info(
+        "[MT5_CALENDAR] ACCEPT "
+        "owner=%s calendar_owner=%s "
+        "dev=%s login=%s server=%s "
+        "events=%d offset_min=%d auth=%s "
+        "collected_age_s=%.1f",
+        owner_id,
+        calendar_owner_id,
+        dev_id,
+        incoming_login,
+        incoming_server,
+        len(events_out),
+        offset_min,
+        auth_source,
+        max(
+            0.0,
+            (
+                server_received_ms - collected_at_ms
+            ) / 1000.0,
+        ),
+    )
+
+    return {
+        "ok": True,
+        "source": "MT5_CALENDAR",
+        "calendar_owner_id": calendar_owner_id,
+        "events_count": len(events_out),
+        "server_received_ms": server_received_ms,
     }
 
 @r.post("/{dev_id}/mt5/ack")
@@ -1376,6 +1812,7 @@ class OhlcPayload(BaseModel):
     count: int
     written_at: int
     bars: List[OhlcBar]
+    mode: str = "full"
     broker: Optional[Dict[str, Any]] = None
     # tolerate extra top-level keys like device_id
     account: Optional[Dict[str, Any]] = None
@@ -1532,6 +1969,15 @@ def post_ohlc(
         sym = (payload.symbol or "").upper()
         tf  = (payload.timeframe or "H1").upper()
         bar_count = len(payload.bars or [])
+        mode = str(
+            getattr(payload, "mode", "full") or "full"
+        ).strip().lower()
+
+        if mode not in ("full", "delta"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid_ohlc_mode:{mode}",
+            )
         log.info(f"[OHLC] owner_id={owner_id} dev_id={dev_id} sym={sym} tf={tf} bars={bar_count}")
 
         # breadcrumb: what the server thinks bar_count is
@@ -1639,37 +2085,202 @@ def post_ohlc(
             except Exception:
                 return False
 
-        valid_bars = [d for d in bars_sec if _is_ok_bar(d)]
+        valid_bars = [
+            d for d in bars_sec
+            if _is_ok_bar(d)
+        ]
 
         MIN_BARS_BY_TF = {
-            "H1": 120,   # ~5 days of H1 bars
-            "H4": 80,    # ~13 days of H4 bars
+            "H1": 120,
+            "H4": 80,
             "M15": 200,
             "M5": 300,
             "M1": 240,
             "D1": 30,
         }
-        min_bars = int(MIN_BARS_BY_TF.get(tf, 80))
 
-        # If series is too short/dirty, DO NOT overwrite last-good snaps
-        if len(valid_bars) < min_bars:
+        min_bars = int(
+            MIN_BARS_BY_TF.get(tf, 80)
+        )
+
+        # ==================================================
+        # OHLC FULL / DELTA SNAPSHOT CONTRACT
+        #
+        # full:
+        #   incoming payload IS the replacement snapshot.
+        #
+        # delta:
+        #   incoming bars are an overlap/update window.
+        #   Merge them into this device's existing full
+        #   snapshot by candle-open timestamp.
+        # ==================================================
+
+        if mode == "delta":
+            device_snap_key = (
+                f"xtl:ohlc:snap:{dev_id}:{sym}:{tf}"
+            )
+
+            old_raw = R.get(device_snap_key)
+
+            if not old_raw:
+                raise HTTPException(
+                    status_code=409,
+                    detail="ohlc_delta_base_missing",
+                )
+
             try:
-                R.setex(
-                    f"xtl:debug:ohlc:{dev_id}:skip_short",
-                    600,
-                    f"sym={sym} tf={tf} raw={len(bars_sec)} valid={len(valid_bars)} min={min_bars}",
+                old_snap = json.loads(old_raw)
+                old_bars = (
+                    old_snap.get("bars") or []
+                    if isinstance(old_snap, dict)
+                    else []
                 )
             except Exception:
-                pass
+                old_bars = []
 
-            log.warning(
-                "[OHLC] skip overwrite snaps sym=%s tf=%s raw=%s valid=%s min=%s (kept last-good)",
-                sym, tf, len(bars_sec), len(valid_bars), min_bars,
+            old_valid = [
+                d for d in old_bars
+                if isinstance(d, dict)
+                and _is_ok_bar(d)
+            ]
+
+            if len(old_valid) < min_bars:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "ohlc_delta_base_short:"
+                        f"{len(old_valid)}<{min_bars}"
+                    ),
+                )
+
+            # Preserve the historical depth already owned
+            # by this timeframe:
+            #
+            # H1 normally remains ~1500.
+            # M1/M15/H4 normally remain around their
+            # existing full-backfill depth.
+            retain_count = min(
+                1500,
+                max(
+                    len(old_valid),
+                    min_bars,
+                ),
             )
-            return {"ok": True, "received": len(payload.bars or []), "snap": "skip-short"}
 
-        # use validated bars from here onward
-        bars_sec = valid_bars
+            # Existing history first; incoming delta wins
+            # when the same candle timestamp is present.
+            merged_by_t = {}
+
+            for d in old_valid:
+                try:
+                    t = int(d.get("t") or 0)
+                except Exception:
+                    t = 0
+
+                if t > 0:
+                    merged_by_t[t] = d
+
+            for d in valid_bars:
+                try:
+                    t = int(d.get("t") or 0)
+                except Exception:
+                    t = 0
+
+                if t > 0:
+                    merged_by_t[t] = d
+
+            bars_sec = [
+                merged_by_t[t]
+                for t in sorted(merged_by_t)
+            ][-retain_count:]
+
+            if len(bars_sec) < min_bars:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "ohlc_delta_merge_short:"
+                        f"{len(bars_sec)}<{min_bars}"
+                    ),
+                )
+
+            log.info(
+                "[OHLC_DELTA_MERGE] "
+                "dev=%s sym=%s tf=%s "
+                "incoming=%s old=%s merged=%s retain=%s",
+                dev_id,
+                sym,
+                tf,
+                len(valid_bars),
+                len(old_valid),
+                len(bars_sec),
+                retain_count,
+            )
+
+        else:
+            # ---------------------------------------------
+            # Existing FULL snapshot safety behavior.
+            # Short/dirty full payload must never replace
+            # the previous last-good snapshot.
+            # ---------------------------------------------
+            if len(valid_bars) < min_bars:
+                try:
+                    R.setex(
+                        f"xtl:debug:ohlc:{dev_id}:skip_short",
+                        600,
+                        (
+                            f"sym={sym} tf={tf} "
+                            f"mode=full "
+                            f"raw={len(bars_sec)} "
+                            f"valid={len(valid_bars)} "
+                            f"min={min_bars}"
+                        ),
+                    )
+                except Exception:
+                    pass
+
+                log.warning(
+                    "[OHLC] skip overwrite snaps "
+                    "sym=%s tf=%s mode=full "
+                    "raw=%s valid=%s min=%s "
+                    "(kept last-good)",
+                    sym,
+                    tf,
+                    len(bars_sec),
+                    len(valid_bars),
+                    min_bars,
+                )
+
+                return {
+                    "ok": True,
+                    "received": len(payload.bars or []),
+                    "snap": "skip-short",
+                }
+
+            bars_sec = valid_bars
+
+        # --------------------------------------------------
+        # Re-derive canonical newest CLOSED candle from the
+        # FINAL snapshot, not merely from the incoming delta.
+        # --------------------------------------------------
+        try:
+            _final_last = bars_sec[-1]
+
+            last_open_ms_for_last_close = (
+                int(_final_last.get("t") or 0)
+                * 1000
+            )
+
+            last_close_ms_seen = (
+                last_open_ms_for_last_close
+                + tf_ms
+            )
+
+            last_close_px = float(
+                _final_last.get("c") or 0.0
+            )
+
+        except Exception:
+            pass
 
         # ==================================================
         # ==================================================

@@ -1737,6 +1737,7 @@ def _persist_dxy_sr_bundle(R, *, source: str, device_id: str, bundle: dict) -> N
         R.set(
             f"{DXY_SR_LAST_PREFIX}:{source}:{device_id}",
             raw,
+            ex=DXY_SR_LAST_TTL_SEC,
             
         )
         if (
@@ -1748,6 +1749,7 @@ def _persist_dxy_sr_bundle(R, *, source: str, device_id: str, bundle: dict) -> N
             R.set(
                 f"{DXY_SR_GOOD_PREFIX}:{source}:{device_id}",
                 raw,
+                ex=DXY_SR_GOOD_TTL_SEC,
                 
             )
     except Exception:

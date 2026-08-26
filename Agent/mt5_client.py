@@ -836,24 +836,26 @@ def _reg_read_value(name: str):
 
 
 def _broker_meta_from_registry():
-    # read offset + name + report source for debugging
-    off, off_src = _reg_read_value("Broker.TzOffsetMin")
-    nm, nm_src = _reg_read_value("Broker.TzName")
+    """
+    Read canonical runtime broker timezone.
+
+    Broker.Tz* must come from the same authoritative HKCU runtime state.
+    Never combine installer HKLM/HKU placeholders with MT5-detected state.
+    """
+    off = _reg_read("Broker.TzOffsetMin")
+    nm = _reg_read("Broker.TzName")
+
     try:
         off = int(off) if off not in (None, "") else None
     except Exception:
         off = None
+
     try:
         nm = str(nm) if nm not in (None, "") else None
     except Exception:
         nm = None
-    try:
-        if off_src:
-            _log(f"[reg_read] Broker.TzOffsetMin={off} from {off_src}")
-    except Exception:
-        pass
-    return (nm, off)
 
+    return (nm, off)
 
 def _reg_get_xtl(name):
     """
@@ -1340,17 +1342,52 @@ def _current_broker_id() -> str:
 
 
 def _reg_read(name: str) -> str | None:
-    val, _src = _reg_read_value(
-        name
-    )  # uses identity-aware order + logs via _broker_meta_from_registry
+    """
+    Canonical XTL registry read.
+
+    Broker.Tz* is runtime MT5-detected state.
+    It MUST come from HKCU only so offset/source/name are never mixed
+    with installer placeholders in HKLM/HKU.
+
+    Other configuration keeps the existing identity-aware fallback.
+    """
+    name_s = str(name or "")
+
+    if name_s.startswith("Broker.Tz"):
+        try:
+            import winreg as _wr
+
+            WOW64_64 = getattr(_wr, "KEY_WOW64_64KEY", 0x0100)
+            WOW64_32 = getattr(_wr, "KEY_WOW64_32KEY", 0x0200)
+
+            for view in (WOW64_64, WOW64_32):
+                try:
+                    with _wr.OpenKey(
+                        _wr.HKEY_CURRENT_USER,
+                        r"Software\XTL",
+                        0,
+                        _wr.KEY_READ | view,
+                    ) as h:
+                        val, _typ = _wr.QueryValueEx(h, name_s)
+
+                    if val not in (None, ""):
+                        return str(val)
+                except Exception:
+                    continue
+
+        except Exception:
+            pass
+
+        return None
+
+    val, _src = _reg_read_value(name_s)
+
     try:
         return str(val) if val not in (None, "") else None
     except Exception:
         return None
 
 
-# ---------- symbol resolution ----------
-# --- Helper: resolve actual broker symbol name (handles suffix variants) ---
 # Cache logical symbol -> broker-native symbol.
 # Resolution is stable for the lifetime of the connected MT5 session.
 _BROKER_SYMBOL_CACHE: dict[str, str] = {}
@@ -1978,132 +2015,376 @@ def _pick_best_known_offset() -> tuple[int | None, str | None]:
     return cand[0] if cand else (None, None)
 
 
-def _tz_bootstrap_to_identity_hive(off_min: int) -> None:
-    """Write off_min + label into the identity-correct hive and log."""
-    label = f"UTC{('+' if off_min>=0 else '')}{off_min//60:02d}:{abs(off_min)%60:02d}"
-    _xtl_reg_write_all("Broker.TzOffsetMin", str(off_min))
-    _xtl_reg_write_all("Broker.TzName", label)
+def _tz_bootstrap_to_identity_hive(
+    off_min: int,
+    *,
+    source: str = "auto_detected",
+) -> None:
+    """
+    Persist one authoritative broker timezone observation.
+
+    Broker.Tz* is runtime state.
+    It must never be derived from the Windows/local PC timezone.
+    """
+    global _BROKER_OFF_MIN_CACHE
+
+    off_min = int(off_min)
+
+    if off_min < -720 or off_min > 900:
+        raise ValueError(
+            f"broker timezone offset out of range: {off_min}"
+        )
+
+    sign = "+" if off_min >= 0 else "-"
+    hh = abs(off_min) // 60
+    mm = abs(off_min) % 60
+    label = f"UTC{sign}{hh:02d}:{mm:02d}"
+
     try:
-        _log(f"[tz_bootstrap] wrote off_min={off_min} label='{label}' to identity hive")
+        import winreg as _wr
+
+        WOW64_64 = getattr(
+            _wr,
+            "KEY_WOW64_64KEY",
+            0x0100,
+        )
+
+        # Do NOT use a partially-indented `with` block here.
+        # Keep the registry handle explicitly alive until all
+        # three values have been written.
+        h = _wr.CreateKeyEx(
+            _wr.HKEY_CURRENT_USER,
+            r"Software\XTL",
+            0,
+            _wr.KEY_SET_VALUE | WOW64_64,
+        )
+
+        try:
+            _wr.SetValueEx(
+                h,
+                "Broker.TzOffsetMin",
+                0,
+                _wr.REG_SZ,
+                str(off_min),
+            )
+
+            _wr.SetValueEx(
+                h,
+                "Broker.TzName",
+                0,
+                _wr.REG_SZ,
+                label,
+            )
+
+            _wr.SetValueEx(
+                h,
+                "Broker.TzSource",
+                0,
+                _wr.REG_SZ,
+                str(source or "auto_detected"),
+            )
+
+        finally:
+            _wr.CloseKey(h)
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to persist canonical HKCU broker timezone: {exc}"
+        ) from exc
+
+    # New timezone is effective immediately in this process.
+    _BROKER_OFF_MIN_CACHE = int(off_min)
+
+    try:
+        _log(
+            "[tz_bootstrap] "
+            f"wrote off_min={off_min} "
+            f"label='{label}' "
+            f"source={source}"
+        )
     except Exception:
         pass
 
 
-def detect_and_write_broker_tz_any(symbols: list[str]) -> None:
+def _d1_epoch_to_broker_offset_min(
+    epoch_sec: int,
+) -> int | None:
     """
-    Detect broker UTC offset (minutes) from last CLOSED M1 bar and persist it.
-    - Tries each symbol in order (ensures visible in Market Watch).
-    - Normalizes numpy arrays safely (no 'ambiguous truth value' errors).
-    - If direct read fails, falls back to grid-scan against now().
-    - Writes both Broker.TzOffsetMin and Broker.TzName to all XTL hives.
+    Infer broker UTC offset from a broker D1 candle open.
+
+    MT5's Python API gives the D1 candle's absolute epoch timestamp.
+    Broker D1 candles are anchored to broker midnight.
+
+    Example:
+        D1 opens 21:00 UTC
+        -> broker midnight is UTC+03:00
+        -> offset = +180 minutes
+
+    This uses only MT5 market timestamps.
+    It does NOT use:
+        - Windows timezone
+        - datetime.now() local timezone
+        - PC UTC offset
+        - calendar/event bridge
     """
-    import MetaTrader5 as MT5
-    from datetime import datetime, timezone, timedelta
-    import time as _time
+    try:
+        ts = int(epoch_sec or 0)
+    except Exception:
+        return None
 
-    def _norm(arr):
-        if arr is None:
-            return []
-        try:
-            return list(arr)
-        except Exception:
-            return [arr]
+    if ts <= 0:
+        return None
 
-    # Try each candidate symbol
-    for base in symbols or []:
-        try:
-            # Resolve and ensure visible in Market Watch
-            resolved = _resolve_broker_symbol(base)
-            try:
-                MT5.symbol_select(resolved, True)
-            except Exception:
-                pass
-
-            # Get the last CLOSED M1 bar via POS (previous bar)
-            arr = MT5.copy_rates_from_pos(resolved, MT5.TIMEFRAME_M1, 1, 1)
-            bars = _norm(arr)
-            if not bars:
-                continue
-
-            r = bars[0]
-            t_open_sec = int(_ff(r, "time", 0))
-            if not t_open_sec:
-                continue
-
-            # Build candidate offsets: prefer exact nearest 15-min grid
-            now_ms = int(_time.time() * 1000)
-            tf_ms = 60_000  # M1
-            t_open_ms = t_open_sec * 1000
-            t_close_ms = t_open_ms + tf_ms
-
-            best_off = None
-            best_err = 10**18
-            # scan -12h .. +15h in 15-min steps
-            for off_min in range(-720, 901, 15):
-                off_ms = off_min * 60_000
-                # next close boundary for "now" at this offset:
-                # floor((now+off)/tf)*tf - off
-                slot_try = ((now_ms + off_ms) // tf_ms) * tf_ms - off_ms
-                err = abs(slot_try - t_close_ms)
-                if err < best_err:
-                    best_err = err
-                    best_off = off_min
-                    if err <= 1500:
-                        break
-
-            # If grid-scan didn’t converge tightly, still accept within 5s
-            if best_off is None or best_err > 5000:
-                # fallback: infer offset directly from local time vs bar time
-                # broker ~= (t_open_ms + tf_ms) - now  -> round to 15 min.
-                delta_min = round(((t_close_ms - now_ms) / 60_000) / 15) * 15
-                best_off = int(delta_min)
-
-            # Hard bounds safety
-            if not (-720 <= best_off <= 900):
-                continue
-
-            # FRESHNESS GUARD: only persist if the M1 bar is recent (market open).
-            # Stale bar (market closed) -> this symbol's offset is unreliable; try next symbol.
-            bar_age_min = (now_ms - t_close_ms) / 60_000
-            if bar_age_min > 5:
-                _log(
-                    f"[mt5_detect_tz] {base}: M1 bar stale ({bar_age_min:.0f}min) - skip, try next symbol"
-                )
-                continue
-
-            # Persist (RE-ENABLED with freshness guard + source tag)
-            global _BROKER_OFF_MIN_CACHE
-
-            if not (-720 <= int(best_off) <= 900):
-                _log(f"[P0_TZ_BLOCK] ignored out-of-range detected offset={best_off}")
-                continue
-
-            _xtl_reg_write_all("Broker.TzOffsetMin", str(int(best_off)))
-            _xtl_reg_write_all("Broker.TzName", _tz_label(int(best_off)))
-            _xtl_reg_write_all("Broker.TzSource", "auto_detected")
-            _BROKER_OFF_MIN_CACHE = int(best_off)
-            try:
-                _log("[mt5_detect_tz] verifying registry writes after auto_detected")
-                for _name in ("Broker.TzOffsetMin", "Broker.TzName", "Broker.TzSource"):
-                    _val = _reg_read(_name)
-                    _log(f"[mt5_detect_tz] verify {_name}={_val}")
-            except Exception as e:
-                _log(f"[mt5_detect_tz] verify registry failed: {e}")
-            _log(
-                f"[mt5_detect_tz] {resolved}: DETECTED off_min={best_off} ({_tz_label(best_off)}) age={bar_age_min:.0f}min err_ms={int(best_err)}"
-            )
-            return
-
-        except Exception as e:
-            _log(f"[mt5_detect_tz] {base} detection error: {e}")
-            continue
-
-    _log(
-        "[mt5_detect_tz] unable to detect broker offset from any candidate (market closed?)"
+    # UTC minute-of-day of the broker-midnight candle.
+    minute_of_day = int(
+        (ts % 86_400) // 60
     )
 
+    # Broker midnight:
+    #
+    #   UTC_time + broker_offset == 00:00 broker
+    #
+    # therefore:
+    #
+    #   broker_offset = -UTC_open_time (mod 24h)
+    candidate = (
+        -minute_of_day
+    ) % 1440
 
-# ---------- rates -> dicts ----------
+    # Convert modulo representation to conventional signed offset.
+    #
+    # Examples:
+    #   180  -> +03:00
+    #   1380 -> -01:00
+    if candidate > 720:
+        candidate -= 1440
+
+    # Global sanity.
+    if candidate < -720 or candidate > 720:
+        return None
+
+    # Broker timezone boundaries should be conventional.
+    # Keep 15-minute support rather than assuming integer hours.
+    if candidate % 15 != 0:
+        return None
+
+    return int(candidate)
+
+
+def detect_and_write_broker_tz_any(
+    symbols: list[str],
+) -> None:
+    """
+    P0 broker timezone auto-detection from LIVE MT5 ticks.
+
+    Why live ticks:
+      - FundingPips D1 history is normalized to 00:00 UTC and therefore
+        cannot reveal broker UTC offset.
+      - Historical M1/D1 inference must NOT be authoritative.
+      - XTL_Calendar_Auto must NOT be required for core timezone startup.
+      - Windows/local-PC timezone must NEVER participate.
+
+    Method:
+      1. Read fresh live ticks from several broker symbols.
+      2. Compare MT5 tick epoch to real UTC epoch.
+      3. Quantize the difference to a conventional 15-minute TZ boundary.
+      4. Reject stale/noisy observations.
+      5. Require multi-symbol consensus.
+      6. Persist only consensus as Broker.TzSource=auto_detected.
+
+    Existing trusted HKCU timezone remains usable when the market is closed
+    and no sufficiently fresh live ticks are available.
+    """
+    global _BROKER_OFF_MIN_CACHE
+
+    try:
+        import time as _time
+        import MetaTrader5 as MT5
+        from collections import Counter
+    except Exception as exc:
+        _log(
+            "[mt5_detect_tz] "
+            f"LIVE_TICK_IMPORT_FAILED err={exc}"
+        )
+        return
+
+    observations: list[tuple[str, int]] = []
+
+    # A liquid symbol's latest tick should normally be seconds old.
+    # 120 seconds gives reasonable tolerance without allowing stale market
+    # timestamps to masquerade as a timezone offset.
+    MAX_RESIDUAL_MS = 120_000
+
+    for base in (symbols or []):
+        sym = str(base or "").upper().strip()
+        if not sym:
+            continue
+
+        resolved = sym
+
+        try:
+            resolved = _resolve_broker_symbol(sym)
+        except Exception:
+            resolved = sym
+
+        try:
+            if not MT5.symbol_select(resolved, True):
+                _log(
+                    "[mt5_detect_tz] "
+                    f"LIVE_TICK_SELECT_FAIL "
+                    f"symbol={sym} resolved={resolved}"
+                )
+                continue
+        except Exception:
+            continue
+
+        try:
+            tick = MT5.symbol_info_tick(resolved)
+        except Exception as exc:
+            _log(
+                "[mt5_detect_tz] "
+                f"LIVE_TICK_READ_FAIL "
+                f"symbol={sym} resolved={resolved} err={exc}"
+            )
+            continue
+
+        if not tick:
+            continue
+
+        try:
+            raw_tick_ms = int(
+                getattr(tick, "time_msc", 0) or 0
+            )
+
+            if raw_tick_ms <= 0:
+                raw_tick_sec = int(
+                    getattr(tick, "time", 0) or 0
+                )
+                raw_tick_ms = raw_tick_sec * 1000
+        except Exception:
+            raw_tick_ms = 0
+
+        if raw_tick_ms <= 0:
+            continue
+
+        # IMPORTANT:
+        # UTC wall clock only. Never datetime.now() local time.
+        now_ms = int(_time.time() * 1000)
+
+        delta_ms = int(raw_tick_ms - now_ms)
+
+        # Convert to minutes then quantize to normal broker TZ boundary.
+        delta_min = float(delta_ms) / 60_000.0
+
+        candidate = int(
+            round(delta_min / 15.0) * 15
+        )
+
+        if candidate < -720 or candidate > 900:
+            _log(
+                "[mt5_detect_tz] "
+                f"LIVE_TICK_REJECT_RANGE "
+                f"symbol={sym} resolved={resolved} "
+                f"raw_tick_ms={raw_tick_ms} now_ms={now_ms} "
+                f"delta_min={delta_min:.3f} "
+                f"candidate={candidate}"
+            )
+            continue
+
+        expected_delta_ms = candidate * 60_000
+
+        residual_ms = abs(
+            delta_ms - expected_delta_ms
+        )
+
+        if residual_ms > MAX_RESIDUAL_MS:
+            _log(
+                "[mt5_detect_tz] "
+                f"LIVE_TICK_REJECT_STALE "
+                f"symbol={sym} resolved={resolved} "
+                f"raw_tick_ms={raw_tick_ms} now_ms={now_ms} "
+                f"delta_min={delta_min:.3f} "
+                f"candidate={candidate} "
+                f"residual_ms={residual_ms}"
+            )
+            continue
+
+        observations.append(
+            (sym, int(candidate))
+        )
+
+        _log(
+            "[mt5_detect_tz] "
+            f"LIVE_TICK_OBS "
+            f"symbol={sym} resolved={resolved} "
+            f"raw_tick_ms={raw_tick_ms} "
+            f"utc_now_ms={now_ms} "
+            f"delta_min={delta_min:.3f} "
+            f"offset_min={candidate} "
+            f"residual_ms={residual_ms}"
+        )
+
+    if not observations:
+        _log(
+            "[mt5_detect_tz] "
+            "LIVE_TICK_NO_OBSERVATIONS "
+            "preserving existing trusted timezone"
+        )
+        return
+
+    counts = Counter(
+        off for _, off in observations
+    )
+
+    best_off, best_votes = counts.most_common(1)[0]
+
+    total_votes = len(observations)
+    consensus_ratio = (
+        float(best_votes) / float(total_votes)
+        if total_votes
+        else 0.0
+    )
+
+    # P0:
+    # Never establish authoritative TZ from a single symbol.
+    if best_votes < 2:
+        _log(
+            "[mt5_detect_tz] "
+            f"LIVE_TICK_WEAK_CONSENSUS "
+            f"offset_min={best_off} "
+            f"votes={best_votes}/{total_votes} "
+            f"observations={observations}"
+        )
+        return
+
+    if consensus_ratio < 0.67:
+        _log(
+            "[mt5_detect_tz] "
+            f"LIVE_TICK_NO_CONSENSUS "
+            f"offset_min={best_off} "
+            f"votes={best_votes}/{total_votes} "
+            f"ratio={consensus_ratio:.3f} "
+            f"observations={observations}"
+        )
+        return
+
+    # Authoritative live MT5 consensus.
+    _tz_bootstrap_to_identity_hive(
+        int(best_off),
+        source="auto_detected",
+    )
+
+    _BROKER_OFF_MIN_CACHE = int(best_off)
+
+    _log(
+        "[mt5_detect_tz] "
+        f"LIVE_TICK_AUTO_DETECTED "
+        f"offset_min={best_off} "
+        f"votes={best_votes}/{total_votes} "
+        f"ratio={consensus_ratio:.3f} "
+        f"observations={observations}"
+    )
+
 def _np_to_dicts(rates) -> List[Dict]:
     out: List[Dict] = []
     if rates is None:
@@ -2275,27 +2556,40 @@ def mt5_fetch_rates(
     except Exception:
         pass
     
-    # If probe failed (MT5 not connected in this session), bootstrap from any good hive
-    # If probe failed, bootstrap only from trusted auto_detected hive.
+    # If probe failed, use only canonical HKCU runtime Broker.Tz state.
+    #
+    # Do NOT bootstrap Broker.Tz from HKLM/HKU because those hives may still
+    # contain installer_pending_detection placeholders. Offset + source must
+    # come from the same authoritative runtime hive.
     if probe is None:
         try:
-            best_off, best_src = _pick_best_known_offset()
-            src = _reg_read("Broker.TzSource") or ""
+            stored_raw = _reg_read("Broker.TzOffsetMin")
+            stored_src = _reg_read("Broker.TzSource") or ""
 
-            if _is_trusted_broker_tz(best_off, src):
-                _tz_bootstrap_to_identity_hive(best_off)
-                _BROKER_OFF_MIN_CACHE = int(best_off)
-                off_min_fresh = int(best_off)
+            stored_off = (
+                int(stored_raw)
+                if stored_raw not in (None, "")
+                else None
+            )
+
+            if _is_trusted_broker_tz(stored_off, stored_src):
+                _BROKER_OFF_MIN_CACHE = int(stored_off)
+                off_min_fresh = int(stored_off)
+
                 _log(
-                    f"[tz_bootstrap] adopted trusted off_min={best_off} from {best_src}"
+                    f"[mt5_tz] adopted trusted HKCU runtime "
+                    f"offset={stored_off} source={stored_src}"
                 )
             else:
                 _log(
-                    f"[P0_TZ_BLOCK] ignored bootstrap offset={best_off} source={src} from={best_src}"
+                    f"[P0_TZ_BLOCK] no trusted HKCU broker timezone "
+                    f"offset={stored_off} source={stored_src}"
                 )
 
-        except Exception:
-            pass
+        except Exception as e:
+            _log(
+                f"[mt5_tz] HKCU runtime bootstrap failed: {e}"
+            )
     # ------------------------------------------------------------
     # Canonical timestamp conversion.
     # off_min_fresh is final at this point, including bootstrap.
@@ -3023,3 +3317,4 @@ def mt5_fetch_rates(
         return rows
     _log("[mt5_fetch_rates] unexpected fallthrough; returning []")
     return []
+

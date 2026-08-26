@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import math
 
-BIAS_ENGINE_VERSION = "XTL_EVIDENCE_BIAS_PROD_1"
+BIAS_ENGINE_VERSION = "XTL_EVIDENCE_BIAS_PROD_2_PREDICTION_COLLECTION"
 H1_MIN_BARS = 60
 H4_MIN_BARS = 40
 CHOCH_ATR_BUFFER = 0.10
@@ -55,12 +55,42 @@ def _ms(value: Any) -> int:
 
 
 def _bar_time_ms(bar: Dict[str, Any]) -> int:
-    for key in ("t_open_ms", "tOpenMs", "open_time_ms", "t", "time", "ts"):
+    """
+    Resolve a stable timestamp for an already-closed OHLC bar.
+
+    Prefer the bar-open timestamp when available because existing structure
+    and swing semantics are based on candle identity/open time.
+
+    Some XTL snapshot paths expose t_open_ms=0 while still carrying a valid
+    close timestamp. In that case, fall back to the close timestamp rather
+    than silently assigning timestamp 0.
+
+    Shadow analytics only.
+    """
+    for key in (
+        "t_open_ms",
+        "tOpenMs",
+        "open_time_ms",
+        "t",
+        "time",
+        "ts",
+    ):
         out = _ms(bar.get(key))
         if out > 0:
             return out
-    return 0
 
+    # Closed-bar fallback for snapshot formats where open time is unavailable.
+    for key in (
+        "t_close_ms",
+        "tCloseMs",
+        "close_time_ms",
+        "closeTimeMs",
+    ):
+        out = _ms(bar.get(key))
+        if out > 0:
+            return out
+
+    return 0
 
 def _normalize_bars(bars: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Chronological closed OHLC bars. Invalid/forming rows are ignored."""
@@ -500,6 +530,20 @@ def evaluate_zone_evidence(
         })
         ranked.append(row)
 
+    valid_by_distance = [
+        z for z in ranked
+        if bool(z.get("valid"))
+        and z.get("distance_atr") is not None
+    ]
+    nearest_valid_zone = (
+        min(
+            valid_by_distance,
+            key=lambda z: float(z.get("distance_atr")),
+        )
+        if valid_by_distance
+        else None
+    )
+
     ranked.sort(key=lambda z: (
         not bool(z.get("valid")),
         -float(z.get("evidence_score") or 0.0),
@@ -510,6 +554,7 @@ def evaluate_zone_evidence(
     return {
         "side": side,
         "best_zone": best,
+        "nearest_valid_zone": nearest_valid_zone,
         "candidate_count": len(ranked),
         "top_candidates": ranked[:5],
         "score": round(float(best.get("evidence_score") or 0.0), 2) if best else 0.0,
@@ -561,6 +606,293 @@ def _relation(executed_side: str, bias: str) -> str:
     if side not in ("BUY", "SELL"): return "UNKNOWN"
     return "ALIGNED" if side == bias else "CONFLICT"
 
+
+
+def _nearest_valid_zone(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    direct = context.get("nearest_valid_zone")
+    if isinstance(direct, dict) and direct.get("valid"):
+        return direct
+
+    rows = [
+        z
+        for z in (context.get("top_candidates") or [])
+        if isinstance(z, dict)
+        and z.get("valid")
+        and z.get("distance_atr") is not None
+    ]
+    if not rows:
+        return None
+    return min(rows, key=lambda z: float(z.get("distance_atr")))
+
+
+def _zone_target_price(
+    zone: Optional[Dict[str, Any]],
+    direction: str,
+) -> Optional[float]:
+    """First band edge encountered while travelling in predicted direction."""
+    if not isinstance(zone, dict):
+        return None
+
+    lo = _f(zone.get("low"), _f(zone.get("level")))
+    hi = _f(zone.get("high"), _f(zone.get("level")))
+    if lo is None or hi is None:
+        return _f(zone.get("level"))
+
+    lo, hi = min(lo, hi), max(lo, hi)
+    return lo if direction == "BUY" else hi
+
+
+def _build_prediction(
+    *,
+    price: float,
+    bias: str,
+    winner_score: float,
+    edge: float,
+    confidence: str,
+    h1_ctx: Dict[str, Any],
+    h4_ctx: Dict[str, Any],
+    choch: Dict[str, Any],
+    regime: Dict[str, Any],
+    buy_zone: Dict[str, Any],
+    sell_zone: Dict[str, Any],
+    conflicts: List[str],
+) -> Dict[str, Any]:
+    """Freeze an uncalibrated market-path prediction for later outcome research.
+
+    Important methodology:
+      * Direction/path are deterministic labels from evidence available NOW.
+      * Structural room/target are observable facts from the frozen SR bundle.
+      * No empirical expected-move percentile is claimed until replay/live data
+        calibrates conditional forward MFE distributions.
+      * No probability is emitted.
+    """
+    direction = bias if bias in ("BUY", "SELL") else "NEUTRAL"
+    h1_atr = _f(h1_ctx.get("atr"), 0.0) or 0.0
+    h4_atr = _f(h4_ctx.get("atr"), 0.0) or 0.0
+
+    phase = str(regime.get("phase") or "UNKNOWN").upper()
+    h1_major = str(
+        (h1_ctx.get("major") or {}).get("state") or "UNKNOWN"
+    ).upper()
+    h4_major = str(
+        (h4_ctx.get("major") or {}).get("state") or "UNKNOWN"
+    ).upper()
+    h1_minor = str(
+        (h1_ctx.get("minor") or {}).get("state") or "UNKNOWN"
+    ).upper()
+    h4_minor = str(
+        (h4_ctx.get("minor") or {}).get("state") or "UNKNOWN"
+    ).upper()
+    choch_state = str(choch.get("state") or "NONE").upper()
+
+    # Score-derived confidence index only. This is NOT a probability.
+    confidence_score = (
+        round(
+            min(
+                100.0,
+                max(
+                    0.0,
+                    0.70 * float(winner_score)
+                    + 0.30 * min(float(edge), 100.0),
+                ),
+            ),
+            2,
+        )
+        if direction != "NEUTRAL"
+        else 0.0
+    )
+
+    aligned_state = (
+        "BULLISH" if direction == "BUY"
+        else "BEARISH" if direction == "SELL"
+        else None
+    )
+    matching_choch = (
+        "BULLISH_CHOCH" if direction == "BUY"
+        else "BEARISH_CHOCH" if direction == "SELL"
+        else None
+    )
+
+    if direction == "NEUTRAL":
+        expected_path = (
+            "RANGE"
+            if phase == "COMPRESSION_RANGE"
+            else "UNCLEAR"
+        )
+    elif choch_state == matching_choch:
+        expected_path = "REVERSAL_CANDIDATE"
+    elif (
+        phase == "EXPANSION"
+        and h1_major == aligned_state
+        and h4_major == aligned_state
+    ):
+        expected_path = "CONTINUATION"
+    elif (
+        phase == "PULLBACK_OR_DISTRIBUTION"
+        and h4_major == aligned_state
+    ):
+        expected_path = "PULLBACK_THEN_CONTINUE"
+    elif phase == "COMPRESSION_RANGE":
+        expected_path = "BREAKOUT_PENDING"
+    else:
+        expected_path = "UNCLEAR"
+
+    # BUY forecast -> resistance is opposing structure.
+    # SELL forecast -> support is opposing structure.
+    opposing_context = (
+        sell_zone if direction == "BUY"
+        else buy_zone if direction == "SELL"
+        else {}
+    )
+    opposing_zone = (
+        _nearest_valid_zone(opposing_context)
+        if direction != "NEUTRAL"
+        else None
+    )
+
+    structural_room_atr = _f(
+        (opposing_zone or {}).get("distance_atr")
+    )
+    first_target_price = (
+        _zone_target_price(opposing_zone, direction)
+        if direction != "NEUTRAL"
+        else None
+    )
+    structural_room_price = (
+        round(structural_room_atr * h1_atr, 10)
+        if structural_room_atr is not None
+        and structural_room_atr >= 0
+        and h1_atr > 0
+        else None
+    )
+
+    # A directional forecast that is already at opposing structure should be
+    # tagged as needing a break, but the room itself remains an observed fact.
+    if (
+        direction != "NEUTRAL"
+        and structural_room_atr is not None
+        and structural_room_atr <= 0.35
+        and expected_path in (
+            "CONTINUATION",
+            "PULLBACK_THEN_CONTINUE",
+        )
+    ):
+        expected_path = "BREAKOUT_PENDING"
+
+    # Same-side structure is preserved as an analytics-only invalidation
+    # reference. It is NOT an execution SL or gate.
+    same_side_context = (
+        buy_zone if direction == "BUY"
+        else sell_zone if direction == "SELL"
+        else {}
+    )
+    same_side_zone = (
+        _nearest_valid_zone(same_side_context)
+        if direction != "NEUTRAL"
+        else None
+    )
+
+    invalidation_level = None
+    if isinstance(same_side_zone, dict):
+        lo = _f(
+            same_side_zone.get("low"),
+            _f(same_side_zone.get("level")),
+        )
+        hi = _f(
+            same_side_zone.get("high"),
+            _f(same_side_zone.get("level")),
+        )
+        if lo is not None and hi is not None:
+            invalidation_level = (
+                min(lo, hi)
+                if direction == "BUY"
+                else max(lo, hi)
+            )
+
+    return {
+        "schema_version": 2,
+        "analytics_only": True,
+        "immutable_prediction": True,
+        "prediction_model": "XTL_SHADOW_PREDICTION_COLLECTION_V1",
+        "move_model": "UNCALIBRATED_COLLECTION_V1",
+        "direction": direction,
+        "confidence": confidence,
+        "confidence_score": confidence_score,
+        "confidence_score_basis": "BIAS_SCORE_AND_SCORE_EDGE_INDEX_NOT_PROBABILITY",
+        "market_state": phase,
+        "expected_path": expected_path,
+        "structure": {
+            "h1_major": h1_major,
+            "h1_minor": h1_minor,
+            "h4_major": h4_major,
+            "h4_minor": h4_minor,
+            "choch": choch_state,
+            "h1_quality": h1_ctx.get("quality"),
+            "h4_quality": h4_ctx.get("quality"),
+            "h1_er": _f(h1_ctx.get("er")),
+            "h4_er": _f(h4_ctx.get("er")),
+        },
+        "h1": {
+            "atr": h1_atr or None,
+            "direction": direction,
+            "first_structural_target": first_target_price,
+            "first_structural_target_atr": (
+                round(structural_room_atr, 4)
+                if structural_room_atr is not None
+                else None
+            ),
+            "structural_room_atr": (
+                round(structural_room_atr, 4)
+                if structural_room_atr is not None
+                else None
+            ),
+            "structural_room_price": structural_room_price,
+            # Deliberately unpopulated until calibrated from forward MFE.
+            "expected_move_atr": None,
+            "expected_move_price": None,
+            "p50_mfe_atr": None,
+            "p75_mfe_atr": None,
+            "p90_mfe_atr": None,
+            "calibration_status": "NOT_CALIBRATED",
+        },
+        "h4": {
+            "atr": h4_atr or None,
+            "major_structure": h4_major,
+            # Deliberately unpopulated until horizon-specific calibration.
+            "expected_move_atr": None,
+            "expected_move_price": None,
+            "calibration_status": "NOT_CALIBRATED",
+        },
+        "opposing_structure": (
+            dict(opposing_zone)
+            if isinstance(opposing_zone, dict)
+            else None
+        ),
+        "invalidation": {
+            "level": invalidation_level,
+            "type": (
+                "STRUCTURAL_ZONE_EDGE"
+                if invalidation_level is not None
+                else None
+            ),
+            "reason": (
+                "PREDICTED_SIDE_STRUCTURE_INVALIDATED"
+                if invalidation_level is not None
+                else "NO_VALID_SAME_SIDE_ZONE"
+            ),
+            "analytics_only": True,
+        },
+        "conflicts": list(conflicts),
+        "calibration": {
+            "status": "COLLECTING",
+            "expected_move_ready": False,
+            "probability_ready": False,
+            "required_future_work": (
+                "CALIBRATE_SYMBOL_CONDITIONED_FORWARD_MFE_ATR_"
+                "BY_HORIZON_FROM_REPLAY_AND_LIVE_ANALYTICS"
+            ),
+        },
+    }
 
 def compute_shadow_bias(
     *,
@@ -680,6 +1012,22 @@ def compute_shadow_bias(
             confidence = "NONE"
 
         selected_zone = buy_zone if bias == "BUY" else sell_zone if bias == "SELL" else None
+
+        prediction = _build_prediction(
+            price=float(px),
+            bias=bias,
+            winner_score=winner_score,
+            edge=edge,
+            confidence=confidence,
+            h1_ctx=h1_ctx,
+            h4_ctx=h4_ctx,
+            choch=choch,
+            regime=regime,
+            buy_zone=buy_zone,
+            sell_zone=sell_zone,
+            conflicts=conflicts,
+        )
+
         return {
             "bias_engine_version": BIAS_ENGINE_VERSION,
             "symbol": str(symbol or "").upper(),
@@ -692,6 +1040,7 @@ def compute_shadow_bias(
             "shadow_bias_relation": _relation(executed_side, bias),
             "executed_side": str(executed_side or "").upper() or None,
             "computed_ms": now,
+            "prediction": prediction,
             "h1_last_closed_ms": int(h1_ctx.get("last_closed_ms") or 0),
             "h4_last_closed_ms": int(h4_ctx.get("last_closed_ms") or 0),
             "buy_score": buy_score,

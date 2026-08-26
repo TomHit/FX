@@ -24,6 +24,7 @@ SYMBOLS = [
     "GBPUSD",
     "USDCAD",
     "USDCHF",
+    "DXY",
 ]
 
 # Example: https://api.xautrendlab.com
@@ -450,7 +451,16 @@ def start_price_publisher(
     """Call this from agent main()."""
     global API_BASE, SYMBOLS, PRICE_PUBLISH_INTERVAL_SEC
     API_BASE = api_base
-    SYMBOLS = list(symbols or SYMBOLS)
+    requested = [
+        str(s).upper().strip()
+        for s in (symbols or SYMBOLS)
+        if str(s or "").strip()
+    ]
+
+    if "DXY" not in requested:
+        requested.append("DXY")
+
+    SYMBOLS = list(dict.fromkeys(requested))
     PRICE_PUBLISH_INTERVAL_SEC = float(max(0.1, min(interval_sec, 5.0)))
 
     # CRITICAL: ensure creds exist for _load_device_creds() in service mode

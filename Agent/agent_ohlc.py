@@ -196,7 +196,7 @@ except ImportError:
     except Exception:
         # Running directly from source folder
         sys.path.append(os.path.dirname(__file__))
-        from mt5_client import (
+        from xtl.mt5_client import (
             MT5_API_LOCK,
             mt5_locked,
             mt5_init,
@@ -209,7 +209,7 @@ except ImportError:
             _broker_offset_min,
         )
 
-DEFAULT_TFS = ["M1", "M15", "H1", "H4"]
+DEFAULT_TFS = ["M1", "M15", "H1", "H4","D1"]
 
 # Canonical logical symbols published by the Agent.
 #
@@ -542,7 +542,7 @@ def _find_bundled_ca() -> Optional[str]:
     return None
 
 
-TF_SEC = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600, "H2": 7200, "H4": 14400}
+TF_SEC = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600, "D1": 86400, "H4": 14400}
 
 
 def push_mt5_positions_once(
@@ -1417,8 +1417,9 @@ def api_post(api_base: str, path: str, payload: dict, token: str, timeout: int =
     url = api_base.rstrip("/") + "/" + path.lstrip("/")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     critical_broker_snapshot = (
-        path.rstrip("/").endswith("/mt5/account")
-        or path.rstrip("/").endswith("/mt5/positions")
+      path.rstrip("/").endswith("/mt5/account")
+      or path.rstrip("/").endswith("/mt5/positions")
+      or path.rstrip("/").endswith("/mt5/calendar")
     )
 
     # Non-critical traffic may use the shared backoff.
@@ -1596,7 +1597,7 @@ def ensure_registry_defaults():
     path = r"S-1-5-18\Software\XTL"
     defaults = {
         "Symbols": DEFAULT_SYMBOLS_CSV,
-        "Timeframes": "M1,M5,M15,H1,H2,H4",
+        "Timeframes": "M1,M5,M15,H1,D1,H4",
         "IncludeLatest": "0",
     }
     try:
@@ -1658,7 +1659,7 @@ def _reg_delete_value(root, subkey, name):
 def reset_registry_tf_symbols(
     include_latest="0",
     symbols=None,
-    timeframes="M1,M15,H1,H4",
+    timeframes="M1,M15,H1,H4,D1",
 ):
     """
     Hard reset the three user-tunable keys under
@@ -1703,7 +1704,7 @@ def maybe_reset_registry_on_new_install():
     )
     if force or str(cur_ver) != str(CONFIG_VERSION):
         # reset to our intended defaults (M1-only + closed bars by default)
-        reset_registry_tf_symbols(include_latest="0", timeframes="M1,M15,H1,H4")
+        reset_registry_tf_symbols(include_latest="0", timeframes="M1,M15,H1,H4,D1")
         _reg_set_value(winreg.HKEY_USERS, subkey, "ConfigVersion", CONFIG_VERSION)
         try:
             log.info(
@@ -1736,13 +1737,13 @@ def _agent_pull_cfg():
     if not syms_raw:
         syms_raw = DEFAULT_SYMBOLS_CSV  # 6 trading instruments + DXY
     if not tfs_raw:
-        tfs_raw = "M1,M15,H1,H2,H4"
+        tfs_raw = "M1,M15,H1,H4,D1"
 
     syms = [s.strip().upper() for s in syms_raw.split(",") if s.strip()]
-    tf_set = {"M1", "M15", "H1", "H4"}  # allow future toggles
+    tf_set = {"M1", "M15", "H1", "H4","D1"}  # allow future toggles
     tfs = [t.upper().strip() for t in tfs_raw.split(",") if t.upper().strip() in tf_set]
     if not tfs:
-        tfs = ["M1", "M15", "H1", "H4"]  # safe fallback, preserves your M1 default
+        tfs = ["M1", "M15", "H1", "H4","D1"]  # safe fallback, preserves your M1 default
 
     include_latest = inc_raw in ("1", "true", "TRUE", "yes", "YES")
     return syms, tfs, include_latest
@@ -1886,8 +1887,18 @@ def push_rates_batch(
         except Exception:
             return 0
 
-    # --- timeframe -> ms (supports M1/M5/M10/M15/H1/H4; tolerant to lowercase) ---
+    # --- timeframe -> ms (supports M1/M5/M10/M15/H1/H4/D1; tolerant to lowercase) ---
     tf_s = (tf or "").upper()
+    mode = str(
+        kw.get("mode") or "full"
+    ).strip().lower()
+
+    if mode not in ("full", "delta"):
+        mode = "full"
+
+    return_response = bool(
+        kw.get("return_response", False)
+    )
     TF_MS = {
         "M1": 1 * 60 * 1000,
         "M5": 5 * 60 * 1000,
@@ -1896,6 +1907,7 @@ def push_rates_batch(
         "H1": 60 * 60 * 1000,
         "H2": 2 * 60 * 60 * 1000,
         "H4": 4 * 60 * 60 * 1000,
+        "D1": 24 * 60 * 60 * 1000,
     }
     tf_ms = TF_MS.get(tf_s, 0)
     if not tf_ms:
@@ -2062,6 +2074,7 @@ def push_rates_batch(
     payload = {
         "symbol": (symbol or "").upper(),
         "timeframe": tf_s,
+        "mode": mode,
         "bars": arr_closed,
         "count": len(arr_closed),
         "written_at": now_ms,
@@ -2101,7 +2114,17 @@ def push_rates_batch(
     if latest_bar is not None:
         payload["latest_bar"] = latest_bar
 
-    r = api_post(api_base, f"/devices/{device_id}/ohlc", payload, token, timeout=20)
+    r = api_post(
+        api_base,
+        f"/devices/{device_id}/ohlc",
+        payload,
+        token,
+        timeout=20,
+    )
+
+    if return_response:
+        return r
+
     return bool(getattr(r, "ok", False))
 
 
@@ -3275,8 +3298,8 @@ def _worker_supervisor_loop(check_sec: float = 2.0) -> None:
         now = time.monotonic()
         # --- MT5 presence: safe, rate-limited relaunch -----------------
         try:
-            from mt5_launcher import try_launch_mt5
-            from mt5_client import _mt5_running
+            from xtl.mt5_launcher import try_launch_mt5
+            from xtl.mt5_client import _mt5_running
             if not _mt5_running():
                 try_launch_mt5()       # internally rate-limited
                 _warn_ghost_datafolder()
@@ -3334,6 +3357,1047 @@ def _ensure_worker_supervisor() -> None:
         daemon=True,
     ).start()
 
+# ============================================================================
+# MT5 ECONOMIC CALENDAR PUBLISHER
+#
+# Reads the account-scoped JSON produced by XTL_Calendar_Bridge.mq5.
+# Does NOT query MT5 Economic Calendar itself.
+# Does NOT run in OHLC/tick hot path.
+#
+# MT5 server time -> canonical UTC:
+#     UTC_MS = SERVER_EPOCH_SEC * 1000 - broker_offset_min * 60_000
+# ============================================================================
+
+_XTL_CALENDAR_SCHEMA_VERSION = 1
+_XTL_CALENDAR_CHECK_SEC = 300.0          # cheap local check every 5 min
+_XTL_CALENDAR_RETRY_SEC = 300.0          # retry failed API delivery
+_XTL_CALENDAR_MAX_EVENTS = 5000
+
+_XTL_CALENDAR_ALLOWED_CCY = {
+    "USD", "EUR", "GBP",
+    "JPY", "CAD", "CHF",
+}
+
+_XTL_CALENDAR_LAST_SENT = {
+    "identity": "",
+    "snapshot_marker": "",
+}
+
+
+def _calendar_safe_file_part(value: str) -> str:
+    """
+    Must mirror SafeFilePart() in XTL_Calendar_Bridge.mq5.
+    """
+    out = []
+
+    for ch in str(value or ""):
+        if (
+            ch.isascii()
+            and (
+                ch.isalnum()
+                or ch in "-_."
+            )
+        ):
+            out.append(ch)
+        else:
+            out.append("_")
+
+    return "".join(out)
+
+
+@mt5_locked
+def _calendar_current_mt5_identity() -> dict:
+    """
+    Read current terminal/account identity and MT5 Common Data path.
+
+    This is called only by the slow calendar worker.
+    """
+    try:
+        import MetaTrader5 as mt5
+    except Exception:
+        return {}
+
+    try:
+        ai = mt5.account_info()
+        ti = mt5.terminal_info()
+    except Exception:
+        return {}
+
+    if not ai or not ti:
+        return {}
+
+    login = getattr(ai, "login", None)
+    server = str(
+        getattr(ai, "server", None)
+        or getattr(ti, "server", None)
+        or ""
+    ).strip()
+
+    company = str(
+        getattr(ai, "company", None)
+        or getattr(ti, "company", None)
+        or ""
+    ).strip()
+
+    commondata_path = str(
+        getattr(ti, "commondata_path", None)
+        or ""
+    ).strip()
+
+    if not login or not server or not commondata_path:
+        return {}
+
+    return {
+        "login": str(login),
+        "server": server,
+        "company": company,
+        "commondata_path": commondata_path,
+    }
+
+
+def _calendar_snapshot_path(identity: dict) -> str:
+    import os
+
+    login = str(
+        identity.get("login") or ""
+    ).strip()
+
+    server = _calendar_safe_file_part(
+        identity.get("server") or ""
+    )
+
+    commondata_path = str(
+        identity.get("commondata_path") or ""
+    ).strip()
+
+    if not login or not server or not commondata_path:
+        return ""
+
+    filename = (
+        f"mt5_calendar_{server}_{login}.json"
+    )
+
+    return os.path.join(
+        commondata_path,
+        "Files",
+        "XTL",
+        filename,
+    )
+
+
+def _calendar_load_json(path: str) -> dict:
+    import json
+    import os
+
+    if not path or not os.path.isfile(path):
+        return {}
+
+    # Defensive file-size limit.
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        return {}
+
+    if size <= 0 or size > 5_000_000:
+        log.warning(
+            "[MT5_CALENDAR] SNAPSHOT_SIZE_INVALID "
+            "path=%s bytes=%s",
+            path,
+            size,
+        )
+        return {}
+
+    try:
+        with open(
+            path,
+            "r",
+            encoding="utf-8-sig",
+        ) as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        log.warning(
+            "[MT5_CALENDAR] SNAPSHOT_READ_FAILED "
+            "path=%s err=%s",
+            path,
+            exc,
+        )
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def _calendar_server_epoch_to_utc_ms(
+    server_epoch,
+    offset_min: int,
+) -> int:
+    try:
+        raw = int(server_epoch or 0)
+        if raw <= 0:
+            return 0
+
+        return (
+            raw * 1000
+            - int(offset_min) * 60_000
+        )
+    except Exception:
+        return 0
+
+
+def _calendar_try_bootstrap_broker_timezone(
+    snapshot: dict,
+    max_snapshot_age_sec: int = 1800,
+) -> bool:
+    """
+    Weekend-safe broker timezone bootstrap.
+
+    Primary source:
+      MT5 TimeTradeServer() - TimeGMT() observation captured
+      by XTL_Calendar_Auto.
+
+    No Windows timezone.
+    No hard-coded broker offset.
+    Fail closed on invalid/stale observation.
+    """
+    import time
+    from datetime import datetime, timezone
+
+    if not isinstance(snapshot, dict):
+        return False
+
+    collection = snapshot.get("collection")
+
+    if not isinstance(collection, dict):
+        return False
+
+    # ---------------------------------------------------------
+    # P0: use the offset observed directly inside MT5.
+    # ---------------------------------------------------------
+    try:
+        observed_offset_min = int(
+            collection.get(
+                "observed_broker_utc_offset_min"
+            )
+        )
+    except Exception:
+        observed_offset_min = None
+
+    try:
+        observed_offset_sec = int(
+            collection.get(
+                "observed_broker_utc_offset_sec"
+            )
+        )
+    except Exception:
+        observed_offset_sec = None
+
+    if (
+        observed_offset_min is None
+        or observed_offset_sec is None
+    ):
+        log.warning(
+            "[mt5_tz] CALENDAR_BOOTSTRAP_REJECT "
+            "reason=observed_offset_missing"
+        )
+        return False
+
+    # Global timezone sanity range.
+    if not (-720 <= observed_offset_min <= 840):
+        log.warning(
+            "[mt5_tz] CALENDAR_BOOTSTRAP_REJECT "
+            "reason=offset_range "
+            "offset_min=%s offset_sec=%s",
+            observed_offset_min,
+            observed_offset_sec,
+        )
+        return False
+
+    # MQL minute and second observations must agree.
+    residual_sec = abs(
+        observed_offset_sec
+        - observed_offset_min * 60
+    )
+
+    if residual_sec > 5:
+        log.warning(
+            "[mt5_tz] CALENDAR_BOOTSTRAP_REJECT "
+            "reason=offset_inconsistent "
+            "offset_min=%s offset_sec=%s "
+            "residual_sec=%s",
+            observed_offset_min,
+            observed_offset_sec,
+            residual_sec,
+        )
+        return False
+
+    # Broker offsets should stay on conventional 15-minute boundaries.
+    if observed_offset_min % 15 != 0:
+        log.warning(
+            "[mt5_tz] CALENDAR_BOOTSTRAP_REJECT "
+            "reason=offset_not_15m "
+            "offset_min=%s",
+            observed_offset_min,
+        )
+        return False
+
+    # ---------------------------------------------------------
+    # Validate snapshot freshness.
+    #
+    # Now that offset is independently known, server_now_epoch
+    # can safely be converted to canonical UTC.
+    # ---------------------------------------------------------
+    try:
+        server_epoch = int(
+            collection.get("server_now_epoch")
+            or 0
+        )
+    except Exception:
+        server_epoch = 0
+
+    if server_epoch <= 0:
+        return False
+
+    observed_utc_sec = (
+        server_epoch
+        - observed_offset_min * 60
+    )
+
+    age_sec = int(
+        time.time() - observed_utc_sec
+    )
+
+    # ---------------------------------------------------------
+    # Freshness policy
+    #
+    # Normal/live operation:
+    #   require a fresh MT5 clock observation (<= 30 min).
+    #
+    # Weekend recovery:
+    #   allow the last trusted MT5-native observation for up to
+    #   72 hours, but ONLY on Saturday/Sunday UTC.
+    #
+    # This never uses Windows timezone and does not weaken the
+    # offset consistency/range checks above.
+    # ---------------------------------------------------------
+    fresh_limit_sec = int(max_snapshot_age_sec)
+    weekend_limit_sec = 72 * 3600
+
+    now_utc = datetime.now(timezone.utc)
+    is_utc_weekend = now_utc.weekday() in (5, 6)  # Sat/Sun
+
+    if age_sec < -180:
+        log.warning(
+            "[mt5_tz] CALENDAR_BOOTSTRAP_REJECT "
+            "reason=snapshot_from_future "
+            "age_sec=%s offset_min=%s",
+            age_sec,
+            observed_offset_min,
+        )
+        return False
+
+    if age_sec > fresh_limit_sec:
+        if not (
+            is_utc_weekend
+            and age_sec <= weekend_limit_sec
+        ):
+            log.warning(
+                "[mt5_tz] CALENDAR_BOOTSTRAP_REJECT "
+                "reason=snapshot_age "
+                "age_sec=%s offset_min=%s "
+                "fresh_limit_sec=%s weekend=%s",
+                age_sec,
+                observed_offset_min,
+                fresh_limit_sec,
+                is_utc_weekend,
+            )
+            return False
+
+        log.warning(
+            "[mt5_tz] CALENDAR_BOOTSTRAP_WEEKEND_REUSE "
+            "source=MT5_CLOCK_OBS "
+            "age_sec=%s offset_min=%s",
+            age_sec,
+            observed_offset_min,
+        )
+
+    sign = "+" if observed_offset_min >= 0 else "-"
+    abs_min = abs(observed_offset_min)
+
+    tz_name = "UTC%s%02d:%02d" % (
+        sign,
+        abs_min // 60,
+        abs_min % 60,
+    )
+
+    try:
+        from xtl.mt5_client import (
+            _tz_bootstrap_to_identity_hive,
+        )
+
+        _tz_bootstrap_to_identity_hive(
+            observed_offset_min,
+            source="auto_detected",
+        )
+
+    except Exception as exc:
+        log.warning(
+            "[mt5_tz] CALENDAR_BOOTSTRAP_WRITE_FAIL "
+            "err=%s",
+            exc,
+        )
+        return False
+
+    log.warning(
+        "[mt5_tz] CALENDAR_BOOTSTRAP_OK "
+        "source=MT5_CLOCK_OBS "
+        "offset_min=%s tz=%s age_sec=%s",
+        observed_offset_min,
+        tz_name,
+        age_sec,
+    )
+
+    return True
+
+def _calendar_normalize_snapshot(
+    snapshot: dict,
+    identity: dict,
+) -> tuple[dict | None, str]:
+    """
+    Convert one MQL5 snapshot to the API payload.
+
+    Returns:
+        (payload, "")
+        (None, reason)
+    """
+    if not isinstance(snapshot, dict):
+        return None, "snapshot_not_dict"
+
+    try:
+        schema_version = int(
+            snapshot.get("schema_version") or 0
+        )
+    except Exception:
+        schema_version = 0
+
+    if schema_version != _XTL_CALENDAR_SCHEMA_VERSION:
+        return None, "schema_version_invalid"
+
+    source = str(
+        snapshot.get("source") or ""
+    ).upper().strip()
+
+    if source != "MT5_CALENDAR":
+        return None, "source_invalid"
+
+    snap_account = snapshot.get("account")
+    if not isinstance(snap_account, dict):
+        return None, "snapshot_account_missing"
+
+    snap_login = str(
+        snap_account.get("login") or ""
+    ).strip()
+
+    snap_server = str(
+        snap_account.get("server") or ""
+    ).strip()
+
+    snap_company = str(
+        snap_account.get("company") or ""
+    ).strip()
+
+    current_login = str(
+        identity.get("login") or ""
+    ).strip()
+
+    current_server = str(
+        identity.get("server") or ""
+    ).strip()
+
+    current_company = str(
+        identity.get("company") or ""
+    ).strip()
+
+    # P0 account isolation.
+    if snap_login != current_login:
+        return None, "account_login_mismatch"
+
+    if (
+        snap_server.casefold()
+        != current_server.casefold()
+    ):
+        return None, "account_server_mismatch"
+
+    # Company is diagnostic only because broker display names
+    # may change between builds.
+    if (
+        snap_company
+        and current_company
+        and snap_company.casefold()
+        != current_company.casefold()
+    ):
+        log.warning(
+            "[MT5_CALENDAR] COMPANY_MISMATCH "
+            "snapshot=%r current=%r",
+            snap_company,
+            current_company,
+        )
+
+    # --------------------------------------------------------
+    # P0 trusted broker timezone only.
+    # --------------------------------------------------------
+    tz = _broker_tz_meta() or {}
+
+    # Reconcile canonical broker timezone from the independently
+    # validated MT5-native calendar clock observation.
+    #
+    # Run this even when the existing Broker.Tz* state is marked
+    # auto_detected. A stale/wrong-but-valid value must not prevent
+    # a fresh MT5 TimeTradeServer()-TimeGMT() observation from
+    # correcting the canonical runtime timezone.
+    if _calendar_try_bootstrap_broker_timezone(
+        snapshot
+    ):
+        # It may have refreshed Broker.Tz* (including DST change).
+        tz = _broker_tz_meta() or {}
+
+    if not bool(tz.get("tz_valid")):
+        return None, "broker_timezone_not_trusted"
+
+    tz_source = str(
+        tz.get("tz_source") or ""
+    ).strip()
+
+    if tz_source.lower() != "auto_detected":
+        return None, "broker_timezone_source_invalid"
+
+    try:
+        offset_min = int(
+            tz.get("tz_offset_min")
+        )
+    except Exception:
+        return None, "broker_timezone_offset_invalid"
+
+    collection = snapshot.get("collection")
+    if not isinstance(collection, dict):
+        return None, "collection_missing"
+
+    try:
+        collected_server_epoch = int(
+            collection.get("server_now_epoch")
+            or 0
+        )
+
+        coverage_from_server = int(
+            collection.get(
+                "coverage_from_server_epoch"
+            )
+            or 0
+        )
+
+        coverage_to_server = int(
+            collection.get(
+                "coverage_to_server_epoch"
+            )
+            or 0
+        )
+    except Exception:
+        return None, "collection_timestamp_invalid"
+
+    collected_at_ms = (
+        _calendar_server_epoch_to_utc_ms(
+            collected_server_epoch,
+            offset_min,
+        )
+    )
+
+    coverage_from_utc_ms = (
+        _calendar_server_epoch_to_utc_ms(
+            coverage_from_server,
+            offset_min,
+        )
+    )
+
+    coverage_to_utc_ms = (
+        _calendar_server_epoch_to_utc_ms(
+            coverage_to_server,
+            offset_min,
+        )
+    )
+
+    if (
+        collected_at_ms <= 0
+        or coverage_from_utc_ms <= 0
+        or coverage_to_utc_ms <= coverage_from_utc_ms
+    ):
+        return None, "canonical_timestamp_invalid"
+
+    raw_events = snapshot.get("events")
+
+    if not isinstance(raw_events, list):
+        return None, "events_not_list"
+
+    if len(raw_events) > _XTL_CALENDAR_MAX_EVENTS:
+        return None, "events_over_limit"
+
+    normalized_events = []
+
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict):
+            continue
+
+        currency = str(
+            raw_event.get("currency") or ""
+        ).upper().strip()
+
+        if currency not in _XTL_CALENDAR_ALLOWED_CCY:
+            continue
+
+        server_time = raw_event.get(
+            "server_time"
+        )
+
+        if not isinstance(server_time, dict):
+            continue
+
+        try:
+            server_epoch = int(
+                server_time.get("epoch")
+                or 0
+            )
+        except Exception:
+            server_epoch = 0
+
+        event_time_utc_ms = (
+            _calendar_server_epoch_to_utc_ms(
+                server_epoch,
+                offset_min,
+            )
+        )
+
+        if event_time_utc_ms <= 0:
+            # NOTIME/TENTATIVE records without a real
+            # timestamp cannot be used as timed windows.
+            # We will revisit these for context analytics.
+            continue
+
+        event_id = str(
+            raw_event.get("event_id") or ""
+        ).strip()
+
+        value_id = str(
+            raw_event.get("value_id") or ""
+        ).strip()
+
+        event_name = str(
+            raw_event.get("event_name") or ""
+        ).strip()
+
+        if (
+            not event_id
+            or not value_id
+            or not event_name
+        ):
+            continue
+
+        importance = str(
+            raw_event.get("importance")
+            or "NONE"
+        ).upper().strip()
+
+        normalized_events.append({
+            "value_id": value_id,
+            "event_id": event_id,
+            "event_code": str(
+                raw_event.get("event_code")
+                or ""
+            ),
+            "event_name": event_name,
+
+            "country": str(
+                raw_event.get("country")
+                or ""
+            ),
+            "country_code": str(
+                raw_event.get("country_code")
+                or ""
+            ),
+
+            "currency": currency,
+
+            "importance": importance,
+            "importance_code": raw_event.get(
+                "importance_code"
+            ),
+
+            "time_mode": str(
+                raw_event.get("time_mode")
+                or ""
+            ),
+            "time_mode_code": raw_event.get(
+                "time_mode_code"
+            ),
+
+            # Diagnostics: preserve the broker/server
+            # timestamp alongside canonical UTC.
+            "event_time_server_epoch": (
+                server_epoch
+            ),
+            "event_time_server_text": str(
+                server_time.get("text")
+                or ""
+            ),
+            "event_time_utc_ms": (
+                event_time_utc_ms
+            ),
+
+            "actual": raw_event.get("actual"),
+            "forecast": raw_event.get(
+                "forecast"
+            ),
+            "previous": raw_event.get(
+                "previous"
+            ),
+            "revised_previous": (
+                raw_event.get(
+                    "revised_previous"
+                )
+            ),
+        })
+
+    payload = {
+        "schema_version": 1,
+        "source": "MT5_CALENDAR",
+
+        "account": {
+            "login": current_login,
+            "server": current_server,
+            "company": current_company,
+        },
+
+        "collected_at_ms": collected_at_ms,
+
+        "broker_tz_offset_minutes": (
+            offset_min
+        ),
+        "broker_timezone": str(
+            tz.get("tz_name") or ""
+        ),
+        "broker_timezone_source": (
+            tz_source
+        ),
+
+        "coverage_from_utc_ms": (
+            coverage_from_utc_ms
+        ),
+        "coverage_to_utc_ms": (
+            coverage_to_utc_ms
+        ),
+
+        "events": normalized_events,
+    }
+
+    return payload, ""
+
+
+def _calendar_snapshot_marker(
+    path: str,
+    payload: dict,
+) -> str:
+    """
+    Cheap deterministic marker.
+
+    No file hashing needed. MQL bridge writes atomically and
+    collected_at_ms + account identity identify the snapshot.
+    """
+    import os
+
+    try:
+        mtime_ns = int(
+            os.stat(path).st_mtime_ns
+        )
+    except Exception:
+        mtime_ns = 0
+
+    account = payload.get("account") or {}
+
+    return (
+        f"{account.get('server')}|"
+        f"{account.get('login')}|"
+        f"{payload.get('collected_at_ms')}|"
+        f"{mtime_ns}"
+    )
+
+
+def push_mt5_calendar_once(
+    api_base: str,
+    device_id: str,
+    token: str,
+) -> tuple[bool, str]:
+    """
+    Publish only if a new account-scoped MQL snapshot exists.
+    """
+    identity = _calendar_current_mt5_identity()
+
+    if not identity:
+        return False, "mt5_identity_unavailable"
+
+    path = _calendar_snapshot_path(identity)
+
+    if not path:
+        return False, "snapshot_path_unavailable"
+
+    snapshot = _calendar_load_json(path)
+
+    if not snapshot:
+        return False, "snapshot_missing_or_invalid"
+
+    payload, err = _calendar_normalize_snapshot(
+        snapshot,
+        identity,
+    )
+
+    if payload is None:
+        return False, err or "normalize_failed"
+
+    marker = _calendar_snapshot_marker(
+        path,
+        payload,
+    )
+
+    current_identity = (
+        f"{identity.get('server')}|"
+        f"{identity.get('login')}"
+    )
+
+    # Same account + same snapshot already ACKed.
+    if (
+        _XTL_CALENDAR_LAST_SENT.get(
+            "identity"
+        )
+        == current_identity
+        and _XTL_CALENDAR_LAST_SENT.get(
+            "snapshot_marker"
+        )
+        == marker
+    ):
+        return True, "unchanged"
+
+    response = api_post(
+        api_base,
+        f"/devices/{device_id}/mt5/calendar",
+        payload,
+        token=token,
+        timeout=15,
+    )
+
+    status_code = int(
+        getattr(
+            response,
+            "status_code",
+            0,
+        )
+        or 0
+    )
+
+    if status_code != 200:
+        return (
+            False,
+            f"api_status_{status_code}",
+        )
+
+    # Update dedupe only AFTER successful server ACK.
+    _XTL_CALENDAR_LAST_SENT[
+        "identity"
+    ] = current_identity
+
+    _XTL_CALENDAR_LAST_SENT[
+        "snapshot_marker"
+    ] = marker
+
+    log.warning(
+        "[MT5_CALENDAR] PUBLISH_OK "
+        "dev=%s login=%s server=%s "
+        "events=%s offset_min=%s "
+        "collected_at_ms=%s path=%s",
+        device_id,
+        identity.get("login"),
+        identity.get("server"),
+        len(payload.get("events") or []),
+        payload.get(
+            "broker_tz_offset_minutes"
+        ),
+        payload.get("collected_at_ms"),
+        path,
+    )
+
+    return True, "published"
+
+
+def _mt5_calendar_worker_loop(
+    api_base: str,
+    device_id: str,
+    token: str,
+    check_sec: float = _XTL_CALENDAR_CHECK_SEC,
+):
+    """
+    Slow local calendar publisher.
+
+    Important:
+      - no MT5 Economic Calendar fetch here
+      - no Redis
+      - no OHLC/tick integration
+      - one small local file check every ~5 minutes
+      - POST only when snapshot changes
+    """
+    name = threading.current_thread().name
+
+    period = max(
+        60.0,
+        float(
+            check_sec
+            or _XTL_CALENDAR_CHECK_SEC
+        ),
+    )
+
+    next_run = time.monotonic()
+
+    last_skip_reason = ""
+    consecutive_failures = 0
+
+    while True:
+        now_mono = time.monotonic()
+
+        if now_mono < next_run:
+            time.sleep(
+                min(
+                    5.0,
+                    max(
+                        0.2,
+                        next_run - now_mono,
+                    ),
+                )
+            )
+            continue
+
+        _worker_mark(
+            name,
+            "loop_started",
+            last_error="",
+        )
+
+        ok = False
+        reason = ""
+
+        try:
+            ok, reason = push_mt5_calendar_once(
+                api_base,
+                device_id,
+                token,
+            )
+
+            # "unchanged" is a healthy successful cycle.
+            healthy = bool(
+                ok
+                and reason in (
+                    "published",
+                    "unchanged",
+                )
+            )
+
+            if healthy:
+                consecutive_failures = 0
+
+                _worker_mark(
+                    name,
+                    "loop_completed",
+                    last_success=time.monotonic(),
+                    consecutive_failures=0,
+                )
+
+            else:
+                consecutive_failures += 1
+
+                _worker_mark(
+                    name,
+                    "loop_completed",
+                    consecutive_failures=(
+                        consecutive_failures
+                    ),
+                    last_error=reason,
+                )
+
+                # Avoid flooding logs with the same expected
+                # "snapshot not generated yet" condition.
+                if reason != last_skip_reason:
+                    log.warning(
+                        "[MT5_CALENDAR] PUBLISH_SKIP "
+                        "dev=%s reason=%s",
+                        device_id,
+                        reason,
+                    )
+
+                last_skip_reason = reason
+
+        except Exception as exc:
+            consecutive_failures += 1
+
+            reason = (
+                f"{type(exc).__name__}:"
+                f"{exc}"
+            )
+
+            _worker_mark(
+                name,
+                "loop_completed",
+                consecutive_failures=(
+                    consecutive_failures
+                ),
+                last_error=reason,
+            )
+
+            log.exception(
+                "[MT5_CALENDAR] WORKER_EXC "
+                "dev=%s err=%s",
+                device_id,
+                exc,
+            )
+
+        # Failed publish: retry in 5 minutes.
+        # Successful/unchanged: same cheap 5-min check;
+        # no API POST occurs until MQL file changes.
+        next_run = (
+            time.monotonic()
+            + period
+        )
+        
+def start_mt5_calendar_worker(
+    api_base,
+    device_id,
+    token,
+    check_sec=300.0,
+):
+    """
+    Start the slow MT5 calendar publisher independently
+    of OHLC/event-driven mode.
+    """
+    log.info(
+        "[MT5_CALENDAR] starting worker "
+        "dev=%s check_sec=%s",
+        device_id,
+        check_sec,
+    )
+
+    _ensure_worker_supervisor()
+
+    return _start_supervised_thread(
+        "mt5-calendar-worker",
+        _mt5_calendar_worker_loop,
+        (
+            api_base,
+            device_id,
+            token,
+            float(check_sec),
+        ),
+    )
 
 def start_ohlc_worker(
     api_base, device_id, token, symbols, tfs, bars=300, period_sec=10
@@ -3353,6 +4417,13 @@ def start_ohlc_worker(
         "mt5-positions-heartbeat",
         _mt5_positions_heartbeat_loop,
         (api_base, device_id, token, "demo", 10),
+    )
+    
+    start_mt5_calendar_worker(
+        api_base,
+        device_id,
+        token,
+        300.0,
     )
     return _start_supervised_thread(
         "ohlc-worker",
@@ -3738,7 +4809,7 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
         #  - M1 / M15 for short-term
         #  - H1 / H2 / H4 for horizon
         if not base_tf:
-            base_tf = ["M1", "M15", "H1", "H2", "H4"]
+            base_tf = ["M1", "M15", "H1", "D1", "H4"]
 
         tflist = base_tf
 
@@ -3749,7 +4820,7 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
             str(tf or "").upper().strip() for tf in (tfs or []) if (tf or "").strip()
         ]
         if not base_tf:
-            base_tf = ["M1", "M15", "H1", "H2", "H4"]
+            base_tf = ["M1", "M15", "H1", "D1", "H4"]
         tflist = base_tf
 
     # fallbacks if everything is empty
@@ -3780,11 +4851,16 @@ def _push_ohlc_once_safe(api_base, device_id, token, symbols, tfs, bars):
         # All normal trading symbols keep their configured timeframes.
         
         # DXY now supplies native M15 flow plus H1/H4 structural context.
-        symbol_tfs = [tf for tf in tflist if tf in ("M15", "H1", "H4")] if sym_u == "DXY" else tflist
+        symbol_tfs = [tf for tf in tflist if tf in ("M15", "H1", "H4","D1")] if sym_u == "DXY" else tflist
         for tf in symbol_tfs:
             # --- fetch with guard (closed bars + optional forming tail) ---
             try:
-                tf_bars = 1500 if tf.upper() == "H1" else int(bars or 300)
+                if tf.upper() == "H1":
+                    tf_bars = 1500
+                elif tf.upper() == "D1":
+                    tf_bars = 400
+                else:
+                    tf_bars = int(bars or 300)
                 rates = mt5_fetch_rates(
                     sym, tf, count=tf_bars, include_latest=include_latest
                 )
@@ -3872,7 +4948,7 @@ def push_ohlc_once(
     #  - M1: live / dashboard / preview
     #  - M15: model update cadence
     #  - H1 / H2 / H4: horizon for prediction meter
-    FIXED_TFS = ["M1", "M15", "H1", "H4"]
+    FIXED_TFS = ["M1", "M15", "H1", "H4","D1"]
 
     # --- ensure defaults exist (no-op if already present) ---
     try:
@@ -3947,7 +5023,12 @@ def push_ohlc_once(
         for tfu in tflist:
             # fetch CLOSED bars (+ tail if include_latest=True)
             try:
-                tf_count = 1500 if str(tfu).upper() == "H1" else int(bars or 300)
+                if str(tfu).upper() == "H1":
+                    tf_count = 1500
+                elif str(tfu).upper() == "D1":
+                    tf_count = 400
+                else:
+                    tf_count = int(bars or 300)
                 arr_raw = mt5_fetch_rates(
                     s, tfu, count=tf_count, include_latest=include_latest
                 )
@@ -4069,7 +5150,7 @@ def canonicalize_outbound(obj):
 # Fires per-TF shortly after each broker-grid bar boundary. Between boundaries
 # the agent sleeps. Weekend/idle markets are detected and skipped cheaply.
 # ---------------------------------------------------------------------------
-_TF_SEC = {"M1": 60, "M15": 900, "H1": 3600, "H2": 7200, "H4": 14400}
+_TF_SEC = {"M1": 60, "M15": 900, "H1": 3600, "D1": 86400, "H4": 14400}
 
 _EVT_FULL_LAST: dict = {}          # (sym, tf) -> monotonic ts of last full-history push
 _REG_STARTUP_DONE = False          # 4.5: registry defaults run once, not per tick
@@ -4134,84 +5215,417 @@ def _market_idle(threshold_s: float = 600.0) -> bool:
         return False
 
 
-def _push_ohlc_for_tfs(api_base, device_id, token, symbols, only_tfs, bars,
-                       include_latest, delta_on, delta_bars, full_refresh_s):
+def _push_ohlc_for_tfs(
+    api_base,
+    device_id,
+    token,
+    symbols,
+    only_tfs,
+    bars,
+    include_latest,
+    delta_on,
+    delta_bars,
+    full_refresh_s,
+    expected_new=False,
+):
     """
-    One event's worth of work: fetch + push ONLY the timeframes that just
-    closed a bar. Same dedupe and push_rates_batch path as the legacy worker.
+    Canonical event-driven OHLC transport.
+
+    Normal operation:
+      - fetch only TFs whose boundary fired
+      - small overlapping delta window
+      - automatically enlarge delta after a gap
+      - fall back to FULL if server has no valid delta base
+
+    Returns:
+      list[(symbol, tf)] whose expected new candle was not yet
+      finalized by MT5. Caller may retry these shortly.
     """
     base = (api_base or "").strip().rstrip("/")
     if base.lower().endswith("/api"):
         base = base[:-4]
 
     try:
-        _ = _last_sent_bar  # noqa: F841
+        _ = _last_sent_bar
     except NameError:
         globals()["_last_sent_bar"] = {}
 
     def _to_sec(t_any):
         try:
             t = int(t_any or 0)
-            return (t // 1000) if t >= 1_000_000_000_000 else t
+            return (
+                t // 1000
+                if t >= 1_000_000_000_000
+                else t
+            )
         except Exception:
             return 0
 
+    pending = []
     now_mono = time.monotonic()
+
     for sym in symbols:
         sym_u = str(sym or "").upper().strip()
-        sym_tfs = [tf for tf in only_tfs if str(tf).upper() in ("M15", "H1", "H4")] \
-            if sym_u == "DXY" else only_tfs
+
+        # DXY intentionally has no M1 transport.
+        sym_tfs = (
+            [
+                tf for tf in only_tfs
+                if str(tf).upper()
+                in ("M15", "H1", "H4","D1")
+            ]
+            if sym_u == "DXY"
+            else only_tfs
+        )
+
         for tf in sym_tfs:
-            tf_u = str(tf).upper()
+            tf_u = str(tf).upper().strip()
+
+            if tf_u not in _TF_SEC:
+                continue
+
             key = (sym_u, tf_u)
 
-            # ---- 4.2 count selection: delta window vs full history ----
-            full_count = 1500 if tf_u == "H1" else int(bars or 300)
-            if delta_on:
-                last_full = _EVT_FULL_LAST.get(key, 0.0)
-                if (now_mono - last_full) >= full_refresh_s:
-                    tf_count, is_full = full_count, True
-                else:
-                    tf_count, is_full = max(2, int(delta_bars)), False
+            if tf_u == "H1":
+                full_count = 1500
+            elif tf_u == "D1":
+                full_count = 400
             else:
-                tf_count, is_full = full_count, True
+                full_count = int(bars or 300)
 
+            prev = int(
+                _last_sent_bar.get(key) or 0
+            )
+
+            # ---------------------------------------------
+            # Decide FULL vs DELTA.
+            # ---------------------------------------------
+            last_full = float(
+                _EVT_FULL_LAST.get(key, 0.0)
+                or 0.0
+            )
+
+            full_due = (
+                not delta_on
+                or last_full <= 0.0
+                or (
+                    now_mono - last_full
+                ) >= float(full_refresh_s)
+            )
+
+            if full_due:
+                tf_count = full_count
+                mode = "full"
+            else:
+                tf_count = max(
+                    5,
+                    int(delta_bars or 5),
+                )
+                mode = "delta"
+
+            # ---------------------------------------------
+            # Initial fetch.
+            # ---------------------------------------------
             try:
                 rates = mt5_fetch_rates(
-                    sym, tf_u, count=tf_count, include_latest=include_latest
+                    sym,
+                    tf_u,
+                    count=tf_count,
+                    include_latest=include_latest,
                 )
             except Exception as e:
-                log.warning("EVT fetch failed %s/%s: %s", sym_u, tf_u, e)
+                log.warning(
+                    "EVT fetch failed %s/%s "
+                    "mode=%s count=%s err=%s",
+                    sym_u,
+                    tf_u,
+                    mode,
+                    tf_count,
+                    e,
+                )
                 continue
+
             if not rates:
                 continue
 
             last_closed = next(
-                (b for b in reversed(rates) if b.get("complete", True)), None
+                (
+                    b for b in reversed(rates)
+                    if b.get("complete", True)
+                ),
+                None,
             )
+
             if not last_closed:
+                if expected_new:
+                    pending.append(key)
                 continue
-            last_t_s = _to_sec(last_closed.get("t"))
-            if _last_sent_bar.get(key) == last_t_s:
-                continue  # boundary fired but broker not finalized yet; sweep will catch
 
-            try:
-                sent = push_rates_batch(
-                    base, device_id, token, sym, tf_u, rates,
-                    include_latest=include_latest, count=tf_count,
+            last_t_s = _to_sec(
+                last_closed.get("t")
+            )
+
+            if not last_t_s:
+                continue
+
+            # ---------------------------------------------
+            # Broker boundary fired but MT5 may not have
+            # finalized the new candle yet.
+            # ---------------------------------------------
+            if prev and last_t_s <= prev:
+                if expected_new:
+                    pending.append(key)
+                continue
+
+            # ---------------------------------------------
+            # GAP-AWARE DELTA.
+            #
+            # Example:
+            # previous successfully posted candle = t0
+            # broker latest candle = t5
+            #
+            # Fetch enough history to include all missing
+            # candles plus a small overlap.
+            # ---------------------------------------------
+            if mode == "delta" and prev:
+                tf_sec = int(_TF_SEC[tf_u])
+
+                gap_bars = max(
+                    0,
+                    int(
+                        (last_t_s - prev)
+                        // tf_sec
+                    ),
                 )
-                if sent:
-                    _last_sent_bar[key] = last_t_s
-                    if is_full:
-                        _EVT_FULL_LAST[key] = now_mono
-                    log.info("EVT pushed %s/%s bars=%s last_closed=%s%s",
-                             sym_u, tf_u, len(rates), last_t_s,
-                             " (full)" if is_full else " (delta)")
-                else:
-                    log.warning("EVT POST failed %s/%s", sym_u, tf_u)
-            except Exception as e:
-                log.warning("EVT post exc %s/%s: %s", sym_u, tf_u, e)
 
+                required_count = max(
+                    tf_count,
+                    gap_bars + 2,
+                )
+
+                if required_count >= full_count:
+                    mode = "full"
+                    required_count = full_count
+
+                if required_count > tf_count:
+                    try:
+                        rates = mt5_fetch_rates(
+                            sym,
+                            tf_u,
+                            count=required_count,
+                            include_latest=include_latest,
+                        )
+
+                        tf_count = required_count
+
+                        last_closed = next(
+                            (
+                                b
+                                for b in reversed(rates)
+                                if b.get(
+                                    "complete",
+                                    True,
+                                )
+                            ),
+                            None,
+                        )
+
+                        if last_closed:
+                            last_t_s = _to_sec(
+                                last_closed.get("t")
+                            )
+
+                    except Exception as e:
+                        log.warning(
+                            "EVT GAP_FETCH_FAIL "
+                            "%s/%s gap=%s "
+                            "count=%s err=%s",
+                            sym_u,
+                            tf_u,
+                            gap_bars,
+                            required_count,
+                            e,
+                        )
+                        continue
+
+                    log.warning(
+                        "EVT GAP_RECOVERY "
+                        "%s/%s gap_bars=%s "
+                        "fetch_count=%s mode=%s",
+                        sym_u,
+                        tf_u,
+                        gap_bars,
+                        tf_count,
+                        mode,
+                    )
+
+            # ---------------------------------------------
+            # POST.
+            # Request the raw HTTP response so delta mode
+            # can detect a missing/invalid server base.
+            # ---------------------------------------------
+            try:
+                r = push_rates_batch(
+                    base,
+                    device_id,
+                    token,
+                    sym,
+                    tf_u,
+                    rates,
+                    include_latest=include_latest,
+                    count=tf_count,
+                    mode=mode,
+                    return_response=True,
+                )
+
+                status = int(
+                    getattr(
+                        r,
+                        "status_code",
+                        0,
+                    )
+                    or 0
+                )
+
+                ok = bool(
+                    getattr(r, "ok", False)
+                )
+
+                # -----------------------------------------
+                # DELTA BASE REPAIR.
+                #
+                # Server has no trustworthy full snapshot.
+                # Repair immediately; do not wait for the
+                # next boundary/safety sweep.
+                # -----------------------------------------
+                if mode == "delta" and status == 409:
+                    detail = ""
+
+                    try:
+                        js = r.json()
+                        detail = str(
+                            js.get("detail") or ""
+                        )
+                    except Exception:
+                        detail = str(
+                            getattr(r, "text", "")
+                            or ""
+                        )
+
+                    if (
+                        "ohlc_delta_base_missing"
+                        in detail
+                        or
+                        "ohlc_delta_base_short"
+                        in detail
+                        or
+                        "ohlc_delta_merge_short"
+                        in detail
+                    ):
+                        log.warning(
+                            "EVT DELTA_BASE_REPAIR "
+                            "%s/%s detail=%s",
+                            sym_u,
+                            tf_u,
+                            detail,
+                        )
+
+                        try:
+                            full_rates = mt5_fetch_rates(
+                                sym,
+                                tf_u,
+                                count=full_count,
+                                include_latest=include_latest,
+                            )
+
+                            if not full_rates:
+                                continue
+
+                            r = push_rates_batch(
+                                base,
+                                device_id,
+                                token,
+                                sym,
+                                tf_u,
+                                full_rates,
+                                include_latest=include_latest,
+                                count=full_count,
+                                mode="full",
+                                return_response=True,
+                            )
+
+                            status = int(
+                                getattr(
+                                    r,
+                                    "status_code",
+                                    0,
+                                )
+                                or 0
+                            )
+
+                            ok = bool(
+                                getattr(
+                                    r,
+                                    "ok",
+                                    False,
+                                )
+                            )
+
+                            if ok:
+                                rates = full_rates
+                                mode = "full"
+
+                        except Exception as e:
+                            log.warning(
+                                "EVT FULL_REPAIR_FAIL "
+                                "%s/%s err=%s",
+                                sym_u,
+                                tf_u,
+                                e,
+                            )
+                            continue
+
+                if not ok:
+                    log.warning(
+                        "EVT POST failed "
+                        "%s/%s mode=%s status=%s",
+                        sym_u,
+                        tf_u,
+                        mode,
+                        status,
+                    )
+                    continue
+
+                # -----------------------------------------
+                # Successful publish.
+                # -----------------------------------------
+                _last_sent_bar[key] = last_t_s
+
+                if mode == "full":
+                    _EVT_FULL_LAST[key] = (
+                        time.monotonic()
+                    )
+
+                log.info(
+                    "EVT pushed "
+                    "%s/%s bars=%s "
+                    "last_closed=%s mode=%s",
+                    sym_u,
+                    tf_u,
+                    len(rates),
+                    last_t_s,
+                    mode,
+                )
+
+            except Exception as e:
+                log.warning(
+                    "EVT post exc %s/%s: %s",
+                    sym_u,
+                    tf_u,
+                    e,
+                )
+
+    return pending
 
 def _ohlc_event_loop(api_base, device_id, token, symbols, tfs, bars, period_sec):
     """
@@ -4236,7 +5650,7 @@ def _ohlc_event_loop(api_base, device_id, token, symbols, tfs, bars, period_sec)
     grace_ms = int(_reg_float("Agent.BarGraceSec", 2.0) * 1000)
     sweep_s = max(60.0, _reg_float("Agent.SafetySweepSec", 300.0))
     idle_thresh = _reg_float("Agent.IdleTickAgeSec", 600.0)
-    delta_on = _reg_flag("Agent.DeltaPush", False)   # see guide before enabling
+    delta_on = _reg_flag("Agent.DeltaPush", True)
     delta_bars = int(_reg_float("Agent.DeltaBars", 5))
     full_refresh = _reg_float("Agent.FullRefreshSec", 3600.0)
 
@@ -4255,19 +5669,79 @@ def _ohlc_event_loop(api_base, device_id, token, symbols, tfs, bars, period_sec)
     if not syms:
         syms = list(DEFAULT_SYMBOLS)
     tflist = [str(t or "").upper().strip() for t in (tfs or []) if str(t or "").strip()]
-    tflist = [t for t in tflist if t in _TF_SEC] or ["M1", "M15", "H1", "H2", "H4"]
+    tflist = [t for t in tflist if t in _TF_SEC] or ["M1", "M15", "H1", "D1", "H4"]
 
     log.info("EVT loop start symbols=%s tfs=%s grace_ms=%s delta=%s sweep_s=%s",
              syms, tflist, grace_ms, delta_on, sweep_s)
 
+    
     # ---- startup backfill: one legacy full pass populates history + dedupe ----
     _worker_mark(name, "loop_started", last_error="")
     try:
-        _push_ohlc_once_safe(api_base, device_id, token, syms, tflist, bars)
-        _worker_mark(name, "loop_completed", last_success=time.monotonic())
+        _push_ohlc_once_safe(
+            api_base,
+            device_id,
+            token,
+            syms,
+            tflist,
+            bars,
+        )
+        _worker_mark(
+            name,
+            "loop_completed",
+            last_success=time.monotonic(),
+        )
     except Exception as exc:
-        _worker_mark(name, "last_error_at", last_error=f"{type(exc).__name__}:{exc}")
-        log.exception("EVT startup backfill failed")
+        _worker_mark(
+            name,
+            "last_error_at",
+            last_error=f"{type(exc).__name__}:{exc}",
+        )
+        log.exception(
+            "EVT startup backfill failed"
+        )
+
+    # ---------------------------------------------------------
+    # STARTUP FULL REFRESH MARK
+    #
+    # Startup backfill already loaded full history.
+    # Mark those successfully populated series as recently full
+    # so the first boundary does not perform another full fetch.
+    # ---------------------------------------------------------
+    _startup_full_ts = time.monotonic()
+
+    for _sym in syms:
+        _sym_u = str(
+            _sym or ""
+        ).upper().strip()
+
+        _sym_tfs = (
+            [
+                _tf
+                for _tf in tflist
+                if str(_tf).upper()
+                in ("M15", "H1", "H4","D1")
+            ]
+            if _sym_u == "DXY"
+            else tflist
+        )
+
+        for _tf in _sym_tfs:
+            _tf_u = str(
+                _tf or ""
+            ).upper().strip()
+
+            _key = (
+                _sym_u,
+                _tf_u,
+            )
+
+            # Only mark a series whose startup backfill
+            # actually populated the dedupe timestamp.
+            if _last_sent_bar.get(_key):
+                _EVT_FULL_LAST[_key] = (
+                    _startup_full_ts
+                )
 
     off_ms = _broker_off_ms_safe()
     now_ms = int(time.time() * 1000)
@@ -4324,9 +5798,75 @@ def _ohlc_event_loop(api_base, device_id, token, symbols, tfs, bars, period_sec)
         _worker_mark(name, "loop_started", last_error="")
         try:
             due_sorted = sorted(due, key=lambda t: _TF_SEC[t])
-            _push_ohlc_for_tfs(api_base, device_id, token, syms, due_sorted,
-                               bars, include_latest, delta_on, delta_bars,
-                               full_refresh)
+            pending = _push_ohlc_for_tfs(
+                api_base,
+                device_id,
+                token,
+                syms,
+                due_sorted,
+                bars,
+                include_latest,
+                delta_on,
+                delta_bars,
+                full_refresh,
+                expected_new=True,
+            )
+
+            # -------------------------------------------------
+            # FAST BAR-FINALIZATION RETRY
+            #
+            # Boundary fired, but MT5 may expose the previous
+            # closed candle for another second or two.
+            #
+            # Never wait for the 5-minute safety sweep for an
+            # M15/H1/H4 confirmation.
+            # -------------------------------------------------
+            for retry_no in range(1, 4):
+                if not pending:
+                    break
+
+                time.sleep(1.0)
+
+                log.info(
+                    "EVT FINALIZE_RETRY "
+                    "attempt=%s pending=%s",
+                    retry_no,
+                    pending,
+                )
+
+                next_pending = []
+
+                for retry_sym, retry_tf in pending:
+                    retry_result = _push_ohlc_for_tfs(
+                        api_base,
+                        device_id,
+                        token,
+                        [retry_sym],
+                        [retry_tf],
+                        bars,
+                        include_latest,
+                        delta_on,
+                        delta_bars,
+                        full_refresh,
+                        expected_new=True,
+                    )
+
+                    if retry_result:
+                        next_pending.extend(
+                            retry_result
+                        )
+
+                # Preserve order while removing duplicates.
+                pending = list(
+                    dict.fromkeys(next_pending)
+                )
+
+            if pending:
+                log.warning(
+                    "EVT FINALIZE_PENDING "
+                    "after_retries=%s",
+                    pending,
+                )
             _worker_mark(name, "loop_completed", last_success=time.monotonic())
         except Exception as exc:
             _worker_mark(name, "last_error_at",
@@ -4344,8 +5884,7 @@ def _ohlc_event_loop(api_base, device_id, token, symbols, tfs, bars, period_sec)
 # (see PHASE1_PATCH_GUIDE.md, edit A2).
 # ---------------------------------------------------------------------------
 def _ohlc_loop_target():
-    if _reg_flag("Agent.EventDriven", False):
-        log.info("OHLC: EVENT-DRIVEN loop selected (Agent.EventDriven=1)")
-        return _ohlc_event_loop
-    log.info("OHLC: legacy fixed-interval loop selected")
-    return _ohlc_loop
+    log.info(
+        "OHLC: CANONICAL EVENT-DRIVEN loop selected"
+    )
+    return _ohlc_event_loop

@@ -73,12 +73,150 @@ def _discord_trade_post(content: str) -> bool:
         req = urllib.request.Request(
             DISCORD_TRADE_WEBHOOK_URL,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "XauTrendLab/1.0",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=4) as resp:
             resp.read()
         return True
+    except Exception:
+        return False
+
+def _discord_notify_event_gate(
+    *,
+    action: str,
+    uid: str,
+    watch: dict,
+    event_gate: dict | None,
+    live_price: float,
+    trigger_level: float,
+) -> bool:
+    """
+    Discord notification for EVENT_WAIT lifecycle.
+
+    action:
+      ACQUIRED -> relevant event blocked a crossed RC
+      RELEASED -> event hold ended; same RC/cross returns to Point-A
+
+    Redis NX dedupe guarantees one notification per RC/action.
+    """
+    try:
+        action_u = str(action or "").upper().strip()
+
+        if action_u not in ("ACQUIRED", "RELEASED"):
+            return False
+
+        if not isinstance(watch, dict):
+            return False
+
+        ev = (
+            event_gate
+            if isinstance(event_gate, dict)
+            else {}
+        )
+
+        sym = str(
+            watch.get("symbol") or ""
+        ).upper().strip()
+
+        side = str(
+            watch.get("direction")
+            or watch.get("side")
+            or ""
+        ).upper().strip()
+
+        rev_ok_ms = int(
+            watch.get("rev_ok_ms") or 0
+        )
+
+        if not sym or not side or rev_ok_ms <= 0:
+            return False
+
+        # One BLOCK + one RELEASE notification per RC generation.
+        dedupe_key = (
+            f"xtl:discord:event_gate:"
+            f"{str(uid or '').strip()}:"
+            f"{sym}:{side}:{rev_ok_ms}:{action_u}"
+        )
+
+        try:
+            claimed = bool(
+                R.set(
+                    dedupe_key,
+                    "1",
+                    nx=True,
+                    ex=7 * 24 * 3600,
+                )
+            )
+        except Exception:
+            claimed = False
+
+        if not claimed:
+            return False
+
+        event_name = str(
+            ev.get("event_name") or "Economic event"
+        ).strip()
+
+        event_tier = str(
+            ev.get("event_tier") or ""
+        ).strip()
+
+        window = str(
+            ev.get("window") or ""
+        ).strip()
+
+        mins = ev.get("minutes_to_event")
+
+        try:
+            mins_txt = (
+                f"{float(mins):+.1f} min"
+                if mins is not None
+                else "n/a"
+            )
+        except Exception:
+            mins_txt = "n/a"
+
+        if action_u == "ACQUIRED":
+            title = "🟠 XTL EVENT BLOCK"
+            status = "ENTRY HELD"
+            next_step = (
+                "RC/cross preserved — waiting for event window to clear."
+            )
+        else:
+            title = "🟢 XTL EVENT RELEASE"
+            status = "EVENT CLEAR"
+            next_step = (
+                "Same RC/cross preserved — re-evaluating current Point-A."
+            )
+
+        content = (
+            f"{title}\n"
+            f"**{sym} {side}** | {status}\n"
+            f"Event: **{event_name}**\n"
+            f"Tier: {event_tier or 'n/a'} | "
+            f"Window: {window or 'CLEAR'} | "
+            f"Time: {mins_txt}\n"
+            f"RC: `{rev_ok_ms}`\n"
+            f"Trigger: `{float(trigger_level):.6f}` | "
+            f"Live: `{float(live_price):.6f}`\n"
+            f"{next_step}"
+        )
+
+        ok = _discord_trade_post(content)
+
+        if not ok:
+            # Allow retry if Discord posting itself failed.
+            try:
+                R.delete(dedupe_key)
+            except Exception:
+                pass
+
+        return bool(ok)
+
     except Exception:
         return False
 
@@ -2677,6 +2815,12 @@ POINT_A_WAIT_STATE = "ENTRY_BLOCKED_POINT_A_WAIT"
 POINT_A_BLOCK_STATE = "ENTRY_BLOCKED_POINT_A_BLOCK"
 POINT_A_EXPIRED_STATE = "ENTRY_BLOCKED_POINT_A_EXPIRED"
 
+# Scheduled macro-event safety hold.
+#
+# This state owns an ALREADY-CROSSED RC opportunity.
+# It must preserve the exact RC/cross while the calendar blocks entry.
+EVENT_WAIT_STATE = "ENTRY_BLOCKED_EVENT_WAIT"
+
 # -------------------------------------------------------------
 # POINT-A PRICE_TOO_FAR threshold.
 #
@@ -3441,7 +3585,7 @@ def _point_a_evaluate(
     #
     # Primary age unit = completed M15 candle boundaries.
     #
-    # Default: 24 completed M15 candles.
+    # Default: 30 completed M15 candles.
     #
     # Reason:
     # DXY M15 alignment can take several candles to develop
@@ -3454,7 +3598,7 @@ def _point_a_evaluate(
     # late-entry protection and is checked BEFORE this horizon.
     #
     # Wall-clock timeout remains safety-only and is deliberately
-    # longer than the normal 24-M15 decision horizon.
+    # longer than the normal 30-M15 decision horizon.
     # -------------------------------------------------
     m15_ms = 15 * 60 * 1000
 
@@ -3463,7 +3607,7 @@ def _point_a_evaluate(
         int(
             _point_a_env_float(
                 "XTL_POINT_A_MAX_WAIT_M15_BARS",
-                24,
+                30,
             )
         ),
     )
@@ -3471,7 +3615,7 @@ def _point_a_evaluate(
     fallback_max_wait_ms = int(
         _point_a_env_float(
             "XTL_POINT_A_FALLBACK_MAX_WAIT_SEC",
-            375 * 60,  # 6h15m safety fallback for 24-M15 horizon
+            465 * 60,  # 7h45m safety fallback for 30-M15 horizon
         )
         * 1000.0
     )
@@ -3629,7 +3773,7 @@ def _point_a_evaluate(
 
     # -------------------------------------------------
     # Normal WAIT expiry:
-    # 24 completed M15 decision cycles have passed.
+    # 30 completed M15 decision cycles have passed.
     # -------------------------------------------------
     if (
         wait_started_ms > 0
@@ -3651,7 +3795,7 @@ def _point_a_evaluate(
     # Safety fallback only.
     #
     # This should normally never be the reason because
-    # the 24-M15 limit above should fire first.
+    # the 30-M15 limit above should fire first.
     # -------------------------------------------------
     if (
         wait_started_ms > 0
@@ -9592,6 +9736,206 @@ def tick_user(uid: str) -> None:
                 point_a_wait_release_result = None
 
                 # -------------------------------------------------
+                # EVENT WAIT RE-EVALUATION
+                #
+                # EVENT_WAIT owns an already-confirmed RC cross.
+                #
+                # While event window remains active:
+                #   preserve RC + exact cross and do nothing.
+                #
+                # Once clear:
+                #   EVENT_WAIT -> REV_OK
+                #   preserve exact cross evidence
+                #   fall through to normal cross-recovery below
+                #   and run CURRENT Point-A.
+                #
+                # IMPORTANT:
+                #   Do NOT use generic blocked_retry lifecycle.
+                #   Do NOT clear rc_trigger_crossed*.
+                #   Do NOT require a second fresh breakout.
+                # -------------------------------------------------
+                if state_w == EVENT_WAIT_STATE:
+                    try:
+                        from api.news_adapter import check_news_block
+
+                        _event_gate = check_news_block(
+                            sym_w,
+                            int(now_e),
+                            R,
+                            shadow_mode=False,
+                        ) or {}
+
+                    except Exception as exc:
+                        log.exception(
+                            "[EVENT_GATE] RECHECK_FAILED "
+                            "sym=%s side=%s rc=%s trigger=%s key=%s",
+                            sym_w,
+                            side_w,
+                            rev_ok_ms,
+                            trigger_level,
+                            wkey,
+                        )
+
+                        # Event protection is optional.
+                        # Infrastructure failure must release the
+                        # event layer and return ownership to the
+                        # original XTL / Point-A path.
+                        _event_gate = {
+                            "block": False,
+                            "verdict": "ALLOW",
+                            "reason": (
+                                "EVENT_GATE_ERROR_BYPASS | "
+                                f"{type(exc).__name__}"
+                            ),
+                            "window": None,
+                            "calendar_source": None,
+                            "event_mode": "ERROR_BYPASS",
+                        }
+                    if bool(_event_gate.get("block")):
+                        # -----------------------------------------
+                        # Still inside PRE/POST event block.
+                        # Preserve exact RC-cross ownership.
+                        # -----------------------------------------
+                        watch["state"] = EVENT_WAIT_STATE
+                        watch["trade_state"] = EVENT_WAIT_STATE
+                        watch["rev_ok"] = True
+                        watch["entry_blocked"] = True
+                        watch["entry_ready"] = False
+                        watch["entry_triggered"] = False
+
+                        watch["entry_block_reason"] = str(
+                            _event_gate.get("reason")
+                            or "EVENT_WAIT"
+                        )
+
+                        watch["event_wait"] = dict(_event_gate)
+                        watch["event_wait_last_eval_ms"] = int(now_e)
+
+                        R.set(
+                            str(wkey),
+                            json.dumps(
+                                watch,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                            ex=7 * 24 * 3600,
+                        )
+
+                        log.warning(
+                            "[EVENT_GATE] WAIT_RETAINED "
+                            "sym=%s side=%s rc=%s trigger=%s "
+                            "event=%s window=%s mins=%s key=%s",
+                            sym_w,
+                            side_w,
+                            rev_ok_ms,
+                            trigger_level,
+                            _event_gate.get("event_name"),
+                            _event_gate.get("window"),
+                            _event_gate.get("minutes_to_event"),
+                            wkey,
+                        )
+
+                        continue
+
+                    # ---------------------------------------------
+                    # Event window cleared.
+                    #
+                    # Restore logical REV_OK state ONLY.
+                    # DO NOT clear:
+                    #   rc_trigger_crossed
+                    #   rc_trigger_crossed_ms
+                    #   rc_trigger_cross_price
+                    #   rc_trigger_cross_level
+                    #   rc_trigger_cross_rev_ok_ms
+                    #   break_state
+                    #
+                    # Normal cross-recovery below will recognize
+                    # this exact persisted RC-cross.
+                    # ---------------------------------------------
+                    _old_event_wait = (
+                        dict(watch.get("event_wait"))
+                        if isinstance(
+                            watch.get("event_wait"),
+                            dict,
+                        )
+                        else {}
+                    )
+
+                    watch["state"] = "REV_OK"
+                    watch["trade_state"] = ""
+                    watch["rev_ok"] = True
+                    watch["entry_blocked"] = False
+                    watch["entry_ready"] = False
+                    watch["entry_triggered"] = False
+
+                    watch["event_wait_released_ms"] = int(now_e)
+                    watch["event_wait_last"] = _old_event_wait
+
+                    watch.pop("event_wait", None)
+                    watch.pop("event_wait_last_eval_ms", None)
+                    watch.pop("entry_block_reason", None)
+                    watch.pop("next_retry_ms", None)
+                    watch.pop("late_entry_max_move", None)
+
+                    R.set(
+                        str(wkey),
+                        json.dumps(
+                            watch,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+
+                    log.warning(
+                        "[EVENT_GATE] WAIT_RELEASED "
+                        "sym=%s side=%s rc=%s trigger=%s "
+                        "live=%s old_event=%s old_window=%s "
+                        "mode=PRESERVE_CROSS_THEN_POINT_A key=%s",
+                        sym_w,
+                        side_w,
+                        rev_ok_ms,
+                        trigger_level,
+                        live_px,
+                        _old_event_wait.get("event_name"),
+                        _old_event_wait.get("window"),
+                        wkey,
+                    )
+                    try:
+                        _event_discord_ok = (
+                            _discord_notify_event_gate(
+                                action="RELEASED",
+                                uid=uid,
+                                watch=watch,
+                                event_gate=_old_event_wait,
+                                live_price=float(live_px),
+                                trigger_level=float(trigger_level),
+                            )
+                        )
+
+                        log.warning(
+                            "[EVENT_GATE] DISCORD_RELEASE "
+                            "sym=%s side=%s sent=%s",
+                            sym_w,
+                            side_w,
+                            _event_discord_ok,
+                        )
+
+                    except Exception as exc:
+                        log.warning(
+                            "[EVENT_GATE] DISCORD_RELEASE_FAILED "
+                            "sym=%s side=%s err=%r",
+                            sym_w,
+                            side_w,
+                            exc,
+                        )
+
+                    # Critical:
+                    # bypass generic ENTRY_BLOCKED retry processing.
+                    state_w = "REV_OK"
+                    blocked_retry = False
+
+                # -------------------------------------------------
                 # P0 POINT-A WAIT RE-EVALUATION
                 #
                 # Once WAIT owns an already-crossed RC opportunity,
@@ -9735,6 +10079,238 @@ def tick_user(uid: str) -> None:
                     )
 
                     if point_a_action == "EXPIRE":
+                        # -------------------------------------------------
+                        # PRICE_TOO_FAR:
+                        # retire ONLY the current RC generation.
+                        #
+                        # Keep the underlying H1 structural watch/zone
+                        # alive so consolidation/retest can produce a
+                        # completely fresh RC later.
+                        #
+                        # The fresh RC must:
+                        #   REV_WATCH -> REV_OK
+                        #   -> fresh trigger cross
+                        #   -> run Point-A again
+                        #
+                        # This branch MUST NOT release the opportunity.
+                        # -------------------------------------------------
+                        _pa_expire_reason = str(
+                            point_a.get("reason") or ""
+                        ).upper().strip()
+
+                        _pa_expire_codes = {
+                            str(_x).upper().strip()
+                            for _x in (
+                                point_a.get("reason_codes") or []
+                            )
+                        }
+
+                        _pa_price_too_far = bool(
+                            "PRICE_TOO_FAR" in _pa_expire_reason
+                            or any(
+                                "PRICE_TOO_FAR" in _x
+                                for _x in _pa_expire_codes
+                            )
+                        )
+
+                        if _pa_price_too_far:
+                            _retired_rev_ok_ms = int(
+                                watch.get("rev_ok_ms") or 0
+                            )
+
+                            _retired_trigger = watch.get(
+                                "trigger_level"
+                            )
+
+                            _retired_cross_ms = (
+                                watch.get("point_a_cross_ms")
+                            )
+
+                            _retired_missed_r = (
+                                point_a.get("missed_move_r")
+                            )
+
+                            _retired_displacement_atr = (
+                                point_a.get(
+                                    "displacement_atr"
+                                )
+                            )
+
+                            log.warning(
+                                "[POINT_A] PRICE_TOO_FAR_RC_REARM "
+                                "sym=%s side=%s "
+                                "old_rev_ok_ms=%s "
+                                "old_trigger=%s "
+                                "old_cross_ms=%s "
+                                "missed_move_r=%s "
+                                "displacement_atr=%s "
+                                "action=RETIRE_RC_KEEP_ZONE",
+                                sym_w,
+                                side_w,
+                                _retired_rev_ok_ms,
+                                _retired_trigger,
+                                _retired_cross_ms,
+                                _retired_missed_r,
+                                _retired_displacement_atr,
+                            )
+
+                            # ---------------------------------------------
+                            # Clear Point-A ownership of THIS stale RC.
+                            #
+                            # This helper clears Point-A transient fields,
+                            # not the frozen H1 structural zone.
+                            # ---------------------------------------------
+                            _point_a_clear_fields(watch)
+
+                            # ---------------------------------------------
+                            # Retire CURRENT RC generation only.
+                            #
+                            # Do NOT remove:
+                            #   zone_low / zone_high / zone_level
+                            #   zone source / structural direction
+                            #   watch identity
+                            # ---------------------------------------------
+                            for _k in (
+                                "rev_ok_ms",
+                                "rev_ok_bar_hi",
+                                "rev_ok_bar_lo",
+                                "rev_ok_bar_close",
+                                "rc_open_ms",
+                                "rc_close_ms",
+                                "rc_high",
+                                "rc_low",
+                                "rc_close",
+                                "rc_source",
+                                "rc_is_touch_candle",
+                                "trigger_level",
+                                "rc_trigger_crossed",
+                                "rc_trigger_crossed_ms",
+                                "rc_trigger_cross_price",
+                                "entry_triggered_ms",
+                            ):
+                                watch.pop(_k, None)
+
+                            watch.pop(
+                                "discord_rc_trigger_sent",
+                                None,
+                            )
+                            watch.pop(
+                                "discord_rc_trigger_sent_ms",
+                                None,
+                            )
+                            watch.pop(
+                                "discord_rc_trigger_price",
+                                None,
+                            )
+                            watch.pop(
+                                "discord_rc_trigger_error",
+                                None,
+                            )
+
+                            # Return to RC discovery.
+                            watch["state"] = "REV_WATCH"
+                            watch["trade_state"] = "REV_WATCH"
+
+                            watch["rev_ok"] = False
+                            watch["entry_ready"] = False
+                            watch["entry_triggered"] = False
+                            watch["entry_blocked"] = False
+
+                            # Remove stale blocking/retry state belonging
+                            # to the retired RC generation.
+                            watch.pop(
+                                "entry_block_reason",
+                                None,
+                            )
+                            watch.pop(
+                                "next_retry_ms",
+                                None,
+                            )
+                            watch.pop(
+                                "late_entry_max_move",
+                                None,
+                            )
+
+                            # ---------------------------------------------
+                            # Non-authoritative diagnostics only.
+                            # These make the lifecycle auditable.
+                            # ---------------------------------------------
+                            watch[
+                                "point_a_last_retired_rc_ms"
+                            ] = int(
+                                _retired_rev_ok_ms
+                            )
+
+                            watch[
+                                "point_a_last_retired_trigger"
+                            ] = (
+                                float(_retired_trigger)
+                                if _retired_trigger
+                                is not None
+                                else None
+                            )
+
+                            watch[
+                                "point_a_last_retired_cross_ms"
+                            ] = (
+                                int(_retired_cross_ms)
+                                if _retired_cross_ms
+                                is not None
+                                else None
+                            )
+
+                            watch[
+                                "point_a_rc_rearm_reason"
+                            ] = "PRICE_TOO_FAR"
+
+                            watch[
+                                "point_a_rc_rearm_at_ms"
+                            ] = int(now_e)
+
+                            watch[
+                                "point_a_rc_rearm_missed_r"
+                            ] = _retired_missed_r
+
+                            watch[
+                                "point_a_rc_rearm_displacement_atr"
+                            ] = _retired_displacement_atr
+
+                            # ---------------------------------------------
+                            # Persist SAME structural watch.
+                            #
+                            # Persistence failure is fail-closed:
+                            # no order is allowed from this iteration.
+                            # Redis will retain its previous safe state.
+                            # ---------------------------------------------
+                            try:
+                                R.set(
+                                    str(wkey),
+                                    json.dumps(
+                                        watch,
+                                        separators=(",", ":"),
+                                        default=str,
+                                    ),
+                                    ex=7 * 24 * 3600,
+                                )
+
+                            except Exception:
+                                log.exception(
+                                    "[POINT_A] "
+                                    "PRICE_TOO_FAR_RC_REARM_PERSIST_FAILED "
+                                    "sym=%s side=%s key=%s",
+                                    sym_w,
+                                    side_w,
+                                    wkey,
+                                )
+
+                            # CRITICAL:
+                            # Do not fall through to
+                            # _point_a_release_expired_watch().
+                            #
+                            # Stop this execution iteration.
+                            # A NEW RC is required.
+                            continue
+                         
                         # -------------------------------------------------
                         # P0-1 WAIT -> EXPIRED -> RELEASE
                         #
@@ -10623,6 +11199,155 @@ def tick_user(uid: str) -> None:
                         wkey,
                         exc,
                     )
+                # -------------------------------------------------
+                # EVENT GATE — FINAL PRE-POINT-A SAFETY HOLD
+                #
+                # At this point the RC cross is already authoritative
+                # and durably persisted on the watch.
+                #
+                # Events do NOT determine direction or bias.
+                # They only decide whether a NEW entry is safe NOW.
+                #
+                # WAIT:
+                #   own this exact crossed RC
+                #   preserve cross evidence
+                #   do not create entry claim/order
+                #
+                # ALLOW:
+                #   continue directly into current Point-A.
+                # -------------------------------------------------
+                try:
+                    from api.news_adapter import check_news_block
+
+                    _event_gate = check_news_block(
+                        sym_w,
+                        int(now_e),
+                        R,
+                        shadow_mode=False,
+                    ) or {}
+
+                except Exception as exc:
+                    log.exception(
+                        "[EVENT_GATE] CHECK_FAILED "
+                        "sym=%s side=%s rc=%s trigger=%s key=%s",
+                        sym_w,
+                        side_w,
+                        watch.get("rev_ok_ms"),
+                        trigger_level,
+                        wkey,
+                    )
+
+                    # Event protection is optional.
+                    # If the event service itself is unavailable,
+                    # preserve original XTL behavior and continue
+                    # to Point-A.
+                    _event_gate = {
+                        "block": False,
+                        "verdict": "ALLOW",
+                        "reason": (
+                            "EVENT_GATE_ERROR_BYPASS | "
+                            f"{type(exc).__name__}"
+                        ),
+                        "window": None,
+                        "calendar_source": None,
+                        "event_mode": "ERROR_BYPASS",
+                    }
+
+                if bool(_event_gate.get("block")):
+                    watch["state"] = EVENT_WAIT_STATE
+                    watch["trade_state"] = EVENT_WAIT_STATE
+
+                    # RC remains structurally confirmed.
+                    watch["rev_ok"] = True
+
+                    # No actual entry has occurred.
+                    watch["entry_ready"] = False
+                    watch["entry_triggered"] = False
+                    watch["entry_blocked"] = True
+
+                    watch["entry_block_reason"] = str(
+                        _event_gate.get("reason")
+                        or "EVENT_WAIT"
+                    )
+
+                    # Full canonical event context for UI/audit.
+                    watch["event_wait"] = dict(_event_gate)
+
+                    watch["event_wait_started_ms"] = int(
+                        watch.get("event_wait_started_ms")
+                        or now_e
+                    )
+
+                    watch["event_wait_last_eval_ms"] = int(now_e)
+
+                    # Record which RC generation EVENT_WAIT owns.
+                    watch["event_wait_rc_rev_ok_ms"] = int(
+                        watch.get("rev_ok_ms") or 0
+                    )
+                    watch["event_wait_trigger_level"] = float(
+                        trigger_level
+                    )
+
+                    # DO NOT touch rc_trigger_crossed*.
+                    R.set(
+                        str(wkey),
+                        json.dumps(
+                            watch,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+
+                    log.warning(
+                        "[EVENT_GATE] WAIT_ACQUIRED "
+                        "sym=%s side=%s rc=%s trigger=%s "
+                        "cross_ms=%s cross_price=%s "
+                        "event=%s tier=%s window=%s mins=%s "
+                        "reason=%s key=%s",
+                        sym_w,
+                        side_w,
+                        watch.get("rev_ok_ms"),
+                        trigger_level,
+                        watch.get("rc_trigger_crossed_ms"),
+                        watch.get("rc_trigger_cross_price"),
+                        _event_gate.get("event_name"),
+                        _event_gate.get("event_tier"),
+                        _event_gate.get("window"),
+                        _event_gate.get("minutes_to_event"),
+                        _event_gate.get("reason"),
+                        wkey,
+                    )
+                    try:
+                        _event_discord_ok = (
+                            _discord_notify_event_gate(
+                                action="ACQUIRED",
+                                uid=uid,
+                                watch=watch,
+                                event_gate=_event_gate,
+                                live_price=float(live_px),
+                                trigger_level=float(trigger_level),
+                            )
+                        )
+
+                        log.warning(
+                            "[EVENT_GATE] DISCORD_BLOCK "
+                            "sym=%s side=%s sent=%s",
+                            sym_w,
+                            side_w,
+                            _event_discord_ok,
+                        )
+
+                    except Exception as exc:
+                        log.warning(
+                            "[EVENT_GATE] DISCORD_BLOCK_FAILED "
+                            "sym=%s side=%s err=%r",
+                            sym_w,
+                            side_w,
+                            exc,
+                        )
+
+                    continue
 
                 # -------------------------------------------------
                 # Point-A final pre-entry gate.

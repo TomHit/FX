@@ -304,67 +304,81 @@ def _compute_local_tz_offset_min() -> int:
 
 def _write_broker_meta_from_env_or_local() -> None:
     """
-    P0 broker timezone seed.
+    P0 broker timezone installer policy.
 
-    Installer must NEVER use:
-      - Windows/PC local timezone
-      - existing HKLM/HKCU/HKU Broker.TzOffsetMin
+    Broker.Tz* is runtime-owned MT5 state.
 
-    Why:
-      Existing registry may contain the historical bad IST value 330.
-      The agent will auto-detect real broker time from MT5 and overwrite
-      with Broker.TzSource=auto_detected.
+    IMPORTANT:
+      - installer must NEVER derive broker TZ from Windows timezone
+      - installer must NEVER replace an existing runtime broker TZ
+      - installer must NEVER delete Broker.Tz* during upgrade/repair
+      - installer must NEVER seed UTC+00:00 as if it were broker truth
 
-    Installer seed must be neutral:
-      Broker.TzOffsetMin = 0
-      Broker.TzName      = UTC+00:00
-      Broker.TzSource    = installer_pending_detection
+    Optional FORCE_TZ_OFFSET_MIN remains available only as an explicit
+    emergency/manual override.
 
-    Optional override:
-      FORCE_TZ_OFFSET_MIN can still be used for emergency/manual installer builds.
+    Normal installs leave broker timezone discovery to the Agent.
     """
     import os
 
     env_off = os.environ.get("FORCE_TZ_OFFSET_MIN")
     env_name = os.environ.get("FORCE_TZ_NAME")
 
-    off = None
-    seeded_source = "installer_pending_detection"
+    # ---------------------------------------------------------
+    # Explicit emergency override only.
+    # No override -> preserve current state exactly as-is.
+    # ---------------------------------------------------------
+    if env_off in (None, ""):
+        try:
+            LOGGER.info(
+                "installer: Broker.Tz* preserved "
+                "(runtime-owned; no installer override)"
+            )
+        except Exception:
+            pass
+        return
 
-    # Optional explicit env override only.
-    # Do not read HKLM/HKCU/HKU and do not use OS timezone.
     try:
-        if env_off not in (None, ""):
-            probe = int(str(env_off).strip())
-            if -720 <= probe <= 900:
-                off = probe
-                seeded_source = "env_force"
+        off = int(str(env_off).strip())
     except Exception:
-        off = None
+        try:
+            LOGGER.warning(
+                "installer: invalid FORCE_TZ_OFFSET_MIN=%r; "
+                "Broker.Tz* left unchanged",
+                env_off,
+            )
+        except Exception:
+            pass
+        return
 
-    if off is None:
-        off = 0
+    if not (-720 <= off <= 900):
+        try:
+            LOGGER.warning(
+                "installer: FORCE_TZ_OFFSET_MIN out of range=%s; "
+                "Broker.Tz* left unchanged",
+                off,
+            )
+        except Exception:
+            pass
+        return
 
-    name = env_name or _tz_label(off)
+    name = (
+        str(env_name).strip()
+        if env_name not in (None, "")
+        else _tz_label(off)
+    )
 
-    # Clean legacy/bad values in all views before writing neutral seed.
-    try:
-        _xtl_del_all_roots("Broker.TzOffsetMin")
-        _xtl_del_all_roots("Broker.TzName")
-        _xtl_del_all_roots("Broker.TzSource")
-    except Exception:
-        pass
-
+    # Explicit operator override only.
     _xtl_set_all_roots("Broker.TzOffsetMin", str(off))
     _xtl_set_all_roots("Broker.TzName", name)
-    _xtl_set_all_roots("Broker.TzSource", seeded_source)
+    _xtl_set_all_roots("Broker.TzSource", "env_force")
 
     try:
-        LOGGER.info(
-            "installer: seeded broker tz off_min=%s name=%s source=%s across all hives",
+        LOGGER.warning(
+            "installer: explicit broker TZ override applied "
+            "off_min=%s name=%s source=env_force",
             off,
             name,
-            seeded_source,
         )
     except Exception:
         pass
@@ -3869,24 +3883,7 @@ def _heartbeat_loop(api_base: str, interval_sec: int = 60) -> None:
                 except Exception as e:
                     alog(f"HB: push_now ohlc error: {e!s}")
 
-            # Cadence push while active
-            if trend_active and mt5_ok_flag and not _event_driven_enabled():
-                for sym in symbols:
-                    for tfu in tfs:
-                        if _due(sym, tfu, cadence, now_s):
-                            alog(f"HB: cadence push -> {sym}/{tfu}")
-                            try:
-                                push_ohlc_once_compat(
-                                    api_base=api_base,
-                                    device_id=device_id,
-                                    token=device_token,
-                                    symbols=[sym],
-                                    tfs=[tfu],
-                                    bars=300,
-                                )
-                                _mark_pushed(sym, tfu, now_s)
-                            except Exception as e:
-                                alog(f"HB: cadence ohlc error {sym}/{tfu}: {e!s}")
+            
 
             # -------------------------------------------------
             # Push MT5 open positions + account snapshot
@@ -4126,6 +4123,45 @@ def _maybe_mt5_worker(api_base: str) -> None:
             alog(f"MT5 CMD: failed to start worker: {type(e).__name__}: {e}")
         # ---------------- END NEW BLOCK ----------------
 
+        # ---------------- MT5 CALENDAR WORKER ----------------
+        # Calendar publishing is independent of OHLC scheduler mode.
+        # It must run whether XTL uses event-driven or legacy OHLC.
+        try:
+            global _MT5_CALENDAR_STARTED
+
+            try:
+                _MT5_CALENDAR_STARTED
+            except Exception:
+                _MT5_CALENDAR_STARTED = False
+
+            if not _MT5_CALENDAR_STARTED:
+                from xtl.agent_ohlc import start_mt5_calendar_worker
+
+                start_mt5_calendar_worker(
+                    api_base=api_base,
+                    device_id=device_id,
+                    token=device_token,
+                    check_sec=300.0,
+                )
+
+                _MT5_CALENDAR_STARTED = True
+
+                alog(
+                    "MT5 CALENDAR: worker started "
+                    "(broker-scoped slow publisher)"
+                )
+            else:
+                alog(
+                    "MT5 CALENDAR: worker already started; skipping"
+                )
+
+        except Exception as e:
+            alog(
+                "MT5 CALENDAR: failed to start worker: "
+                f"{type(e).__name__}: {e}"
+            )
+        # ---------------- END MT5 CALENDAR WORKER ----------------
+
         # Cadence
         s_per_cycle = int(mt5_cfg.get("period_sec") or 60)
         if s_per_cycle < 15:
@@ -4134,49 +4170,41 @@ def _maybe_mt5_worker(api_base: str) -> None:
         alog(
             f"OHLC: starting worker symbols={symbols} tfs={tfs} bars={bars} every {s_per_cycle}s"
         )
-        # ---- EVENT-DRIVEN MODE: delegate to the supervised agent worker ----
-        if _event_driven_enabled():
-            try:
-                from xtl.agent_ohlc import start_ohlc_worker
-                alog("OHLC: EVENT-DRIVEN mode -> delegating to agent_ohlc.start_ohlc_worker")
-                start_ohlc_worker(
-                    api_base=api_base,
-                    device_id=device_id,
-                    token=device_token,
-                    symbols=symbols,
-                    tfs=tfs,
-                    bars=bars,
-                    period_sec=float(s_per_cycle),
-                )
-                while not _stop.is_set():   # worker runs supervised in its own thread
-                    _stop.wait(30)
-                alog("OHLC: event-driven wrapper exiting")
-                return
-            except Exception as e:
-                alog(f"OHLC: event-driven start failed ({e!s}); falling back to legacy loop")
-        # ---- legacy loop below runs only when flag is off or start failed ----
+        # ---------------------------------------------------------
+        # CANONICAL OHLC ENGINE
+        # One bar-close-aligned scheduler owns all normal OHLC work.
+        # No legacy fixed-interval fallback in production.
+        # ---------------------------------------------------------
+        try:
+            from xtl.agent_ohlc import start_ohlc_worker
 
-        # Main loop
-        while not _stop.is_set():
-            try:
-                push_ohlc_once_compat(
-                    api_base=api_base,
-                    device_id=device_id,
-                    token=device_token,
-                    symbols=symbols,
-                    tfs=tfs,
-                    bars=bars,
-                )
-                alog("OHLC: push cycle done")
-            except Exception as e:
-                alog(f"OHLC: push cycle error: {e}")
-            finally:
-                for _ in range(s_per_cycle):
-                    if _stop.is_set():
-                        break
-                    time.sleep(1)
+            alog(
+                "OHLC: starting CANONICAL EVENT-DRIVEN worker "
+                f"symbols={symbols} tfs={tfs} bars={bars}"
+            )
 
-        alog("OHLC: worker exiting")
+            start_ohlc_worker(
+                api_base=api_base,
+                device_id=device_id,
+                token=device_token,
+                symbols=symbols,
+                tfs=tfs,
+                bars=bars,
+                period_sec=float(s_per_cycle),
+            )
+
+            while not _stop.is_set():
+                _stop.wait(30)
+
+            alog("OHLC: canonical worker wrapper exiting")
+            return
+
+        except Exception as e:
+            alog(
+                "OHLC: CANONICAL WORKER FAILED "
+                f"{type(e).__name__}: {e}"
+            )
+            return
 
     except Exception as e:
         alog(f"OHLC: worker failed to start: {e}")
@@ -4288,33 +4316,72 @@ def agent_main_foreground() -> None:
         return t
 
     def _spawn_price() -> threading.Thread:
-        # Use bound creds and registry symbols (same as OHLC)
+        # ---------------------------------------------------------
+        # PRICE WORKER
+        #
+        # start_price_publisher() ALREADY creates and returns the
+        # real long-running agent_price_loop thread.
+        #
+        # Do NOT wrap it in another short-lived thread; otherwise
+        # the watchdog sees the wrapper exit and continuously
+        # creates duplicate price publishers.
+        # ---------------------------------------------------------
         try:
-            dev_id = (_hku_ls_get("DeviceId") or "").strip()
-            dev_tok = (_hku_ls_get("DeviceToken") or "").strip()
+            dev_id = (
+                _hku_ls_get("DeviceId") or ""
+            ).strip()
+            dev_tok = (
+                _hku_ls_get("DeviceToken") or ""
+            ).strip()
         except Exception:
             dev_id, dev_tok = "", ""
 
         syms = []
+
         try:
-            syms_raw = (reg_get("Symbols") or "").strip()
-            syms = [s.strip().upper() for s in syms_raw.split(",") if s.strip()]
+            syms_raw = (
+                reg_get("Symbols") or ""
+            ).strip()
+
+            syms = [
+                s.strip().upper()
+                for s in syms_raw.split(",")
+                if s.strip()
+            ]
         except Exception:
             syms = []
 
         if not syms:
-            syms = ["XAUUSD", "EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDCHF"]
+            syms = [
+                "XAUUSD",
+                "EURUSD",
+                "USDJPY",
+                "GBPUSD",
+                "USDCAD",
+                "USDCHF",
+            ]
 
-        t = threading.Thread(
-            target=start_price_publisher,
-            args=(api_base, dev_id, dev_tok, syms),
-            kwargs={"interval_sec": 0.25},
-            daemon=True,
-            name="price",
+        # start_price_publisher() returns the REAL worker thread.
+        t = start_price_publisher(
+            api_base,
+            dev_id,
+            dev_tok,
+            syms,
+            interval_sec=0.25,
         )
-        t.start()
-        return t
 
+        if not isinstance(t, threading.Thread):
+            raise RuntimeError(
+                "start_price_publisher did not return a thread"
+            )
+
+        alog(
+            f"PRICE: worker started "
+            f"name={t.name} ident={t.ident} "
+            f"symbols={syms}"
+        )
+
+        return t
     def _spawn_mt5_positions() -> threading.Thread:
         def _loop():
             try:
@@ -4739,15 +4806,55 @@ def cmd_install(
 
         # 1) HKLM baseline config (api_base only)
         cfg = upsert_config(api_base=api_eff, bind_token="")
-        # Ensure broker meta is present and fresh each install/repair
-        _write_broker_meta_from_env_or_local()
-
-        # 2) Hygiene: clear LocalSystem creds from any prior attempt
+        # ---------------------------------------------------------
+        # P0 BROKER TIMEZONE PRESERVATION
+        #
+        # Broker.Tz* is runtime MT5-detected state.
+        # Normal install / upgrade / repair / service recreation
+        # must NEVER clear or reseed a previously detected broker
+        # timezone.
+        #
+        # New installs may start without trusted Broker.Tz*.
+        # The Agent is responsible for establishing trusted runtime
+        # broker timezone after MT5 connects.
+        # ---------------------------------------------------------
         try:
-            _hku_ls_del("DeviceId")
-            _hku_ls_del("DeviceToken")
+            LOGGER.info(
+                "installer: preserving Broker.Tz* runtime state "
+                "(no reset during install/repair)"
+            )
         except Exception:
             pass
+
+        # ---------------------------------------------------------
+        # DEVICE CREDENTIAL PRESERVATION
+        #
+        # DeviceId / DeviceToken are persistent installation
+        # identity. Never delete them during normal install,
+        # upgrade, repair, reboot, or service recreation.
+        #
+        # They may only be cleared by an explicit unpair/reset
+        # workflow.
+        # ---------------------------------------------------------
+        try:
+            _existing_dev_id = (
+                _hku_ls_get("DeviceId") or ""
+            ).strip()
+
+            _existing_dev_tok = (
+                _hku_ls_get("DeviceToken") or ""
+            ).strip()
+
+            alog(
+                "install: preserving device credentials "
+                f"device_id_present={bool(_existing_dev_id)} "
+                f"device_token_present={bool(_existing_dev_tok)}"
+            )
+        except Exception as e:
+            alog(
+                "install: credential preservation check failed "
+                f"{type(e).__name__}: {e}"
+            )
 
         # 3) Persist ApiBase into LS hive for the running service
         try:

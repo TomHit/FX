@@ -5303,17 +5303,87 @@ def zone_reversal_gate(
     gate["min_cap"] = float(min_cap)
     gate["zone_tf"] = zone_tf
     gate["dist_gate_model"] = "ZONE_BAND_ACTIONABLE_DISTANCE_CAP"
-
+    
     # Protect CONFIRMED/ACTIVE states from the too-far reset — these zones
     # are held until invalidation/confirmation, never reset on distance.
     # Unconfirmed WATCH/REV_WATCH are NOT protected: a zone price has fled
     # far from, before any confirmation, should reset for rediscovery.
     _frozen_state = False
+    _point_a_rc_rearm_pending = False
+
     if isinstance(watch, dict):
-        _wst = str(watch.get("state") or "").upper()
-        _frozen_state = _wst in (
-            "REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE",
+        _wst = str(
+            watch.get("state") or ""
+        ).upper().strip()
+
+        # ------------------------------------------------------------
+        # Point-A PRICE_TOO_FAR RC re-arm protection.
+        #
+        # Ordinary WATCH / REV_WATCH remain distance-evictable.
+        #
+        # But when Point-A explicitly retired only the stale RC because
+        # PRICE_TOO_FAR was reached, the underlying H1 structural watch
+        # must survive price distance/consolidation so that a genuinely
+        # newer RC can form later.
+        #
+        # This does NOT protect the setup from normal structural
+        # invalidation. It protects only this FAR-ZONE distance reset.
+        # ------------------------------------------------------------
+        _point_a_rc_rearm_pending = bool(
+            _wst == "REV_WATCH"
+            and str(
+                watch.get(
+                    "point_a_rc_rearm_reason"
+                )
+                or ""
+            ).upper().strip()
+            == "PRICE_TOO_FAR"
+            and int(
+                watch.get(
+                    "point_a_last_retired_rc_ms"
+                )
+                or 0
+            ) > 0
         )
+
+        _frozen_state = bool(
+            _wst in (
+                "REV_OK",
+                "ENTRY_READY",
+                "ORDER_PENDING",
+                "TRADE_ACTIVE",
+            )
+            or _point_a_rc_rearm_pending
+        )
+    if debug_gate:
+        gate["dbg_point_a_rc_rearm_pending"] = bool(
+            _point_a_rc_rearm_pending
+        )
+
+        if _point_a_rc_rearm_pending:
+            gate["dbg_point_a_rc_rearm"] = {
+                "reason": str(
+                    watch.get(
+                        "point_a_rc_rearm_reason"
+                    )
+                    or ""
+                ),
+                "retired_rc_ms": int(
+                    watch.get(
+                        "point_a_last_retired_rc_ms"
+                    )
+                    or 0
+                ),
+                "rearm_at_ms": int(
+                    watch.get(
+                        "point_a_rc_rearm_at_ms"
+                    )
+                    or 0
+                ),
+                "distance": float(dist),
+                "max_distance": float(max_dist),
+            }
+
 
     if dist > (max_dist + eps) and not _frozen_state:
         # ------------------------------------------------------------
@@ -5732,14 +5802,40 @@ def zone_reversal_gate(
         # ------------------------------------------------------------
         try:
             _cur_closed_ms = int(closed_ms or 0)
-            _old_rev_ms = int(watch.get("rev_ok_ms") or 0)
+            
+
+            _dir = str(watch.get("direction") or resolved_dir).upper()
+            _old_rev_ms = int(
+                watch.get("rev_ok_ms") or 0
+            )
+
+            # ---------------------------------------------------------
+            # Point-A PRICE_TOO_FAR RC retirement floor.
+            #
+            # PRICE_TOO_FAR may intentionally clear rev_ok_ms while
+            # preserving the underlying H1 structural watch. In that
+            # case the retired RC must NEVER be rediscovered as a
+            # "fresh" RC during the next REV_WATCH scan.
+            #
+            # Therefore RC candidates must be strictly newer than both:
+            #   1) current rev_ok_ms, if any
+            #   2) last Point-A-retired RC close timestamp
+            # ---------------------------------------------------------
+            _retired_rc_floor_ms = int(
+                watch.get(
+                    "point_a_last_retired_rc_ms"
+                )
+                or 0
+            )
+
+            _rc_floor_ms = max(
+                int(_old_rev_ms),
+                int(_retired_rc_floor_ms),
+            )
 
             _newer_rc = False
             _rc_reject_reason = None
             _best_rc = None
-
-            _dir = str(watch.get("direction") or resolved_dir).upper()
-
             # P1 FIX:
             # Do not check only the latest/current closed candle.
             # Scan all completed bars after old rev_ok_ms and pick the latest valid RC.
@@ -5793,7 +5889,7 @@ def zone_reversal_gate(
                         continue
                     if (
                         _b_close_ms
-                        <= int(_old_rev_ms or 0)
+                        <= int(_rc_floor_ms or 0)
                     ):
                         continue
 
@@ -5874,8 +5970,12 @@ def zone_reversal_gate(
                 )
             else:
                 _rc_reject_reason = {
-                    "need": "latest valid RC after old_rev_ok_ms",
+                    "need": "latest valid RC after rc_floor_ms",
                     "old_rev_ok_ms": int(_old_rev_ms),
+                    "retired_rc_floor_ms": int(
+                        _retired_rc_floor_ms
+                    ),
+                    "rc_floor_ms": int(_rc_floor_ms),
                     "latest_closed_ms": int(_cur_closed_ms),
                     "direction": str(_dir),
                     "zone_low": float(zl),
@@ -6000,6 +6100,29 @@ def zone_reversal_gate(
                     _cur_closed_ms
                 )
                 watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
+                # ---------------------------------------------------------
+                # Fresh RC has now replaced the Point-A-retired RC.
+                #
+                # Clear only the ACTIVE re-arm lifecycle markers.
+                # Keep point_a_last_retired_rc_ms / trigger / cross_ms
+                # for audit and as the permanent lower RC floor.
+                # ---------------------------------------------------------
+                watch.pop(
+                    "point_a_rc_rearm_reason",
+                    None,
+                )
+                watch.pop(
+                    "point_a_rc_rearm_at_ms",
+                    None,
+                )
+                watch.pop(
+                    "point_a_rc_rearm_missed_r",
+                    None,
+                )
+                watch.pop(
+                    "point_a_rc_rearm_displacement_atr",
+                    None,
+                )
                 # Refreshed RC closed after old rev_ok_ms, so it can never
                 # be the original touch candle — keep the flag accurate.
                 watch["rc_is_touch_candle"] = False
@@ -6642,6 +6765,15 @@ def zone_reversal_gate(
         )
         and (_min_reclaim <= 0 or int(closed_ms or 0) >= int(_min_reclaim))
     )
+    try:
+        _rev_watch_retired_rc_floor_ms = int(
+            (watch or {}).get(
+                "point_a_last_retired_rc_ms"
+            )
+            or 0
+        )
+    except Exception:
+        _rev_watch_retired_rc_floor_ms = 0
     # Scan ALL closed bars after freeze for RC — not just last picked bar
     # This finds the FIRST bar after freeze that meets RC condition
     import time as _t6
@@ -6666,6 +6798,14 @@ def zone_reversal_gate(
             # Same-touch candle is valid:
             # its open can be BEFORE freeze, but its close must be the touch_close_ms.
             _sb_cm = int(_sb_om) + int(tf_ms)
+            # Point-A PRICE_TOO_FAR retired RC must never
+            # become the RC again during REV_WATCH re-arm.
+            if (
+                _rev_watch_retired_rc_floor_ms > 0
+                and int(_sb_cm)
+                <= int(_rev_watch_retired_rc_floor_ms)
+            ):
+                continue
             _touch_close_ms_scan = int((watch or {}).get("touch_close_ms") or 0)
             _same_touch_scan = bool(
                 _touch_close_ms_scan > 0
@@ -6823,6 +6963,24 @@ def zone_reversal_gate(
             watch["rc_low"] = float(lo)
             watch["rc_close"] = float(cl)
             watch["trigger_level"] = float(lo) if _dir_for_trigger == "SELL" else float(hi)
+            # Fresh RC has completed Point-A PRICE_TOO_FAR re-arm.
+            # Keep retired-RC history/floor, clear only active marker.
+            watch.pop(
+                "point_a_rc_rearm_reason",
+                None,
+            )
+            watch.pop(
+                "point_a_rc_rearm_at_ms",
+                None,
+            )
+            watch.pop(
+                "point_a_rc_rearm_missed_r",
+                None,
+            )
+            watch.pop(
+                "point_a_rc_rearm_displacement_atr",
+                None,
+            )
             # POLICY: the touch candle itself is a valid RC if it closed
             # reclaiming the zone, even though its close time is <= watch
             # creation time. Persist WHY this RC was accepted so the

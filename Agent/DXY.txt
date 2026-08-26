@@ -1,0 +1,1182 @@
+# DXY 15
+
+#Find the DXY snapshot key
+export REDISCLI_AUTH='xau12345'
+
+redis-cli --scan --pattern 'xtl:ohlc:snap:*DXY*M15*'
+
+# View the latest 10 M15 candles
+
+redis-cli GET '<KEY>' |
+jq '.bars[-10:] | map({
+  time:.t,
+  open:.o,
+  high:.h,
+  low:.l,
+  close:.c
+})'
+
+#Check XTL's computed trend for DXY M15
+redis-cli --scan --pattern 'xtl:trend:*DXY*M15*'
+
+redis-cli GET '<TREND_KEY>' | jq .
+
+# Check DXY Support/Resistance
+redis-cli --scan --pattern 'xtl:sr:*DXY*'
+
+#Check the complete DXY bundle
+redis-cli GET xtl:sr:bundle:last_good:DXY | jq .
+
+#Detect exactly when the classifier changes
+
+export REDISCLI_AUTH='xau12345'
+
+DEV='dev_970a8ac0e6c745259e5b820a2e4c5d8a'
+
+LAST=""
+
+while true; do
+    K=$(redis-cli --scan \
+      --pattern "xtl:dxy:features:M15:REAL_DXY:${DEV}:*" \
+      | sort -t: -k7 -n | tail -1)
+
+    CUR=$(redis-cli GET "$K" | jq -r '.candidate_direction')
+
+    if [ "$CUR" != "$LAST" ]; then
+        echo
+        echo "=============================="
+        echo "$(date)"
+        echo "Direction changed:"
+        echo "$LAST  --->  $CUR"
+
+        redis-cli GET "$K" | jq '{
+            broker_bar_close_ms,
+            candidate_direction,
+            candidate_confidence,
+            recent_net_atr,
+            slope_5_atr,
+            acceleration_atr,
+            bullish_structure_break,
+            bearish_structure_break,
+            up_steps,
+            down_steps
+        }'
+
+        LAST="$CUR"
+    fi
+
+    sleep 30
+done
+
+
+#Use this improved validator. It prints whenever any of these change:
+
+classifier direction
+classifier confidence
+bullish structure break
+bearish structure break
+
+export REDISCLI_AUTH='xau12345'
+
+DEV='dev_970a8ac0e6c745259e5b820a2e4c5d8a'
+
+LAST_DIR=""
+LAST_CONF=""
+LAST_BULL_BREAK=""
+LAST_BEAR_BREAK=""
+LAST_KEY=""
+
+while true; do
+    K=$(
+        redis-cli --scan \
+          --pattern "xtl:dxy:features:H1:REAL_DXY:${DEV}:*" |
+        awk -F: '
+          BEGIN {
+            max = 0
+            key = ""
+          }
+          {
+            ts = $NF + 0
+            if (ts > max) {
+              max = ts
+              key = $0
+            }
+          }
+          END {
+            print key
+          }
+        '
+    )
+
+    if [ -z "$K" ]; then
+        echo "$(date -u) no DXY H1 feature key found"
+        sleep 30
+        continue
+    fi
+
+    RAW=$(redis-cli --raw GET "$K" 2>/dev/null)
+
+    if ! printf '%s\n' "$RAW" | jq -e . >/dev/null 2>&1; then
+        echo "$(date -u) invalid JSON key=$K"
+        sleep 30
+        continue
+    fi
+
+    DIR=$(printf '%s\n' "$RAW" |
+        jq -r '.candidate_direction // "UNKNOWN"')
+
+    CONF=$(printf '%s\n' "$RAW" |
+        jq -r '.candidate_confidence // 0')
+
+    BULL_BREAK=$(printf '%s\n' "$RAW" |
+        jq -r '.bullish_structure_break // false')
+
+    BEAR_BREAK=$(printf '%s\n' "$RAW" |
+        jq -r '.bearish_structure_break // false')
+
+    CHANGED=false
+
+    [ "$DIR" != "$LAST_DIR" ] && CHANGED=true
+    [ "$CONF" != "$LAST_CONF" ] && CHANGED=true
+    [ "$BULL_BREAK" != "$LAST_BULL_BREAK" ] && CHANGED=true
+    [ "$BEAR_BREAK" != "$LAST_BEAR_BREAK" ] && CHANGED=true
+
+    # Also print once for every newly published M15 snapshot.
+    if [ "$K" != "$LAST_KEY" ]; then
+        NEW_BAR=true
+    else
+        NEW_BAR=false
+    fi
+
+    if [ "$CHANGED" = true ] || [ "$NEW_BAR" = true ]; then
+        echo
+        echo "=================================================="
+        echo "UTC time: $(date -u)"
+        echo "Key: $K"
+        echo
+        echo "Previous:"
+        echo "  direction=$LAST_DIR"
+        echo "  confidence=$LAST_CONF"
+        echo "  bullish_break=$LAST_BULL_BREAK"
+        echo "  bearish_break=$LAST_BEAR_BREAK"
+        echo
+        echo "Current:"
+
+        printf '%s\n' "$RAW" |
+        jq '{
+          source,
+          device_id,
+          broker_bar_open_ms,
+          broker_bar_close_ms,
+          bar_close_ms,
+          detected_at_ms,
+
+          candidate_direction,
+          candidate_confidence,
+
+          bullish_structure_break,
+          bearish_structure_break,
+
+          recent_net_atr,
+          prior_net_atr,
+          slope_5_atr,
+          prior_slope_5_atr,
+          slope_12_atr,
+          acceleration_atr,
+
+          up_steps,
+          down_steps,
+          bullish_bodies,
+          bearish_bodies,
+
+          pin_bar_direction,
+          bullish_pin_score,
+          bearish_pin_score,
+
+          compression_ratio,
+          expansion_ratio,
+          body_ratio,
+
+          nearest_H1_support:
+            .sr_audit.H1.nearest_support,
+
+          nearest_H1_resistance:
+            .sr_audit.H1.nearest_resistance
+        }'
+
+        if [ "$BULL_BREAK" = true ] &&
+           [ "$LAST_BULL_BREAK" != true ]; then
+            echo
+            echo ">>> NEW BULLISH STRUCTURE BREAK"
+        fi
+
+        if [ "$BEAR_BREAK" = true ] &&
+           [ "$LAST_BEAR_BREAK" != true ]; then
+            echo
+            echo ">>> NEW BEARISH STRUCTURE BREAK"
+        fi
+
+        if [ "$DIR" != "$LAST_DIR" ]; then
+            echo
+            echo ">>> CLASSIFIER CHANGE: $LAST_DIR -> $DIR"
+        fi
+
+        if [ "$NEW_BAR" = true ]; then
+            echo
+            echo ">>> NEW H1 SNAPSHOT"
+        fi
+    fi
+
+    LAST_DIR="$DIR"
+    LAST_CONF="$CONF"
+    LAST_BULL_BREAK="$BULL_BREAK"
+    LAST_BEAR_BREAK="$BEAR_BREAK"
+    LAST_KEY="$K"
+
+    sleep 30
+done
+
+
+***********************************
+#audit
+
+export REDISCLI_AUTH='xau12345'
+
+T=513077017
+
+echo "================ BROKER DEAL ================"
+redis-cli GET "xtl:mt5:deal:$T" | jq .
+
+echo
+echo "================ ANALYTICS ================"
+redis-cli GET "xtl:analytics:trade:$T" | jq .
+
+echo
+echo "================ CLOSED TRADE ================"
+redis-cli --scan --pattern 'xtl:strategy:oppt:closed:*' |
+while read K
+do
+    redis-cli HVALS "$K"
+done |
+jq -c --arg t "$T" '
+select(
+    (
+        .mt5_ticket
+        // .ticket
+        // .position_id
+        | tostring
+    )==$t
+)'
+
+
+***************************
+
+redis-cli -a xau12345 GET \
+'xtl:zone:watch:f3a3cf2e-6095-495c-a5fd-94227948cd3a:XAUUSD:SELL:H1' \
+| jq '{
+  state,
+  point_a,
+  rc_trigger_crossed_ms,
+  rc_trigger_cross_price,
+  trigger_level
+}'
+
+
+*********************************
+# point A block trade check command 
+
+journalctl -u xauapi -f \
+| grep -E "POINT_A.*(EVAL|BLOCK_PERSISTED|BLOCK_RELEASED_RESET|BLOCK_IMMEDIATE_RELEASE_FAILED)|ERROR|Traceback"
+
+
+# redis sanity check after block:
+
+for k in $(redis-cli -a xau12345 --scan \
+  --pattern 'xtl:zone:watch:*:USDCHF:BUY:H1' 2>/dev/null); do
+
+  echo "KEY=$k"
+  redis-cli -a xau12345 --raw GET "$k" 2>/dev/null \
+  | jq '{
+      state,
+      trade_state,
+      rev_ok,
+      point_a_decision,
+      point_a_reason
+    }'
+done
+
+
+# DXY check
+
+UID_DXY='2c600182-39bc-4642-82aa-43ba39266025'
+DEV_DXY='dev_fb70471c06da4d00b68d54648279e0ac'
+
+echo "===== REAL DXY ====="
+redis-cli -a xau12345 --raw GET \
+"xtl:dxy:turn:state:M15:REAL_DXY:${DEV_DXY}" \
+| jq '{
+    source,
+    device_id,
+    status,
+    direction,
+    candidate_direction,
+    last_evaluated_bar_close_ms,
+    candidate_started_ms,
+    updated_ms,
+    detected_at_ms,
+    features:{
+        bar_close_ms:.features.bar_close_ms,
+        broker_bar_close_ms:.features.broker_bar_close_ms,
+        candidate_direction:.features.candidate_direction,
+        candidate_confidence:.features.candidate_confidence,
+        evidence_direction:.features.evidence_direction,
+        market_flow:.features.market_flow,
+        recent_net_atr:.features.recent_net_atr,
+        slope_5_atr:.features.slope_5_atr
+    }
+}'
+
+#H1
+cd /opt/xauapi
+
+DEV_DXY='dev_fb70471c06da4d00b68d54648279e0ac'
+
+K=$(
+  redis-cli -a xau12345 --scan 2>/dev/null \
+  | grep "xtl:dxy:features:H1:REAL_DXY:${DEV_DXY}:" \
+  | awk -F: '{print $NF, $0}' \
+  | sort -n \
+  | tail -1 \
+  | cut -d' ' -f2-
+)
+
+TURN_KEY="xtl:dxy:turn:state:H1:REAL_DXY:${DEV_DXY}"
+
+echo "FEATURE_KEY=$K"
+echo "TURN_KEY=$TURN_KEY"
+
+FEATURE=$(
+  redis-cli -a xau12345 --raw GET "$K" 2>/dev/null
+)
+
+TURN=$(
+  redis-cli -a xau12345 --raw GET "$TURN_KEY" 2>/dev/null
+)
+
+jq -n \
+  --argjson f "$FEATURE" \
+  --argjson t "$TURN" \
+'{
+  feature: {
+    bar_close_ms: $f.bar_close_ms,
+    candidate_direction: $f.candidate_direction,
+    candidate_confidence: $f.candidate_confidence,
+    evidence_direction: $f.evidence_direction,
+    recent_net_atr: $f.recent_net_atr,
+    prior_net_atr: $f.prior_net_atr,
+    slope_5_atr: $f.slope_5_atr,
+
+    flow: {
+      direction: $f.market_flow.direction,
+      strength: $f.market_flow.strength,
+      confidence: $f.market_flow.confidence,
+      stage: $f.market_flow.stage,
+      reason: $f.market_flow.reason
+    },
+
+    structure: {
+      price: $f.market_flow.structure.price,
+      nearest_support: $f.market_flow.structure.nearest_support,
+      nearest_resistance: $f.market_flow.structure.nearest_resistance,
+      room_up_atr: $f.market_flow.structure.room_up_atr,
+      room_down_atr: $f.market_flow.structure.room_down_atr,
+      directional_room_atr: $f.market_flow.structure.directional_room_atr,
+      structure_pressure: $f.market_flow.structure.structure_pressure
+    }
+  },
+
+  h1_turn: {
+    short_state: $t.short_state,
+    confidence: $t.confidence,
+    recent_net_atr: $t.recent_net_atr,
+    prior_net_atr: $t.prior_net_atr,
+    last_turn_direction: $t.last_turn_direction,
+    last_turn_ms: $t.last_turn_ms,
+    last_evaluated_bar_close_ms: $t.last_evaluated_bar_close_ms,
+    detected_at_ms: $t.detected_at_ms
+  }
+}'
+
+*****************************************************
+
+DEV="dev_45eeb26eaeef4b5bb4404f1be96c8ce4"
+
+echo "===== REAL DXY M15 TRACKER ====="
+redis-cli -a xau12345 GET \
+"xtl:dxy:turn:state:M15:REAL_DXY:${DEV}" 2>/dev/null \
+| jq '{
+  status,
+  direction,
+  last_evaluated_bar_close_ms,
+  broker_bar_close_ms,
+  detected_at_ms,
+  latest_feature_direction,
+  latest_feature_qualified
+}'
+
+echo
+echo "===== REAL DXY H1 FEATURE ====="
+redis-cli -a xau12345 GET \
+"xtl:dxy:features:latest:H1:REAL_DXY:${DEV}" 2>/dev/null \
+| jq '{
+  broker_bar_close_ms,
+  bar_close_ms,
+  bull_evidence_score,
+  bear_evidence_score,
+  evidence_direction
+}'
+
+*************************************************
+
+DEV='dev_2de805905764477f956320fa43d652e5'
+
+redis-cli -a xau12345 GET \
+"xtl:dxy:turn:state:M15:REAL_DXY:${DEV}" 2>/dev/null \
+| jq '{
+    status,
+    direction,
+    candidate_direction,
+    last_confirmed_direction,
+    support_bars,
+    confidence,
+    bull_score,
+    bear_score,
+    candidate_started_ms,
+    confirmed_ms,
+    market_flow: {
+        direction: .market_flow.direction,
+        strength: .market_flow.strength,
+        confidence: .market_flow.confidence,
+        stage: .market_flow.stage,
+        support_bars: .market_flow.support_bars,
+        opposite_bars: .market_flow.opposite_bars
+    }
+}'
+
+
+***************************************
+#SYMBOL check
+
+DEV_DXY='dev_b4e5f08fb8da41dcb662c82d09fbd8aa'
+BLOCK_MS=$(date -u -d '2026-08-12 14:45:51' +%s)000
+
+echo "BLOCK_MS=$BLOCK_MS"
+
+redis-cli -a xau12345 --raw LRANGE \
+"xtl:dxy:turn:history:M15:REAL_DXY:${DEV_DXY}" 0 -1 2>/dev/null \
+| jq -s --argjson t "$BLOCK_MS" '
+    map(
+      select(
+        (
+          .detected_at_ms
+          // .updated_ms
+          // .features.detected_at_ms
+          // .bar_close_ms
+          // .features.bar_close_ms
+          // 0
+        ) <= $t
+      )
+    )
+    | sort_by(
+        .detected_at_ms
+        // .updated_ms
+        // .features.detected_at_ms
+        // .bar_close_ms
+        // .features.bar_close_ms
+        // 0
+      )
+    | last
+    | {
+        source,
+        device_id,
+        status,
+        direction,
+        candidate_direction,
+        confidence,
+
+        detected_at_ms,
+        bar_close_ms,
+        last_evaluated_bar_close_ms,
+
+        feature_bar_close_ms:.features.bar_close_ms,
+        candidate:.features.candidate_direction,
+        candidate_confidence:.features.candidate_confidence,
+        evidence_direction:.features.evidence_direction,
+
+        market_flow:.features.market_flow,
+
+        recent_net_atr:.features.recent_net_atr,
+        slope_5_atr:.features.slope_5_atr,
+        slope_12_atr:.features.slope_12_atr,
+
+        structure_pressure:.features.market_flow.structure_pressure,
+        directional_room_atr:.features.market_flow.directional_room_atr,
+
+        nearest_support:.features.market_flow.structure.nearest_support,
+        nearest_resistance:.features.market_flow.structure.nearest_resistance
+      }
+'
+
+
+sudo bash -c '
+set -a
+source /etc/xauapi.env
+set +a
+
+cd /opt/xauapi
+
+/opt/xauapi/.venv/bin/python - <<'"'"'PY'"'"'
+import json
+from api.strategy.oppt_executor import R
+from api.zone_entry_gate import _dxy_sr_confirmation_analytics
+
+tests = [
+    ("EURUSD", "BUY"),
+    ("GBPUSD", "BUY"),
+    ("USDCAD", "BUY"),
+    ("USDCHF", "SELL"),
+    ("XAUUSD", "BUY"),
+    ("XAUUSD", "SELL"),
+]
+
+for sym, side in tests:
+    x = _dxy_sr_confirmation_analytics(
+        R=R,
+        device_id="dev_b4e5f08fb8da41dcb662c82d09fbd8aa",
+        symbol=sym,
+        side=side,
+        entry_ms=0,
+        profile_id="ftmo-main",
+    )
+
+    s = x.get("snapshot") or {}
+
+    print("\n" + "=" * 80)
+    print(sym, side)
+    print("=" * 80)
+
+    print(json.dumps({
+        "status": x.get("status"),
+        "reason_codes": x.get("reason_codes"),
+        "source": s.get("selected_source"),
+        "device": s.get("selected_device_id"),
+        "available": s.get("available"),
+        "fresh": s.get("fresh"),
+        "lifecycle": s.get("lifecycle_status"),
+        "dxy_direction": s.get("direction"),
+        "required_direction": s.get("required_direction_for_trade"),
+        "alignment": s.get("trade_alignment"),
+        "candidate_qualified": s.get("candidate_qualified"),
+        "analysis_direction": s.get("analysis_direction"),
+        "room_class": s.get("room_class"),
+        "structure_conflict": s.get("structure_conflict"),
+        "near_h1_support": s.get("near_h1_support"),
+        "near_h1_resistance": s.get("near_h1_resistance"),
+        "inside_h4_support": s.get("inside_h4_support"),
+        "inside_h4_resistance": s.get("inside_h4_resistance"),
+        "opposing_sr": s.get("opposing_sr_selection"),
+    }, indent=2, default=str))
+PY
+'
+
+******************************************************************
+sudo bash -c '
+set -a
+source /etc/xauapi.env
+set +a
+cd /opt/xauapi
+
+/opt/xauapi/.venv/bin/python - <<'"'"'PY'"'"'
+import json
+import os
+import redis
+
+from api.dxy_m15_tracker import read_dxy_m15_state
+
+R = redis.Redis.from_url(
+    os.environ["REDIS_URL"],
+    decode_responses=True,
+)
+
+dev = "dev_b4e5f08fb8da41dcb662c82d09fbd8aa"
+
+x = read_dxy_m15_state(
+    R,
+    "REAL_DXY",
+    dev,
+)
+
+f = x.get("features") if isinstance(x.get("features"), dict) else {}
+
+print("========== TOP LEVEL ==========")
+print(json.dumps({
+    "keys": sorted(x.keys()),
+    "source": x.get("source"),
+    "device_id": x.get("device_id"),
+    "status": x.get("status"),
+    "direction": x.get("direction"),
+    "candidate_direction": x.get("candidate_direction"),
+    "last_confirmed_direction": x.get("last_confirmed_direction"),
+    "candidate_started_ms": x.get("candidate_started_ms"),
+    "confirmed_ms": x.get("confirmed_ms"),
+    "last_evaluated_bar_close_ms": x.get("last_evaluated_bar_close_ms"),
+    "detected_at_ms": x.get("detected_at_ms"),
+    "updated_ms": x.get("updated_ms"),
+    "candidate_qualified": x.get("candidate_qualified"),
+    "trade_alignment": x.get("trade_alignment"),
+}, indent=2, default=str))
+
+print("\n========== FEATURES ==========")
+print(json.dumps({
+    "keys": sorted(f.keys()),
+    "bar_close_ms": f.get("bar_close_ms"),
+    "broker_bar_close_ms": f.get("broker_bar_close_ms"),
+    "candidate_direction": f.get("candidate_direction"),
+    "candidate_confidence": f.get("candidate_confidence"),
+    "evidence_direction": f.get("evidence_direction"),
+    "candidate_qualified": f.get("candidate_qualified"),
+    "atr": f.get("atr"),
+    "atr_m15": f.get("atr_m15"),
+    "price": f.get("price"),
+    "close": f.get("close"),
+    "market_flow": f.get("market_flow"),
+}, indent=2, default=str))
+
+print("\n========== SR ==========")
+print(json.dumps(
+    f.get("sr"),
+    indent=2,
+    default=str,
+))
+PY
+'
+
+***************************
+
+cd /opt/xauapi
+
+/opt/xauapi/.venv/bin/python - <<'PY'
+import json
+from api.strategy.oppt_executor import R
+from api.zone_entry_gate import _dxy_sr_confirmation_analytics
+
+x = _dxy_sr_confirmation_analytics(
+    R=R,
+    device_id="dev_b4e5f08fb8da41dcb662c82d09fbd8aa",
+    symbol="USDCAD",
+    side="BUY",
+    entry_ms=0,
+    profile_id="ftmo-main",
+)
+
+print(json.dumps(x, indent=2, default=str))
+PY
+***********************************
+
+#monitor trade status
+journalctl -u xauapi -f \
+| grep -E "POINT_A.*EVAL|BLOCK_RELEASED_RESET|ERROR|Traceback"
+
+
+*************************
+echo "===== USDCHF WATCH ====="
+redis-cli -a xau12345 GET 'xtl:zone:watch:USDCHF:BUY:H1' | jq '{
+  direction,
+  state,
+  rev_ok_ms,
+  rc_high,
+  rc_low,
+  rc_close,
+  trigger_level,
+  entry_triggered,
+  entry_triggered_ms
+}'
+
+redis-cli -a xau12345 GET 'xtl:zone:watch:USDCHF:SELL:H1' | jq '{
+  direction,
+  state,
+  rev_ok_ms,
+  rc_high,
+  rc_low,
+  rc_close,
+  trigger_level,
+  entry_triggered,
+  entry_triggered_ms
+}'
+
+
+*************************************
+cd /opt/xauapi
+
+REDIS_URL='redis://:xau12345@127.0.0.1:6379/0' \
+/opt/xauapi/.venv/bin/python - <<'PY'
+import json
+from api.strategy.oppt_executor import R
+from api.dxy_m15_tracker import read_dxy_m15_state
+
+raw = R.get("xtl:dxy:canonical")
+canonical = json.loads(raw) if raw else {}
+dev = canonical.get("device_id") or canonical.get("real_device_id")
+
+state = read_dxy_m15_state(
+    R,
+    "REAL_DXY",
+    dev,
+)
+
+print("CANONICAL:")
+print(json.dumps(canonical, indent=2))
+
+print("\nREAL_DXY_STATE:")
+print(json.dumps({
+    "status": state.get("status"),
+    "direction": state.get("direction"),
+    "trade_alignment": state.get("trade_alignment"),
+    "revoke_score": state.get("revoke_score"),
+    "revoke_reasons": state.get("revoke_reasons"),
+    "latest_feature_direction": state.get("latest_feature_direction"),
+    "latest_feature_qualified": state.get("latest_feature_qualified"),
+    "latest_qualification_reason": state.get("latest_qualification_reason"),
+    "last_evaluated_bar_close_ms": state.get("last_evaluated_bar_close_ms"),
+}, indent=2))
+PY
+
+*********************************************************************************************
+cd /opt/xauapi
+
+REDIS_URL='redis://:xau12345@127.0.0.1:6379/0' \
+/opt/xauapi/.venv/bin/python - <<'PY'
+import json
+from datetime import datetime, timezone
+
+from api.strategy.oppt_executor import R
+from api.dxy_m15_tracker import (
+    read_dxy_m15_state,
+    _load_native_real_dxy_htf_bars,
+    _bars_to_sr_frame,
+    DXY_NATIVE_H1_MAX_BARS,
+    DXY_NATIVE_H4_MAX_BARS,
+    DXY_SR_PIP_FACTOR,
+)
+from api.trend_sr import (
+    summarize_sr_multi_tf,
+    build_market_structure_state,
+)
+
+H1_MIN_SCORE = 40
+H1_MIN_MARGIN = 20
+
+def dec(x):
+    if isinstance(x,(bytes,bytearray)):
+        x=x.decode("utf-8","replace")
+    try:
+        return json.loads(x or "{}")
+    except:
+        return {}
+
+def ts(ms):
+    return datetime.fromtimestamp(
+        int(ms)/1000,
+        tz=timezone.utc,
+    ).strftime("%Y-%m-%d %H:%M:%S UTC") if ms else None
+
+c=dec(R.get("xtl:dxy:canonical"))
+dev=c.get("device_id") or c.get("real_device_id")
+
+m=read_dxy_m15_state(R,"REAL_DXY",dev) or {}
+f=m.get("features") or {}
+
+cutoff=int(
+    f.get("bar_close_ms")
+    or f.get("broker_bar_close_ms")
+    or m.get("last_evaluated_bar_close_ms")
+    or 0
+)
+
+old=((f.get("market_flow") or {}).get("structure") or {})
+px=float(old.get("price") or 0)
+
+h1f=dec(R.get(
+    f"xtl:dxy:features:latest:H1:REAL_DXY:{dev}"
+))
+
+bull=int(h1f.get("bull_evidence_score") or 0)
+bear=int(h1f.get("bear_evidence_score") or 0)
+margin=abs(bull-bear)
+
+if bull >= H1_MIN_SCORE and bull-bear >= H1_MIN_MARGIN:
+    h1_dir="BULLISH"
+elif bear >= H1_MIN_SCORE and bear-bull >= H1_MIN_MARGIN:
+    h1_dir="BEARISH"
+else:
+    h1_dir="NEUTRAL"
+
+m15_dir=str(m.get("direction") or "NEUTRAL").upper()
+
+if h1_dir in ("BULLISH","BEARISH") and m15_dir == h1_dir:
+    combined="AGREE"
+    combined_dir=h1_dir
+elif h1_dir in ("BULLISH","BEARISH") and m15_dir in ("BULLISH","BEARISH"):
+    combined="CONFLICT"
+    combined_dir="NEUTRAL"
+else:
+    combined="DEVELOPING"
+    combined_dir="NEUTRAL"
+
+h1=_load_native_real_dxy_htf_bars(
+    device_id=dev,tf="H1",cutoff_ms=cutoff,
+    max_bars=DXY_NATIVE_H1_MAX_BARS,
+)
+
+h4=_load_native_real_dxy_htf_bars(
+    device_id=dev,tf="H4",cutoff_ms=cutoff,
+    max_bars=DXY_NATIVE_H4_MAX_BARS,
+)
+
+bundle=summarize_sr_multi_tf(
+    symbol=f"REAL_DXY:{dev}",
+    price=px,
+    h1_df=_bars_to_sr_frame(h1),
+    h4_df=_bars_to_sr_frame(h4),
+    pip_factor=DXY_SR_PIP_FACTOR,
+    cache=None,
+)
+
+# For chart diagnostics use the combined direction when confirmed.
+# Otherwise use NEUTRAL so structure shows nearest pressure both ways.
+structure=build_market_structure_state(
+    bundle,
+    price=px,
+    flow_direction=(
+        combined_dir
+        if combined == "AGREE"
+        else "NEUTRAL"
+    ),
+)
+
+ns=structure.get("nearest_support") or {}
+nr=structure.get("nearest_resistance") or {}
+
+print("\n===== XTL DXY LIVE DIAGNOSTIC =====")
+print("price             =",px)
+print("cutoff            =",ts(cutoff))
+
+print("\n--- H1 ---")
+print("bull / bear       =",bull,"/",bear)
+print("margin            =",margin)
+print("H1 direction      =",h1_dir)
+
+print("\n--- M15 ---")
+print("status            =",m.get("status"))
+print("M15 direction     =",m15_dir)
+print("recent net ATR    =",f.get("recent_net_atr"))
+
+print("\n--- COMBINED ---")
+print("state             =",combined)
+print("direction         =",combined_dir)
+
+print("\n--- STRUCTURE ---")
+print("pressure          =",structure.get("structure_pressure"))
+print("reason            =",structure.get("structure_pressure_reason"))
+print("directional room  =",structure.get("directional_room_atr"))
+print("inside support    =",bool(structure.get("inside_support")))
+print("inside resistance =",bool(structure.get("inside_resistance")))
+
+print("\n--- SUPPORT ---")
+print("level             =",ns.get("level"))
+print("zone              =",ns.get("low"),"-",ns.get("high"))
+print("TF                =",ns.get("tf"))
+print("distance ATR      =",ns.get("distance_atr"))
+
+print("\n--- RESISTANCE ---")
+print("level             =",nr.get("level"))
+print("zone              =",nr.get("low"),"-",nr.get("high"))
+print("TF                =",nr.get("tf"))
+print("distance ATR      =",nr.get("distance_atr"))
+
+print()
+PY
+
+
+********************************************************************************************************
+
+cd /opt/xauapi
+
+REDIS_URL='redis://:xau12345@127.0.0.1:6379/0' \
+/opt/xauapi/.venv/bin/python - <<'PY'
+import json
+import time
+
+from api.strategy.oppt_executor import R
+from api.zone_entry_gate import _dxy_sr_confirmation_analytics
+
+DEV = "dev_2de805905764477f956320fa43d652e5"
+
+r = _dxy_sr_confirmation_analytics(
+    R=R,
+    device_id=DEV,
+    symbol="XAUUSD",
+    side="SELL",
+    entry_ms=int(time.time() * 1000),
+    profile_id="ftmo-main",
+)
+
+s = r.get("snapshot") or {}
+
+print("===== BASIC =====")
+for k in (
+    "canonical_price",
+    "canonical_structure_pressure",
+    "canonical_structure_pressure_reason",
+    "canonical_directional_room_atr",
+    "canonical_inside_support",
+    "canonical_inside_resistance",
+    "canonical_inside_opposing",
+    "canonical_sr_risk",
+):
+    print(f"{k:40} = {s.get(k)}")
+
+print("\n===== OPPOSING SELECTION =====")
+print(json.dumps(
+    s.get("opposing_sr_selection"),
+    indent=2,
+    default=str,
+))
+
+print("\n===== SNAPSHOT KEYS CONTAINING SR/STRUCTURE =====")
+for k in sorted(s):
+    if any(x in k.lower() for x in (
+        "support",
+        "resistance",
+        "structure",
+        "opposing",
+        "room",
+        "price",
+    )):
+        print(f"\n{k}:")
+        print(json.dumps(s.get(k), indent=2, default=str))
+PY
+*****************************************************************************************************
+*******************************************************************************************************
+cd /opt/xauapi
+
+REDIS_URL='redis://:xau12345@127.0.0.1:6379/0' \
+/opt/xauapi/.venv/bin/python - <<'PY'
+import json
+from api.strategy.oppt_executor import R
+
+DEV="dev_2de805905764477f956320fa43d652e5"
+
+patterns = [
+    f"xtl:dxy:sr:bundle:last_good:M15:REAL_DXY:{DEV}",
+    f"xtl:dxy:sr:bundle:last_good:H1:REAL_DXY:{DEV}",
+]
+
+for key in patterns:
+    raw = R.get(key)
+    if not raw:
+        continue
+
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+
+    try:
+        x = json.loads(raw)
+    except Exception:
+        continue
+
+    print("\n========================================")
+    print("KEY =", key)
+    print("========================================")
+
+    def walk(v, path="root"):
+        if isinstance(v, dict):
+            lvl = v.get("level")
+            try:
+                is_654 = (
+                    lvl is not None
+                    and abs(float(lvl) - 99.654) < 0.002
+                )
+            except Exception:
+                is_654 = False
+
+            if is_654:
+                print("\nFOUND:", path)
+                print(json.dumps(v, indent=2, default=str))
+
+            for k, vv in v.items():
+                walk(vv, f"{path}.{k}")
+
+        elif isinstance(v, list):
+            for i, vv in enumerate(v):
+                walk(vv, f"{path}[{i}]")
+
+    walk(x)
+PY
+*********************************************************************************************************
+cd /opt/xauapi
+
+REDIS_URL='redis://:xau12345@127.0.0.1:6379/0' \
+/opt/xauapi/.venv/bin/python - <<'PY'
+import json
+
+from api.strategy.oppt_executor import R
+from api.dxy_m15_tracker import (
+    read_dxy_m15_state,
+    _load_native_real_dxy_htf_bars,
+    _bars_to_sr_frame,
+    DXY_NATIVE_H1_MAX_BARS,
+    DXY_NATIVE_H4_MAX_BARS,
+    DXY_SR_PIP_FACTOR,
+)
+from api.trend_sr import summarize_sr_multi_tf, build_market_structure_state
+
+c = json.loads(R.get("xtl:dxy:canonical") or "{}")
+DEV = c.get("device_id") or c.get("real_device_id")
+
+m15 = read_dxy_m15_state(R, "REAL_DXY", DEV)
+f = m15.get("features") or {}
+mf = f.get("market_flow") or {}
+live_structure = mf.get("structure") or {}
+
+PX = float(live_structure.get("price") or 0)
+CUTOFF = int(
+    f.get("bar_close_ms")
+    or f.get("broker_bar_close_ms")
+    or m15.get("last_evaluated_bar_close_ms")
+    or 0
+)
+
+h1 = _load_native_real_dxy_htf_bars(
+    device_id=DEV,
+    tf="H1",
+    cutoff_ms=CUTOFF,
+    max_bars=DXY_NATIVE_H1_MAX_BARS,
+)
+
+h4 = _load_native_real_dxy_htf_bars(
+    device_id=DEV,
+    tf="H4",
+    cutoff_ms=CUTOFF,
+    max_bars=DXY_NATIVE_H4_MAX_BARS,
+)
+
+bundle = summarize_sr_multi_tf(
+    symbol=f"REAL_DXY:{DEV}",
+    price=PX,
+    h1_df=_bars_to_sr_frame(h1),
+    h4_df=_bars_to_sr_frame(h4),
+    pip_factor=DXY_SR_PIP_FACTOR,
+    cache=None,
+)
+
+structure = build_market_structure_state(
+    bundle,
+    price=PX,
+    flow_direction=str(m15.get("direction") or "NEUTRAL"),
+)
+
+def in_band(z):
+    if not isinstance(z, dict):
+        return False
+    vals = [
+        z.get("level"),
+        z.get("low"),
+        z.get("high"),
+        z.get("price"),
+    ]
+    vals = [float(x) for x in vals if isinstance(x, (int,float))]
+    return bool(vals) and max(vals) >= 99.60 and min(vals) <= 99.75
+
+def slim(z):
+    return {
+        "tf": z.get("tf") or z.get("source_tf"),
+        "level": z.get("level") or z.get("price"),
+        "low": z.get("low"),
+        "high": z.get("high"),
+        "source_type": z.get("source_type"),
+        "source_role": z.get("source_role"),
+        "flip_source": z.get("flip_source"),
+        "touches": z.get("touches"),
+        "strength": z.get("strength"),
+        "sr_score": z.get("sr_score"),
+        "distance": z.get("distance"),
+        "distance_atr": z.get("distance_atr"),
+        "broken": z.get("broken"),
+        "stale": z.get("stale"),
+        "active": z.get("active"),
+    }
+
+print("===== CURRENT BOUNDARY =====")
+print(json.dumps({
+    "device": DEV,
+    "cutoff_ms": CUTOFF,
+    "price": PX,
+    "m15_direction": m15.get("direction"),
+    "h1_bars": len(h1),
+    "h4_bars": len(h4),
+    "atr": bundle.get("atr"),
+}, indent=2))
+
+sections = [
+    ("H1 RESISTANCES", (bundle.get("h1") or {}).get("resistances") or []),
+    ("H1 MAJOR", (bundle.get("h1") or {}).get("resistances_major") or []),
+    ("H4 RESISTANCES", (bundle.get("h4") or {}).get("resistances") or []),
+    ("H4 MAJOR", (bundle.get("h4") or {}).get("resistances_major") or []),
+    ("SR INVENTORY", bundle.get("sr_inventory") or []),
+    ("ACTIVE RESISTANCES", structure.get("active_resistances") or []),
+]
+
+for name, xs in sections:
+    print(f"\n===== {name} 99.60-99.75 =====")
+    rows = [slim(x) for x in xs if in_band(x)]
+    print(json.dumps(rows, indent=2))
+
+print("\n===== FINAL STRUCTURE =====")
+print(json.dumps({
+    "nearest_resistance": structure.get("nearest_resistance"),
+    "resistance_path": [
+        slim(x)
+        for x in (structure.get("resistance_path") or [])
+        if in_band(x)
+    ],
+    "room_up_atr": structure.get("room_up_atr"),
+    "directional_room_atr": structure.get("directional_room_atr"),
+    "structure_pressure": structure.get("structure_pressure"),
+    "structure_pressure_reason": structure.get("structure_pressure_reason"),
+}, indent=2))
+
+print("\n===== 99.688 VERDICT =====")
+hits = []
+for name, xs in sections:
+    for x in xs:
+        if not isinstance(x, dict):
+            continue
+        lo = x.get("low")
+        hi = x.get("high")
+        lv = x.get("level") or x.get("price")
+        try:
+            if (
+                (lo is not None and hi is not None and float(lo) <= 99.688 <= float(hi))
+                or (lv is not None and abs(float(lv)-99.688) <= 0.025)
+            ):
+                hits.append({
+                    "stage": name,
+                    **slim(x),
+                })
+        except Exception:
+            pass
+
+print(json.dumps(hits, indent=2))
+PY
+

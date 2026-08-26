@@ -1,4 +1,1513 @@
-# status
+#3 next SR for each symbols
+
+
+cd /opt/xauapi
+
+/opt/xauapi/.venv/bin/python - <<'PY'
+import json
+import redis
+
+from api.tenant_keys import zone_watch_key
+
+UID = "f3a3cf2e-6095-495c-a5fd-94227948cd3a"
+
+SYMBOLS = [
+    "EURUSD",
+]
+
+R = redis.Redis(
+    host="127.0.0.1",
+    port=6379,
+    password="xau12345",
+    decode_responses=True,
+)
+
+def get_json(key):
+    raw = R.get(key)
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+def num(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+def zone_bounds(z):
+    """
+    Return (low, high) from whatever band fields exist.
+    Fall back to level when bundle has only a point level.
+    """
+    level = num(z.get("level"))
+
+    low = (
+        num(z.get("zone_low"))
+        or num(z.get("band_low"))
+        or num(z.get("low"))
+    )
+
+    high = (
+        num(z.get("zone_high"))
+        or num(z.get("band_high"))
+        or num(z.get("high"))
+    )
+
+    if low is None:
+        low = level
+
+    if high is None:
+        high = level
+
+    if low is not None and high is not None and low > high:
+        low, high = high, low
+
+    return low, high
+
+def band_distance(price, z):
+    low, high = zone_bounds(z)
+
+    if price is None or low is None or high is None:
+        return None
+
+    if low <= price <= high:
+        return 0.0
+
+    if price < low:
+        return low - price
+
+    return price - high
+
+def collect_h1(bundle, side):
+    """
+    Prefer H1 *_near arrays because they represent the actionable
+    nearby structural candidates.
+
+    Fall back to regular supports/resistances if needed.
+    """
+    h1 = bundle.get("h1") or {}
+
+    keys = (
+        ["supports_near", "supports"]
+        if side == "SUPPORT"
+        else ["resistances_near", "resistances"]
+    )
+
+    rows = []
+
+    for key in keys:
+        arr = h1.get(key) or []
+
+        if not isinstance(arr, list):
+            continue
+
+        for z in arr:
+            if not isinstance(z, dict):
+                continue
+
+            if num(z.get("level")) is None:
+                continue
+
+            row = dict(z)
+            row["_source_list"] = key
+            rows.append(row)
+
+        if rows:
+            break
+
+    # deduplicate levels
+    dedup = {}
+
+    for z in rows:
+        lvl = num(z.get("level"))
+        if lvl is None:
+            continue
+
+        k = round(lvl, 8)
+
+        old = dedup.get(k)
+
+        if old is None:
+            dedup[k] = z
+            continue
+
+        old_sc = num(old.get("sr_score")) or 0.0
+        new_sc = num(z.get("sr_score")) or 0.0
+
+        if new_sc > old_sc:
+            dedup[k] = z
+
+    return list(dedup.values())
+
+def print_zone(i, z, price):
+    lvl = num(z.get("level"))
+    low, high = zone_bounds(z)
+    dist = band_distance(price, z)
+
+    print(
+        f"  #{i} "
+        f"level={lvl} "
+        f"band=[{low},{high}] "
+        f"band_dist={dist} "
+        f"score={z.get('sr_score')} "
+        f"strength={z.get('strength')} "
+        f"touches={z.get('touches')} "
+        f"source={z.get('source_type') or z.get('source')} "
+        f"flip={z.get('flip_source')} "
+        f"list={z.get('_source_list')}"
+    )
+
+for sym in SYMBOLS:
+    bundle_key = f"xtl:sr:bundle:last_good:{sym}"
+    bundle = get_json(bundle_key)
+
+    print()
+    print("=" * 110)
+    print(sym)
+    print("=" * 110)
+
+    if not bundle:
+        print("NO SR BUNDLE:", bundle_key)
+        continue
+
+    price = (
+        num(bundle.get("price"))
+        or num(bundle.get("current_price"))
+        or num((bundle.get("meta") or {}).get("price"))
+    )
+
+    print("PRICE =", price)
+    print("SR_KEY =", bundle_key)
+
+    supports = collect_h1(bundle, "SUPPORT")
+    resistances = collect_h1(bundle, "RESISTANCE")
+
+    supports.sort(
+        key=lambda z: (
+            band_distance(price, z)
+            if band_distance(price, z) is not None
+            else float("inf")
+        )
+    )
+
+    resistances.sort(
+        key=lambda z: (
+            band_distance(price, z)
+            if band_distance(price, z) is not None
+            else float("inf")
+        )
+    )
+
+    print()
+    print("NEXT 3 H1 SUPPORTS")
+    if supports:
+        for i, z in enumerate(supports[:3], 1):
+            print_zone(i, z, price)
+    else:
+        print("  NONE")
+
+    print()
+    print("NEXT 3 H1 RESISTANCES")
+    if resistances:
+        for i, z in enumerate(resistances[:3], 1):
+            print_zone(i, z, price)
+    else:
+        print("  NONE")
+
+    nearest_s = supports[0] if supports else None
+    nearest_r = resistances[0] if resistances else None
+
+    ds = (
+        band_distance(price, nearest_s)
+        if nearest_s
+        else None
+    )
+
+    dr = (
+        band_distance(price, nearest_r)
+        if nearest_r
+        else None
+    )
+
+    print()
+    print("===== FRESH LOCATION DECISION =====")
+    print("support_band_distance   =", ds)
+    print("resistance_band_distance=", dr)
+
+    if ds is None and dr is None:
+        fresh = "UNKNOWN"
+    elif dr is None:
+        fresh = "BUY"
+    elif ds is None:
+        fresh = "SELL"
+    elif ds < dr:
+        fresh = "BUY"
+    elif dr < ds:
+        fresh = "SELL"
+    else:
+        fresh = "TIE"
+
+    print("nearest-band fresh side =", fresh)
+
+    print()
+    print("===== EXISTING WATCHES =====")
+
+    for side in ("BUY", "SELL"):
+        key = zone_watch_key(
+            UID,
+            sym,
+            side,
+            "H1",
+        )
+
+        w = get_json(key)
+
+        if not w:
+            print(f"{side}: NONE")
+            continue
+
+        print(
+            f"{side}: "
+            f"state={w.get('state') or w.get('rev_state')} "
+            f"zone=[{w.get('zone_low')},{w.get('zone_high')}] "
+            f"trigger={w.get('entry_trigger') or w.get('trigger_level')} "
+            f"rev_ok_ms={w.get('rev_ok_ms')} "
+            f"point_a_state={w.get('point_a_state')} "
+            f"selection_model={w.get('selection_model')} "
+            f"direction_model={w.get('direction_model')}"
+        )
+PY
+******************************************************
+
+#all symbol gate and direction clean command
+
+cd /opt/xauapi
+sudo systemctl stop xauapi
+
+#inspect both open hashes before deleting any watches:
+
+for K in \
+'xtl:strategy:oppt:open:f3a3cf2e-6095-495c-a5fd-94227948cd3a' \
+'xtl:strategy:oppt:open:2c600182-39bc-4642-82aa-43ba39266025'
+do
+    echo
+    echo "===== $K ====="
+    redis-cli -a xau12345 HVALS "$K" 2>/dev/null \
+    | jq -c 'fromjson? // . |
+      {
+        symbol,
+        side,
+        trade_state,
+        status,
+        mt5_ticket,
+        broker_ticket,
+        mt5_job_id,
+        profile_id,
+        device_id,
+        trade_id
+      }'
+done
+
+#clean pending order 
+cd /opt/xauapi
+
+/opt/xauapi/.venv/bin/python - <<'PY'
+import json
+import redis
+
+R = redis.Redis(
+    host="127.0.0.1",
+    port=6379,
+    password="xau12345",
+    decode_responses=True,
+)
+
+JOBS = {
+    "mt5_3bad52b885e04e54a5a45ac488760ba6",
+    "mt5_547fa305b6b04268a309affd6adc0ce6",
+    "mt5_dba9fd9e8f0c442291d86a5f97c7c61a",
+}
+
+QUEUES = [
+    "xtl:mt5:cmdq:dev_cd84eab551d54a10a4ad161ec2752f91",
+    "xtl:mt5:cmdq:dev_2de805905764477f956320fa43d652e5",
+]
+
+OPEN_HASHES = [
+    "xtl:strategy:oppt:open:f3a3cf2e-6095-495c-a5fd-94227948cd3a",
+    "xtl:strategy:oppt:open:2c600182-39bc-4642-82aa-43ba39266025",
+]
+
+print("===== REMOVE STALE MT5 COMMANDS =====")
+
+for q in QUEUES:
+    rows = R.lrange(q, 0, -1) or []
+
+    for raw in rows:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+
+        job = str(obj.get("job_id") or "")
+
+        if job in JOBS:
+            deleted = R.lrem(q, 0, raw)
+
+            print(
+                "QUEUE_REMOVE",
+                q,
+                job,
+                "deleted=",
+                deleted,
+            )
+
+print()
+print("===== REMOVE STALE ORDER_PENDING LEDGER ROWS =====")
+
+for hkey in OPEN_HASHES:
+    rows = R.hgetall(hkey) or {}
+
+    for field, raw in rows.items():
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+
+        job = str(obj.get("mt5_job_id") or "")
+
+        if (
+            job in JOBS
+            and str(obj.get("trade_state") or "").upper()
+            == "ORDER_PENDING"
+            and not obj.get("mt5_ticket")
+            and not obj.get("broker_ticket")
+        ):
+            deleted = R.hdel(hkey, field)
+
+            print(
+                "OPEN_ROW_REMOVE",
+                hkey,
+                "field=",
+                field,
+                "job=",
+                job,
+                "symbol=",
+                obj.get("symbol"),
+                "deleted=",
+                deleted,
+            )
+
+print()
+print("===== DONE =====")
+PY
+
+
+cd /opt/xauapi
+
+/opt/xauapi/.venv/bin/python - <<'PY'
+import redis
+
+from api.tenant_keys import (
+    zone_watch_key,
+    zone_watch_delete,
+    break_state_key,
+    delete_latest_entry_claim,
+)
+
+from api.trend_endpoints import (
+    _release_point_a_expired_opportunity,
+)
+
+UIDS = [
+    "f3a3cf2e-6095-495c-a5fd-94227948cd3a",
+    "2c600182-39bc-4642-82aa-43ba39266025",
+]
+
+SYMBOLS = [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "USDCAD",
+    "XAUUSD",
+]
+
+SIDES = ["BUY", "SELL"]
+
+R = redis.Redis(
+    host="127.0.0.1",
+    port=6379,
+    password="xau12345",
+    decode_responses=True,
+)
+
+print("===== XTL ALL-SYMBOL FRESH DISCOVERY RESET =====")
+
+for uid in UIDS:
+    print()
+    print("UID =", uid)
+
+    for sym in SYMBOLS:
+        print(f"  --- {sym} ---")
+
+        for side in SIDES:
+            try:
+                wkey = zone_watch_key(
+                    uid,
+                    sym,
+                    side,
+                    "H1",
+                )
+
+                before_watch = bool(R.exists(wkey))
+
+                # 1. Retire old opportunity/cache presentation.
+                try:
+                    released = _release_point_a_expired_opportunity(
+                        uid=uid,
+                        symbol=sym,
+                        side=side,
+                        profile_id=None,
+                        device_id=None,
+                        reason="MANUAL_FRESH_DISCOVERY_RESET",
+                    )
+                except Exception as exc:
+                    released = False
+                    print(
+                        f"    {side}: opportunity release error={exc!r}"
+                    )
+
+                # 2. Remove break/cross ownership.
+                bkey = break_state_key(
+                    uid,
+                    sym,
+                    side,
+                    "H1",
+                )
+
+                break_deleted = int(
+                    R.delete(bkey) or 0
+                )
+
+                # 3. Remove latest entry claim.
+                try:
+                    claim_deleted = delete_latest_entry_claim(
+                        R,
+                        uid,
+                        sym,
+                        side,
+                        tf="H1",
+                    )
+                except TypeError:
+                    claim_deleted = delete_latest_entry_claim(
+                        R,
+                        uid,
+                        sym,
+                        side,
+                        "H1",
+                    )
+
+                # 4. Remove old directional watch.
+                zone_watch_delete(
+                    R,
+                    uid,
+                    sym,
+                    side,
+                    tf="H1",
+                )
+
+                after_watch = bool(R.exists(wkey))
+
+                print(
+                    f"    {side}: "
+                    f"watch_before={before_watch} "
+                    f"watch_after={after_watch} "
+                    f"break_deleted={break_deleted} "
+                    f"claim_deleted={claim_deleted} "
+                    f"opportunity_released={released}"
+                )
+
+            except Exception as exc:
+                print(
+                    f"    {side}: RESET_FAILED "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+print()
+print("===== RESET COMPLETE =====")
+PY
+********************************************************
+# calendar check commant in agent machine:
+$log = "C:\ProgramData\XTL\logs\xtl_agent.log"
+
+Select-String `
+  -Path $log `
+  -Pattern "MT5_CALENDAR|CALENDAR_BOOTSTRAP|mt5/calendar" |
+  Select-Object -Last 40
+
+************************************************************
+#OB ANALYTICS
+
+cd /opt/xauapi
+
+REDIS_URL='redis://:xau12345@127.0.0.1:6379/0' \
+/opt/xauapi/.venv/bin/python - <<'PY'
+import json
+
+from api.strategy.oppt_executor import R
+import api.xtl_analytics as xa
+
+
+# ---------------------------------------------------------
+# Canonical REAL_DXY device
+# ---------------------------------------------------------
+raw = R.get("xtl:dxy:canonical")
+
+if isinstance(raw, (bytes, bytearray)):
+    raw = raw.decode("utf-8", "replace")
+
+canonical = json.loads(raw or "{}")
+
+dev = (
+    canonical.get("device_id")
+    or canonical.get("real_device_id")
+)
+
+if not dev:
+    raise SystemExit("NO_CANONICAL_REAL_DXY_DEVICE")
+
+
+# ---------------------------------------------------------
+# Current canonical DXY structure
+# ---------------------------------------------------------
+dxy_structure = xa.capture_dxy_structure_snapshot(
+    device_id=dev,
+    direction=None,
+)
+
+
+# ---------------------------------------------------------
+# OB shadow
+# ---------------------------------------------------------
+ob = xa.capture_dxy_order_block_shadow(
+    device_id=dev,
+    entry_ms=xa._now_ms(),
+    dxy_structure=dxy_structure,
+)
+
+
+print("\n==============================================")
+print("       DXY OB QUALIFICATION DIAGNOSTIC")
+print("==============================================")
+print("device             =", dev)
+print("price              =", ob.get("price"))
+print("H1 reference price =", ob.get("h1_reference_price"))
+print("H4 reference price =", ob.get("h4_reference_price"))
+print("H1 ATR             =", ob.get("atr_h1"))
+print("H4 ATR             =", ob.get("atr_h4"))
+print("error              =", ob.get("capture_error"))
+
+
+def slim(x):
+    return {
+        "tf": x.get("tf"),
+        "type": x.get("type"),
+        "role": x.get("role"),
+
+        "low": x.get("raw_low"),
+        "high": x.get("raw_high"),
+
+        # Price provenance
+        "reference_price":
+            x.get("reference_price"),
+
+        "h1_reference_price":
+            x.get("h1_reference_price"),
+
+        "h4_reference_price":
+            x.get("h4_reference_price"),
+
+        # ATR provenance
+        "detector_atr":
+            x.get("detector_atr"),
+
+        "native_tf_atr":
+            x.get("native_tf_atr"),
+
+        # Width
+        "raw_width_atr_detector":
+            x.get("raw_width_atr_detector"),
+
+        "raw_width_atr_native_tf":
+            x.get("raw_width_atr_native_tf"),
+
+        "body_width_atr_detector":
+            x.get("body_width_atr_detector"),
+
+        "body_width_atr_native_tf":
+            x.get("body_width_atr_native_tf"),
+
+        "wick_fraction":
+            x.get("wick_fraction"),
+
+        # Impulse
+        "impulse_body_atr_detector":
+            x.get("impulse_body_atr_detector"),
+
+        "impulse_body_atr_native_tf":
+            x.get("impulse_body_atr_native_tf"),
+
+        "impulse_body_ratio":
+            x.get("impulse_body_ratio"),
+
+        # NEW qualification audit
+        "detector_impulse_qualifies":
+            x.get("detector_impulse_qualifies"),
+
+        "native_impulse_qualifies":
+            x.get("native_impulse_qualifies"),
+
+        "qualification_comparison":
+            x.get("qualification_comparison"),
+
+        "native_ob_candidate_shadow":
+            x.get("native_ob_candidate_shadow"),
+
+        # Lifecycle
+        "quality":
+            x.get("quality"),
+
+        "mitigated":
+            x.get("mitigated"),
+
+        "age_bars":
+            x.get("age_bars"),
+
+        # Location
+        "inside_ob":
+            x.get("inside_ob"),
+
+        "distance_to_edge":
+            x.get("distance_to_edge"),
+
+        "distance_to_edge_atr_detector":
+            x.get("distance_to_edge_atr_detector"),
+
+        "distance_to_edge_atr_native_tf":
+            x.get("distance_to_edge_atr_native_tf"),
+
+        # SR relationship
+        "canonical_sr_low":
+            x.get("canonical_sr_low"),
+
+        "canonical_sr_high":
+            x.get("canonical_sr_high"),
+
+        "overlaps_sr":
+            x.get("overlaps_sr"),
+
+        "overlap_ratio_ob":
+            x.get("overlap_ratio_ob"),
+
+        # Width classification
+        "wide_ob_shadow":
+            x.get("wide_ob_shadow"),
+
+        "wide_ob_native_tf_shadow":
+            x.get("wide_ob_native_tf_shadow"),
+    }
+
+
+for tf in ("H1", "H4"):
+    for side in ("bullish", "bearish"):
+
+        rows = (
+            ((ob.get("candidates") or {}).get(tf) or {})
+            .get(side)
+            or []
+        )
+
+        print(
+            "\n===== %s %s OB ====="
+            % (tf, side.upper())
+        )
+
+        if not rows:
+            print("NO CANDIDATES")
+            continue
+
+        print(
+            json.dumps(
+                [slim(x) for x in rows],
+                indent=2,
+            )
+        )
+
+
+# ---------------------------------------------------------
+# Compact qualification summary
+# ---------------------------------------------------------
+print("\n==============================================")
+print("          QUALIFICATION SUMMARY")
+print("==============================================")
+
+for tf in ("H1", "H4"):
+    for side in ("bullish", "bearish"):
+
+        rows = (
+            ((ob.get("candidates") or {}).get(tf) or {})
+            .get(side)
+            or []
+        )
+
+        for x in rows:
+
+            print(
+                "%-2s %-7s "
+                "zone=%s-%s "
+                "det_imp=%s "
+                "native_imp=%s "
+                "det_ok=%s "
+                "native_ok=%s "
+                "class=%s "
+                "inside=%s "
+                "dist_native=%s "
+                "age=%s "
+                "mitigated=%s"
+                % (
+                    tf,
+                    side.upper(),
+                    x.get("raw_low"),
+                    x.get("raw_high"),
+                    x.get(
+                        "impulse_body_atr_detector"
+                    ),
+                    x.get(
+                        "impulse_body_atr_native_tf"
+                    ),
+                    x.get(
+                        "detector_impulse_qualifies"
+                    ),
+                    x.get(
+                        "native_impulse_qualifies"
+                    ),
+                    x.get(
+                        "qualification_comparison"
+                    ),
+                    x.get("inside_ob"),
+                    x.get(
+                        "distance_to_edge_atr_native_tf"
+                    ),
+                    x.get("age_bars"),
+                    x.get("mitigated"),
+                )
+            )
+
+print("\n==============================================")
+PY
+
+
+# sunday clean command 
+count=$(redis-cli -a xau12345 --scan --pattern 'xtl:dxy:sr:*' 2>/dev/null | wc -l)
+
+echo "DXY SR keys before cleanup: $count"
+
+if [ "$count" -gt 0 ]; then
+    redis-cli -a xau12345 --scan --pattern 'xtl:dxy:sr:*' 2>/dev/null \
+    | xargs -r -n 100 redis-cli -a xau12345 UNLINK >/dev/null
+
+    echo "DXY SR keys after cleanup: $(redis-cli -a xau12345 --scan --pattern 'xtl:dxy:sr:*' 2>/dev/null | wc -l)"
+else
+    echo "Nothing to clean."
+fi
+
+********************************
+
+#verify every open trade:
+journalctl -u xauapi --since "30 minutes ago" --no-pager |
+grep -Ei \
+'ERROR|Traceback|ENTRY_VALIDATION_CAPTURE_FAILED|DXY.*FAILED|MT5_ENQUEUE|MT5_ACK|TRADE_ACTIVE'
+
+
+for k in $(redis-cli -a xau12345 --scan \
+  --pattern 'xtl:strategy:oppt:open:*'); do
+  redis-cli -a xau12345 HVALS "$k" 2>/dev/null
+done |
+jq -s '
+  .[]
+  | {
+      symbol,
+      side,
+      mt5_ticket,
+      setup_analysis_present:
+        (.setup_analysis | type == "object"),
+      entry_confirmation_present:
+        (.entry_confirmation | type == "object"),
+      entry_validation_present:
+        (.entry_validation | type == "object"),
+      zone_status:
+        .entry_validation.zone_quality_sr.status,
+      dxy_status:
+        .entry_validation.dxy_sr.status
+    }
+'
+********************************************************
+
+dxy#BEST SR
+
+
+DEV=dev_cef91ec7f3be46fb9e460456f67d844f
+curl -s -H "X-Device-Id: $DEV" "http://127.0.0.1:8000/trend/opportunities?symbols=EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,XAUUSD" \
+ | python3 -c "import sys,json
+rows=json.load(sys.stdin)['rows']
+for r in rows:
+    sr=r.get('sr') or {}
+    bs=sr.get('best_support'); br=sr.get('best_resistance')
+    print(r.get('symbol'),
+          'best_support=', (bs.get('level') if isinstance(bs,dict) else None),
+          'best_resistance=', (br.get('level') if isinstance(br,dict) else None),
+          'scored=', len(sr.get('scored_supports') or [])+len(sr.get('scored_resistances') or []),
+          'reason=', r.get('reason'))"
+		 
+		 
+		 
+DEV=dev_cef91ec7f3be46fb9e460456f67d844f
+curl -s -H "X-Device-Id: $DEV" "http://127.0.0.1:8000/trend/opportunities?symbols=EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,XAUUSD" \
+ | python3 -c "
+import sys,json
+rows=json.load(sys.stdin)['rows']
+def levels(lst): return [z for z in (lst or []) if isinstance(z,dict) and z.get('level') is not None]
+for r in rows:
+    sr=r.get('sr') or {}
+    price=r.get('price') or r.get('live_price') or sr.get('price')
+    print(r.get('symbol'), 'price=', price)
+    for side in ('scored_supports','scored_resistances'):
+        lst=levels(sr.get(side))
+        if not lst: continue
+        by_score=sorted(lst, key=lambda z:-float(z.get('sr_score') or 0))
+        by_near=sorted(lst, key=lambda z:abs(float(z['level'])-float(price))) if price else lst
+        cs=by_score[0]; cn=by_near[0]
+        chg='  <-- CHANGES' if cs.get('level')!=cn.get('level') else ''
+        print(f\"   {side.replace('scored_',''):11} score#1={cs.get('level')}(sc{cs.get('sr_score')},t{cs.get('touches')})  nearest={cn.get('level')}(sc{cn.get('sr_score')},t{cn.get('touches')}){chg}\")
+"
+
+************************************************************
+#macro and direction check:
+
+/opt/xauapi/.venv/bin/python -c "
+import sys; sys.path.insert(0,'/opt/xauapi')
+from api.usd_strength import macro_bias_for_trade
+from api.trend_endpoints import R
+print(macro_bias_for_trade(R, 'XAUUSD', 'SELL'))
+"
+
+/opt/xauapi/.venv/bin/python -c "
+import sys; sys.path.insert(0,'/opt/xauapi')
+from api.usd_strength import usd_strength_all, pair_htf_trend
+from api.trend_endpoints import R
+print('=== USD STRENGTH ===')
+print(usd_strength_all(R))
+print()
+print('=== PER-PAIR TRENDS ===')
+for s in ['EURUSD','GBPUSD','USDJPY','USDCHF','USDCAD','XAUUSD']:
+    print(f'{s}: H4={pair_htf_trend(R,s,\"H4\")}  H1={pair_htf_trend(R,s,\"H1\")}')
+"
+*********************************************************************
+
+#deal check:
+
+
+
+*****************************************************************
+#news check:
+cd /opt/xauapi && /opt/xauapi/.venv/bin/python -c "
+import api.xtl_analytics as A
+from api.trend_endpoints import R
+import json, time
+from datetime import datetime, timezone
+
+now = int(time.time()*1000)
+raw = R.get('xtl:news:calendar:daily')
+events = json.loads(raw).get('events', []) if raw else []
+
+uid='f3a3cf2e-6095-495c-a5fd-94227948cd3a'
+h = R.hgetall(f'xtl:strategy:oppt:open:{uid}') or {}
+print('OPEN TRADES vs UPCOMING EVENTS (next 24h)\n')
+if not h:
+    print('  (no open trades)')
+for fk, rawp in h.items():
+    rawp = rawp.decode() if isinstance(rawp,(bytes,bytearray)) else rawp
+    p = json.loads(rawp)
+    sym = str(p.get('symbol') or '').upper()
+    side = p.get('side')
+    ccys = A._currencies_for_symbol(sym)
+    upcoming = sorted([e for e in events
+                       if str(e.get('currency','')).upper() in ccys
+                       and now <= int(e.get('time_ms',0)) <= now + 24*3600000],
+                      key=lambda e: int(e.get('time_ms',0)))
+    flag = '⚠️ EVENT RISK' if upcoming else 'clear'
+    print(f'{sym} {side} -> {flag}')
+    for e in upcoming[:3]:
+        dt = datetime.fromtimestamp(int(e['time_ms'])/1000, timezone.utc)
+        hrs = round((int(e['time_ms'])-now)/3600000,1)
+        print(f\"    {dt.strftime('%m-%d %H:%M UTC')} | {e['currency']} {e['event'][:30]} | in {hrs}h\")
+    print()
+"
+
+***********************************************************
+
+#order placed:
+
+journalctl -u xauapi -f \
+| grep -E "MT5_POS_PUSH_START|MT5_DEAL|mt5/positions|ERROR|Traceback"
+
+
+journalctl -u xauapi -f \
+| grep -E "MT5_POS|last_mt5_pos|MT5_DEAL|/mt5/positions|Traceback|ERROR|redis_error"
+
+
+journalctl -u xauapi -f \
+| grep USDJPY \
+| grep -E "REV_OK|REV_WATCH|AFTER_CROSS|BREAK_CHECK|ENTRY_READY|RC_LOCKED|ZONE_INVALIDATED|CLEAR|DELETE"
+
+*******************************************************
+journalctl -u xauapi -f \
+| grep -E "ENTRY_EVENT_ADDED|ENTRY_CAND|CLAIM_RESULT|duplicate_exec_claim|BLOCK_ENTRY|OK_ENTRY|QTY_DECISION|MT5_ENQUEUE|MT5_ENQUEUE_RES|MT5_ACK|ORDER_PENDING|TRADE_ACTIVE|BROKER_CLOSED|BROKER_REPAIR|RELEASE_ATTEMPT|RELEASE_DONE|RELEASE_FAILED|DAILY_OUTCOME|ZONE_COOLDOWN|ENTRY_FAIL|tick_user failed|Traceback|ERROR"
+*******************************************************
+
+journalctl -u xauapi -f \
+| grep -E "USDCHF|ENTRY_EVENT_ADDED|ENTRY_CAND|OK_ENTRY|MT5_ENQUEUE|MT5_ENQUEUE_RES|MT5_ACK|BROKER_CLOSED|RELEASE_DONE|DAILY_OUTCOME|ENTRY_FAIL|ERROR|Traceback"
+
+
+journalctl -u xauapi -f | grep -E "USDCAD|ENTRY_CAND|QTY_DECISION|OK_ENTRY|BLOCK_ENTRY|MAX_OPEN|PROP_CAPACITY|same_symbol_active|MT5_ENQUEUE|MT5_ENQUEUE_RES|ENTRY_BLOCK_PRESERVE"
+
+***********************************************************
+redis-cli --no-auth-warning -a 'xau12345' GET "xtl:zone:watch:XAUUSD:BUY:H1" \
+  | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+z=d.get('zone_used') or {}
+print('zone_source:', z.get('zone_source'))
+print('selection_model:', z.get('selection_model'))
+print('zone low/high/level:', z.get('low'), z.get('high'), z.get('level'))
+print('band_type:', z.get('band_type'), '| band_width:', z.get('band_width'))
+print('flip_source:', z.get('flip_source'), '| was_kind:', z.get('was_kind'))
+print('quality_score:', z.get('quality_score'))
+print('sr_score:', z.get('sr_score'), '| touches:', z.get('touches'), '| strength:', z.get('strength'))
+"
+******************************************************************************
+#watch stale key check
+DEV=dev_4ad056c8ad1649ecb929c771c70ac888
+
+echo "=== XAUUSD watch keys (frozen zones) ==="
+redis-cli -a xau12345 --no-auth-warning KEYS "xtl:zone:watch:XAUUSD:*"
+
+echo "=== contents (zone_used + timestamps) ==="
+for k in $(redis-cli -a xau12345 --no-auth-warning KEYS "xtl:zone:watch:XAUUSD:*"); do
+  echo "--- $k (TTL: $(redis-cli -a xau12345 --no-auth-warning TTL "$k")s) ---"
+  redis-cli -a xau12345 --no-auth-warning GET "$k" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); z=d.get('zone_used') or {}; print('zone_used low/high:',z.get('low'),z.get('high'),' state:',d.get('state'),' created/updated:',d.get('created_ms') or d.get('updated_ms') or d.get('ts_ms'))" 2>/dev/null || echo "(raw)"
+done
+
+
+*************************
+
+clean 
+#Delete all watch keys
+redis-cli -a xau12345 --scan --pattern "xtl:zone:watch:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+#Verify:
+
+redis-cli -a xau12345 --scan --pattern "xtl:zone:watch:*"
+
+Should return nothing.
+
+#2. Delete active opportunity pointers
+
+redis-cli -a xau12345 --scan --pattern "xtl:trend:opp:active:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+#Delete entry claims
+
+redis-cli -a xau12345 --scan --pattern "xtl:watch:entry_claim:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+#Delete breakout tracking state
+
+redis-cli -a xau12345 --scan --pattern "xtl:watch:break_state:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+#Delete opportunity cache
+
+redis-cli -a xau12345 --scan --pattern "xtl:oppt:cache:*" | \
+xargs -r redis-cli -a xau12345 DEL
+
+*****************************************************
+#clean
+
+# ---------- 1. Delete all H1 watch states ----------
+redis-cli -a xau12345 --scan --pattern "xtl:zone:watch:*:*:H1" \
+| xargs -r -n100 redis-cli -a xau12345 DEL
+
+# ---------- 2. Delete all breakout states ----------
+redis-cli -a xau12345 --scan --pattern "xtl:watch:break_state:*" \
+| xargs -r -n100 redis-cli -a xau12345 DEL
+
+# ---------- 3. Delete entry claims ----------
+redis-cli -a xau12345 --scan --pattern "xtl:watch:entry_claim:*" \
+| xargs -r -n100 redis-cli -a xau12345 DEL
+
+# ---------- 4. Delete pending ENTRY_EVENT queue ----------
+redis-cli -a xau12345 --scan --pattern "xtl:entry:event:*" \
+| xargs -r -n100 redis-cli -a xau12345 DEL
+
+echo "Watch state reset complete."
+
+****************************************************
+
+USDCHF clean
+
+# Remove watch state
+redis-cli -a xau12345 DEL xtl:zone:watch:USDCAD:SELL:H1
+
+# Remove breakout tracking
+redis-cli -a xau12345 DEL xtl:watch:break_state:USDCAD:SELL:H1
+
+# Remove entry claim if it exists
+redis-cli -a xau12345 --scan --pattern "xtl:watch:entry_claim:USDCAD:SELL:H1:*" \
+| xargs -r redis-cli -a xau12345 DEL
+
+***********************************************************
+#!/bin/bash
+
+REDIS_PASS="xau12345"
+deleted=0
+
+while read -r k; do
+    case "$k" in
+        xtl:zone:watch:*|\
+        xtl:watch:break_state:*|\
+        xtl:watch:cross:*|\
+        xtl:watch:trigger:*|\
+        xtl:watch:entry:*|\
+        xtl:watch:entry_claim:*|\
+        xtl:entry:claim:*|\
+        xtl:entry:alert:*|\
+        xtl:entry:candidate:*|\
+        xtl:oppt:exec_claim:*|\
+        xtl:duplicate_entry_claim:*|\
+        xtl:duplicate_exec_claim:*|\
+        xtl:watch:rc_trigger:*|\
+        xtl:watch:triggered:*|\
+        xtl:watch:pending:* )
+
+            echo "DEL $k"
+            redis-cli -a "$REDIS_PASS" DEL "$k" >/dev/null
+            deleted=$((deleted + 1))
+            ;;
+    esac
+done < <(redis-cli -a "$REDIS_PASS" --scan)
+
+echo
+echo "=================================="
+echo "Cleanup complete."
+echo "Deleted keys : $deleted"
+echo "=================================="
+
+************************************************************
+
+#!/bin/bash
+
+REDIS_PASS="xau12345"
+SYMBOL="USDJPY"
+
+deleted=0
+
+while read -r k; do
+    case "$k" in
+        xtl:zone:watch:${SYMBOL}:*|\
+        xtl:watch:break_state:${SYMBOL}:*|\
+        xtl:watch:cross:${SYMBOL}:*|\
+        xtl:watch:trigger:${SYMBOL}:*|\
+        xtl:watch:entry:${SYMBOL}:*|\
+        xtl:watch:entry_claim:${SYMBOL}:*|\
+        xtl:entry:claim:${SYMBOL}:*|\
+        xtl:entry:alert:${SYMBOL}:*|\
+        xtl:entry:candidate:${SYMBOL}:*|\
+        xtl:oppt:exec_claim:*:${SYMBOL}:*|\
+        xtl:duplicate_entry_claim:*:${SYMBOL}:*|\
+        xtl:duplicate_exec_claim:*:${SYMBOL}:*|\
+        xtl:watch:rc_trigger:${SYMBOL}:*|\
+        xtl:watch:triggered:${SYMBOL}:*|\
+        xtl:watch:pending:${SYMBOL}:*)
+
+            echo "DEL $k"
+            redis-cli -a "$REDIS_PASS" DEL "$k" >/dev/null
+            deleted=$((deleted + 1))
+            ;;
+    esac
+done < <(redis-cli -a "$REDIS_PASS" --scan)
+
+echo
+echo "=================================="
+echo "EURUSD cleanup complete."
+echo "Deleted keys : $deleted"
+echo "=================================="
+
+*****************************************************
+
+#!/bin/bash
+
+REDIS_PASS="xau12345"
+
+deleted=0
+
+while read -r k; do
+    case "$k" in
+        xtl:zone:watch:*|\
+		xtl:watch:break:*|\
+        xtl:zone:break:*|\
+        xtl:watch:break_state:*|\
+        xtl:watch:cross:*|\
+        xtl:watch:trigger:*|\
+        xtl:watch:entry:*|\
+        xtl:watch:entry_claim:*|\
+        xtl:entry:claim:*|\
+        xtl:entry:alert:*|\
+        xtl:entry:candidate:*|\
+        xtl:oppt:exec_claim:*|\
+        xtl:duplicate_entry_claim:*|\
+        xtl:duplicate_exec_claim:*|\
+        xtl:watch:rc_trigger:*|\
+        xtl:watch:triggered:*|\
+        xtl:watch:pending:* )
+
+            echo "DEL $k"
+            redis-cli -a "$REDIS_PASS" UNLINK  "$k" >/dev/null
+            deleted=$((deleted + 1))
+            ;;
+    esac
+done < <(redis-cli -a "$REDIS_PASS" --scan)
+
+echo
+echo "=================================="
+echo "XTL Watch / Entry Cleanup Complete"
+echo "Deleted keys : $deleted"
+echo "=================================="
+
+********************************************************
+# Clean watch / claim / break / exec-claim keys
+# Skip USDCAD (change this symbol if needed)
+
+for k in $(redis-cli -a xau12345 --scan); do
+    case "$k" in
+        *USDCAD*)
+            continue
+            ;;
+    esac
+
+    case "$k" in
+        xtl:zone:watch:*|\
+        xtl:watch:break_state:*|\
+        xtl:watch:entry_claim:*|\
+        xtl:oppt:exec_claim:*|\
+        xtl:entry:claim:*|\
+        xtl:entry:alert:*|\
+        xtl:entry:candidate:*|\
+        xtl:watch:entry:*|\
+        xtl:watch:cross:*|\
+        xtl:watch:trigger:*)
+            echo "DEL $k"
+            redis-cli -a xau12345 DEL "$k" >/dev/null
+            ;;
+    esac
+done
+
+echo "Cleanup complete."
+
+*************************************************
+#!/bin/bash
+
+deleted=0
+
+for k in $(redis-cli -a xau12345 --scan); do
+    case "$k" in
+        *USDCAD*)
+            continue
+            ;;
+    esac
+
+    case "$k" in
+        xtl:zone:watch:*|\
+        xtl:watch:break_state:*|\
+        xtl:watch:entry_claim:*|\
+        xtl:oppt:exec_claim:*|\
+        xtl:entry:claim:*|\
+        xtl:entry:alert:*|\
+        xtl:entry:candidate:*|\
+        xtl:watch:entry:*|\
+        xtl:watch:cross:*|\
+        xtl:watch:trigger:*)
+            echo "DEL $k"
+            redis-cli -a xau12345 DEL "$k" >/dev/null
+            deleted=$((deleted + 1))
+            ;;
+    esac
+done
+
+echo "Cleanup complete. Deleted $deleted keys."
+************************************************************
+#verify keys deleted.
+redis-cli -a xau12345 --scan \
+| grep -E "xtl:zone:watch|xtl:watch:break_state|xtl:watch:entry_claim" \
+| sort
+
+*************************************************
+
+curl -s --max-time 60 "http://127.0.0.1:8000/trend/opportunities?tf=H1&debug_gate=1" \
+  | python3 -c "
+import sys,json
+d=json.load(sys.stdin); rows=d.get('rows') or d.get('opportunities') or d
+for r in rows:
+    if (r.get('symbol') or r.get('sym'))=='XAUUSD':
+        sr=r.get('sr',{}); eg=r.get('entry_gate',{})
+        print('price:', r.get('live_price') or r.get('price'))
+        print('resolved_dir:', eg.get('resolved_dir'), '| reason:', eg.get('reason'))
+        print('actionable_cap:', eg.get('actionable_cap'))
+        print('active_supports:', len(sr.get('active_supports') or []), '| scored_supports:', len(sr.get('scored_supports') or []))
+        print('active_resistances:', len(sr.get('active_resistances') or []), '| scored_resistances:', len(sr.get('scored_resistances') or []))
+        print('nearest_support:', sr.get('nearest_support'), '| nearest_resistance:', sr.get('nearest_resistance'))
+        print('best_support:', (sr.get('best_support') or {}).get('level'), '| best_resistance:', (sr.get('best_resistance') or {}).get('level'))
+        print('--- actionable_candidates:')
+        for c in (eg.get('actionable_candidates') or []):
+            print('   ', c.get('side'), c.get('level'), 'dist', round(float(c.get('dist') or 0),2), c.get('zone_source'))
+"
+
+***********************************************************
+curl -s "http://127.0.0.1:8000/trend/opportunities?tf=H1&symbols=USDJPY&debug_gate=1" \
+| jq '.rows[0].entry_gate | {
+  reason,
+  stage,
+  dbg_pick_model,
+  dbg_pick_bar_start_ms,
+  dbg_pick_bar_close_ms,
+  picked_closed_bar,
+  touch_basis,
+  zone,
+  planned_zone,
+  zone_used
+}'
+
+**********************************************
+python3 - <<'PY'
+import json
+import subprocess
+import time
+
+REDIS_PASS = "xau12345"
+MARKET_TIMEOUT_MS = 5 * 60 * 1000
+now_ms = int(time.time() * 1000)
+
+def redis_scan(pattern):
+    out = subprocess.check_output(
+        [
+            "redis-cli",
+            "-a", REDIS_PASS,
+            "--scan",
+            "--pattern", pattern,
+        ],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    return [x.strip() for x in out.splitlines() if x.strip()]
+
+def hash_values(key):
+    out = subprocess.check_output(
+        [
+            "redis-cli",
+            "-a", REDIS_PASS,
+            "HVALS", key,
+        ],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    return [x for x in out.splitlines() if x.strip()]
+
+found = False
+
+for key in redis_scan("xtl:strategy:oppt:open:*"):
+    for line in hash_values(key):
+        try:
+            trade = json.loads(line)
+        except Exception:
+            continue
+
+        if not isinstance(trade, dict):
+            continue
+
+        state = str(
+            trade.get("trade_state")
+            or trade.get("state")
+            or ""
+        ).upper().strip()
+
+        if state != "ORDER_PENDING":
+            continue
+
+        # Ticket may exist at top level or inside the MT5 acknowledgement.
+        ack = (
+            trade.get("mt5_ack")
+            if isinstance(trade.get("mt5_ack"), dict)
+            else {}
+        )
+        result = (
+            ack.get("result")
+            if isinstance(ack.get("result"), dict)
+            else {}
+        )
+
+        ticket = (
+            trade.get("mt5_ticket")
+            or trade.get("position_ticket")
+            or result.get("ticket")
+            or result.get("position_ticket")
+        )
+
+        if ticket not in (None, "", 0, "0"):
+            continue
+
+        order_type = str(
+            trade.get("order_type")
+            or trade.get("entry_order_type")
+            or "MARKET"
+        ).upper().strip()
+
+        created_ms = int(
+            trade.get("order_pending_at_ms")
+            or trade.get("enqueue_timestamp")
+            or trade.get("opened_at_ms")
+            or trade.get("created_at_ms")
+            or 0
+        )
+
+        age_ms = now_ms - created_ms if created_ms > 0 else None
+        age_min = round(age_ms / 60000, 1) if age_ms is not None else None
+
+        # Only an old MARKET order is a timeout candidate.
+        timeout_candidate = (
+            order_type == "MARKET"
+            and age_ms is not None
+            and age_ms >= MARKET_TIMEOUT_MS
+        )
+
+        print("=" * 90)
+        print("KEY               :", key)
+        print("TRADE_ID          :", trade.get("trade_id"))
+        print("SYMBOL            :", trade.get("symbol"))
+        print("SIDE              :", trade.get("side"))
+        print("PROFILE           :", trade.get("profile_id"))
+        print("DEVICE            :", trade.get("device_id"))
+        print("JOB_ID            :", trade.get("mt5_job_id"))
+        print("ORDER_TYPE        :", order_type)
+        print("PENDING_SINCE_MS  :", created_ms or None)
+        print("AGE_MINUTES       :", age_min)
+        print("TIMEOUT_CANDIDATE :", timeout_candidate)
+        print("NOTE              :", (
+            "Check broker position/order snapshot before cleanup."
+            if timeout_candidate
+            else "Not yet proven orphaned."
+        ))
+
+        found = True
+
+if not found:
+    print("No ORDER_PENDING trades without an MT5 ticket.")
+PY
+*************************************************
+journalctl -u xauapi -f --no-pager \
+| grep -E "SKIP_ENTRY_FUTURE_RC|BREAK_CHECK|AFTER_CROSS|ENTRY_CAND|MT5_ENQUEUE|ERROR|Traceback"
+************************************************
+
+
+***************************************************
+#DXY direction
+redis-cli -a xau12345 \
+GET xtl:dxy:state:H1:SYNTHETIC_DXY:dev_fd0febc2532e464db1257d2b8ea11610 \
+| jq .
+
+redis-cli -a xau12345 \
+GET xtl:dxy:state:H1:SYNTHETIC_DXY:dev_fd0febc2532e464db1257d2b8ea11610 \
+| jq '{
+    trend_h1,
+    trend_h4,
+    direction,
+    state,
+    regime,
+    updated_at_ms
+}'
+
+redis-cli -a xau12345 \
+GET xtl:dxy:state:H1:SYNTHETIC_DXY:dev_b80f607517f44db693901cd28c098bbd \
+| jq '{
+  source,
+  direction,
+  previous_direction,
+  direction_raw,
+  tilt,
+  net_atr,
+  slope_atr,
+  r2,
+  bars_used,
+  direction_since_ms,
+  last_change_ms,
+  last_evaluated_bar_close_ms,
+  broker_bar_close_ms,
+  synthetic_pair_count,
+  synthetic_pairs
+}'
+
+
+ DEV=dev_b80f607517f44db693901cd28c098bbd
+
+redis-cli -a xau12345 \
+GET "xtl:dxy:turn:state:M15:SYNTHETIC_DXY:${DEV}" |
+jq '{
+  broker_offset_minutes,
+  broker_bar_close_ms,
+  broker_bar_close_utc_ms:
+    (.broker_bar_close_ms - ((.broker_offset_minutes // 0) * 60000)),
+  last_evaluated_bar_close_ms,
+  actual_difference_ms:
+    (
+      (.broker_bar_close_ms - ((.broker_offset_minutes // 0) * 60000))
+      - .last_evaluated_bar_close_ms
+    ),
+
+  status,
+  direction,
+  previous_direction,
+  last_confirmed_direction,
+
+  synthetic_health:
+    (.basket_health.synthetic_health // .synthetic_health),
+  synthetic_complete:
+    (.basket_health.synthetic_complete // .synthetic_complete),
+  synthetic_pair_count:
+    (.basket_health.synthetic_pair_count // .synthetic_pair_count),
+  synthetic_pairs:
+    (.basket_health.synthetic_pairs // .synthetic_pairs),
+  synthetic_missing_pairs:
+    (.basket_health.synthetic_missing_pairs // .synthetic_missing_pairs),
+  evaluation_pending_retry
+}'
+
+
+******************************************************
 sudo systemctl status xauapi --no-pager
 
 #blank lines removal command from python files.
@@ -10,7 +1519,12 @@ sudo systemctl start xauapi
 sudo systemctl enable xauapi
 
 # restart after any code/env change
+	
 sudo systemctl restart xauapi
+
+sudo systemctl restart xtl-oppt-compute
+sudo systemctl restart xtl-oppt-refresh
+
 
 sudo systemctl cat xauapi | sed -n '1,200p'
 
@@ -51,9 +1565,10 @@ sudo systemctl start redis-server
 
 sudo systemctl status nginx --no-pager
 
-
-connect ubuntu vis powershell
 ssh ubuntu@129.159.224.89
+connect ubuntu vis powershell
+cd /
+cdc
 
 # grab ssh key 
 sudo cat /root/.ssh/id_ed25519.pub
@@ -402,6 +1917,8 @@ sudo mv ~/xtl.zip* /var/www/downloads/
 
 sudo mv ~/xtl_agent_1.0.2.zip* /var/www/downloads/
 
+sudo mv ~/xtl* /opt/xauapi/api/dist/
+
 sudo chown root:root /var/www/downloads/xtl_agent-1.0.0.zip*
 sudo chmod 0644 /var/www/downloads/xtl_agent-1.0.2.zip*
 
@@ -427,8 +1944,17 @@ sudo rm /var/www/downloads/xtl.zip
 sudo rm /var/www/downloads/xtl_installer-1.0.0.zip.sha256
 sudo rm /var/www/downloads/xtl_agent_1.0.2.zip
 
+
+ls -ld /opt/xauapi/api/dist
+ls -ld /opt/xauapi/api/dist/xtl
+
 sudo rm /var/www/downloads/xtl.zip
 sudo rm /opt/xauapi/dist/xtl.exe
+
+sudo rm -rf /opt/xauapi/api/dist/xtl
+mkdir -p /opt/xauapi/api/dist
+
+
 
 Publish SHA-256 checksums
 
@@ -895,12 +2421,28 @@ SELECT name FROM devices where id='dev_15a5ce3ddd6c430b9a6937556376cd1c';"
 sudo -u postgres psql -d xautrendlab -c "
 SELECT username,id FROM users where username='dherya';"
 
+SELECT * FROM users where username='dherya';"
+
+
+
 sudo -u postgres psql -d xautrendlab -c "
 SELECT token FROM user_download_tokens where user_id='f3a3cf2e-6095-495c-a5fd-94227948cd3a' ORDER BY created_at DESC
 LIMIT 1;"
 
 sudo -u postgres psql -d xautrendlab -c "
-SELECT username,mfa_enabled FROM users;"
+SELECT * FROM users where username='dherya';"
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT * FROM users ;"
+
+sudo -u postgres psql -d xautrendlab -c "
+SELECT
+  id, username, email, mfa_enabled,
+  convert_from(mfa_secret, 'SQL_ASCII') AS mfa_secret_text
+FROM users
+WHERE username='dherya';
+"
+
 
 
 sudo -u postgres psql -d xautrendlab -c "
@@ -973,13 +2515,13 @@ verify device status:
 sudo -u postgres psql -d xautrendlab -c "
 SELECT id, user_id, status, last_heartbeat_at
 FROM devices
-WHERE id = 'dev_0d8eb03deb2144428a631ca2a8204f7e';
+WHERE id = 'dev_9245cd0ac05446569f11a466be978ab0';
 "
 
 ATTACH DEVICE TO USER:
 
 # 
-DEV_ID='dev_ce9f3968e6a5400a9c5a56b86538cce9'
+DEV_ID='dev_9245cd0ac05446569f11a466be978ab0'
 USER_UUID='f3a3cf2e-6095-495c-a5fd-94227948cd3a'
 
 # preview
@@ -1126,12 +2668,12 @@ Remove-Item .\build,.\dist,.\__pycache__ -Recurse -Force -ErrorAction SilentlyCo
 Get-ChildItem -Recurse -Include *.pyc,__pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
 # 1) Compile only the key files (fail fast)
-Write-Host "[compile] mt5_client, agent_ohlc, xtl_installer"
-python -m py_compile .\xtl\mt5_client.py .\xtl\agent_ohlc.py .\xtl_installer.py
+Write-Host "[compile] mt5_client, agent_ohlc, xtl_installer,agent_price"
+python -m py_compile .\xtl\mt5_client.py .\xtl\agent_ohlc.py .\xtl_installer.py .\xtl\agent_price.py
 if ($LASTEXITCODE -ne 0) { throw "❌ Python compile failed. Fix errors above." }
 
 # 1b) Quick import check for package modules only (safe)
-Write-Host "[import-check] xtl.mt5_client, xtl.agent_ohlc"
+Write-Host "[import-check] xtl.mt5_client, xtl.agent_ohlc,xtl.agent_price"
 $env:PYTHONPATH = (Get-Location).Path
 $importFile = Join-Path $env:TEMP ("xtl_import_check_{0}.py" -f (Get-Random))
 @'
@@ -1139,6 +2681,7 @@ import importlib, sys
 sys.path.insert(0, r".")
 importlib.import_module("xtl.mt5_client")
 importlib.import_module("xtl.agent_ohlc")
+importlib.import_module("xtl.agent_price")
 print("✅ imports OK")
 '@ | Set-Content -Encoding ASCII $importFile
 python $importFile
@@ -1329,7 +2872,7 @@ if ($LASTEXITCODE -gt 1) { throw "robocopy failed with code $LASTEXITCODE" }
 
 # Zip from the *stage* folder (static snapshot)
 if (Test-Path $Zip) { Remove-Item $Zip -Force -ErrorAction SilentlyContinue }
-Write-Host "[zip] -> $Zip"
+Write-Host "[zip] -> $Zip"rm
 tar -a -c -f $Zip -C (Split-Path $Stage -Parent) (Split-Path $Stage -Leaf)
 
 if (-not (Test-Path $Zip)) { throw "❌ ZIP not created (tar failed)" }
@@ -1349,11 +2892,134 @@ Write-Host "[install] skipped during build (package does not self-install)"
 # 6) (Disabled) Verify service
 Write-Host "[verify] skipped (no service install during build)"
 
+**************************************************************************
+latest build steps:
+
+1. cd D:\Algo\Gold\wizard
+
+2. .\build_xtl.ps1 -Version "1.0.2"
+
+once step 2 done then run step 3
+
+3. Deploy latest build to Program Files
+$SRC = "D:\Algo\Gold\wizard\dist\xtl"
+$DST = "C:\Program Files\XTL\dist\xtl"
+
+& "$DST\XTLAgent.exe" stop
+Start-Sleep -Seconds 3
+
+robocopy $SRC $DST /MIR /NFL /NDL /NJH /NJS /NP
+if ($LASTEXITCODE -gt 1) { throw "robocopy deploy failed: $LASTEXITCODE" }
+
+$srcExe = Get-Item "$SRC\xtl.exe"
+$dstExe = Get-Item "$DST\xtl.exe"
+
+if ($srcExe.Length -ne $dstExe.Length) {
+    throw "Install failed: xtl.exe size mismatch. SRC=$($srcExe.Length), DST=$($dstExe.Length)"
+}
+
+& "$DST\XTLAgent.exe" start
+
+Write-Host "✅ XTL deployed and started"
+
+4. Verify installed exe
+
+Get-Item "D:\Algo\Gold\wizard\dist\xtl\xtl.exe" | Select FullName,Length,LastWriteTime
+Get-Item "C:\Program Files\XTL\dist\xtl\xtl.exe" | Select FullName,Length,LastWriteTime
+
+5. Verify Redis
+
+redis-cli -a xau12345 --scan --pattern "xtl:ohlc:snap:dev_fe64a5e1442b4d409e009d1f5a9b07b6:XAUUSD:*" | sort
 
 
 
 
+*************************************************************************
+clean resistry
 
+# HKCU
+reg delete "HKCU\Software\XTL" /v "Broker.TzOffsetMin" /f
+reg delete "HKCU\Software\XTL" /v "Broker.TzName" /f
+reg delete "HKCU\Software\XTL" /v "Broker.TzSource" /f
+
+# HKLM
+reg delete "HKLM\Software\XTL" /v "Broker.TzOffsetMin" /f
+reg delete "HKLM\Software\XTL" /v "Broker.TzName" /f
+reg delete "HKLM\Software\XTL" /v "Broker.TzSource" /f
+
+# LocalSystem hive
+reg delete "HKU\S-1-5-18\Software\XTL" /v "Broker.TzOffsetMin" /f
+reg delete "HKU\S-1-5-18\Software\XTL" /v "Broker.TzName" /f
+reg delete "HKU\S-1-5-18\Software\XTL" /v "Broker.TzSource" /f
+
+
+
+reg query "HKLM\Software\XTL" /v "Broker.TzOffsetMin"
+reg query "HKLM\Software\XTL" /v "Broker.TzSource"
+reg query "HKU\S-1-5-18\Software\XTL" /v "Broker.TzOffsetMin"
+reg query "HKU\S-1-5-18\Software\XTL" /v "Broker.TzSource"
+reg query "HKU\S-1-5-18\Software\XTL" /v "Broker.TzName"
+
+
+
+
+reg query "HKCU\Software\XTL"
+
+
+
+************************************************************
+
+#1. 
+cd D:\Algo\Gold\wizard
+python -m py_compile .\xtl\mt5_client.py .\xtl\agent_ohlc.py .\xtl_installer.py .\xtl\agent_price.py
+
+#2. 
+Remove-Item .\build,.\dist,.\__pycache__ -Recurse -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Recurse -Include *.pyc,__pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+#3. 
+pyinstaller .\xtl_installer.spec --noconfirm --clean --log-level=INFO
+
+# 4) Package for frontend download  (safe, no tzdata locks)
+$Zip    = ".\dist\xtl_agent_$Version.zip"
+$Stage  = ".\dist\_stage_xtl"
+$OutDir = ".\dist\xtl"
+
+Write-Host "[stage] preparing staging folder to avoid lock issues..."
+Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+
+Get-Process xtl -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process python,py,pyw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -ErrorAction SilentlyContinue | Where-Object {
+  $_.Path -and $_.Path.StartsWith((Resolve-Path $OutDir))
+} | Stop-Process -Force -ErrorAction SilentlyContinue
+
+Write-Host "[mirror] copying dist\xtl -> $Stage"
+robocopy $OutDir $Stage /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+if ($LASTEXITCODE -gt 1) { throw "robocopy failed with code $LASTEXITCODE" }
+
+if (Test-Path $Zip) { Remove-Item $Zip -Force -ErrorAction SilentlyContinue }
+
+Write-Host "[zip] -> $Zip"
+tar -a -c -f $Zip -C (Split-Path $Stage -Parent) (Split-Path $Stage -Leaf)
+
+if (-not (Test-Path $Zip)) { throw "❌ ZIP not created (tar failed)" }
+
+(Get-FileHash $Zip -Algorithm SHA256).Hash | Out-File "$Zip.sha256" -Encoding ascii
+Write-Host "[ok] checksum: $((Get-Content "$Zip.sha256"))"
+
+Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+
+#5
+Get-FileHash "D:\Algo\Gold\wizard\dist\xtl\xtl.exe"
+Get-FileHash "C:\Program Files\XTL\dist\xtl\xtl.exe"
+
+Get-FileHash "D:\Algo\Gold\wizard\dist\xtl\_internal\base_library.zip"
+Get-FileHash "C:\Program Files\XTL\dist\xtl\_internal\base_library.zip"
+
+
+****************************************************************************
 
 sc.exe query XTLAgent
 

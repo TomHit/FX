@@ -34,7 +34,7 @@ from pathlib import Path
 try:
     from .mt5_client import _log, _mt5_running, reg_get
 except ImportError:
-    from mt5_client import _log, _mt5_running, reg_get
+    from xtl.mt5_client import _log, _mt5_running, reg_get
 
 # ---------------------------------------------------------------- limits ----
 # NO daily cap. A launch that succeeds and passes the data_path check is
@@ -214,9 +214,9 @@ def try_launch_mt5() -> bool:
     # --- guard 2: never launch from a service context ----------------------
     try:
         try:
-            from .mt5_client import _is_localsystem
+            from xtl.mt5_client import _is_localsystem
         except ImportError:
-            from mt5_client import _is_localsystem
+            from xtl.mt5_client import _is_localsystem
         if _is_localsystem():
             _log(
                 "[mt5_launch] refused: running as LocalSystem, not a user "

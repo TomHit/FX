@@ -6,6 +6,7 @@ from __future__ import annotations
 # === OPPT profiling: per-symbol/per-phase perf_counter timing (Step 1 instrument) ===
 import logging as _oppt_logging
 import json as _oppt_json
+
 from fastapi import HTTPException
 from time import perf_counter as _oppt_perf_counter
 _oppt_log = _oppt_logging.getLogger("xtl.oppt")
@@ -494,6 +495,19 @@ try:
     from openai import OpenAI  # type: ignore
 except Exception:
     OpenAI = None  # type: ignore
+
+
+# Phase-1 liquidity observation/display only.
+# Keep disabled by default to avoid expensive repeated LIQ detection.
+# Does NOT disable pre-gate SR liquidity scoring.
+XTL_LIQ_OBSERVATION_ENABLED = (
+    os.getenv("XTL_LIQ_OBSERVATION_ENABLED", "0")
+    .strip()
+    .lower()
+    in ("1", "true", "yes", "on")
+)
+
+DISCORD_WEBHOOK_URL = (os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("XTL_DISCORD_WEBHOOK_URL") or "").strip()
 
 # --------------------------
 # Discord webhook (optional)
@@ -10852,7 +10866,12 @@ def _resolve_live_device(
     except Exception:
         return None
 
-def _refresh_dynamic_sr_fields(sym_u: str, row: dict, out: dict) -> dict:
+def _refresh_dynamic_sr_fields(
+    sym_u: str,
+    row: dict,
+    out: dict,
+    sr_bundle_override: dict | None = None,
+) -> dict:
     try:
         live_px = (
             row.get("last_price")
@@ -10881,10 +10900,15 @@ def _refresh_dynamic_sr_fields(sym_u: str, row: dict, out: dict) -> dict:
         )
         
 
-        sr_bundle = _get_sr_bundle(
-            sym_u,
-            prefer_dev=prefer_dev,
-            display_only=True,  # always recompute for display — never block on frozen watch
+        sr_bundle = (
+            sr_bundle_override
+            if isinstance(sr_bundle_override, dict)
+            and sr_bundle_override
+            else _get_sr_bundle(
+                sym_u,
+                prefer_dev=prefer_dev,
+                display_only=True,
+            )
         )
 
         if not isinstance(sr_bundle, dict) or not sr_bundle:
@@ -20502,6 +20526,15 @@ def trend_opportunities(
     # ==========================================================
     watch_rows: list[dict[str, Any]] = []
 
+    # Request-local SR x liquidity reuse.
+    # One previous scoring snapshot per symbol.
+    # Reuse only when every input actually consumed by
+    # score_sr_with_liquidity() is exactly equal.
+    _liq_score_req_cache: dict[str, dict] = {}
+    
+
+    
+
     symbols_list = _sym_list(symbols)
 
     # fallback if request symbols empty
@@ -20524,6 +20557,10 @@ def trend_opportunities(
             continue
 
         _sym_side_rows = []   # collect surviving side-rows; collapse to one after loop
+        # PERF: H4 is symbol-level within one opportunities request.
+        # Load/decode once and reuse for BUY + SELL.
+        _sym_h4_loaded = False
+        _sym_h4_bars = []
 
         for side in ("BUY", "SELL"):
             _oppt_t.start(sym_u, side)
@@ -20639,32 +20676,132 @@ def trend_opportunities(
                     if callable(_score_sr_with_liquidity):
                         _b_px  = float(row.get("last_price") or row.get("price") or 0)
                         _b_atr = float(row.get("atr_1h") or row.get("atr14") or 0)
-                        _b_h4  = []
-                        try:
-                            _pt = _oppt_t.now()
-                            _h4_raw = R.get(f"xtl:ohlc:snap:{dev_for_gate}:{sym_u}:H4") if R is not None else None
-                            _oppt_t.add("h4_read", _oppt_t.now() - _pt)
-                            if isinstance(_h4_raw, (bytes, bytearray)):
-                                _h4_raw = _h4_raw.decode("utf-8", "ignore")
-                            if _h4_raw:
-                                _h4_obj = json.loads(_h4_raw)
-                                _b_h4 = (
-                                    (_h4_obj.get("bars") or _h4_obj.get("ohlc") or [])
-                                    if isinstance(_h4_obj, dict)
-                                    else (_h4_obj if isinstance(_h4_obj, list) else [])
-                                )
-                        except Exception:
+                        if _sym_h4_loaded:
+                            _b_h4 = _sym_h4_bars
+                        else:
                             _b_h4 = []
+                            try:
+                                _pt = _oppt_t.now()
+
+                                _h4_raw = (
+                                    R.get(
+                                        f"xtl:ohlc:snap:{dev_for_gate}:{sym_u}:H4"
+                                    )
+                                    if R is not None
+                                    else None
+                                )
+
+                                _oppt_t.add(
+                                    "h4_read",
+                                    _oppt_t.now() - _pt,
+                                )
+
+                                if isinstance(
+                                    _h4_raw,
+                                    (bytes, bytearray),
+                                ):
+                                    _h4_raw = _h4_raw.decode(
+                                        "utf-8",
+                                        "ignore",
+                                    )
+
+                                if _h4_raw:
+                                    _h4_obj = json.loads(_h4_raw)
+
+                                    _b_h4 = (
+                                        (
+                                            _h4_obj.get("bars")
+                                            or _h4_obj.get("ohlc")
+                                            or []
+                                        )
+                                        if isinstance(_h4_obj, dict)
+                                        else (
+                                            _h4_obj
+                                            if isinstance(_h4_obj, list)
+                                            else []
+                                        )
+                                    )
+
+                            except Exception:
+                                _b_h4 = []
+
+                            _sym_h4_bars = _b_h4
+                            _sym_h4_loaded = True
                         _sr_pre = row.get("sr") if isinstance(row.get("sr"), dict) else {}
-                        if _sr_pre and (_sr_pre.get("active_supports") or _sr_pre.get("active_resistances")):
+                        if _sr_pre and (
+                            _sr_pre.get("active_supports")
+                            or _sr_pre.get("active_resistances")
+                        ):
                             _pt = _oppt_t.now()
-                            _sc = _score_sr_with_liquidity(sym_u, _sr_pre, bars_h1, _b_h4, _b_px, _b_atr)
-                            _oppt_t.add("liq_score", _oppt_t.now() - _pt)
+
+                            _liq_prev = _liq_score_req_cache.get(sym_u)
+
+                            _active_sup = (
+                                _sr_pre.get("active_supports") or []
+                            )
+                            _active_res = (
+                                _sr_pre.get("active_resistances") or []
+                            )
+
+                            _liq_cache_hit = bool(
+                                isinstance(_liq_prev, dict)
+                                and _liq_prev.get("price") == _b_px
+                                and _liq_prev.get("atr") == _b_atr
+                                and _liq_prev.get("active_supports") == _active_sup
+                                and _liq_prev.get("active_resistances") == _active_res
+                                and _liq_prev.get("bars_h1") == bars_h1
+                                and _liq_prev.get("bars_h4") == _b_h4
+                                and isinstance(_liq_prev.get("score"), dict)
+                            )
+
+                            if _liq_cache_hit:
+                                _sc = _liq_prev["score"]
+
+                                _oppt_t.add(
+                                    "liq_score_cache_hit",
+                                    _oppt_t.now() - _pt,
+                                )
+
+                            else:
+                                _sc = _score_sr_with_liquidity(
+                                    sym_u,
+                                    _sr_pre,
+                                    bars_h1,
+                                    _b_h4,
+                                    _b_px,
+                                    _b_atr,
+                                )
+
+                                _oppt_t.add(
+                                    "liq_score",
+                                    _oppt_t.now() - _pt,
+                                )
+
+                                if isinstance(_sc, dict):
+                                    _liq_score_req_cache[sym_u] = {
+                                        "price": _b_px,
+                                        "atr": _b_atr,
+                                        "active_supports": _active_sup,
+                                        "active_resistances": _active_res,
+                                        "bars_h1": bars_h1,
+                                        "bars_h4": _b_h4,
+                                        "score": _sc,
+                                    }
+
                             if isinstance(_sc, dict) and _sc:
-                                _sr_pre["scored_supports"]    = _sc.get("scored_supports") or []
-                                _sr_pre["scored_resistances"] = _sc.get("scored_resistances") or []
-                                _sr_pre["best_support"]       = _sc.get("best_support")
-                                _sr_pre["best_resistance"]    = _sc.get("best_resistance")
+                                _sr_pre["scored_supports"] = (
+                                    _sc.get("scored_supports") or []
+                                )
+                                _sr_pre["scored_resistances"] = (
+                                    _sc.get("scored_resistances") or []
+                                )
+                                _sr_pre["best_support"] = (
+                                    _sc.get("best_support")
+                                )
+                                _sr_pre["best_resistance"] = (
+                                    _sc.get("best_resistance")
+                                )
+
                                 row["sr"] = _sr_pre
                                 if debug_gate_on:
                                     row["dbg_bridge_preglate_ran"] = True
@@ -20782,7 +20919,16 @@ def trend_opportunities(
 
             try:
                 _pt = _oppt_t.now()
-                _refresh_dynamic_sr_fields(sym_u, row, row)
+                _refresh_dynamic_sr_fields(
+                    sym_u,
+                    row,
+                    row,
+                    sr_bundle_override=(
+                        row.get("sr")
+                        if isinstance(row.get("sr"), dict)
+                        else None
+                    ),
+                )
                 
             except Exception:
                 pass
@@ -20807,7 +20953,7 @@ def trend_opportunities(
 
             # -- LIQ STRUCTURE OBSERVATION (Phase 1 — display only) --------
             try:
-                if callable(_detect_liq_signals):
+                if XTL_LIQ_OBSERVATION_ENABLED and callable(_detect_liq_signals):
                     _liq_px  = float(row.get("last_price") or row.get("price") or 0)
                     _liq_atr_tmp = float(row.get("atr_1h") or row.get("atr14") or 0) or 1.0
                     _liq_zone = (

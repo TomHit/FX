@@ -24,6 +24,14 @@ from typing import Any
 
 log = logging.getLogger("xtl.liq")
 
+# Process-local liquidity primitive cache.
+#
+# One entry per symbol. Reused only when H1/H4 bars and ATR are
+# exactly unchanged. No Redis, no TTL, no stale cross-process state.
+#
+# Final SR scoring and round-number calculations remain LIVE.
+_SR_LIQ_PRIMITIVE_CACHE: dict[str, dict] = {}
+
 # ─── ATR helper ──────────────────────────────────────────────────────────────
 
 def _atr14(bars: list[dict]) -> float:
@@ -1710,19 +1718,154 @@ def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
         active_sup = (sr_bundle or {}).get("active_supports") or []
         active_res = (sr_bundle or {}).get("active_resistances") or []
 
-        # ---- precompute liquidity objects once (both directions) ----
-        ob_bull = find_order_blocks(bars_h1, "BUY", atr=_atr) + \
-                  (find_order_blocks(bars_h4, "BUY", atr=_atr) if bars_h4 else [])
-        ob_bear = find_order_blocks(bars_h1, "SELL", atr=_atr) + \
-                  (find_order_blocks(bars_h4, "SELL", atr=_atr) if bars_h4 else [])
-        fvg_bull = [f for f in find_fair_value_gaps(bars_h1, "BUY", atr=_atr) if not f.get("filled")]
-        fvg_bear = [f for f in find_fair_value_gaps(bars_h1, "SELL", atr=_atr) if not f.get("filled")]
-        eq_ssl = find_equal_levels(bars_h1, _atr, "BUY")   # equal lows
-        eq_bsl = find_equal_levels(bars_h1, _atr, "SELL")  # equal highs
-        sw_ssl = [s for s in find_untouched_swings(bars_h1, "BUY") if s.get("fresh")]
-        sw_bsl = [s for s in find_untouched_swings(bars_h1, "SELL") if s.get("fresh")]
-        rn_buy = find_round_numbers(price, _atr, sym, "BUY")
-        rn_sell = find_round_numbers(price, _atr, sym, "SELL")
+        
+        # ---------------------------------------------------------
+        # PERF: cache only OHLC-derived liquidity primitives.
+        #
+        # Cache hit requires exact equality of:
+        #   - complete H1 input
+        #   - complete H4 input
+        #   - ATR
+        #
+        # Current price and active SR levels are NOT cached here.
+        # Round numbers + final SR scoring remain live every call.
+        # ---------------------------------------------------------
+        _cache_sym = str(sym or "").upper().strip()
+        _prim = _SR_LIQ_PRIMITIVE_CACHE.get(_cache_sym)
+
+        _primitive_cache_hit = bool(
+            isinstance(_prim, dict)
+            and _prim.get("atr") == _atr
+            and _prim.get("bars_h1") == bars_h1
+            and _prim.get("bars_h4") == bars_h4
+        )
+
+        if _primitive_cache_hit:
+            ob_bull = _prim["ob_bull"]
+            ob_bear = _prim["ob_bear"]
+            fvg_bull = _prim["fvg_bull"]
+            fvg_bear = _prim["fvg_bear"]
+            eq_ssl = _prim["eq_ssl"]
+            eq_bsl = _prim["eq_bsl"]
+            sw_ssl = _prim["sw_ssl"]
+            sw_bsl = _prim["sw_bsl"]
+
+        else:
+            ob_bull = (
+                find_order_blocks(
+                    bars_h1,
+                    "BUY",
+                    atr=_atr,
+                )
+                + (
+                    find_order_blocks(
+                        bars_h4,
+                        "BUY",
+                        atr=_atr,
+                    )
+                    if bars_h4
+                    else []
+                )
+            )
+
+            ob_bear = (
+                find_order_blocks(
+                    bars_h1,
+                    "SELL",
+                    atr=_atr,
+                )
+                + (
+                    find_order_blocks(
+                        bars_h4,
+                        "SELL",
+                        atr=_atr,
+                    )
+                    if bars_h4
+                    else []
+                )
+            )
+
+            fvg_bull = [
+                f
+                for f in find_fair_value_gaps(
+                    bars_h1,
+                    "BUY",
+                    atr=_atr,
+                )
+                if not f.get("filled")
+            ]
+
+            fvg_bear = [
+                f
+                for f in find_fair_value_gaps(
+                    bars_h1,
+                    "SELL",
+                    atr=_atr,
+                )
+                if not f.get("filled")
+            ]
+
+            eq_ssl = find_equal_levels(
+                bars_h1,
+                _atr,
+                "BUY",
+            )
+
+            eq_bsl = find_equal_levels(
+                bars_h1,
+                _atr,
+                "SELL",
+            )
+
+            sw_ssl = [
+                s
+                for s in find_untouched_swings(
+                    bars_h1,
+                    "BUY",
+                )
+                if s.get("fresh")
+            ]
+
+            sw_bsl = [
+                s
+                for s in find_untouched_swings(
+                    bars_h1,
+                    "SELL",
+                )
+                if s.get("fresh")
+            ]
+
+            # One bounded entry per symbol. Replacing it on structural
+            # change prevents an unbounded process-local cache.
+            if _cache_sym:
+                _SR_LIQ_PRIMITIVE_CACHE[_cache_sym] = {
+                    "atr": _atr,
+                    "bars_h1": bars_h1,
+                    "bars_h4": bars_h4,
+                    "ob_bull": ob_bull,
+                    "ob_bear": ob_bear,
+                    "fvg_bull": fvg_bull,
+                    "fvg_bear": fvg_bear,
+                    "eq_ssl": eq_ssl,
+                    "eq_bsl": eq_bsl,
+                    "sw_ssl": sw_ssl,
+                    "sw_bsl": sw_bsl,
+                }
+
+        # LIVE components — never cached by the structural cache.
+        rn_buy = find_round_numbers(
+            price,
+            _atr,
+            sym,
+            "BUY",
+        )
+
+        rn_sell = find_round_numbers(
+            price,
+            _atr,
+            sym,
+            "SELL",
+        )
 
         def _near_level(objs, lo, hi, key="level", tol=None):
             t = tol if tol is not None else 0.20 * _atr
