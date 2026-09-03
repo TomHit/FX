@@ -1886,23 +1886,26 @@ def post_ohlc(
     if not token:
         raise HTTPException(status_code=401, detail="missing token")
 
-    # --- verify token + find owner (DB); non-fatal if DB read fails ---
+    
+    # ------------------------------------------------------------
+    # Cached device authentication.
+    #
+    # Fast path:
+    #   L1 process memory
+    #   -> Redis
+    #   -> PostgreSQL only on cache miss
+    #
+    # Security:
+    #   - invalid token still returns 401
+    #   - auth backend failure returns 503
+    #   - no fail-open owner_id=None path
+    # ------------------------------------------------------------
     owner_id: Optional[str] = None
-    try:
-        with db() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT user_id::text, device_token FROM devices WHERE id=%s",
-                (dev_id,),
-            )
-            row = cur.fetchone()
-            if (not row) or (str(row[1]) != token):
-                raise HTTPException(status_code=401, detail="invalid token")
-            owner_id = row[0]
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.info(f"[OHLC] token verify error (continuing): {e}")
-        owner_id = None
+
+    owner_id, _device_auth_source = _authenticate_device_cached(
+        dev_id,
+        token,
+    )
 
     
     # --- persist minimal device facts (non-fatal) ---

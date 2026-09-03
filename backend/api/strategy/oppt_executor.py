@@ -167,7 +167,23 @@ def _discord_notify_event_gate(
 
         window = str(
             ev.get("window") or ""
-        ).strip()
+        ).upper().strip()
+
+        currency = str(
+            ev.get("currency") or ""
+        ).upper().strip()
+
+        event_time_ms = int(
+            ev.get("event_time_ms") or 0
+        )
+
+        pre_block_min = int(
+            ev.get("pre_block_min") or 0
+        )
+
+        post_block_min = int(
+            ev.get("post_block_min") or 0
+        )
 
         mins = ev.get("minutes_to_event")
 
@@ -180,32 +196,115 @@ def _discord_notify_event_gate(
         except Exception:
             mins_txt = "n/a"
 
+        # ---------------------------------------------------------
+        # Discord event-level affected-symbol presentation.
+        #
+        # IMPORTANT:
+        # This is DISPLAY ONLY.
+        # It does not change check_news_block(), symbol relevance,
+        # RC ownership, Point-A, or execution behavior.
+        # ---------------------------------------------------------
+        _symbol_currency_map = {
+            "XAUUSD": {"USD"},
+            "EURUSD": {"EUR", "USD"},
+            "GBPUSD": {"GBP", "USD"},
+            "USDJPY": {"USD", "JPY"},
+            "USDCAD": {"USD", "CAD"},
+            "USDCHF": {"USD", "CHF"},
+        }
+
+        affected_symbols = [
+            _sym
+            for _sym, _ccys in _symbol_currency_map.items()
+            if currency and currency in _ccys
+        ]
+
+        affected_txt = (
+            ", ".join(affected_symbols)
+            if affected_symbols
+            else sym
+        )
+
+        # Event timestamps are canonical UTC epochs.
+        def _fmt_event_utc(ms: int) -> str:
+            if int(ms or 0) <= 0:
+                return "n/a"
+
+            try:
+                return time.strftime(
+                    "%Y-%m-%d %H:%M UTC",
+                    time.gmtime(int(ms) / 1000.0),
+                )
+            except Exception:
+                return "n/a"
+
+        event_time_txt = _fmt_event_utc(
+            event_time_ms
+        )
+
+        block_start_ms = (
+            event_time_ms
+            - pre_block_min * 60_000
+            if event_time_ms > 0
+            else 0
+        )
+
+        block_end_ms = (
+            event_time_ms
+            + post_block_min * 60_000
+            if event_time_ms > 0
+            else 0
+        )
+
+        block_start_txt = _fmt_event_utc(
+            block_start_ms
+        )
+
+        block_end_txt = _fmt_event_utc(
+            block_end_ms
+        )
+
         if action_u == "ACQUIRED":
             title = "🟠 XTL EVENT BLOCK"
-            status = "ENTRY HELD"
+            status = "NEW ENTRIES HELD"
+
             next_step = (
-                "RC/cross preserved — waiting for event window to clear."
+                "Crossed RC preserved. "
+                "When the event window clears, "
+                "the same RC/cross is re-evaluated "
+                "through current Point-A."
             )
+
         else:
             title = "🟢 XTL EVENT RELEASE"
             status = "EVENT CLEAR"
+
             next_step = (
-                "Same RC/cross preserved — re-evaluating current Point-A."
+                "Event window cleared. "
+                "Same RC/cross preserved — "
+                "re-evaluating current Point-A."
             )
 
         content = (
             f"{title}\n"
-            f"**{sym} {side}** | {status}\n"
-            f"Event: **{event_name}**\n"
-            f"Tier: {event_tier or 'n/a'} | "
-            f"Window: {window or 'CLEAR'} | "
-            f"Time: {mins_txt}\n"
+            f"**{event_name}** | {status}\n"
+            f"Currency: **{currency or 'n/a'}** | "
+            f"Tier: {event_tier or 'n/a'}\n"
+            f"Event: `{event_time_txt}`\n"
+            f"Policy: PRE `{pre_block_min}m` | "
+            f"POST `{post_block_min}m`\n"
+            f"Block window: `{block_start_txt}` → "
+            f"`{block_end_txt}`\n"
+            f"Current window: `{window or 'CLEAR'}` | "
+            f"Time: `{mins_txt}`\n"
+            f"Blocked symbols: **{affected_txt}**\n"
+            f"\n"
+            f"Crossed setup: **{sym} {side}**\n"
             f"RC: `{rev_ok_ms}`\n"
             f"Trigger: `{float(trigger_level):.6f}` | "
             f"Live: `{float(live_price):.6f}`\n"
             f"{next_step}"
         )
-
         ok = _discord_trade_post(content)
 
         if not ok:
@@ -2222,6 +2321,432 @@ def _make_repair_prop_check(
         "planned_rr": round(float(planned_rr or 0.0), 4),
     }
 
+def _reconcile_market_fill_tp(
+    uid: str,
+    trade_id: str,
+    pos: dict,
+    bp: dict,
+) -> bool:
+    """
+    Re-anchor the original 2R TP to the authoritative MT5 MARKET fill.
+
+    Structural SL remains unchanged.
+
+    This is one-time broker reconciliation only:
+      planned entry -> actual broker price_open
+      original SL   -> unchanged
+      target TP     -> 2R from actual fill
+
+    Broker snapshot is authoritative.
+    """
+    try:
+        if (
+            str(pos.get("execution_mode") or "").lower().strip()
+            != "mt5"
+        ):
+            return False
+
+        if _normalize_order_type(pos) != "MARKET":
+            return False
+
+        ticket = int(
+            pos.get("mt5_ticket")
+            or pos.get("broker_ticket")
+            or pos.get("position_ticket")
+            or 0
+        )
+
+        broker_ticket = int(bp.get("ticket") or 0)
+
+        if ticket <= 0 or broker_ticket != ticket:
+            return False
+
+        side = str(
+            pos.get("side") or ""
+        ).upper().strip()
+
+        if side not in ("BUY", "SELL"):
+            return False
+
+        broker_entry = float(
+            bp.get("price_open")
+            or 0.0
+        )
+
+        if broker_entry <= 0:
+            return False
+
+        initial_sl = float(
+            pos.get("original_sl_price")
+            or pos.get("sl_price")
+            or 0.0
+        )
+
+        if initial_sl <= 0:
+            return False
+
+        # -------------------------------------------------
+        # Broker fill is authoritative.
+        # Persist it even when ACK result.price was zero.
+        # -------------------------------------------------
+        planned_entry = float(
+            pos.get("original_entry_price")
+            or pos.get("planned_entry_price")
+            or pos.get("entry_price")
+            or 0.0
+        )
+
+        pos["mt5_fill_price"] = broker_entry
+        pos["entry_price"] = broker_entry
+        pos["fill_price_source"] = (
+            "BROKER_POSITION_PRICE_OPEN"
+        )
+
+        risk_dist = abs(
+            broker_entry - initial_sl
+        )
+
+        if risk_dist <= 0:
+            return False
+
+        if side == "BUY":
+            if initial_sl >= broker_entry:
+                return False
+
+            target_tp_raw = (
+                broker_entry
+                + (2.0 * risk_dist)
+            )
+
+        else:
+            if initial_sl <= broker_entry:
+                return False
+
+            target_tp_raw = (
+                broker_entry
+                - (2.0 * risk_dist)
+            )
+
+        step = _broker_price_step(bp)
+
+        if step <= 0:
+            log.error(
+                "[OPPT] FILL_TP_RECONCILE_NO_PRECISION "
+                "uid=%s tid=%s sym=%s ticket=%s",
+                uid,
+                trade_id,
+                pos.get("symbol"),
+                ticket,
+            )
+            return False
+
+        target_tp = _normalize_price_to_step(
+            target_tp_raw,
+            step,
+        )
+
+        broker_tp = float(
+            bp.get("tp")
+            or 0.0
+        )
+
+        broker_sl = float(
+            bp.get("sl")
+            or initial_sl
+            or 0.0
+        )
+        
+        pos["fill_tp_target_raw"] = float(
+            target_tp_raw
+        )
+        pos["fill_tp_target"] = float(
+            target_tp
+        )
+        pos["fill_tp_price_step"] = float(
+            step
+        )
+        pos["fill_tp_broker_before"] = float(
+            broker_tp
+        )
+        pos["fill_tp_reconcile_checked_at_ms"] = (
+            now_ms()
+        )
+
+        # -------------------------------------------------
+        # Already correct at broker.
+        # Do not enqueue anything.
+        # -------------------------------------------------
+        tolerance = max(
+            step * 0.5,
+            1e-12,
+        )
+
+        if (
+            broker_tp > 0
+            and abs(
+                broker_tp - target_tp
+            ) <= tolerance
+        ):
+            pos["fill_tp_reconciled"] = True
+            pos["fill_tp_verified_from_broker"] = True
+            pos["fill_tp_reconciled_at_ms"] = (
+                now_ms()
+            )
+            pos["broker_current_tp"] = broker_tp
+            pos["fill_tp_pending_job_id"] = None
+            pos["fill_tp_retry_after_ms"] = 0
+
+            return True
+        # -------------------------------------------------
+        # SAFETY:
+        # Target-match was checked first above.
+        #
+        # If broker TP is neither the corrected target nor
+        # the original XTL TP, another/manual modification
+        # owns it. Preserve that broker TP.
+        # -------------------------------------------------
+        original_tp = float(
+            pos.get("original_tp_price")
+            or pos.get("tp_price")
+            or 0.0
+        )
+
+        if (
+            broker_tp > 0
+            and original_tp > 0
+            and abs(
+                broker_tp - original_tp
+            ) > max(
+                step * 0.5,
+                1e-12,
+            )
+        ):
+            pos["fill_tp_reconcile_skipped"] = True
+            pos["fill_tp_reconcile_skip_reason"] = (
+                "BROKER_TP_CHANGED_FROM_ORIGINAL"
+            )
+            pos["fill_tp_reconcile_checked_at_ms"] = now_ms()
+
+            log.warning(
+                "[OPPT] FILL_TP_RECONCILE_SKIP_CHANGED_TP "
+                "uid=%s tid=%s sym=%s ticket=%s "
+                "original_tp=%s broker_tp=%s target_tp=%s",
+                uid,
+                trade_id,
+                pos.get("symbol"),
+                ticket,
+                original_tp,
+                broker_tp,
+                target_tp,
+            )
+
+            return False
+
+        # -------------------------------------------------
+        # Existing request:
+        # wait for ACK / broker snapshot before retrying.
+        # -------------------------------------------------
+        pending_job_id = str(
+            pos.get("fill_tp_pending_job_id")
+            or ""
+        ).strip()
+
+        if pending_job_id:
+            ack = _get_mt5_ack(
+                pending_job_id
+            )
+
+            if isinstance(ack, dict):
+                if bool(ack.get("ok")):
+                    # ACK alone is not final proof.
+                    # Wait until broker snapshot shows target TP.
+                    pos["fill_tp_ack_ok"] = True
+                    pos["fill_tp_ack_at_ms"] = now_ms()
+
+                    return False
+
+                pos["fill_tp_ack_ok"] = False
+                pos["fill_tp_last_error"] = str(
+                    ack.get("error")
+                    or (
+                        ack.get("result")
+                        or {}
+                    ).get("error")
+                    or "MODIFY_ACK_FAILED"
+                )
+
+                pos["fill_tp_pending_job_id"] = None
+
+                retry_after = int(
+                    pos.get(
+                        "fill_tp_retry_after_ms"
+                    )
+                    or 0
+                )
+
+                if now_ms() < retry_after:
+                    return False
+
+            else:
+                requested_at = int(
+                    pos.get(
+                        "fill_tp_requested_at_ms"
+                    )
+                    or 0
+                )
+
+                # Avoid duplicate Agent commands while ACK/snapshot
+                # is still propagating.
+                if (
+                    requested_at > 0
+                    and now_ms() - requested_at
+                    < 10_000
+                ):
+                    return False
+
+                pos["fill_tp_pending_job_id"] = None
+
+        retry_after = int(
+            pos.get(
+                "fill_tp_retry_after_ms"
+            )
+            or 0
+        )
+
+        if now_ms() < retry_after:
+            return False
+
+        device_id = str(
+            bp.get("device_id")
+            or pos.get("device_id")
+            or ""
+        ).strip()
+
+        if not device_id:
+            return False
+
+        job_id = (
+            "mt5_"
+            + uuid.uuid4().hex
+        )
+
+        payload = {
+            "job_id": job_id,
+            "type": "modify_position_sltp",
+            "kind": "ENTRY_FILL_RECONCILE",
+            "mt5_account": str(
+                pos.get("mt5_account")
+                or "demo"
+            ).lower().strip(),
+            "symbol": str(
+                pos.get("symbol")
+                or ""
+            ).upper().strip(),
+            "side": side,
+            "ticket": ticket,
+
+            # Preserve broker-live SL exactly.
+            "sl": float(broker_sl),
+
+            # Replace only TP with corrected 2R target.
+            "tp": float(target_tp),
+
+            "trade_id": str(
+                pos.get("trade_id")
+                or trade_id
+                or ""
+            ),
+            "user_id": uid,
+            "profile_id": str(
+                pos.get("profile_id")
+                or ""
+            ),
+            "device_id": device_id,
+            "reason": "MARKET_FILL_TP_RECONCILE",
+            "planned_entry": float(
+                planned_entry
+            ),
+            "broker_fill": float(
+                broker_entry
+            ),
+            "original_sl": float(
+                initial_sl
+            ),
+            "broker_sl_before": float(
+                broker_sl
+            ),
+            "broker_tp_before": float(
+                broker_tp
+            ),
+            "target_tp": float(
+                target_tp
+            ),
+            "created_at_ms": now_ms(),
+            "source": "oppt_executor",
+        }
+
+        R.rpush(
+            _mt5_cmdq_key(device_id),
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+        R.ltrim(
+            _mt5_cmdq_key(device_id),
+            -200,
+            -1,
+        )
+
+        pos["fill_tp_pending_job_id"] = (
+            job_id
+        )
+        pos["fill_tp_requested_at_ms"] = (
+            now_ms()
+        )
+        pos["fill_tp_retry_after_ms"] = (
+            now_ms() + 5_000
+        )
+
+        log.warning(
+            "[OPPT] FILL_TP_RECONCILE_ENQUEUE "
+            "uid=%s tid=%s sym=%s side=%s "
+            "ticket=%s planned_entry=%s "
+            "broker_fill=%s original_sl=%s "
+            "broker_tp=%s target_tp=%s job_id=%s",
+            uid,
+            trade_id,
+            pos.get("symbol"),
+            side,
+            ticket,
+            planned_entry,
+            broker_entry,
+            initial_sl,
+            broker_tp,
+            target_tp,
+            job_id,
+        )
+
+        return False
+
+    except Exception as exc:
+        log.exception(
+            "[OPPT] FILL_TP_RECONCILE_FAILED "
+            "uid=%s tid=%s ticket=%s err=%r",
+            uid,
+            trade_id,
+            (
+                pos.get("mt5_ticket")
+                if isinstance(pos, dict)
+                else None
+            ),
+            exc,
+        )
+
+        return False
+
 def _sync_open_trade_broker_sl_tp(uid: str, bp: dict) -> None:
     """
     Sync live broker SL/TP/current price into XTL open trade ledger.
@@ -2277,6 +2802,19 @@ def _sync_open_trade_broker_sl_tp(uid: str, bp: dict) -> None:
             pos["broker_sl_tp_synced_at_ms"] = now_ms()
             pos["broker_snapshot_key"] = str(bp.get("snapshot_key") or "")
             pos["broker_device_id"] = str(bp.get("device_id") or "")
+
+            # -------------------------------------------------
+            # MARKET fill -> TP reconciliation.
+            #
+            # Uses authoritative broker price_open and preserves
+            # the original structural SL.
+            # -------------------------------------------------
+            _reconcile_market_fill_tp(
+                uid,
+                trade_id,
+                pos,
+                bp,
+            )
 
             broker_price_step = _broker_price_step(bp)
 
@@ -2702,6 +3240,12 @@ def _sync_watches_for_broker_active_position(uid: str,bp: dict, reason: str = "B
                     w["zone_used"] = _rebuilt
 
         R.set(same_key, json.dumps(w, separators=(",", ":")), ex=7 * 24 * 3600)
+        zone_watch_index_add(
+            R,
+            uid_u,
+            same_key,
+            tf="H1",
+        )
 
         log.warning(
             "[WATCHLIST] BROKER_ACTIVE_SYMBOL_GUARD sym=%s active_side=%s ticket=%s cleared_side=%s reason=%s",
@@ -2801,6 +3345,7 @@ from api.tenant_keys import (
     break_state_key,
     entry_claim_key,
     zone_watch_index_key,
+    zone_watch_index_add,
     
     entry_claim_acquire as tenant_entry_claim_acquire,
     delete_latest_entry_claim as tenant_delete_latest_entry_claim,
@@ -4614,15 +5159,65 @@ def _maybe_dxy_h1_early_close_loss(
     if entry <= 0 or price <= 0:
         return {"action": "SKIP", "reason": "PRICE_UNAVAILABLE"}
 
-    # Strictly losing only. Flat or profitable positions remain under the
-    # existing position-manager BE/profit-protection lifecycle.
-    adverse = (
-        price < entry - max(step * 0.5, 1e-12)
-        if side == "BUY"
-        else price > entry + max(step * 0.5, 1e-12)
+    
+    # -------------------------------------------------
+    # DXY H1 early-loss price protection.
+    #
+    # Policy:
+    #   - Before +0.50R MFE:
+    #       adverse REAL_DXY H1 may close only after price reaches -0.15R.
+    #   - Once +0.50R has ever been reached:
+    #       DXY early market-close is permanently disabled for this trade.
+    #       Dedicated position manager owns BE/profit protection.
+    #
+    # original_sl_price / sl_price is immutable initial risk denominator.
+    # -------------------------------------------------
+    initial_sl = _sf(
+        pos.get("original_sl_price")
+        or pos.get("sl_price"),
+        0.0,
     )
-    if not adverse:
-        return {"action": "SKIP", "reason": "NOT_LOSING"}
+    initial_risk = abs(entry - initial_sl) if initial_sl > 0 else 0.0
+
+    if initial_risk <= 0:
+        return {
+            "action": "SKIP",
+            "reason": "DXY_EARLY_INITIAL_RISK_UNAVAILABLE",
+        }
+
+    current_r = (
+        (price - entry) / initial_risk
+        if side == "BUY"
+        else (entry - price) / initial_risk
+    )
+
+    pm = pos.get("position_management")
+    if not isinstance(pm, dict):
+        pm = {}
+
+    max_r_seen = _sf(pm.get("max_r_seen"), current_r)
+    max_r_seen = max(float(max_r_seen), float(current_r))
+
+    # +0.50R is a one-way ownership boundary.
+    # Once achieved, DXY must never market-close this trade via early-loss.
+    if max_r_seen + 1e-9 >= 0.50:
+        return {
+            "action": "SKIP",
+            "reason": "DXY_EARLY_DISABLED_AFTER_050R",
+            "current_r": round(float(current_r), 4),
+            "max_r_seen": round(float(max_r_seen), 4),
+        }
+
+    # Price must confirm meaningful deterioration.
+    # Being 1-2 ticks below entry is no longer sufficient.
+    if current_r > -0.15:
+        return {
+            "action": "SKIP",
+            "reason": "DXY_EARLY_LOSS_THRESHOLD_NOT_REACHED",
+            "current_r": round(float(current_r), 4),
+            "threshold_r": -0.15,
+            "max_r_seen": round(float(max_r_seen), 4),
+        }
 
     # If broker SL already protects entry/profit, do not race the dedicated
     # position manager with an executor close command.
@@ -4718,13 +5313,7 @@ def _maybe_dxy_h1_early_close_loss(
             "opened_at_ms": opened_at_ms,
         }
 
-    initial_sl = _sf(pos.get("original_sl_price") or pos.get("sl_price"), 0.0)
-    initial_risk = abs(entry - initial_sl) if initial_sl > 0 else 0.0
-    current_r = (
-        ((price - entry) / initial_risk if side == "BUY" else (entry - price) / initial_risk)
-        if initial_risk > 0
-        else None
-    )
+    
 
     trade_id = str(pos.get("trade_id") or "").strip()
     profile_id = str(pos.get("profile_id") or "").strip().lower()
@@ -4808,7 +5397,22 @@ def _maybe_dxy_h1_early_close_loss(
         "dxy_exit_h1_detected_at_ms": h1_detected_at_ms,
         "dxy_exit_h1_source_key": dxy.get("_redis_key"),
     }
-    _patch_open_trade_fields(uid, trade_id, patch)
+    patch_ok = _patch_open_trade_fields(uid, trade_id, patch)
+
+    if patch_ok:
+        # Keep this reconciliation-loop snapshot consistent with Redis.
+        # Otherwise a broker close observed in the same sweep can lose the
+        # requested DXY exit reason/audit fields.
+        pos.update(patch)
+    else:
+        log.error(
+            "[OPPT] DXY_H1_EARLY_CLOSE_AUDIT_PATCH_FAILED "
+            "uid=%s tid=%s ticket=%s job=%s",
+            uid,
+            trade_id,
+            ticket,
+            close_res.get("job_id"),
+        )
 
     log.error(
         "[OPPT] DXY_H1_EARLY_CLOSE_ENQUEUED "
@@ -4825,7 +5429,6 @@ def _maybe_dxy_h1_early_close_loss(
         price,
         current_r,
         current_sl,
-        h1_status,
         h1_direction,
         h1_bar_close_ms,
         h1_detected_at_ms,
@@ -5288,6 +5891,12 @@ def _alert_to_event(row: dict) -> Optional[dict]:
                                     "entry_trigger_type": "REV_OK_BAR_BREAK",
                                     "trade_state": "ORDER_PENDING",
                                 }))
+                            zone_watch_index_add(
+                                R,
+                                event_uid,
+                                str(wkey),
+                                tf="H1",
+                            )
                         except Exception:
                             pass
                 except Exception:
@@ -6931,9 +7540,9 @@ def tick_user(uid: str) -> None:
                 pos["status"] = "filled"
                 pos["trade_state"] = "TRADE_ACTIVE"
 
-                # IMPORTANT:
-                # Read authoritative MT5 ticket/fill FIRST, before persisting
-                # the trade or publishing TRADE_ACTIVE into the zone watch.
+                # -------------------------------------------------
+                # MT5 FILL RECONCILIATION
+                # -------------------------------------------------
                 try:
                     res = ack.get("result") or {}
 
@@ -6941,19 +7550,122 @@ def tick_user(uid: str) -> None:
                         if res.get("ticket") is not None:
                             pos["mt5_ticket"] = res.get("ticket")
 
-                        if res.get("price") is not None:
-                            pos["mt5_fill_price"] = res.get("price")
+                        if "planned_entry_price" not in pos:
+                            pos["planned_entry_price"] = pos.get("entry_price")
 
-                            # For MT5-filled trades, store real fill as entry.
+                        if "original_tp_price" not in pos:
+                            pos["original_tp_price"] = pos.get("tp_price")
+
+                        if "original_sl_price" not in pos:
+                            pos["original_sl_price"] = pos.get("sl_price")
+
+                        fp = 0.0
+
+                        try:
+                            fp = float(res.get("price") or 0.0)
+                        except Exception:
+                            fp = 0.0
+
+                        if fp > 0:
+                            pos["mt5_fill_price"] = fp
+                            pos["entry_price"] = fp
+                            pos["fill_price_source"] = "ACK_RESULT_PRICE"
+
+                        else:
                             try:
-                                fp = float(res.get("price"))
-                                if fp > 0:
-                                    pos["entry_price"] = fp
+                                ack_ticket = int(
+                                    pos.get("mt5_ticket")
+                                    or pos.get("broker_ticket")
+                                    or 0
+                                )
                             except Exception:
-                                pass
+                                ack_ticket = 0
+
+                            profile_id = str(
+                                pos.get("profile_id")
+                                or ""
+                            ).strip().lower()
+
+                            account_type = str(
+                                pos.get("mt5_account")
+                                or "demo"
+                            ).strip().lower()
+
+                            if ack_ticket > 0 and profile_id:
+                                broker_positions = _broker_xtl_positions(
+                                    uid,
+                                    account_type=account_type,
+                                    profile_id=profile_id,
+                                )
+
+                                broker_match = None
+
+                                for bp in broker_positions or []:
+                                    try:
+                                        if int(bp.get("ticket") or 0) == ack_ticket:
+                                            broker_match = bp
+                                            break
+                                    except Exception:
+                                        continue
+
+                                if broker_match:
+                                    try:
+                                        broker_fill = float(
+                                            broker_match.get("price_open")
+                                            or 0.0
+                                        )
+                                    except Exception:
+                                        broker_fill = 0.0
+
+                                    if broker_fill > 0:
+                                        pos["mt5_fill_price"] = broker_fill
+                                        pos["entry_price"] = broker_fill
+                                        pos["fill_price_source"] = (
+                                            "BROKER_POSITION_PRICE_OPEN"
+                                        )
+
+                                        pos["broker_current_sl"] = (
+                                            broker_match.get("sl")
+                                        )
+                                        pos["broker_current_tp"] = (
+                                            broker_match.get("tp")
+                                        )
+                                        pos["broker_position_seen_at_ms"] = now_ms()
+
+                                        log.warning(
+                                            "[OPPT] ACK_FILL_RECONCILED "
+                                            "uid=%s tid=%s sym=%s ticket=%s "
+                                            "planned_entry=%s broker_fill=%s "
+                                            "broker_sl=%s broker_tp=%s",
+                                            uid,
+                                            pos.get("trade_id"),
+                                            pos.get("symbol"),
+                                            ack_ticket,
+                                            pos.get("planned_entry_price"),
+                                            broker_fill,
+                                            broker_match.get("sl"),
+                                            broker_match.get("tp"),
+                                        )
+                                    else:
+                                        pos["mt5_fill_price"] = 0.0
+                                        pos["fill_price_source"] = (
+                                            "BROKER_PRICE_OPEN_UNAVAILABLE"
+                                        )
+                                else:
+                                    pos["mt5_fill_price"] = 0.0
+                                    pos["fill_price_source"] = (
+                                        "BROKER_POSITION_NOT_YET_VISIBLE"
+                                    )
 
                 except Exception:
-                    pass
+                    log.exception(
+                        "[OPPT] ACK_FILL_RECONCILE_FAILED "
+                        "uid=%s tid=%s sym=%s job_id=%s",
+                        uid,
+                        pos.get("trade_id"),
+                        pos.get("symbol"),
+                        job_id,
+                    )
                 
                 # -------------------------------------------------
                 # P0 SAFETY:
@@ -7512,6 +8224,20 @@ def tick_user(uid: str) -> None:
                                 ),
                                 ex=7 * 24 * 3600,
                             )
+
+                            # Keep the H1 watch index synchronized with
+                            # broker-failure restoration. _close_trade()
+                            # may remove the watch/index during ENTRY_FAIL,
+                            # so restoring the preserved RC must restore
+                            # its index membership as well.
+                            zone_watch_index_add(
+                                R,
+                                uid,
+                                _watch_key_fail,
+                                tf="H1",
+                            )
+
+                            
 
                             log.warning(
                                 "[WATCHLIST] "
@@ -9763,6 +10489,17 @@ def tick_user(uid: str) -> None:
                             int(now_e),
                             R,
                             shadow_mode=False,
+                            gate_context={
+                                "uid": str(uid or "").strip(),
+                                "device_id": (
+                                    str(dev_for_px or "").strip()
+                                    or None
+                                ),
+                                "profile_id": (
+                                    str(profile_id_px or "").strip()
+                                    or None
+                                ),
+                            },
                         ) or {}
 
                     except Exception as exc:
@@ -11224,6 +11961,17 @@ def tick_user(uid: str) -> None:
                         int(now_e),
                         R,
                         shadow_mode=False,
+                        gate_context={
+                            "uid": str(uid or "").strip(),
+                            "device_id": (
+                                str(dev_for_px or "").strip()
+                                or None
+                            ),
+                            "profile_id": (
+                                str(profile_id_px or "").strip()
+                                or None
+                            ),
+                        },
                     ) or {}
 
                 except Exception as exc:
@@ -14045,6 +14793,12 @@ def tick_user(uid: str) -> None:
                         w["device_id"] = enq.get("device_id")
                         w["trade_id"] = tid  # persist exact reserved field for release-on-fail
                         R.set(str(watch_key), json.dumps(w))
+                        zone_watch_index_add(
+                            R,
+                            uid,
+                            str(watch_key),
+                            tf="H1",
+                        )
                 except Exception:
                     pass
             # Release the frozen zone watch on entry — same as paper path

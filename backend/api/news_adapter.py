@@ -33,6 +33,7 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+import hashlib
 
 log = logging.getLogger("xtl.news_adapter")
 
@@ -231,120 +232,485 @@ def _wait_response(reason: str, window: str, shadow: bool) -> dict:
     }
 
 
-def _load_mt5_gate_calendar(R, now_ms: int) -> Optional[dict]:
-    """
-    Load the freshest valid canonical MT5 calendar snapshot.
+def _calendar_owner_id(
+    uid: str,
+    account_server: str,
+    account_login: str,
+) -> str:
+    material = (
+        f"{str(uid or '').strip()}|"
+        f"{str(account_server or '').strip().casefold()}|"
+        f"{str(account_login or '').strip()}"
+    )
 
-    Freshness authority is server_received_ms, not collected_at_ms.  This is
-    important on weekends: an older broker snapshot can remain valid when the
-    Agent is still actively validating and republishing it.
+    return hashlib.sha256(
+        material.encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _load_mt5_gate_calendar(
+    R,
+    now_ms: int,
+    gate_context: Optional[dict] = None,
+) -> Optional[dict]:
     """
+    Load the exact broker/account-owned canonical MT5 calendar
+    for this execution context.
+
+    STRICT BROKER SCOPE:
+      - no Redis SCAN
+      - no freshest-global calendar
+      - no cross-broker fallback
+      - no alternate-device fallback
+
+    Ownership identity must match ingestion exactly:
+
+        SHA256(
+            uid
+            + "|"
+            + account_server.casefold()
+            + "|"
+            + account_login
+        )[:32]
+
+    Calendar freshness:
+      - MT5 calendar is a slow scheduled-event snapshot,
+        not a live market feed.
+      - collected_at_ms is the content-freshness authority.
+      - server_received_ms is transport/provenance only.
+      - requested evaluation time must remain inside
+        coverage_from_utc_ms -> coverage_to_utc_ms.
+
+    Failure returns None. check_news_block() will then preserve
+    the existing EVENT_DATA_UNAVAILABLE_BYPASS behavior.
+    """
+
     if R is None:
         return None
 
-    evaluation_ms = int(now_ms or _now_ms())
+    evaluation_ms = int(
+        now_ms or _now_ms()
+    )
 
-    # Calendar-feed freshness must ALWAYS use actual server time.
-    # evaluation_ms may be historical/future during replay.
     server_now_ms = _now_ms()
-    best = None
-    best_received_ms = 0
 
-    try:
-        keys = list(
-            R.scan_iter(
-                match=REDIS_MT5_CALENDAR_PATTERN,
-                count=100,
-            )
+    ctx = (
+        gate_context
+        if isinstance(gate_context, dict)
+        else {}
+    )
+
+    uid = str(
+        ctx.get("uid") or ""
+    ).strip()
+
+    device_id = str(
+        ctx.get("device_id") or ""
+    ).strip()
+
+    profile_id = str(
+        ctx.get("profile_id") or ""
+    ).strip()
+
+    # ---------------------------------------------------------
+    # Exact execution identity is mandatory.
+    #
+    # Never fall back to another broker's calendar when the
+    # current execution context is incomplete.
+    # ---------------------------------------------------------
+    if not uid or not device_id:
+        log.warning(
+            "[NEWS_MT5] CALENDAR_CONTEXT_MISSING "
+            "uid=%s dev=%s profile=%s",
+            uid or None,
+            device_id or None,
+            profile_id or None,
         )
-    except Exception as exc:
-        log.warning("[NEWS_MT5] calendar scan failed: %s", exc)
         return None
 
-    for key in keys:
-        try:
-            raw = R.get(key)
-            data = _json_load(raw)
-            if not isinstance(data, dict):
-                continue
+    # ---------------------------------------------------------
+    # Resolve the MT5 account attached to this exact device.
+    #
+    # This gives us login + server, which together with uid form
+    # the same stable calendar-owner identity used by ingestion.
+    # ---------------------------------------------------------
+    try:
+        account_raw = R.get(
+            f"xtl:mt5:account:{device_id}:demo"
+        )
 
-            if str(data.get("source") or "").upper() != "MT5_CALENDAR":
-                continue
+        account = _json_load(
+            account_raw
+        )
 
-            received_ms = int(data.get("server_received_ms") or 0)
-            if received_ms <= 0:
-                continue
+    except Exception as exc:
+        log.warning(
+            "[NEWS_MT5] ACCOUNT_LOAD_FAILED "
+            "uid=%s dev=%s profile=%s err=%r",
+            uid,
+            device_id,
+            profile_id or None,
+            exc,
+        )
+        return None
 
-            age_ms = server_now_ms - received_ms
-            if age_ms < -180_000:
-                continue
-            # -------------------------------------------------
-            # Calendar feed freshness
-            #
-            # Weekday:
-            #   require a recently received MT5 calendar.
-            #
-            # Weekend:
-            #   scheduled-event data can legitimately remain
-            #   unchanged while MT5/market activity is quiet.
-            #   Allow the last broker-owned snapshot for up to
-            #   72 hours, provided coverage still contains the
-            #   requested evaluation timestamp.
-            # -------------------------------------------------
-            server_now_utc = datetime.now(timezone.utc)
-            is_utc_weekend = (
-                server_now_utc.weekday() in (5, 6)
-            )
+    if not isinstance(account, dict):
+        log.warning(
+            "[NEWS_MT5] ACCOUNT_UNAVAILABLE "
+            "uid=%s dev=%s profile=%s",
+            uid,
+            device_id,
+            profile_id or None,
+        )
+        return None
 
-            max_age_sec = (
-                MT5_CALENDAR_WEEKEND_MAX_RECEIVE_AGE_SEC
-                if is_utc_weekend
-                else MT5_CALENDAR_MAX_RECEIVE_AGE_SEC
-            )
+    account_login = str(
+        account.get("login")
+        or account.get("account_login")
+        or ""
+    ).strip()
 
-            if (
-                is_utc_weekend
-                and age_ms
-                > MT5_CALENDAR_MAX_RECEIVE_AGE_SEC * 1000
-            ):
-                log.info(
-                    "[NEWS_MT5] WEEKEND_CALENDAR_REUSE "
-                    "age_sec=%.1f received_ms=%s",
-                    age_ms / 1000.0,
-                    received_ms,
-                )
+    account_server = str(
+        account.get("server")
+        or account.get("account_server")
+        or ""
+    ).strip()
 
-            if age_ms > max_age_sec * 1000:
-                continue
+    if not account_login or not account_server:
+        log.warning(
+            "[NEWS_MT5] ACCOUNT_IDENTITY_MISSING "
+            "uid=%s dev=%s profile=%s "
+            "login=%s server=%s",
+            uid,
+            device_id,
+            profile_id or None,
+            account_login or None,
+            account_server or None,
+        )
+        return None
 
-            events = data.get("events")
-            if not isinstance(events, list) or not events:
-                continue
+    # ---------------------------------------------------------
+    # Derive EXACT same owner ID as routes_devices.py ingestion.
+    # ---------------------------------------------------------
+    owner_material = (
+        f"{uid}|"
+        f"{account_server.casefold()}|"
+        f"{account_login}"
+    )
 
-            coverage_from = int(data.get("coverage_from_utc_ms") or 0)
-            coverage_to = int(data.get("coverage_to_utc_ms") or 0)
+    calendar_owner_id = hashlib.sha256(
+        owner_material.encode("utf-8")
+    ).hexdigest()[:32]
 
-            if (
-                coverage_from > 0
-                and evaluation_ms < coverage_from
-            ):
-                continue
+    redis_key = (
+        "xtl:news:calendar:mt5:"
+        f"{calendar_owner_id}"
+    )
 
-            if (
-                coverage_to > 0
-                and evaluation_ms > coverage_to
-            ):
-                continue
+    # ---------------------------------------------------------
+    # Exact Redis GET.
+    #
+    # NO SCAN.
+    # NO selection among brokers.
+    # ---------------------------------------------------------
+    try:
+        raw = R.get(redis_key)
+        data = _json_load(raw)
 
-            if received_ms > best_received_ms:
-                best = data
-                best_received_ms = received_ms
+    except Exception as exc:
+        log.warning(
+            "[NEWS_MT5] CALENDAR_GET_FAILED "
+            "uid=%s dev=%s profile=%s "
+            "owner=%s key=%s err=%r",
+            uid,
+            device_id,
+            profile_id or None,
+            calendar_owner_id,
+            redis_key,
+            exc,
+        )
+        return None
 
-        except Exception:
-            continue
+    if not isinstance(data, dict):
+        log.warning(
+            "[NEWS_MT5] CALENDAR_NOT_FOUND "
+            "uid=%s dev=%s profile=%s "
+            "login=%s server=%s owner=%s",
+            uid,
+            device_id,
+            profile_id or None,
+            account_login,
+            account_server,
+            calendar_owner_id,
+        )
+        return None
 
-    return best
+    # ---------------------------------------------------------
+    # Canonical source validation.
+    # ---------------------------------------------------------
+    if (
+        str(
+            data.get("source") or ""
+        ).upper().strip()
+        != "MT5_CALENDAR"
+    ):
+        log.warning(
+            "[NEWS_MT5] CALENDAR_SOURCE_INVALID "
+            "uid=%s owner=%s source=%s",
+            uid,
+            calendar_owner_id,
+            data.get("source"),
+        )
+        return None
 
+    stored_owner_id = str(
+        data.get("calendar_owner_id") or ""
+    ).strip()
+
+    if (
+        stored_owner_id
+        and stored_owner_id != calendar_owner_id
+    ):
+        log.error(
+            "[NEWS_MT5] CALENDAR_OWNER_ID_MISMATCH "
+            "expected=%s stored=%s "
+            "uid=%s dev=%s",
+            calendar_owner_id,
+            stored_owner_id,
+            uid,
+            device_id,
+        )
+        return None
+
+    # ---------------------------------------------------------
+    # Defensive owner verification.
+    #
+    # Redis key is already deterministic, but verify the
+    # embedded ownership too. This protects against accidental
+    # bad writes / stale migrations.
+    # ---------------------------------------------------------
+    owner = (
+        data.get("owner")
+        if isinstance(
+            data.get("owner"),
+            dict,
+        )
+        else {}
+    )
+
+    stored_uid = str(
+        owner.get("uid") or ""
+    ).strip()
+
+    stored_login = str(
+        owner.get("account_login") or ""
+    ).strip()
+
+    stored_server = str(
+        owner.get("account_server") or ""
+    ).strip()
+
+    if stored_uid and stored_uid != uid:
+        log.error(
+            "[NEWS_MT5] CALENDAR_UID_MISMATCH "
+            "expected=%s stored=%s owner=%s",
+            uid,
+            stored_uid,
+            calendar_owner_id,
+        )
+        return None
+
+    if (
+        stored_login
+        and stored_login != account_login
+    ):
+        log.error(
+            "[NEWS_MT5] CALENDAR_LOGIN_MISMATCH "
+            "expected=%s stored=%s owner=%s",
+            account_login,
+            stored_login,
+            calendar_owner_id,
+        )
+        return None
+
+    if (
+        stored_server
+        and (
+            stored_server.casefold()
+            != account_server.casefold()
+        )
+    ):
+        log.error(
+            "[NEWS_MT5] CALENDAR_SERVER_MISMATCH "
+            "expected=%s stored=%s owner=%s",
+            account_server,
+            stored_server,
+            calendar_owner_id,
+        )
+        return None
+
+    # ---------------------------------------------------------
+    # Transport/provenance sanity.
+    #
+    # server_received_ms is NOT the weekday expiry authority.
+    # ---------------------------------------------------------
+    received_ms = int(
+        data.get("server_received_ms") or 0
+    )
+
+    if received_ms <= 0:
+        return None
+
+    received_age_ms = (
+        server_now_ms - received_ms
+    )
+
+    # Reject materially future-dated API receive timestamps.
+    if received_age_ms < -180_000:
+        log.warning(
+            "[NEWS_MT5] CALENDAR_RECEIVED_IN_FUTURE "
+            "owner=%s age_ms=%s",
+            calendar_owner_id,
+            received_age_ms,
+        )
+        return None
+
+    # ---------------------------------------------------------
+    # Calendar content freshness.
+    #
+    # Calendar is slow-moving scheduled data. Agent deliberately
+    # does not re-POST every five minutes when file is unchanged.
+    #
+    # Allow up to 36 hours since the broker snapshot itself was
+    # collected. This safely spans broker-midnight/reset timing
+    # without accepting old multi-day snapshots.
+    # ---------------------------------------------------------
+    collected_ms = int(
+        data.get("collected_at_ms") or 0
+    )
+
+    if collected_ms <= 0:
+        return None
+
+    collected_age_ms = (
+        server_now_ms - collected_ms
+    )
+
+    if collected_age_ms < -180_000:
+        log.warning(
+            "[NEWS_MT5] CALENDAR_COLLECTED_IN_FUTURE "
+            "owner=%s age_ms=%s",
+            calendar_owner_id,
+            collected_age_ms,
+        )
+        return None
+
+    max_collected_age_ms = (
+        36 * 60 * 60 * 1000
+    )
+
+    if (
+        collected_age_ms
+        > max_collected_age_ms
+    ):
+        log.warning(
+            "[NEWS_MT5] CALENDAR_CONTENT_STALE "
+            "uid=%s dev=%s profile=%s "
+            "owner=%s age_hours=%.2f",
+            uid,
+            device_id,
+            profile_id or None,
+            calendar_owner_id,
+            (
+                collected_age_ms
+                / 3_600_000.0
+            ),
+        )
+        return None
+
+    # ---------------------------------------------------------
+    # Coverage validation.
+    #
+    # evaluation_ms is intentional here because replay /
+    # historical analytics may evaluate another timestamp.
+    # ---------------------------------------------------------
+    coverage_from = int(
+        data.get(
+            "coverage_from_utc_ms"
+        )
+        or 0
+    )
+
+    coverage_to = int(
+        data.get(
+            "coverage_to_utc_ms"
+        )
+        or 0
+    )
+
+    if (
+        coverage_from > 0
+        and evaluation_ms < coverage_from
+    ):
+        log.warning(
+            "[NEWS_MT5] CALENDAR_BEFORE_COVERAGE "
+            "owner=%s eval=%s from=%s",
+            calendar_owner_id,
+            evaluation_ms,
+            coverage_from,
+        )
+        return None
+
+    if (
+        coverage_to > 0
+        and evaluation_ms > coverage_to
+    ):
+        log.warning(
+            "[NEWS_MT5] CALENDAR_AFTER_COVERAGE "
+            "owner=%s eval=%s to=%s",
+            calendar_owner_id,
+            evaluation_ms,
+            coverage_to,
+        )
+        return None
+
+    # ---------------------------------------------------------
+    # Events container validation.
+    #
+    # An empty event list can legitimately mean there are no
+    # broker calendar events in the covered period. That is a
+    # valid calendar, not infrastructure failure.
+    # ---------------------------------------------------------
+    events = data.get("events")
+
+    if not isinstance(events, list):
+        log.warning(
+            "[NEWS_MT5] CALENDAR_EVENTS_INVALID "
+            "owner=%s type=%s",
+            calendar_owner_id,
+            type(events).__name__,
+        )
+        return None
+
+    log.debug(
+        "[NEWS_MT5] CALENDAR_SELECTED "
+        "uid=%s dev=%s profile=%s "
+        "login=%s server=%s owner=%s "
+        "events=%s collected_age_h=%.2f",
+        uid,
+        device_id,
+        profile_id or None,
+        account_login,
+        account_server,
+        calendar_owner_id,
+        len(events),
+        (
+            collected_age_ms
+            / 3_600_000.0
+        ),
+    )
+
+    return data
 
 def _normalize_mt5_gate_events(
     calendar_data: dict,
@@ -466,7 +832,7 @@ def check_news_block(
     if sym_u not in _MT5_SYMBOL_CURRENCIES:
         return {**_allow, "reason": "NEWS_SYMBOL_NOT_MANAGED"}
 
-    calendar_data = _load_mt5_gate_calendar(R, now_ms)
+    calendar_data = _load_mt5_gate_calendar(R, now_ms,gate_context=gate_context,)
     if not isinstance(calendar_data, dict):
         # ---------------------------------------------------------
         # EVENT DATA IS OPTIONAL.
@@ -737,11 +1103,25 @@ def _cb_name(event_name: str, currency: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 
-def _load_calendar_events(R) -> List[dict]:
-    """Load all canonical MT5 HIGH events, including unclassified ones."""
-    data = _load_mt5_gate_calendar(R, _now_ms())
+def _load_calendar_events(
+    R,
+    gate_context: Optional[dict] = None,
+) -> List[dict]:
+    """
+    Load canonical MT5 HIGH events for one exact broker/account.
+
+    No global calendar fallback.
+    No cross-broker aggregation.
+    """
+    data = _load_mt5_gate_calendar(
+        R,
+        _now_ms(),
+        gate_context=gate_context,
+    )
+
     if not isinstance(data, dict):
         return []
+
     return _normalize_mt5_gate_events(
         data,
         symbol=None,
@@ -753,30 +1133,246 @@ def get_upcoming_events(
     R,
     symbol: Optional[str] = None,
     hours_ahead: int = 24,
+    gate_context: Optional[dict] = None,
 ) -> List[dict]:
-    """Return upcoming canonical MT5 HIGH events, optionally symbol-filtered."""
+    """
+    Return upcoming canonical MT5 HIGH events for the exact
+    broker/account represented by gate_context.
+
+    This is the backend/UI read path.
+    It uses the same canonical calendar as check_news_block().
+    """
     try:
-        data = _load_mt5_gate_calendar(R, _now_ms())
+        now_ms = _now_ms()
+
+        data = _load_mt5_gate_calendar(
+            R,
+            now_ms,
+            gate_context=gate_context,
+        )
+
         if not isinstance(data, dict):
             return []
 
         events = _normalize_mt5_gate_events(
             data,
-            symbol=str(symbol).upper().strip() if symbol else None,
+            symbol=(
+                str(symbol).upper().strip()
+                if symbol
+                else None
+            ),
             include_unclassified=True,
         )
 
-        now_ms = _now_ms()
-        cut_ms = now_ms + int(hours_ahead) * 3_600_000
+        cut_ms = (
+            now_ms
+            + int(hours_ahead) * 3_600_000
+        )
+
         result = [
             e
             for e in events
-            if now_ms <= int(e.get("time_ms") or 0) <= cut_ms
+            if (
+                now_ms
+                <= int(e.get("time_ms") or 0)
+                <= cut_ms
+            )
         ]
-        result.sort(key=lambda x: int(x.get("time_ms") or 0))
+
+        result.sort(
+            key=lambda x: int(
+                x.get("time_ms") or 0
+            )
+        )
+
         return result
-    except Exception:
+
+    except Exception as exc:
+        log.warning(
+            "[NEWS_MT5] UPCOMING_LOAD_FAILED "
+            "err=%r",
+            exc,
+        )
         return []
+
+
+def get_calendar_status(
+    R,
+    gate_context: Optional[dict] = None,
+) -> dict:
+    """
+    Health/status for the exact broker-owned MT5 calendar
+    used by the production entry gate.
+
+    This is also the canonical backend status returned to UI.
+    """
+    try:
+        now_ms = _now_ms()
+
+        data = _load_mt5_gate_calendar(
+            R,
+            now_ms,
+            gate_context=gate_context,
+        )
+
+        ctx = (
+            gate_context
+            if isinstance(gate_context, dict)
+            else {}
+        )
+
+        if not isinstance(data, dict):
+            return {
+                "ok": False,
+                "available": False,
+                "reason": (
+                    "mt5_calendar_missing_or_stale"
+                ),
+                "source": "MT5_CALENDAR",
+                "profile_id": (
+                    ctx.get("profile_id")
+                ),
+                "device_id": (
+                    ctx.get("device_id")
+                ),
+            }
+
+        received_ms = int(
+            data.get("server_received_ms")
+            or 0
+        )
+
+        collected_ms = int(
+            data.get("collected_at_ms")
+            or 0
+        )
+
+        all_high = _normalize_mt5_gate_events(
+            data,
+            symbol=None,
+            include_unclassified=True,
+        )
+
+        classified = [
+            e
+            for e in all_high
+            if e.get("gate_classified")
+        ]
+
+        owner = (
+            data.get("owner")
+            if isinstance(
+                data.get("owner"),
+                dict,
+            )
+            else {}
+        )
+
+        return {
+            "ok": True,
+            "available": True,
+
+            "source": "MT5_CALENDAR",
+            "source_of_truth": (
+                "BROKER_NATIVE_MT5_CALENDAR"
+            ),
+
+            "calendar_owner_id": (
+                data.get(
+                    "calendar_owner_id"
+                )
+            ),
+
+            "profile_id": (
+                ctx.get("profile_id")
+            ),
+
+            "device_id": (
+                ctx.get("device_id")
+            ),
+
+            "account_server": (
+                owner.get("account_server")
+            ),
+
+            "broker_company": (
+                owner.get("broker_company")
+            ),
+
+            "events_count": int(
+                data.get("event_count")
+                or len(
+                    data.get("events")
+                    or []
+                )
+            ),
+
+            "high_events_count": len(
+                all_high
+            ),
+
+            "gate_classified_high_count": len(
+                classified
+            ),
+
+            "collected_at_ms": collected_ms,
+
+            "collected_age_minutes": (
+                round(
+                    (
+                        now_ms
+                        - collected_ms
+                    ) / 60_000,
+                    1,
+                )
+                if collected_ms > 0
+                else None
+            ),
+
+            "server_received_ms": (
+                received_ms
+            ),
+
+            # Transport age for diagnostics only.
+            "server_receive_age_minutes": (
+                round(
+                    (
+                        now_ms
+                        - received_ms
+                    ) / 60_000,
+                    1,
+                )
+                if received_ms > 0
+                else None
+            ),
+
+            "coverage_from_utc_ms": (
+                data.get(
+                    "coverage_from_utc_ms"
+                )
+            ),
+
+            "coverage_to_utc_ms": (
+                data.get(
+                    "coverage_to_utc_ms"
+                )
+            ),
+
+            "timezone": (
+                data.get("timezone")
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "available": False,
+            "reason": (
+                f"{type(exc).__name__}:{exc}"
+            ),
+            "source": "MT5_CALENDAR",
+        }
+
 
 
 def get_block_snapshot(R, symbol: str) -> Optional[dict]:
@@ -789,43 +1385,6 @@ def get_block_snapshot(R, symbol: str) -> Optional[dict]:
         return _json_load(raw)
     except Exception:
         return None
-
-
-def get_calendar_status(R) -> dict:
-    """Health/status for the canonical MT5 calendar used by entry gates."""
-    try:
-        now_ms = _now_ms()
-        data = _load_mt5_gate_calendar(R, now_ms)
-        if not isinstance(data, dict):
-            return {
-                "ok": False,
-                "reason": "mt5_calendar_missing_or_stale",
-                "source": "MT5_CALENDAR",
-            }
-
-        received_ms = int(data.get("server_received_ms") or 0)
-        all_high = _normalize_mt5_gate_events(
-            data,
-            symbol=None,
-            include_unclassified=True,
-        )
-        classified = [e for e in all_high if e.get("gate_classified")]
-
-        return {
-            "ok": True,
-            "source": "MT5_CALENDAR",
-            "calendar_owner_id": data.get("calendar_owner_id"),
-            "events_count": int(data.get("event_count") or len(data.get("events") or [])),
-            "high_events_count": len(all_high),
-            "gate_classified_high_count": len(classified),
-            "server_received_ms": received_ms,
-            "age_minutes": round((now_ms - received_ms) / 60_000, 1),
-            "coverage_from_utc_ms": data.get("coverage_from_utc_ms"),
-            "coverage_to_utc_ms": data.get("coverage_to_utc_ms"),
-            "timezone": data.get("timezone"),
-        }
-    except Exception as exc:
-        return {"ok": False, "reason": str(exc), "source": "MT5_CALENDAR"}
 
 
 # ---------------------------------------------------------------------------

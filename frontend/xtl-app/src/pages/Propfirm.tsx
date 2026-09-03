@@ -662,8 +662,27 @@ export default function Propfirm() {
       ? status?.profile_device
       : undefined;
 
+  /*
+   * Connection truth can come from either:
+   *
+   * 1. /prop/status strict profile->device resolution, or
+   * 2. /prop/connected-accounts fresh account matching.
+   *
+   * connectedProfiles already contains ONLY profiles whose configured
+   * login/server/company match a fresh connected MT5 account.
+   *
+   * This prevents a stale/out-of-order status response from falsely
+   * disabling a genuinely connected account in the UI.
+   *
+   * Backend enable/activate still performs its own strict resolver check,
+   * so this does NOT weaken execution safety.
+   */
   const deviceConnected =
-    Boolean(profileDevice?.ok);
+     Boolean(profileDevice?.ok) ||
+     (
+       Boolean(displayedProfileId) &&
+       connectedProfileIds.has(displayedProfileId)
+     );
 
   const profileEnabled =
     Boolean(cfg?.enabled);

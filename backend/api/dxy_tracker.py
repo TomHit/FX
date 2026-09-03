@@ -1086,6 +1086,13 @@ def _real_snapshot(
         result.get("dxy_available")
     ):
         return None
+    source_device_id = str(
+        result.get("dxy_device_id")
+        or ""
+    ).strip()
+
+    if not source_device_id:
+        return None
 
     broker_bar_close_ms = _to_ms(
         result.get(
@@ -1109,13 +1116,18 @@ def _real_snapshot(
         return None
 
     return {
-        "_bars": _closed_real_dxy_bars(R, device_id),
+        "_bars": _closed_real_dxy_bars(
+            R,
+            source_device_id,
+        ),
         "source": "REAL_DXY",
         "source_detail": (
             result.get("dxy_source")
             or "broker_mt5"
         ),
         "device_id": device_id,
+        # Actual canonical REAL_DXY market-data publisher.
+        "source_device_id": source_device_id,
         "bar_close_ms": bar_close_ms,
         "last_close": result.get(
             "dxy_last_closed_h1_close"
@@ -1763,56 +1775,14 @@ def update_global_dxy_state(
                     device_id,
                 )
 
+            
             # ---------------------------------------------
-            # Track same-device synthetic DXY independently,
-            # even when real DXY is available.
+            # SYNTHETIC_DXY live production disabled.
+            #
+            # REAL_DXY is the canonical live execution source.
+            # Keep synthetic builders/readers/history intact for
+            # historical analytics and rollback compatibility.
             # ---------------------------------------------
-            try:
-                synthetic = (
-                    _synthetic_snapshot(
-                        R,
-                        device_id
-                    )
-                )
-
-                if synthetic:
-                    stats[
-                        "synthetic_available"
-                    ] += 1
-
-                    result = _persist_snapshot(
-                        R,
-                        synthetic,
-                        binding,
-                        detected_at_ms,
-                    )
-
-                    if result.get(
-                        "initialized"
-                    ):
-                        stats[
-                            "initialized"
-                        ] += 1
-
-                    if result.get("changed"):
-                        stats["changed"] += 1
-
-                    turn_result = _persist_turn_snapshot(
-                        R, synthetic, binding, detected_at_ms
-                    )
-                    if turn_result.get("initialized"):
-                        stats["turn_initialized"] += 1
-                    if turn_result.get("emitted"):
-                        stats["turn_events"] += 1
-
-            except Exception:
-                stats["errors"] += 1
-
-                log.exception(
-                    "[DXY_TRACKER] SYNTHETIC_UPDATE_FAILED "
-                    "device=%s",
-                    device_id,
-                )
 
         return stats
 

@@ -13,7 +13,7 @@ TF_MS = 60 * 60 * 1000
 
 SOURCE_VALUES = (
     "REAL_DXY",
-    "SYNTHETIC_DXY",
+    
 )
 
 FEATURES_PREFIX = "xtl:dxy:features:H1"
@@ -372,6 +372,7 @@ def update_global_dxy_h1_features(
         from api.dxy_tracker import (
             _load_bindings,
         )
+        from api.xtl_analytics import resolve_canonical_dxy_source
 
         bindings = _load_bindings(R) or []
 
@@ -396,13 +397,33 @@ def update_global_dxy_h1_features(
 
             for source in SOURCE_VALUES:
                 try:
+                    source_device_id = device_id
+
+                    if source == "REAL_DXY":
+                        canonical = (
+                            resolve_canonical_dxy_source(
+                                R,
+                                device_id,
+                            )
+                            or {}
+                        )
+                        source_device_id = str(
+                            canonical.get("real_device_id")
+                            or ""
+                        ).strip()
+
+                        # REAL_DXY has no live synthetic fallback.
+                        # Retry on the next tracker tick if the canonical
+                        # publisher is currently unavailable.
+                        if not source_device_id:
+                            continue
+
                     bars = _completed_bars(
                         _load_source_bars(
                             source,
-                            device_id,
+                            source_device_id,
                         )
                     )
-
                     if len(bars) < MIN_FEATURE_BARS:
                         continue
 
@@ -414,6 +435,39 @@ def update_global_dxy_h1_features(
                         stats[
                             "synthetic_available"
                         ] += 1
+                    
+                    # Fast path: if the newest completed H1 candle was already
+                    # successfully published using the canonical UTC-epoch
+                    # timestamp basis, there is no catch-up or repair work.
+                    latest_broker_close_ms = _bar_close_ms(bars[-1])
+
+                    if latest_broker_close_ms > 0:
+                        latest_existing = _json_load(
+                            R.get(
+                                _latest_key(
+                                    source,
+                                    device_id,
+                                )
+                            ),
+                            {},
+                        )
+
+                        latest_is_current = (
+                            isinstance(latest_existing, dict)
+                            and latest_existing.get("timestamp_basis")
+                            == "UTC_EPOCH"
+                            and int(
+                                latest_existing.get("bar_close_ms")
+                                or 0
+                            )
+                            == int(latest_broker_close_ms)
+                        )
+
+                        if latest_is_current:
+                            stats["unchanged"] += 1
+                            continue
+
+                    
 
                     # Publish every unseen completed H1 bar, not only bars[-1].
                     # Each snapshot receives only its causal prefix.
@@ -479,10 +533,11 @@ def update_global_dxy_h1_features(
                     stats["errors"] += 1
 
                     log.exception(
-                        "[DXY_H1] source update failed "
-                        "source=%s device=%s",
+                        "[DXY_H1] SOURCE_UPDATE_FAILED "
+                        "source=%s consumer_device=%s source_device=%s",
                         source,
                         device_id,
+                        source_device_id,
                     )
 
     except Exception:

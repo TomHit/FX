@@ -11017,66 +11017,232 @@ def _snap_key(dev: str, sym: str, tf: str) -> str:
     tf  = str(tf or "").upper().strip()
     return f"xtl:ohlc:snap:{dev}:{sym}:{tf}"
 
+# ============================================================
+# PERF: parsed device H1 snapshot cache
+#
+# Safety model:
+#   - Redis GET still happens on EVERY call.
+#   - Reuse parsed bars ONLY when the exact raw snapshot is unchanged.
+#   - Any new Agent H1 publish changes the raw signature and forces
+#     the existing JSON/normalize/sort path immediately.
+#
+# This caches DATA DECODING only.
+# It does NOT cache:
+#   live price / gate / RC / Point-A / SR decision / entry decision.
+#
+# One bounded entry per device+symbol.
+# ============================================================
+_H1_PARSED_SNAP_CACHE: dict[str, dict] = {}
 
-def _load_device_h1_bars(sym: str, dev_id: str) -> tuple[list[dict], str]:
+
+def _load_device_h1_bars(
+    sym: str,
+    dev_id: str,
+) -> tuple[list[dict], str,dict]:
     """
     Hard source of truth for H1 gate:
     - reads ONLY device-scoped key
-    - supports STRING or HASH storage (via _snap_get_raw_json)
     - returns normalized + sorted bars (ms)
+
+    PERF:
+    Redis is still read on every call so freshness is unchanged.
+    JSON decode / normalization / sorting are reused only when the
+    exact raw Redis snapshot has not changed.
     """
+
     sym_u = (sym or "").upper().strip()
     dev = (dev_id or "").strip()
+
     if not sym_u or not dev:
-        return [], ""
+        return [], "", {}
 
     key = f"xtl:ohlc:snap:{dev}:{sym_u}:H1"
+
+    # ---------------------------------------------------------
+    # ALWAYS fetch current Redis value.
+    # Do not cache the Redis read itself.
+    # ---------------------------------------------------------
     raw = R.get(key)
 
     if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode("utf-8", "ignore")
-    if not raw:
-        return [], key
+        raw = raw.decode(
+            "utf-8",
+            "ignore",
+        )
 
+    if not raw:
+        _H1_PARSED_SNAP_CACHE.pop(
+            key,
+            None,
+        )
+        return [], key, {}
+
+    # ---------------------------------------------------------
+    # Cheap exact-snapshot identity.
+    #
+    # len + Python hash is only an in-process identity used to
+    # decide whether we need to repeat JSON/normalization work.
+    # The actual Redis value is fetched every time.
+    # ---------------------------------------------------------
+    try:
+        raw_sig = (
+            len(raw),
+            hash(raw),
+        )
+    except Exception:
+        raw_sig = None
+
+    cached = _H1_PARSED_SNAP_CACHE.get(
+        key
+    )
+
+    if (
+        raw_sig is not None
+        and isinstance(cached, dict)
+        and cached.get("raw_sig") == raw_sig
+        and isinstance(
+            cached.get("bars"),
+            list,
+        )
+    ):
+        return (
+            [
+               dict(b)
+               for b in cached["bars"]
+               if isinstance(b, dict)
+            ],
+            key,
+            dict(
+                cached.get("snapshot_ctx")
+                or {}
+            ),
+        )
+
+    # ---------------------------------------------------------
+    # Existing parse path.
+    # ---------------------------------------------------------
     try:
         obj = json.loads(raw)
+        snapshot_ctx = {
+            "snap_key": key,
+            "serverNow": (
+                obj.get("serverNow")
+                if isinstance(obj, dict)
+                else None
+            ),
+            "lastClosedTs": (
+                obj.get("lastClosedTs")
+                if isinstance(obj, dict)
+                else None
+            ),
+        }
     except Exception:
-        return [], key
+        _H1_PARSED_SNAP_CACHE.pop(
+            key,
+            None,
+        )
+        return [], key, {}
 
     bars = None
+
     if isinstance(obj, dict):
-        bars = obj.get("bars") or obj.get("ohlc")
+        bars = (
+            obj.get("bars")
+            or obj.get("ohlc")
+        )
+
     elif isinstance(obj, list):
         bars = obj
 
-    bars = bars if isinstance(bars, list) else []
+    bars = (
+        bars
+        if isinstance(bars, list)
+        else []
+    )
+
     if not bars:
-        return [], key
+        _H1_PARSED_SNAP_CACHE.pop(
+            key,
+            None,
+        )
+        return [], key, snapshot_ctx
 
     try:
-        nb = _normalize_snap_bars_to_ms(bars, 60 * 60 * 1000)
+        nb = _normalize_snap_bars_to_ms(
+            bars,
+            60 * 60 * 1000,
+        )
     except Exception:
         nb = bars
 
-    # enforce sort by close time
+    # ---------------------------------------------------------
+    # Existing validation + sorting.
+    # ---------------------------------------------------------
     out = []
+
     for b in (nb or []):
         if not isinstance(b, dict):
             continue
-        if not all(k in b for k in ("o", "h", "l", "c")):
+
+        if not all(
+            k in b
+            for k in (
+                "o",
+                "h",
+                "l",
+                "c",
+            )
+        ):
             continue
-        tcm = b.get("t_close_ms") or b.get("tClose") or b.get("t") or 0
+
+        tcm = (
+            b.get("t_close_ms")
+            or b.get("tClose")
+            or b.get("t")
+            or 0
+        )
+
         try:
             tcm = int(tcm)
         except Exception:
             tcm = 0
-        if 0 < tcm < 10_000_000_000:
-            tcm *= 1000
-        b["t_close_ms"] = int(tcm)
-        out.append(b)
 
-    out.sort(key=lambda x: int(x.get("t_close_ms") or 0))
-    return out, key
+        if (
+            0
+            < tcm
+            < 10_000_000_000
+        ):
+            tcm *= 1000
+
+        bb = dict(b)
+        bb["t_close_ms"] = int(tcm)
+
+        out.append(bb)
+
+    out.sort(
+        key=lambda x: int(
+            x.get("t_close_ms")
+            or 0
+        )
+    )
+
+    # ---------------------------------------------------------
+    # Bounded process-local cache:
+    # one latest parsed snapshot per device+symbol.
+    # Six symbols × connected devices only.
+    # ---------------------------------------------------------
+    _H1_PARSED_SNAP_CACHE[key] = {
+        "raw_sig": raw_sig,
+        "bars": [
+            dict(b)
+            for b in out
+        ],
+        "snapshot_ctx": dict(
+            snapshot_ctx
+        ),
+    }
+
+    return out, key, snapshot_ctx
 
 def _get_sr_bundle(sym: str, prefer_dev=None, return_src: bool = False, display_only: bool = False):
     """
@@ -13369,10 +13535,13 @@ def _discord_notify_rc_trigger(
             or ""
         ).upper().strip()
 
+        # Stable Discord identity must follow the watch/RC,
+        # not an execution-attempt trade_id which may be
+        # recreated during broker-failure retry lifecycle.
         base_trade_id = str(
-            watch.get("trade_id")
+            watch.get("watch_key")
             or watch.get("watch_id")
-            or watch.get("watch_key")
+            or watch.get("trade_id")
             or f"{sym}:{side}"
         ).strip()
 
@@ -13405,6 +13574,32 @@ def _discord_notify_rc_trigger(
                 sym,
                 side,
                 base_trade_id,
+                rc_rev_ok_ms,
+            )
+            return False
+        # Local persisted-watch protection.
+        # Even if the Redis NX dedupe key is evicted or an execution
+        # attempt is reconstructed, do not notify twice for the same RC.
+        try:
+            _already_sent_same_rc = bool(
+                watch.get("discord_rc_trigger_sent")
+                and int(
+                    watch.get(
+                        "discord_rc_trigger_sent_rev_ok_ms"
+                    )
+                    or 0
+                ) == int(rc_rev_ok_ms)
+            )
+        except Exception:
+            _already_sent_same_rc = False
+
+        if _already_sent_same_rc:
+            log.warning(
+                "[DISCORD] RC_TRIGGER_WATCH_DEDUPE_SKIP "
+                "sym=%s side=%s trade_id=%s rc=%s",
+                sym,
+                side,
+                trade_id,
                 rc_rev_ok_ms,
             )
             return False
@@ -13470,6 +13665,11 @@ def _discord_notify_rc_trigger(
 
         watch["discord_rc_trigger_sent"] = bool(
             sent
+        )
+        watch["discord_rc_trigger_sent_rev_ok_ms"] = (
+            int(rc_rev_ok_ms)
+            if sent
+            else None
         )
         watch["discord_rc_trigger_sent_ms"] = (
             int(now_ms)
@@ -20619,8 +20819,20 @@ def trend_opportunities(
 
             _pt = _oppt_t.now()
             try:
-                bars_h1, h1_key = _load_device_h1_bars(sym_u, dev_for_gate)
-                _oppt_t.add("h1_bars", _oppt_t.now() - _pt)
+                (
+                    bars_h1,
+                    h1_key,
+                    h1_snapshot_ctx,
+                ) = _load_device_h1_bars(
+                    sym_u,
+                    dev_for_gate,
+                )
+
+                _oppt_t.add(
+                    "h1_bars",
+                    _oppt_t.now() - _pt,
+                )
+
                 row_h1 = {
                     "bars": bars_h1,
                     "last_price": row.get("last_price"),
@@ -20631,8 +20843,27 @@ def trend_opportunities(
                         or row.get("live_price_ts_ms")
                         or row.get("price_ts_ms")
                         or row.get("tick_ts_ms")
-                       
                     ),
+                    "authoritative_h1_snapshot": {
+                        "snap_key": h1_key,
+                        "serverNow": (
+                            h1_snapshot_ctx.get("serverNow")
+                            if isinstance(
+                                h1_snapshot_ctx,
+                                dict,
+                            )
+                            else None
+                        ),
+                        "lastClosedTs": (
+                            h1_snapshot_ctx.get("lastClosedTs")
+                            if isinstance(
+                                h1_snapshot_ctx,
+                                dict,
+                            )
+                            else None
+                        ),
+                        "bars": bars_h1,
+                    },
                 }
                 # --- MARKET CLOSED / NO MT5 DATA guard ---
                 # Triggers when: no bars at all, OR latest bar is stale (>3h old).
@@ -20770,6 +21001,7 @@ def trend_opportunities(
                                     _b_h4,
                                     _b_px,
                                     _b_atr,
+                                    device_id=dev_for_gate,
                                 )
 
                                 _oppt_t.add(
@@ -20826,6 +21058,11 @@ def trend_opportunities(
                     x_device_id=dev_for_gate,
                     debug_gate=bool(debug_gate_on),
                     live_px=row.get("last_price"),
+                    authoritative_h1_snapshot=(
+                        row_h1.get(
+                            "authoritative_h1_snapshot"
+                        )
+                    ),
                 )
                 _oppt_t.add("gate", _oppt_t.now() - _pt)
 
@@ -27027,56 +27264,482 @@ def _evaluate_alert_outcome(sym: str, snap: dict, row: dict, now_ms: int):
 
 
 @router.get("/confluence/news")
-async def get_confluence_news(request: Request):
+async def get_confluence_news(
+    request: Request,
+    profile_id: str | None = Query(None),
+    user=Depends(require_prop_auth),
+):
     import time
-    from datetime import datetime, timezone
-    from api.news_adapter import check_news_block, get_upcoming_events, get_calendar_status
+    from datetime import (
+        datetime,
+        timezone,
+    )
 
-    now_ms  = int(time.time() * 1000)
-    SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF"]
+    from api.news_adapter import (
+        check_news_block,
+        get_upcoming_events,
+        get_calendar_status,
+    )
 
-    cal_status     = get_calendar_status(R)
-    symbol_results = {}
-    any_blocked    = False
+    now_ms = int(
+        time.time() * 1000
+    )
 
-    for sym in SYMBOLS:
-        result = check_news_block(sym, now_ms, R, shadow_mode=False)
-        symbol_results[sym] = {
-            "verdict":          result.get("verdict", "ALLOW"),
-            "reason":           result.get("reason"),
-            "event_name":       result.get("event_name"),
-            "window":           result.get("window"),
-            "minutes_to_event": result.get("minutes_to_event"),
+    SYMBOLS = [
+        "XAUUSD",
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "USDCAD",
+        "USDCHF",
+    ]
+
+    # ---------------------------------------------------------
+    # AUTHENTICATED USER
+    # ---------------------------------------------------------
+    uid = _require_prop_uid(
+        user
+    )
+
+    # ---------------------------------------------------------
+    # BACKEND resolves profile.
+    #
+    # If UI supplies profile_id, it selects that user-owned
+    # profile.
+    #
+    # If omitted, backend resolves the user's active profile.
+    #
+    # Frontend must NEVER provide device/login/server as
+    # calendar authority.
+    # ---------------------------------------------------------
+    pid = _resolve_user_prop_profile_id(
+        uid,
+        profile_id,
+    )
+
+    # ---------------------------------------------------------
+    # Strict profile -> broker/device resolution.
+    #
+    # No global device fallback.
+    # No latest connected account fallback.
+    # ---------------------------------------------------------
+    try:
+        resolved = (
+            _resolve_prop_profile_device(
+                pid,
+                uid,
+            )
+            or {}
+        )
+    except Exception as exc:
+        log.exception(
+            "[NEWS_UI] PROFILE_RESOLVE_FAILED "
+            "uid=%s profile=%s err=%r",
+            uid,
+            pid,
+            exc,
+        )
+
+        resolved = {
+            "ok": False,
+            "reason": (
+                "PROFILE_RESOLVE_EXCEPTION"
+            ),
         }
+
+    if (
+        not isinstance(resolved, dict)
+        or not resolved.get("ok")
+    ):
+        reason = str(
+            (
+                resolved.get("reason")
+                if isinstance(
+                    resolved,
+                    dict,
+                )
+                else None
+            )
+            or "PROFILE_ACCOUNT_UNAVAILABLE"
+        )
+
+        # Backend remains authoritative.
+        # UI simply renders this payload.
+        return JSONResponse({
+            "ok": True,
+
+            "source_of_truth": (
+                "XTL_BACKEND"
+            ),
+
+            "calendar_source": (
+                "MT5_CALENDAR"
+            ),
+
+            "profile_id": pid,
+
+            "calendar_status": {
+                "ok": False,
+                "available": False,
+                "reason": reason,
+                "source": "MT5_CALENDAR",
+                "profile_id": pid,
+                "device_id": None,
+            },
+
+            "symbols": {
+                sym: {
+                    "verdict": "ALLOW",
+                    "reason": (
+                        "EVENT_DATA_"
+                        "UNAVAILABLE_BYPASS"
+                    ),
+                    "event_name": None,
+                    "window": None,
+                    "minutes_to_event": None,
+                }
+                for sym in SYMBOLS
+            },
+
+            "upcoming_events": [],
+
+            "any_blocked": False,
+
+            "generated_at_ms": now_ms,
+        })
+
+    device_id = str(
+        resolved.get("device_id")
+        or ""
+    ).strip()
+
+    account = (
+        resolved.get("account")
+        if isinstance(
+            resolved.get("account"),
+            dict,
+        )
+        else {}
+    )
+
+    if not device_id:
+        return JSONResponse({
+            "ok": True,
+            "source_of_truth": "XTL_BACKEND",
+            "calendar_source": "MT5_CALENDAR",
+            "profile_id": pid,
+
+            "calendar_status": {
+                "ok": False,
+                "available": False,
+                "reason": (
+                    "PROFILE_DEVICE_MISSING"
+                ),
+                "source": "MT5_CALENDAR",
+                "profile_id": pid,
+                "device_id": None,
+            },
+
+            "symbols": {
+                sym: {
+                    "verdict": "ALLOW",
+                    "reason": (
+                        "EVENT_DATA_"
+                        "UNAVAILABLE_BYPASS"
+                    ),
+                    "event_name": None,
+                    "window": None,
+                    "minutes_to_event": None,
+                }
+                for sym in SYMBOLS
+            },
+
+            "upcoming_events": [],
+            "any_blocked": False,
+            "generated_at_ms": now_ms,
+        })
+
+    # ---------------------------------------------------------
+    # ONE canonical broker context for this entire response.
+    #
+    # Same structure consumed by production check_news_block().
+    # ---------------------------------------------------------
+    gate_context = {
+        "uid": str(uid).strip(),
+        "profile_id": str(
+            pid
+        ).strip(),
+        "device_id": device_id,
+    }
+
+    # ---------------------------------------------------------
+    # Calendar health from EXACT same calendar as execution.
+    # ---------------------------------------------------------
+    cal_status = (
+        get_calendar_status(
+            R,
+            gate_context=gate_context,
+        )
+        or {}
+    )
+
+    symbol_results = {}
+    any_blocked = False
+
+    # ---------------------------------------------------------
+    # Each UI symbol uses production check_news_block().
+    #
+    # Do NOT duplicate event logic in trend_endpoints or UI.
+    # ---------------------------------------------------------
+    for sym in SYMBOLS:
+        result = (
+            check_news_block(
+                sym,
+                now_ms,
+                R,
+                shadow_mode=False,
+                gate_context=gate_context,
+            )
+            or {}
+        )
+
+        symbol_results[sym] = {
+            "verdict": result.get(
+                "verdict",
+                "ALLOW",
+            ),
+
+            "block": bool(
+                result.get("block")
+            ),
+
+            "reason": (
+                result.get("reason")
+            ),
+
+            "event_name": (
+                result.get(
+                    "event_name"
+                )
+            ),
+
+            "event_tier": (
+                result.get(
+                    "event_tier"
+                )
+            ),
+
+            "currency": (
+                result.get("currency")
+            ),
+
+            "window": (
+                result.get("window")
+            ),
+
+            "minutes_to_event": (
+                result.get(
+                    "minutes_to_event"
+                )
+            ),
+
+            "pre_block_min": (
+                result.get(
+                    "pre_block_min"
+                )
+            ),
+
+            "post_block_min": (
+                result.get(
+                    "post_block_min"
+                )
+            ),
+
+            "calendar_source": (
+                result.get(
+                    "calendar_source"
+                )
+            ),
+        }
+
         if result.get("block"):
             any_blocked = True
 
-    upcoming_raw = get_upcoming_events(R, hours_ahead=336)   # 14 days, matches scraper lookahead
-    upcoming     = []
+    # ---------------------------------------------------------
+    # Upcoming list from SAME broker calendar.
+    # ---------------------------------------------------------
+    upcoming_raw = (
+        get_upcoming_events(
+            R,
+            hours_ahead=336,
+            gate_context=gate_context,
+        )
+        or []
+    )
+
+    upcoming = []
+
     for ev in upcoming_raw:
-        t_ms          = int(ev.get("time_ms") or 0)
-        minutes_until = round((t_ms - now_ms) / 60000, 1)
-        pre_ms        = int(ev.get("pre_block_min") or 15) * 60_000
-        post_ms       = int(ev.get("post_block_min") or 15) * 60_000
-        stab_ms       = int(ev.get("stabilization_min") or 0) * 60_000
-        is_blocking   = (t_ms - pre_ms) <= now_ms <= (t_ms + post_ms + stab_ms)
-        dt_str        = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).strftime("%b %d  %H:%M")
+        t_ms = int(
+            ev.get("time_ms")
+            or 0
+        )
+
+        minutes_until = round(
+            (
+                t_ms
+                - now_ms
+            ) / 60_000,
+            1,
+        )
+
+        pre_min = int(
+            ev.get(
+                "pre_block_min"
+            )
+            or 0
+        )
+
+        post_min = int(
+            ev.get(
+                "post_block_min"
+            )
+            or 0
+        )
+
+        pre_ms = (
+            pre_min * 60_000
+        )
+
+        post_ms = (
+            post_min * 60_000
+        )
+
+        is_blocking = bool(
+            ev.get("gate_classified")
+            and (
+                t_ms - pre_ms
+                <= now_ms
+                <= t_ms + post_ms
+            )
+        )
+
+        dt_str = (
+            datetime.fromtimestamp(
+                t_ms / 1000,
+                tz=timezone.utc,
+            ).strftime(
+                "%b %d  %H:%M"
+            )
+            if t_ms > 0
+            else None
+        )
+
         upcoming.append({
-            "event":             ev.get("event", ""),
-            "currency":          ev.get("currency", ""),
-            "datetime_utc":      dt_str,
-            "time_ms":           t_ms,
-            "pre_block_min":     ev.get("pre_block_min", 15),
-            "post_block_min":    ev.get("post_block_min", 15),
-            "stabilization_min": ev.get("stabilization_min", 0),
-            "minutes_until":     minutes_until,
-            "is_blocking":       is_blocking,
+            "event": ev.get(
+                "event",
+                "",
+            ),
+
+            "event_code": (
+                ev.get(
+                    "event_code"
+                )
+            ),
+
+            "event_tier": (
+                ev.get(
+                    "xtl_event_tier"
+                )
+            ),
+
+            "gate_classified": bool(
+                ev.get(
+                    "gate_classified"
+                )
+            ),
+
+            "currency": ev.get(
+                "currency",
+                "",
+            ),
+
+            "datetime_utc": (
+                dt_str
+            ),
+
+            "time_ms": t_ms,
+
+            "pre_block_min": (
+                pre_min
+            ),
+
+            "post_block_min": (
+                post_min
+            ),
+
+            "minutes_until": (
+                minutes_until
+            ),
+
+            "is_blocking": (
+                is_blocking
+            ),
         })
 
+    # ---------------------------------------------------------
+    # Single backend source-of-truth response.
+    # ---------------------------------------------------------
     return JSONResponse({
-        "calendar_status": cal_status,
-        "symbols":         symbol_results,
-        "upcoming_events": upcoming,
-        "any_blocked":     any_blocked,
-        "generated_at_ms": now_ms,
+        "ok": True,
+
+        "source_of_truth": (
+            "XTL_BACKEND"
+        ),
+
+        "calendar_source": (
+            "MT5_CALENDAR"
+        ),
+
+        "profile_id": pid,
+
+        "broker_context": {
+            "device_id": (
+                device_id
+            ),
+
+            "account_server": (
+                account.get("server")
+                or account.get(
+                    "account_server"
+                )
+            ),
+
+            "broker_company": (
+                account.get("company")
+                or account.get(
+                    "broker_company"
+                )
+            ),
+        },
+
+        "calendar_status": (
+            cal_status
+        ),
+
+        "symbols": (
+            symbol_results
+        ),
+
+        "upcoming_events": (
+            upcoming
+        ),
+
+        "any_blocked": (
+            any_blocked
+        ),
+
+        "generated_at_ms": (
+            now_ms
+        ),
     })

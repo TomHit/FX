@@ -16,7 +16,7 @@ log = logging.getLogger("uvicorn.error")
 
 TF = "M15"
 TF_MS = 15 * 60 * 1000
-SOURCE_VALUES = ("REAL_DXY", "SYNTHETIC_DXY")
+SOURCE_VALUES = ("REAL_DXY",)
 
 STATE_PREFIX = "xtl:dxy:turn:state:M15"
 HISTORY_PREFIX = "xtl:dxy:turn:history:M15"
@@ -55,6 +55,21 @@ BEAR_CONFIRM_SCORE = 66
 BEAR_CONFIRM_MARGIN = 22
 
 CONFIRM_SUPPORT_BARS = 2
+
+# -------------------------------------------------------------
+# Exceptional one-M15 impulse confirmation.
+#
+# Normal DXY lifecycle is unchanged:
+#     IDLE -> PENDING -> second-bar confirmation -> CONFIRMED
+#
+# Only an exceptional directional M15 candle may confirm on
+# its own.  This affects confirmation timing ONLY.
+#
+# SR / directional-room / structure-pressure / Point-A remain
+# fully authoritative downstream.
+# -------------------------------------------------------------
+IMPULSE_EARLY_CONFIRM_RANGE_ATR = 1.80
+IMPULSE_EARLY_CONFIRM_BODY_RATIO = 0.65
 REVOKE_SCORE = 60
 REVOKE_ADVERSE_ATR = 0.50
 CANDIDATE_HARD_REJECT_ATR = 0.65
@@ -241,16 +256,18 @@ def _completed_bars_at_or_before(
     bars: list[dict],
     *,
     cutoff_ms: int,
+    tf_ms: int = TF_MS,
 ) -> list[dict]:
     """
     Return only completed OHLC bars whose close is causally known at cutoff_ms.
 
-    This protects the M15 evaluation from accidentally consuming a forming
-    native H1/H4 candle or an HTF candle closing after the current M15
-    evaluation bar.
+    Native H1/H4 bars may not carry an explicit t_close_ms.  In that case
+    their causal close must be derived from their own timeframe duration,
+    not the M15 tracker TF_MS.
     """
     out: list[dict] = []
     cutoff_i = int(cutoff_ms or 0)
+    tf_i = max(1, int(tf_ms or TF_MS))
 
     for bar in bars or []:
         if not isinstance(bar, dict):
@@ -260,7 +277,18 @@ def _completed_bars_at_or_before(
         if bar.get("complete") is False:
             continue
 
-        close_ms = _bar_close_ms(bar)
+        explicit_close_ms = _to_ms(
+            bar.get("t_close_ms")
+            or bar.get("t_close")
+            or 0
+        )
+
+        if explicit_close_ms > 0:
+            close_ms = explicit_close_ms
+        else:
+            open_ms = _bar_open_ms(bar)
+            close_ms = open_ms + tf_i if open_ms > 0 else 0
+
         if close_ms <= 0:
             continue
 
@@ -279,7 +307,6 @@ def _completed_bars_at_or_before(
 
     out.sort(key=lambda b: _bar_open_ms(b))
     return out
-
 
 def _load_native_real_dxy_htf_bars(
     *,
@@ -309,9 +336,16 @@ def _load_native_real_dxy_htf_bars(
             or []
         )
 
+        native_tf_ms = (
+            60 * 60 * 1000
+            if tf_u == "H1"
+            else 4 * 60 * 60 * 1000
+        )
+
         return _completed_bars_at_or_before(
             bars,
             cutoff_ms=int(cutoff_ms or 0),
+            tf_ms=native_tf_ms,
         )
 
     except Exception:
@@ -2048,8 +2082,20 @@ def _history_last_confirmed_direction(R, source: str, device_id: str) -> str | N
     return None
 
 
-def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[dict], index: int,
-                  detected_at_ms: int, offset_min: int, historical: bool) -> dict:
+def _evaluate_one(
+    R,
+    *,
+    source: str,
+    device_id: str,
+    source_device_id: str | None = None,
+    binding: dict,
+    bars: list[dict],
+    index: int,
+    detected_at_ms: int,
+    offset_min: int,
+    historical: bool,
+) -> dict:
+    source_device_id = str(source_device_id or device_id or "").strip()
     prefix = bars[:index + 1]
     features = _feature_snapshot(prefix)
     if not features:
@@ -2161,7 +2207,7 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
         h4_bar_source,
     ) = _dxy_sr_htf_bars(
         source=source,
-        device_id=device_id,
+        device_id=source_device_id,
         prefix=prefix,
         close_ms=close_ms,
         historical=historical,
@@ -2389,6 +2435,68 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
     else:
         start_score_required = BULL_CANDIDATE_START_SCORE
         start_margin_required = BULL_CANDIDATE_START_MARGIN
+    # ---------------------------------------------------------
+    # EXCEPTIONAL SINGLE-M15 IMPULSE
+    #
+    # This does NOT bypass SR or Point-A.
+    #
+    # It only answers:
+    #   "Is this one completed M15 candle itself strong enough
+    #    that we do not need a second M15 candle to confirm
+    #    the DXY direction?"
+    #
+    # Existing market_flow strong_single_signal already requires:
+    #   - strong directional score
+    #   - strong directional margin
+    #   - meaningful directional displacement
+    #
+    # We additionally require:
+    #   - exceptional full candle expansion >= 1.80 ATR
+    #   - directional body >= 65% of candle range
+    #   - market-flow direction agrees with evidence direction
+    #
+    # Everything downstream (SR, room ATR, structure pressure,
+    # Point-A) remains unchanged.
+    # ---------------------------------------------------------
+    try:
+        _impulse_expansion_atr = float(
+            features.get("expansion_ratio")
+            or 0.0
+        )
+    except Exception:
+        _impulse_expansion_atr = 0.0
+
+    try:
+        _impulse_body_ratio = float(
+            features.get("body_ratio")
+            or 0.0
+        )
+    except Exception:
+        _impulse_body_ratio = 0.0
+
+    _impulse_flow_direction = str(
+        market_flow.get("direction")
+        or "NEUTRAL"
+    ).upper().strip()
+
+    _impulse_strong_single = bool(
+        market_flow.get("strong_single_signal")
+    )
+
+    impulse_early_confirm = bool(
+        source == "REAL_DXY"
+        and start_direction in ("BULLISH", "BEARISH")
+        and _impulse_flow_direction == start_direction
+        and _impulse_strong_single
+        and (
+            _impulse_expansion_atr
+            >= IMPULSE_EARLY_CONFIRM_RANGE_ATR
+        )
+        and (
+            _impulse_body_ratio
+            >= IMPULSE_EARLY_CONFIRM_BODY_RATIO
+        )
+    )
 
     if old_status == "PENDING":
         supporting = direction == score_direction and current_direction_score >= 45 and score_margin >= 10
@@ -2476,13 +2584,13 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
     else:  # IDLE / unknown
         status = "IDLE"
         direction = "NEUTRAL"
+
         if (
             basket_ok
             and start_direction in ("BULLISH", "BEARISH")
             and start_score >= start_score_required
             and score_margin >= start_margin_required
         ):
-            status = "PENDING"
             direction = start_direction
             started_ms = close_ms
             start_price = current_close
@@ -2494,8 +2602,39 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
             max_adverse_atr = 0.0
             peak_favorable_ms = close_ms
             bars_to_peak = 0
-            confirmed_ms = 0
-            event = {"status": "PENDING", "direction": direction, "reason": "EARLY_EVIDENCE_CANDIDATE"}
+
+            # -------------------------------------------------
+            # Exceptional one-M15 impulse.
+            #
+            # Skip ONLY the second-candle confirmation wait.
+            #
+            # This does NOT imply Point-A PASS.
+            # Existing DXY SR / room / structure logic still
+            # decides whether the confirmed direction is safe.
+            # -------------------------------------------------
+            if impulse_early_confirm:
+                status = "CONFIRMED"
+                confirmed_ms = close_ms
+
+                event = {
+                    "status": "CONFIRMED",
+                    "direction": direction,
+                    "reason": (
+                        "SINGLE_M15_IMPULSE_CONFIRMED"
+                    ),
+                }
+
+            else:
+                status = "PENDING"
+                confirmed_ms = 0
+
+                event = {
+                    "status": "PENDING",
+                    "direction": direction,
+                    "reason": (
+                        "EARLY_EVIDENCE_CANDIDATE"
+                    ),
+                }
 
     active = status in ("PENDING", "CONFIRMED")
     active_score = bull_score if direction == "BULLISH" else bear_score if direction == "BEARISH" else 0
@@ -2590,7 +2729,17 @@ def _evaluate_one(R, *, source: str, device_id: str, binding: dict, bars: list[d
         "market_flow_confidence": market_flow.get("confidence"),
         "market_flow_stage": market_flow.get("stage"),
         "market_flow_reason": market_flow.get("reason"),
-
+        "impulse_early_confirm": bool(
+            impulse_early_confirm
+        ),
+        "impulse_expansion_atr": round(
+            _impulse_expansion_atr,
+            4,
+        ),
+        "impulse_body_ratio": round(
+            _impulse_body_ratio,
+            4,
+        ),
         "structure": structure,
         "structure_targets": structure_targets,
         "structure_source": "trend_sr",
@@ -2894,6 +3043,7 @@ def update_global_dxy_m15_state(*, R, now_ms: int | None = None) -> dict:
 
     try:
         from api.dxy_tracker import _load_bindings
+        from api.xtl_analytics import resolve_canonical_dxy_source
         bindings = _load_bindings(R) or []
         stats["bindings"] = len(bindings); stats["devices"] = len(bindings)
         for binding in bindings:
@@ -2901,33 +3051,156 @@ def update_global_dxy_m15_state(*, R, now_ms: int | None = None) -> dict:
             if not device_id:
                 continue
             offset_min = _broker_offset_minutes(R, device_id)
+
             for source in SOURCE_VALUES:
                 try:
-                    bars = _load_source_bars(source, device_id)
+                    source_device_id = device_id
+
+                    if source == "REAL_DXY":
+                        canonical = (
+                            resolve_canonical_dxy_source(
+                                R,
+                                device_id,
+                            )
+                            or {}
+                        )
+                        source_device_id = str(
+                            canonical.get("real_device_id")
+                            or ""
+                        ).strip()
+
+                        # REAL_DXY has no live synthetic fallback.
+                        # If the canonical REAL_DXY publisher is unavailable,
+                        # leave this consumer unchanged and retry next tick.
+                        if not source_device_id:
+                            continue
+
+                    bars = _load_source_bars(
+                        source,
+                        source_device_id,
+                    )
                     if len(bars) < MIN_FEATURE_BARS:
                         continue
+
                     if source == "REAL_DXY":
                         stats["real_available"] += 1
                     else:
                         stats["synthetic_available"] += 1
-                    _persist_series(R, source, device_id, bars, offset_min, detected_at_ms)
-                    stats["series_built"] += 1
-                    marker = _bootstrap(
-                        R, source=source, device_id=device_id, binding=binding,
-                        bars=bars, offset_min=offset_min, detected_at_ms=detected_at_ms,
+
+                    latest_close_ms = _broker_to_utc_ms(
+                        _bar_close_ms(bars[-1]),
+                        offset_min,
                     )
+
+                    bootstrap_marker = _json_load(
+                        R.get(
+                            _bootstrap_key(
+                                source,
+                                device_id,
+                            )
+                        ),
+                        {},
+                    )
+
+                    state = _json_load(
+                        R.get(
+                            _state_key(
+                                source,
+                                device_id,
+                            )
+                        ),
+                        {},
+                    )
+
+                    last_evaluated_ms = int(
+                        (state or {}).get(
+                            "last_evaluated_bar_close_ms"
+                        )
+                        or 0
+                    )
+
+                    caught_up = (
+                        latest_close_ms > 0
+                        and isinstance(
+                            bootstrap_marker,
+                            dict,
+                        )
+                        and bool(
+                            bootstrap_marker.get(
+                                "completed"
+                            )
+                        )
+                        and isinstance(
+                            state,
+                            dict,
+                        )
+                        and not bool(
+                            state.get(
+                                "evaluation_pending_retry"
+                            )
+                        )
+                        and last_evaluated_ms
+                        == latest_close_ms
+                    )
+
+                    if caught_up:
+                        continue
+
+                    _persist_series(
+                        R,
+                        source,
+                        device_id,
+                        bars,
+                        offset_min,
+                        detected_at_ms,
+                    )
+                    stats["series_built"] += 1
+
+                    marker = _bootstrap(
+                        R,
+                        source=source,
+                        device_id=device_id,
+                        binding=binding,
+                        bars=bars,
+                        offset_min=offset_min,
+                        detected_at_ms=detected_at_ms,
+                    )
+
                     if marker.get("completed"):
                         stats["bootstrapped"] += 1
+
+                    # Bootstrap can rebuild the state from historical bars.
+                    # Reload it before calculating unseen live M15 candles.
+                    state = _json_load(
+                        R.get(
+                            _state_key(
+                                source,
+                                device_id,
+                            )
+                        ),
+                        {},
+                    )
+
+                    last_evaluated_ms = int(
+                        (state or {}).get(
+                            "last_evaluated_bar_close_ms"
+                        )
+                        or 0
+                    )
+
                     # Evaluate every unseen completed bar in chronological order.
                     # The former latest-only path permanently lost intermediate
                     # M15 evidence whenever the source advanced by two or more bars.
-                    state = _json_load(R.get(_state_key(source, device_id)), {})
-                    last_evaluated_ms = int(
-                        (state or {}).get("last_evaluated_bar_close_ms") or 0
-                    )
                     pending_indexes = [
-                        idx for idx in range(MIN_FEATURE_BARS - 1, len(bars))
-                        if _broker_to_utc_ms(_bar_close_ms(bars[idx]), offset_min)
+                        idx
+                        for idx in range(
+                            MIN_FEATURE_BARS - 1,
+                            len(bars),
+                        )
+                        if _broker_to_utc_ms(
+                            _bar_close_ms(bars[idx]),
+                            offset_min,
+                        )
                         > last_evaluated_ms
                     ]
                     for pending_pos, idx in enumerate(pending_indexes):
@@ -2957,8 +3230,13 @@ def update_global_dxy_m15_state(*, R, now_ms: int | None = None) -> dict:
                         if not R.set(eval_key, str(detected_at_ms), nx=True, ex=2 * 60 * 60):
                             continue
                         result = _evaluate_one(
-                            R, source=source, device_id=device_id,
-                            binding=binding, bars=bars, index=idx,
+                            R,
+                            source=source,
+                            device_id=device_id,
+                            source_device_id=source_device_id,
+                            binding=binding,
+                            bars=bars,
+                            index=idx,
                             detected_at_ms=detected_at_ms,
                             offset_min=offset_min,
                             historical=(pending_pos < len(pending_indexes) - 1),

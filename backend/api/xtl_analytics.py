@@ -3274,36 +3274,247 @@ def read_reversal_candle(symbol: str, device_id: str, pos: dict) -> dict:
                 int(_entry_ms) - int(_rc_identity_ms)
             )
 
-        # The broker-entry payload is the only authoritative description of the
-        # RC that actually triggered this trade.  Use it only when complete;
-        # older/incomplete payloads continue through the pre-existing fallback
-        # chain below.  This is analytics-only and never changes gate state.
+        # -------------------------------------------------------------
+        # Authoritative broker-entry RC capture.
+        #
+        # entry_confirmation owns the identity of the RC which actually
+        # triggered this trade.
+        #
+        # Preferred:
+        #   1. Entry payload already contains rc_open_ms + full OHLC.
+        #
+        # Fallback for the SAME authoritative RC:
+        #   2. Entry payload contains rev_ok_ms / rc_close_ms but not
+        #      full OHLC. Reconstruct that exact completed H1 candle.
+        #
+        # IMPORTANT:
+        # Never substitute a later live-watch RC for an entry-confirmed
+        # RC generation.
+        # -------------------------------------------------------------
         if isinstance(ec, dict) and ec:
+            H1_MS = 3_600_000
+
+            ec_open_ms = _safe_int(
+                ec.get("rc_open_ms")
+                or ec.get("open_ms")
+                or ec.get("rev_ok_bar_open_ms")
+            )
+
+            ec_close_ms = _safe_int(
+                ec.get("rc_close_ms")
+                or ec.get("rev_ok_ms")
+            )
+
+            # Normalize seconds -> milliseconds defensively.
+            if ec_open_ms and ec_open_ms < 100_000_000_000:
+                ec_open_ms *= 1000
+
+            if ec_close_ms and ec_close_ms < 100_000_000_000:
+                ec_close_ms *= 1000
+
+            # rev_ok_ms / rc_close_ms identifies the completed RC close.
+            # Derive the H1 candle open only when explicit open identity
+            # was not frozen into the broker-entry payload.
+            if not ec_open_ms and ec_close_ms:
+                ec_open_ms = int(ec_close_ms) - H1_MS
+
             ec_rc = {
-                "rc_open_ms": ec.get("rc_open_ms") or ec.get("open_ms"),
-                "rc_open": _safe_float(ec.get("rc_open") if ec.get("rc_open") is not None else ec.get("open")),
-                "rc_high": _safe_float(ec.get("rc_high") if ec.get("rc_high") is not None else ec.get("high")),
-                "rc_low": _safe_float(ec.get("rc_low") if ec.get("rc_low") is not None else ec.get("low")),
-                "rc_close": _safe_float(ec.get("rc_close") if ec.get("rc_close") is not None else ec.get("close")),
+                "rc_open_ms": ec_open_ms,
+                "rc_open": _safe_float(
+                    ec.get("rc_open")
+                    if ec.get("rc_open") is not None
+                    else ec.get("open")
+                ),
+                "rc_high": _safe_float(
+                    ec.get("rc_high")
+                    if ec.get("rc_high") is not None
+                    else ec.get("high")
+                ),
+                "rc_low": _safe_float(
+                    ec.get("rc_low")
+                    if ec.get("rc_low") is not None
+                    else ec.get("low")
+                ),
+                "rc_close": _safe_float(
+                    ec.get("rc_close")
+                    if ec.get("rc_close") is not None
+                    else ec.get("close")
+                ),
             }
-            if ec_rc["rc_open_ms"] and None not in (
-                ec_rc["rc_open"], ec_rc["rc_high"],
-                ec_rc["rc_low"], ec_rc["rc_close"],
+
+            # Preserve authoritative lifecycle identity.
+            if ec_close_ms:
+                rc["rc_close_ms"] = int(ec_close_ms)
+                rc["rev_ok_ms"] = int(
+                    _safe_int(ec.get("rev_ok_ms"))
+                    or ec_close_ms
+                )
+
+            if ec_open_ms:
+                rc["rc_open_ms"] = int(ec_open_ms)
+
+            # ---------------------------------------------------------
+            # A. Best case: broker-entry payload already froze OHLC.
+            # ---------------------------------------------------------
+            if ec_open_ms and None not in (
+                ec_rc["rc_open"],
+                ec_rc["rc_high"],
+                ec_rc["rc_low"],
+                ec_rc["rc_close"],
             ):
                 rc.update(ec_rc)
-                rc["rc_open_ms"] = int(ec_rc["rc_open_ms"])
                 rc["rc_found"] = True
                 rc["rc_source"] = "entry_confirmation"
-                rc["rc_capture_note"] = "authoritative_entry_time_rc"
-                o, h, l, c = (rc["rc_open"], rc["rc_high"], rc["rc_low"], rc["rc_close"])
-                rng = (h - l) or 0.0
-                rc["rc_size_pips"] = round(rng / _pip(symbol), 1) if rng else 0.0
-                rc["rc_body_pct"] = round(abs(c - o) / rng * 100.0, 1) if rng else 0.0
-                rc["rc_direction"] = "BULL" if c > o else ("BEAR" if c < o else "DOJI")
-                for key in ("rc_shifted_before_entry", "rc_shifted"):
-                    if key in ec:
-                        rc["rc_shifted_before_entry"] = bool(ec.get(key))
-                        break
+                rc["rc_capture_note"] = (
+                    "authoritative_entry_time_rc"
+                )
+
+            # ---------------------------------------------------------
+            # B. Entry identity exists but OHLC was not transported.
+            #    Reconstruct the SAME RC from historical H1 bars.
+            # ---------------------------------------------------------
+            elif ec_open_ms:
+                rc["rc_source"] = "entry_confirmation"
+                rc["rc_capture_note"] = (
+                    "authoritative_entry_time_rc:"
+                    "h1_reconstructed_from_entry_identity"
+                )
+
+                dev = _resolve_bar_device(
+                    symbol,
+                    device_id,
+                    allow_scan_fallback=False,
+                )
+
+                if dev:
+                    from api.trend_endpoints import (
+                        _get_closed_h1_bars,
+                    )
+
+                    bars = (
+                        _get_closed_h1_bars(
+                            symbol,
+                            dev,
+                        )
+                        or []
+                    )
+
+                    matched = None
+
+                    for b in bars:
+                        b_open_ms = _norm_ms(
+                            b.get("t_open_ms")
+                            or b.get("t")
+                            or 0
+                        )
+
+                        b_close_ms = _norm_ms(
+                            b.get("t_close_ms")
+                            or 0
+                        )
+
+                        if not b_close_ms and b_open_ms:
+                            b_close_ms = (
+                                int(b_open_ms) + H1_MS
+                            )
+
+                        # Prefer exact open identity.
+                        if (
+                            b_open_ms
+                            and int(b_open_ms)
+                            == int(ec_open_ms)
+                        ):
+                            matched = b
+                            break
+
+                        # Defensive exact close-identity match.
+                        if (
+                            ec_close_ms
+                            and b_close_ms
+                            and int(b_close_ms)
+                            == int(ec_close_ms)
+                        ):
+                            matched = b
+                            break
+
+                    if matched:
+                        rc["rc_open"] = _safe_float(
+                            matched.get("o")
+                        )
+                        rc["rc_high"] = _safe_float(
+                            matched.get("h")
+                        )
+                        rc["rc_low"] = _safe_float(
+                            matched.get("l")
+                        )
+                        rc["rc_close"] = _safe_float(
+                            matched.get("c")
+                        )
+
+                        rc["rc_found"] = (
+                            None not in (
+                                rc["rc_open"],
+                                rc["rc_high"],
+                                rc["rc_low"],
+                                rc["rc_close"],
+                            )
+                        )
+
+            # ---------------------------------------------------------
+            # If entry_confirmation supplied RC identity, DO NOT allow
+            # a later live watch to replace this RC generation.
+            # ---------------------------------------------------------
+            if ec_open_ms or ec_close_ms:
+                if rc["rc_found"]:
+                    o = rc["rc_open"]
+                    h = rc["rc_high"]
+                    l = rc["rc_low"]
+                    c = rc["rc_close"]
+
+                    rng = (h - l) or 0.0
+
+                    rc["rc_size_pips"] = (
+                        round(
+                            rng / _pip(symbol),
+                            1,
+                        )
+                        if rng
+                        else 0.0
+                    )
+
+                    rc["rc_body_pct"] = (
+                        round(
+                            abs(c - o) / rng * 100.0,
+                            1,
+                        )
+                        if rng
+                        else 0.0
+                    )
+
+                    rc["rc_direction"] = (
+                        "BULL"
+                        if c > o
+                        else "BEAR"
+                        if c < o
+                        else "DOJI"
+                    )
+
+                    for key in (
+                        "rc_shifted_before_entry",
+                        "rc_shifted",
+                    ):
+                        if key in ec:
+                            rc[
+                                "rc_shifted_before_entry"
+                            ] = bool(ec.get(key))
+                            break
+
+                else:
+                    rc["rc_capture_note"] = (
+                        "authoritative_entry_time_rc:"
+                        "identity_present_ohlc_unavailable"
+                    )
+
                 return rc
 
         sources = [("pos", p)]
@@ -3509,6 +3720,282 @@ def compute_setup_quality_flags(snap_like: dict) -> list:
     except Exception as e:
         log.warning("analytics: quality flags failed: %s", e)
     return flags
+
+
+# -- Market-news context from local PostgreSQL (shadow analytics only) -------
+def read_market_news_at_entry(
+    symbol: str,
+    entry_ms: int,
+    lookback_h: int = 24,
+    limit: int = 20,
+) -> dict:
+    """
+    Freeze market-news articles XTL causally knew by broker-confirmed entry.
+
+    PostgreSQL is read-only here. No Finnhub/network call, no Redis mutation,
+    and no trading decision is changed. Never raises.
+    """
+    captured_at_ms = _now_ms()
+
+    out = {
+        "status": "UNAVAILABLE",
+        "source": "POSTGRES_XTL_NEWS_ARTICLES",
+        "symbol": str(symbol or "").upper(),
+        "entry_cutoff_ms": int(entry_ms or 0),
+        "captured_at_ms": captured_at_ms,
+        "lookback_h": int(lookback_h),
+        "article_count": 0,
+        "articles": [],
+    }
+
+    try:
+        cutoff_ms = int(entry_ms or 0)
+        if cutoff_ms <= 0:
+            out["status"] = "INVALID_ENTRY_TIME"
+            return out
+
+        database_url = str(os.getenv("DATABASE_URL") or "").strip()
+        if not database_url:
+            out["status"] = "DATABASE_URL_MISSING"
+            return out
+
+        # Local import keeps PostgreSQL an analytics-only optional dependency.
+        import psycopg2
+        import psycopg2.extras
+
+        lookback_ms = max(1, int(lookback_h)) * 3_600_000
+        max_rows = max(1, min(int(limit), 50))
+
+        conn = psycopg2.connect(
+            database_url,
+            connect_timeout=2,
+        )
+
+        try:
+            with conn.cursor(
+                cursor_factory=psycopg2.extras.DictCursor
+            ) as cur:
+                # Analytics-only safety bound. A slow/locked PostgreSQL
+                # query must never materially delay the post-fill path.
+                cur.execute("SET LOCAL statement_timeout = '500ms'")
+
+                cur.execute(
+                    """
+                    SELECT
+                        provider,
+                        provider_article_id,
+                        source,
+                        headline,
+                        article_url,
+                        feed_categories,
+                        topics,
+                        relevance_score,
+                        published_at_ms,
+                        first_seen_at_ms
+                    FROM xtl_news_articles
+                    WHERE first_seen_at_ms <= %s
+                      AND published_at_ms <= %s
+                      AND published_at_ms >= %s
+                      AND relevance_score >= 1
+                    ORDER BY
+                        relevance_score DESC,
+                        published_at_ms DESC,
+                        first_seen_at_ms DESC
+                    LIMIT %s
+                    """,
+                    (
+                        cutoff_ms,
+                        cutoff_ms,
+                        cutoff_ms - lookback_ms,
+                        max_rows,
+                    ),
+                )
+
+                rows = cur.fetchall()
+
+            articles = []
+
+            for row in rows:
+                articles.append({
+                    "provider": row["provider"],
+                    "provider_article_id": row["provider_article_id"],
+                    "source": row["source"],
+                    "headline": row["headline"],
+                    "article_url": row["article_url"],
+                    "feed_categories": list(row["feed_categories"] or []),
+                    "topics": list(row["topics"] or []),
+                    "relevance_score": int(row["relevance_score"]),
+                    "published_at_ms": int(row["published_at_ms"]),
+                    "first_seen_at_ms": int(row["first_seen_at_ms"]),
+                })
+
+            out["status"] = "OK"
+            out["article_count"] = len(articles)
+            out["articles"] = articles
+            return out
+
+        finally:
+            conn.close()
+
+    except Exception as exc:
+        out["status"] = "ERROR"
+        out["error"] = str(exc)[:300]
+
+        log.warning(
+            "analytics: market-news entry read failed "
+            "symbol=%s entry_ms=%s err=%s",
+            symbol,
+            entry_ms,
+            exc,
+        )
+
+        return out
+
+
+# -- Market news first observed while a trade was open ----------------------
+def read_market_news_during_trade(
+    symbol: str,
+    entry_ms: int,
+    close_ms: int,
+    limit: int = 50,
+) -> dict:
+    """
+    Return locally persisted market news first observed after entry and no
+    later than close.
+
+    PostgreSQL read only. No Finnhub/network call, no Redis mutation,
+    and no trading authority. Never raises.
+    """
+    captured_at_ms = _now_ms()
+
+    out = {
+        "status": "UNAVAILABLE",
+        "source": "POSTGRES_XTL_NEWS_ARTICLES",
+        "symbol": str(symbol or "").upper(),
+        "entry_cutoff_ms": int(entry_ms or 0),
+        "close_cutoff_ms": int(close_ms or 0),
+        "captured_at_ms": captured_at_ms,
+        "article_count": 0,
+        "articles": [],
+    }
+
+    try:
+        entry_cutoff_ms = int(entry_ms or 0)
+        close_cutoff_ms = int(close_ms or 0)
+
+        if (
+            entry_cutoff_ms <= 0
+            or close_cutoff_ms <= entry_cutoff_ms
+        ):
+            out["status"] = "INVALID_TRADE_WINDOW"
+            return out
+
+        database_url = str(os.getenv("DATABASE_URL") or "").strip()
+
+        if not database_url:
+            out["status"] = "DATABASE_URL_MISSING"
+            return out
+
+        import psycopg2
+        import psycopg2.extras
+
+        max_rows = max(1, min(int(limit), 100))
+
+        conn = psycopg2.connect(
+            database_url,
+            connect_timeout=2,
+        )
+
+        try:
+            with conn.cursor(
+                cursor_factory=psycopg2.extras.DictCursor
+            ) as cur:
+                # Analytics-only safety bound.
+                cur.execute(
+                    "SET LOCAL statement_timeout = '500ms'"
+                )
+
+                cur.execute(
+                    """
+                    SELECT
+                        provider,
+                        provider_article_id,
+                        source,
+                        headline,
+                        article_url,
+                        feed_categories,
+                        topics,
+                        relevance_score,
+                        published_at_ms,
+                        first_seen_at_ms
+                    FROM xtl_news_articles
+                    WHERE first_seen_at_ms > %s
+                      AND first_seen_at_ms <= %s
+                      AND published_at_ms <= %s
+                      AND relevance_score >= 1
+                    ORDER BY
+                        first_seen_at_ms ASC,
+                        relevance_score DESC,
+                        published_at_ms ASC
+                    LIMIT %s
+                    """,
+                    (
+                        entry_cutoff_ms,
+                        close_cutoff_ms,
+                        close_cutoff_ms,
+                        max_rows,
+                    ),
+                )
+
+                rows = cur.fetchall()
+
+            articles = []
+
+            for row in rows:
+                articles.append({
+                    "provider": row["provider"],
+                    "provider_article_id": row["provider_article_id"],
+                    "source": row["source"],
+                    "headline": row["headline"],
+                    "article_url": row["article_url"],
+                    "feed_categories": list(
+                        row["feed_categories"] or []
+                    ),
+                    "topics": list(row["topics"] or []),
+                    "relevance_score": int(
+                        row["relevance_score"]
+                    ),
+                    "published_at_ms": int(
+                        row["published_at_ms"]
+                    ),
+                    "first_seen_at_ms": int(
+                        row["first_seen_at_ms"]
+                    ),
+                })
+
+            out["status"] = "OK"
+            out["article_count"] = len(articles)
+            out["articles"] = articles
+
+            return out
+
+        finally:
+            conn.close()
+
+    except Exception as exc:
+        out["status"] = "ERROR"
+        out["error"] = str(exc)[:300]
+
+        log.warning(
+            "analytics: during-trade market-news read failed "
+            "symbol=%s entry_ms=%s close_ms=%s err=%s",
+            symbol,
+            entry_ms,
+            close_ms,
+            exc,
+        )
+
+        return out
 
 
 # -- Phase-F  11: news_block context (shadow read   observes, never blocks) ---
@@ -8889,6 +9376,25 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
         news   = read_news_at_ack(sym, ets)
         news_day = read_news_day_context(sym, ets)
 
+        # -------------------------------------------------
+        # Finnhub-derived market-news context at entry.
+        #
+        # Local PostgreSQL read only:
+        #   - no network/API call
+        #   - no Redis mutation
+        #   - no execution/gate authority
+        #   - causal cutoff is the broker-confirmed entry timestamp
+        #
+        # The returned object is frozen into the immutable per-ticket
+        # entry analytics snapshot.
+        # -------------------------------------------------
+        entry_market_news = read_market_news_at_entry(
+            sym,
+            ets,
+            lookback_h=24,
+            limit=20,
+        )
+
         # -- derivations (no new source) --
         import datetime as _dt
         _d = _dt.datetime.fromtimestamp(ets / 1000.0, _dt.timezone.utc)
@@ -9232,7 +9738,11 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             # -- market-context derivation ( 11) --
             "atr_pct":   atr_pct,
 
-            # -- news context @ entry ( 11, shadow   observed not blocking) --
+            # -- market-news context @ entry (shadow analytics only) --
+            "entry_market_news": entry_market_news,
+
+            # -- scheduled economic-event context @ entry
+            #    (shadow observed; existing behavior unchanged) --
             "news_block":            news.get("news_block"),
             "news_verdict":          news.get("news_verdict"),
             "news_event":            news.get("news_event"),
@@ -12308,6 +12818,77 @@ def _holding_minutes(snap) -> int:
         return None
 
 
+def _apply_market_news_during_trade(snap: dict) -> None:
+    """
+    Freeze market news first observed while this trade was open.
+
+    Uses the same UTC-domain entry/close convention as close analytics.
+    PostgreSQL read only; analytics/shadow only. Never raises.
+    """
+    try:
+        entry_ms = _norm_ms(
+            snap.get("broker_open_time_utc_ms")
+            or snap.get("enqueue_timestamp")
+            or snap.get("opened_at_ms")
+            or 0
+        )
+
+        close_ms = _norm_ms(
+            snap.get("broker_close_time_utc_ms")
+            or 0
+        )
+
+        if close_ms <= 0:
+            raw_close_ms = _norm_ms(
+                snap.get("broker_close_time_ms")
+                or snap.get("close_timestamp")
+                or 0
+            )
+
+            broker_offset_min = int(
+                snap.get("broker_tz_offset_minutes")
+                or 0
+            )
+
+            if raw_close_ms > 0:
+                close_ms = (
+                    raw_close_ms
+                    - (broker_offset_min * 60_000)
+                )
+
+        snap["during_trade_market_news"] = (
+            read_market_news_during_trade(
+                snap.get("symbol"),
+                entry_ms,
+                close_ms,
+                limit=50,
+            )
+        )
+
+    except Exception as exc:
+        log.warning(
+            "analytics: during-trade market-news apply failed "
+            "ticket=%s err=%s",
+            snap.get("mt5_ticket")
+            or snap.get("ticket"),
+            exc,
+        )
+
+        snap["during_trade_market_news"] = {
+            "status": "ERROR",
+            "source": "POSTGRES_XTL_NEWS_ARTICLES",
+            "symbol": str(
+                snap.get("symbol") or ""
+            ).upper(),
+            "entry_cutoff_ms": 0,
+            "close_cutoff_ms": 0,
+            "captured_at_ms": _now_ms(),
+            "article_count": 0,
+            "articles": [],
+            "error": str(exc)[:300],
+        }
+
+
 def _apply_news_during_trade(snap: dict) -> None:
     
     """
@@ -12800,7 +13381,10 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
             log.warning("analytics: close-side enrichment failed: %s", _e)
 
         
-        # Recalculate news overlap using server/UTC-domain timestamps.
+        # Freeze market news first observed while this trade was open.
+        _apply_market_news_during_trade(snap)
+
+        # Existing scheduled economic-event overlap remains unchanged.
         _apply_news_during_trade(snap)
         snap["holding_minutes"] = _holding_minutes(snap)
 
@@ -13189,6 +13773,10 @@ def reconcile_pending_broker_truth(fetch_h1_bars=None) -> dict:
                                 # Reconciliation must rebuild derived truth, not
                                 # only copy broker fields.
                                 _apply_realized_r_net_and_outcome(upgraded_row)
+
+                                _apply_market_news_during_trade(
+                                    upgraded_row
+                                )
 
                                 _apply_news_during_trade(
                                     upgraded_row
@@ -13874,6 +14462,294 @@ def _dxy_milestone_signature(dxy: dict) -> str:
     return "|".join(str(dxy.get(field) or "") for field in fields)
 
 
+def _capture_exit_h4_context(
+    snap: dict,
+    captured_ms: int,
+) -> dict:
+    """
+    Capture native broker REAL_DXY H4 direction at the exact
+    CONSIDER_EXIT moment.
+
+    STRICT REAL_DXY ONLY:
+      - canonical REAL_DXY device only
+      - native broker H4 candles only
+      - no synthetic USD basket
+      - no SYNTHETIC_DXY
+      - no M15 -> H4 aggregation fallback
+      - analytics only
+    """
+
+    out = {
+        "captured_at_ms": int(captured_ms),
+        "available": False,
+
+        "source": "REAL_DXY",
+        "device_id": None,
+        "timeframe": "H4",
+
+        "direction": "UNAVAILABLE",
+        "direction_raw": None,
+        "tilt": None,
+
+        "net_atr": None,
+        "slope_atr": None,
+        "r2": None,
+        "bars_used": 0,
+        "atr": None,
+
+        "model": (
+            "NATIVE_REAL_DXY_H4_"
+            "WINDOW_DIRECTION_V1"
+        ),
+
+        "analytics_only": True,
+    }
+
+    try:
+        R = from_app_R()
+
+        # ---------------------------------------------------------
+        # Use the SAME canonical REAL_DXY authority as Point-A.
+        # ---------------------------------------------------------
+        raw = R.get(
+            "xtl:dxy:canonical"
+        )
+
+        if isinstance(
+            raw,
+            (bytes, bytearray),
+        ):
+            raw = raw.decode(
+                "utf-8",
+                "replace",
+            )
+
+        canonical = (
+            json.loads(raw)
+            if raw
+            else {}
+        )
+
+        if not isinstance(
+            canonical,
+            dict,
+        ):
+            canonical = {}
+
+        canonical_source = str(
+            canonical.get("source")
+            or ""
+        ).upper().strip()
+
+        real_dev = str(
+            canonical.get("device_id")
+            or canonical.get(
+                "real_device_id"
+            )
+            or ""
+        ).strip()
+
+        if (
+            canonical_source
+            != "REAL_DXY"
+            or not real_dev
+        ):
+            out["unavailable_reason"] = (
+                "CANONICAL_REAL_DXY_MISSING"
+            )
+            return out
+
+        out["device_id"] = real_dev
+
+        # ---------------------------------------------------------
+        # Native REAL_DXY H4 bars ONLY.
+        #
+        # Important:
+        # Do NOT call _dxy_sr_htf_bars().
+        # That helper can fall back to M15 aggregation.
+        # ---------------------------------------------------------
+        from api.dxy_m15_tracker import (
+            _load_native_real_dxy_htf_bars,
+            DXY_NATIVE_H4_MAX_BARS,
+            DXY_NATIVE_H4_MIN_BARS,
+        )
+
+        bars = (
+            _load_native_real_dxy_htf_bars(
+                device_id=real_dev,
+                tf="H4",
+                cutoff_ms=int(
+                    captured_ms
+                ),
+                max_bars=int(
+                    DXY_NATIVE_H4_MAX_BARS
+                ),
+            )
+            or []
+        )
+
+        if len(bars) < int(
+            DXY_NATIVE_H4_MIN_BARS
+        ):
+            out["bars_used"] = len(
+                bars
+            )
+            out[
+                "unavailable_reason"
+            ] = (
+                "REAL_DXY_H4_"
+                "INSUFFICIENT_NATIVE_BARS"
+            )
+            return out
+
+        # ---------------------------------------------------------
+        # Native H4 ATR.
+        # Existing XTL helper.
+        # ---------------------------------------------------------
+        atr_h4 = _atr_from_bars(
+            bars
+        )
+
+        if not atr_h4 or atr_h4 <= 0:
+            out[
+                "unavailable_reason"
+            ] = (
+                "REAL_DXY_H4_ATR_INVALID"
+            )
+            return out
+
+        out["atr"] = float(
+            atr_h4
+        )
+
+        # ---------------------------------------------------------
+        # Reuse XTL's existing direction methodology.
+        #
+        # 30 native H4 bars keeps the broader/macro horizon.
+        #
+        # Internally this measures:
+        #   - net displacement / ATR
+        #   - regression slope / ATR
+        #   - R² trend cleanliness
+        #
+        # UP/DOWN requires:
+        #   abs(net) >= 1 ATR
+        #   and R² >= 0.20
+        #
+        # Otherwise SIDEWAYS -> NEUTRAL.
+        # ---------------------------------------------------------
+        d = _h1_window_direction(
+            bars,
+            atr_h4,
+            n=30,
+            r2_gate=0.20,
+        )
+
+        if not isinstance(d, dict) or not d:
+            out[
+                "unavailable_reason"
+            ] = (
+                "REAL_DXY_H4_DIRECTION_"
+                "CALC_FAILED"
+            )
+            return out
+
+        gated = str(
+            d.get(
+                "h1_20_direction"
+            )
+            or ""
+        ).upper().strip()
+
+        raw_dir = str(
+            d.get(
+                "h1_20_direction_raw"
+            )
+            or ""
+        ).upper().strip()
+
+        tilt = str(
+            d.get(
+                "h1_20_tilt"
+            )
+            or ""
+        ).upper().strip()
+
+        if gated == "UP":
+            h4_direction = "BULLISH"
+
+        elif gated == "DOWN":
+            h4_direction = "BEARISH"
+
+        else:
+            h4_direction = "NEUTRAL"
+
+        out.update({
+            "available": True,
+
+            "direction": (
+                h4_direction
+            ),
+
+            "direction_raw": (
+                "BULLISH"
+                if raw_dir == "UP"
+                else "BEARISH"
+                if raw_dir == "DOWN"
+                else "NEUTRAL"
+            ),
+
+            "tilt": (
+                "BULLISH"
+                if tilt == "UP"
+                else "BEARISH"
+                if tilt == "DOWN"
+                else "NEUTRAL"
+            ),
+
+            "net_atr": (
+                _safe_float(
+                    d.get(
+                        "h1_20_net_atr"
+                    )
+                )
+            ),
+
+            "slope_atr": (
+                _safe_float(
+                    d.get(
+                        "h1_20_slope_atr"
+                    )
+                )
+            ),
+
+            "r2": (
+                _safe_float(
+                    d.get(
+                        "h1_20_r2"
+                    )
+                )
+            ),
+
+            "bars_used": int(
+                d.get(
+                    "h1_20_bars_used"
+                )
+                or 0
+            ),
+        })
+
+        return out
+
+    except Exception as exc:
+        out[
+            "unavailable_reason"
+        ] = (
+            f"{type(exc).__name__}:"
+            f"{exc}"
+        )
+        return out
+
 def _append_exit_candidate(
     history: dict,
     *,
@@ -13883,6 +14759,7 @@ def _append_exit_candidate(
     current_r: float,
     reasons: list[str],
     dxy: dict | None,
+    h4_context: dict | None = None,
 ) -> None:
     keys = history.setdefault("exit_candidate_keys", [])
     if key in keys:
@@ -13896,6 +14773,11 @@ def _append_exit_candidate(
         "candidate_action": "CONSIDER_EXIT",
         "reasons": list(reasons),
         "dxy_snapshot": dxy if isinstance(dxy, dict) else None,
+        "h4_context": (
+            h4_context
+            if isinstance(h4_context, dict)
+            else None
+        ),
         "analytics_only": True,
         "order_modified": False,
         "sl_modified": False,
@@ -14909,10 +15791,58 @@ def update_open_trade_snapshot(
                     del events[:-MILESTONE_MAX_DXY_EVENTS]
                 history["dxy_last_signature"] = signature
 
-        # Analytics-only candidate observations. No order action is taken.
-        alignment = str((dxy or {}).get("trade_alignment") or "").upper()
-        status = str((dxy or {}).get("status") or "").upper()
-        giveback = _safe_float(state.get("giveback_from_max_r"), 0.0) or 0.0
+        
+        # -------------------------------------------------
+        # Analytics-only exit-candidate observations.
+        #
+        # IMPORTANT:
+        # If this update can produce a CONSIDER_EXIT event,
+        # force a fresh DXY + H4 context so the research row
+        # never loses the exact decision-time evidence.
+        #
+        # No order action is taken.
+        # -------------------------------------------------
+
+        giveback = (
+            _safe_float(
+                state.get("giveback_from_max_r"),
+                0.0,
+            )
+            or 0.0
+        )
+
+        exit_candidate_possible = bool(
+            current_r >= 1.0
+            or (
+                max_r >= 1.0
+                and giveback >= 0.50
+            )
+            or current_r >= 1.50
+        )
+
+        if exit_candidate_possible and not isinstance(dxy, dict):
+            dxy = _compact_live_dxy_snapshot(
+                snap,
+                now,
+            )
+
+        h4_context = None
+
+        if exit_candidate_possible:
+            h4_context = _capture_exit_h4_context(
+                snap,
+                now,
+            )
+
+        alignment = str(
+            (dxy or {}).get("trade_alignment")
+            or ""
+        ).upper()
+
+        status = str(
+            (dxy or {}).get("status")
+            or ""
+        ).upper()
 
         if current_r >= 1.0 and alignment == "AGAINST":
             _append_exit_candidate(
@@ -14920,6 +15850,7 @@ def update_open_trade_snapshot(
                 current_r=current_r,
                 reasons=["R_100_REACHED", "DXY_ALIGNMENT_AGAINST"],
                 dxy=dxy,
+                h4_context=h4_context,
             )
 
         if max_r >= 1.0 and giveback >= 0.50:
@@ -14928,6 +15859,7 @@ def update_open_trade_snapshot(
                 current_r=current_r,
                 reasons=["R_100_PREVIOUSLY_REACHED", "GIVEBACK_FROM_PEAK_GE_0_50R"],
                 dxy=dxy,
+                h4_context=h4_context,
             )
 
         if current_r >= 1.5 and status in ("REVOKED", "IDLE"):
@@ -14936,6 +15868,7 @@ def update_open_trade_snapshot(
                 current_r=current_r,
                 reasons=["R_150_REACHED", "DXY_STATUS_NOT_CONFIRMED"],
                 dxy=dxy,
+                h4_context=h4_context,
             )
 
         snap["trade_milestone_history"] = history

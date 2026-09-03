@@ -32,11 +32,11 @@ ACK_TEMPLATE = "xtl:mt5:ack:{job_id}"
 # Frozen first production thresholds. Symbols not listed here are untouched.
 BE_TRIGGER_R: dict[str, float] = {
     "XAUUSD": 0.50,
-    "USDJPY": 0.75,
-    "USDCAD": 0.75,
-    "USDCHF": 0.75,
-    "EURUSD": 0.75,
-    "GBPUSD": 0.75,
+    "USDJPY": 0.50,
+    "USDCAD": 0.50,
+    "USDCHF": 0.50,
+    "EURUSD": 0.50,
+    "GBPUSD": 0.50,
 
 
     
@@ -379,14 +379,20 @@ def _manage_trade(R, uid: str, trade_id: str, pos: dict, now_ms: int) -> tuple[b
     if side not in ("BUY", "SELL"):
         return False, "BAD_SIDE"
 
-    entry = _f(pos.get("entry_price") or pos.get("mt5_fill_price"), 0.0)
-    initial_sl = _f(pos.get("original_sl_price") or pos.get("sl_price"), 0.0)
-    if entry <= 0 or initial_sl <= 0:
-        return False, "MISSING_ENTRY_OR_INITIAL_SL"
+    ledger_entry = _f(
+        pos.get("entry_price")
+        or pos.get("mt5_fill_price"),
+        0.0,
+    )
 
-    initial_risk = abs(entry - initial_sl)
-    if initial_risk <= 0:
-        return False, "BAD_INITIAL_RISK"
+    initial_sl = _f(
+        pos.get("original_sl_price")
+        or pos.get("sl_price"),
+        0.0,
+    )
+
+    if ledger_entry <= 0 or initial_sl <= 0:
+        return False, "MISSING_ENTRY_OR_INITIAL_SL"
 
     profile_id = str(pos.get("profile_id") or "").strip().lower()
     if not profile_id:
@@ -421,10 +427,21 @@ def _manage_trade(R, uid: str, trade_id: str, pos: dict, now_ms: int) -> tuple[b
     if broker_symbol and not broker_symbol.startswith(symbol):
         return False, "BROKER_SYMBOL_MISMATCH"
 
+    broker_entry = _f(bp.get("price_open"), 0.0)
+
+    # Live MT5 position is authoritative for position management.
+    # Ledger entry remains only a fallback if price_open is unavailable.
+    entry = broker_entry if broker_entry > 0 else ledger_entry
+
+    initial_risk = abs(entry - initial_sl)
+    if initial_risk <= 0:
+        return False, "BAD_INITIAL_RISK"
+
     price = _f(bp.get("price_current"), 0.0)
     current_sl = _f(bp.get("sl"), 0.0)
     current_tp = _f(bp.get("tp"), 0.0)
     step = _price_step(bp)
+
     if price <= 0 or step <= 0:
         return False, "BROKER_PRICE_OR_PRECISION_MISSING"
 
@@ -432,19 +449,15 @@ def _manage_trade(R, uid: str, trade_id: str, pos: dict, now_ms: int) -> tuple[b
     buffer_distance = initial_risk * buffer_r
 
     if side == "BUY":
-        be_sl_raw = (
-            entry + buffer_distance
-            
-        )
+        be_sl_raw = entry + buffer_distance
     else:
-        be_sl_raw = (
-            entry - buffer_distance
-            
-        )
+        be_sl_raw = entry - buffer_distance
+
     be_sl = _normalize_price(
         be_sl_raw,
         bp,
     )
+
     current_r = (
         (price - entry) / initial_risk
         if side == "BUY"

@@ -509,35 +509,84 @@ def _dxy_opposing_sr_next_three(
         except Exception:
             continue
 
-        # Keep only SR in the direction DXY must travel.
+        low = _dxy_float_or_none(z.get("low"))
+        high = _dxy_float_or_none(z.get("high"))
+
+        # Older tracker rows may only carry a central level.
+        if low is None:
+            low = level
+
+        if high is None:
+            high = level
+
+        zone_low = min(float(low), float(high))
+        zone_high = max(float(low), float(high))
+
+        inside_zone = False
+        distance = None
+
+        # ---------------------------------------------------------
+        # Zone-aware directional geometry.
+        #
+        # BEARISH DXY:
+        #   opposing structure = SUPPORT
+        #   - already inside support => zero room
+        #   - support fully below price => distance to zone HIGH
+        #
+        # BULLISH DXY:
+        #   opposing structure = RESISTANCE
+        #   - already inside resistance => zero room
+        #   - resistance fully above price => distance to zone LOW
+        # ---------------------------------------------------------
         if current_price is not None:
-            if (
-                direction == "BEARISH"
-                and level >= float(current_price)
-            ):
-                continue
+            px = float(current_price)
 
-            if (
-                direction == "BULLISH"
-                and level <= float(current_price)
-            ):
-                continue
+            inside_zone = bool(
+                zone_low <= px <= zone_high
+            )
 
-        distance_atr = _dxy_float_or_none(
-            z.get("distance_atr")
-            if z.get("distance_atr") is not None
-            else z.get("dist_atr")
-        )
+            if direction == "BEARISH":
+                if inside_zone:
+                    distance = 0.0
 
+                elif zone_high < px:
+                    distance = px - zone_high
+
+                else:
+                    # Support is entirely above current price,
+                    # so it is not a downside obstacle.
+                    continue
+
+            elif direction == "BULLISH":
+                if inside_zone:
+                    distance = 0.0
+
+                elif zone_low > px:
+                    distance = zone_low - px
+
+                else:
+                    # Resistance is entirely below current price,
+                    # so it is not an upside obstacle.
+                    continue
+
+        distance_atr = None
+
+        # Prefer freshly computed distance to the zone boundary.
         if (
-            distance_atr is None
-            and current_price is not None
-            and atr
-            and atr > 0
+            distance is not None
+            and atr is not None
+            and float(atr) > 0
         ):
             distance_atr = (
-                abs(float(current_price) - level)
-                / float(atr)
+                float(distance) / float(atr)
+            )
+
+        # Fallback when live price / ATR is unavailable.
+        if distance_atr is None:
+            distance_atr = _dxy_float_or_none(
+                z.get("distance_atr")
+                if z.get("distance_atr") is not None
+                else z.get("dist_atr")
             )
 
         if distance_atr is None:
@@ -545,6 +594,9 @@ def _dxy_opposing_sr_next_three(
 
         candidates.append({
             "level": level,
+            "low": float(zone_low),
+            "high": float(zone_high),
+            "inside": bool(inside_zone),
             "tf": str(
                 z.get("tf") or ""
             ).upper().strip(),
@@ -636,57 +688,130 @@ def _dxy_opposing_sr_next_three(
                 try:
                     level = float(
                         z.get("level")
+                        if z.get("level") is not None
+                        else z.get("price")
                     )
                 except Exception:
                     continue
 
-                if current_price is not None:
-                    if (
-                        direction == "BEARISH"
-                        and level >= float(
-                            current_price
-                        )
-                    ):
-                        continue
-
-                    if (
-                        direction == "BULLISH"
-                        and level <= float(
-                            current_price
-                        )
-                    ):
-                        continue
-
-                distance_atr = (
-                    _dxy_float_or_none(
-                        z.get("distance_atr")
-                        if z.get(
-                            "distance_atr"
-                        ) is not None
-                        else z.get("dist_atr")
-                    )
+                low = _dxy_float_or_none(
+                    z.get("low")
+                )
+                high = _dxy_float_or_none(
+                    z.get("high")
                 )
 
+                # Older SR rows may carry only the central level.
+                if low is None:
+                    low = level
+
+                if high is None:
+                    high = level
+
+                zone_low = min(
+                    float(low),
+                    float(high),
+                )
+                zone_high = max(
+                    float(low),
+                    float(high),
+                )
+
+                inside_zone = False
+                distance = None
+
+                # -------------------------------------------------
+                # Zone-aware directional geometry.
+                #
+                # Required BEARISH DXY:
+                #   opposing SR = SUPPORT
+                #   inside support => zero room
+                #   otherwise measure to support HIGH boundary.
+                #
+                # Required BULLISH DXY:
+                #   opposing SR = RESISTANCE
+                #   inside resistance => zero room
+                #   otherwise measure to resistance LOW boundary.
+                # -------------------------------------------------
+                if current_price is not None:
+                    px = float(current_price)
+
+                    inside_zone = bool(
+                        zone_low
+                        <= px
+                        <= zone_high
+                    )
+
+                    if direction == "BEARISH":
+                        if inside_zone:
+                            distance = 0.0
+
+                        elif zone_high < px:
+                            distance = (
+                                px - zone_high
+                            )
+
+                        else:
+                            # Support is entirely above price.
+                            # It is not a downside obstacle.
+                            continue
+
+                    elif direction == "BULLISH":
+                        if inside_zone:
+                            distance = 0.0
+
+                        elif zone_low > px:
+                            distance = (
+                                zone_low - px
+                            )
+
+                        else:
+                            # Resistance is entirely below price.
+                            # It is not an upside obstacle.
+                            continue
+
+                distance_atr = None
+
+                # Prefer fresh distance to the actual zone boundary.
                 if (
-                    distance_atr is None
-                    and current_price is not None
-                    and atr
-                    and atr > 0
+                    distance is not None
+                    and atr is not None
+                    and float(atr) > 0
                 ):
                     distance_atr = (
-                        abs(
-                            float(current_price)
-                            - level
-                        )
+                        float(distance)
                         / float(atr)
+                    )
+
+                # Fallback when current price / ATR is unavailable.
+                if distance_atr is None:
+                    distance_atr = (
+                        _dxy_float_or_none(
+                            z.get("distance_atr")
+                            if z.get(
+                                "distance_atr"
+                            ) is not None
+                            else z.get(
+                                "dist_atr"
+                            )
+                        )
                     )
 
                 if distance_atr is None:
                     continue
 
                 candidates.append({
-                    "level": level,
-                    "tf": tf_name,
+                    "level": float(level),
+                    "low": float(zone_low),
+                    "high": float(zone_high),
+                    "inside": bool(
+                        inside_zone
+                    ),
+                    "tf": str(
+                        z.get("tf")
+                        or tf_name
+                        or ""
+                    ).upper().strip(),
                     "strength": (
                         _dxy_float_or_none(
                             z.get("strength")
@@ -707,7 +832,9 @@ def _dxy_opposing_sr_next_three(
                     ),
                     "distance_atr": max(
                         0.0,
-                        float(distance_atr),
+                        float(
+                            distance_atr
+                        ),
                     ),
                     "room_class": (
                         str(
@@ -1762,7 +1889,7 @@ def _dxy_sr_confirmation_analytics(
         selected_opposing_sr.get("tf") or ""
     ).upper().strip()
 
-    # Selected strongest SR among the immediate next 3
+    # Selected nearest meaningful SR among the immediate next 3
     # must be both meaningful and genuinely too close
     # before DXY structure blocks the direction.
     selected_sr_strong = bool(
@@ -3221,6 +3348,7 @@ def zone_reversal_gate(
     pinned_device: str | None = None,
     x_device_id: str | None = None,
     live_px: float | None = None,
+    authoritative_h1_snapshot: dict | None = None,
     debug_gate: bool = False,
     move_away_atr: float = 2.0,
     hard_close_bars: int = 2,
@@ -3263,96 +3391,228 @@ def zone_reversal_gate(
         bars = None
 
     
-    # If missing bars, pull from Redis snap: xtl:ohlc:snap:<DEV>:<SYM>:H1
-    # PHASE-1 FIX:
-    # Always prefer latest device Redis snap.
-    # row_h1 bars may be stale from trend_endpoints snapshot.
-    if True:
-        dev = (str(x_device_id or "").strip() or str(pinned_device or "").strip())
-        if dev:
+    # ------------------------------------------------------------
+    # PHASE-2 PERF:
+    # Prefer the authoritative H1 snapshot already fetched by
+    # trend_endpoints during this exact symbol evaluation.
+    #
+    # Safety:
+    #   - exact Redis snapshot-key identity must match
+    #   - valid bars must be present
+    #   - otherwise fall back to the original Redis GET
+    #
+    # This removes duplicate Redis/JSON work ONLY.
+    # RC / live price / SR / watch / Point-A remain live.
+    # ------------------------------------------------------------
+    dev = (
+        str(x_device_id or "").strip()
+        or str(pinned_device or "").strip()
+    )
+
+    js = None
+    k = ""
+
+    if dev:
+        k = f"xtl:ohlc:snap:{dev}:{sym_u}:{tfu}"
+
+        _pre = (
+            authoritative_h1_snapshot
+            if isinstance(
+                authoritative_h1_snapshot,
+                dict,
+            )
+            else None
+        )
+
+        if (
+            isinstance(_pre, dict)
+            and str(_pre.get("snap_key") or "") == k
+            and isinstance(_pre.get("bars"), list)
+            and len(_pre.get("bars") or []) >= 2
+        ):
+            js = _pre
+
+            if debug_gate:
+                gate["dbg_h1_authoritative_reuse"] = True
+
+        else:
+            # Original safety fallback:
+            # no valid caller snapshot -> read Redis exactly as before.
             try:
-                k = f"xtl:ohlc:snap:{dev}:{sym_u}:{tfu}"
-                raw = R.get(k) if R is not None else None
+                raw = (
+                    R.get(k)
+                    if R is not None
+                    else None
+                )
+
                 js = _json_load(raw)
-                b2 = js.get("bars") if isinstance(js, dict) else None
-                if not isinstance(b2, list):
-                    b2 = js.get("ohlc") if isinstance(js, dict) else None
 
-                if isinstance(b2, list) and len(b2) >= 2:
-                    bars = b2
+                if debug_gate:
+                    gate["dbg_h1_authoritative_reuse"] = False
 
-                    # --- FIX: use snap clock for "closed bar" logic (defensive) ---
-                    snap_last_closed = 0
-                    snap_server_now = 0
-                    try:
-                        snap_last_closed = int(js.get("lastClosedTs") or 0) if isinstance(js, dict) else 0
-                    except Exception:
-                        snap_last_closed = 0
-                    try:
-                        snap_server_now = int(js.get("serverNow") or 0) if isinstance(js, dict) else 0
-                    except Exception:
-                        snap_server_now = 0
-
-                    # lastClosedTs must not be ahead of serverNow by a large margin
-                    # IMPORTANT:
-                    # Use serverNow/current clock to decide which candle is closed.
-                    # Do NOT use lastClosedTs as now_ms_pick, otherwise picker can lag by 1-2 candles.
-                    # Fix: serverNow can be stale (MT5 bridge doesn't update it every tick)
-                    # Use max of serverNow, last bar close time, and system now
-                    # This prevents the bar picker from treating recent closed bars as "future"
-                    _snap_server_now = int(snap_server_now) if snap_server_now > 0 else 0
-                    _last_bar_close_ms = 0
-                    try:
-                        if isinstance(bars, list) and bars:
-                            _lb = bars[-1]
-                            _lb_t = _to_ms_any(
-                                _lb.get("t_close_ms") or _lb.get("tCloseMs") or
-                                _lb.get("t") or _lb.get("ts") or _lb.get("time") or 0
-                            )
-                            if _lb_t and int(_lb_t) > 0:
-                                # If bar key is open time, add tf_ms to get close time
-                                _lb_close = int(_lb_t)
-                                if _lb_close < int(now_ms) - tf_ms:
-                                    # looks like open time — add tf_ms
-                                    _lb_close = _lb_close + int(tf_ms)
-                                _last_bar_close_ms = _lb_close
-                    except Exception:
-                        _last_bar_close_ms = 0
-
-                    # Use the freshest REAL clock (snap serverNow or system now).
-                    # Do NOT max in _last_bar_close_ms: MT5 emits future bars whose
-                    # close time would inflate now_ms_pick into the future, poisoning
-                    # started_ms / last_checked_closed_ms / rev_ok_ms and causing the
-                    # executor (true UTC) to reject every RC as "future".
-                    now_ms_pick = max(
-                        _snap_server_now,
-                        int(now_ms or 0)
-                    )
-                    if now_ms_pick <= 0:
-                        now_ms_pick = int(now_ms)
-                    snap_repaired = False
-
-                    # lastClosedTs is debug/reference only
-                    if snap_last_closed > 0 and snap_server_now > 0 and snap_last_closed > (snap_server_now + 120_000):
-                        snap_repaired = True
-
-                    if debug_gate:
-                        gate["dbg_h1_bars_src"] = "dev_snap"
-                        gate["dbg_h1_snap_key"] = k
-                        gate["dbg_h1_bars_n"] = int(len(bars))
-                        gate["dbg_h1_snap_serverNow"] = (js.get("serverNow") if isinstance(js, dict) else None)
-                        gate["dbg_lastClosedTs"] = (js.get("lastClosedTs") if isinstance(js, dict) else None)
-                        gate["dbg_h1_snap_clock_delta_ms"] = int((snap_last_closed or 0) - (snap_server_now or 0))
-                        gate["dbg_h1_snap_clock_repaired"] = bool(snap_repaired)
-                else:
-                    if debug_gate:
-                        gate["dbg_h1_bars_src"] = "dev_snap_empty"
-                        gate["dbg_h1_snap_key"] = k
             except Exception as e:
+                js = None
+
                 if debug_gate:
                     gate["dbg_h1_bars_src"] = "dev_snap_exc"
                     gate["dbg_h1_bars_exc_type"] = type(e).__name__
                     gate["dbg_h1_bars_exc"] = str(e)
+
+        b2 = (
+            js.get("bars")
+            if isinstance(js, dict)
+            else None
+        )
+
+        if not isinstance(b2, list):
+            b2 = (
+                js.get("ohlc")
+                if isinstance(js, dict)
+                else None
+            )
+
+        if isinstance(b2, list) and len(b2) >= 2:
+            bars = b2
+
+            # ----------------------------------------------------
+            # Preserve existing broker snapshot clock handling.
+            # ----------------------------------------------------
+            snap_last_closed = 0
+            snap_server_now = 0
+
+            try:
+                snap_last_closed = (
+                    int(js.get("lastClosedTs") or 0)
+                    if isinstance(js, dict)
+                    else 0
+                )
+            except Exception:
+                snap_last_closed = 0
+
+            try:
+                snap_server_now = (
+                    int(js.get("serverNow") or 0)
+                    if isinstance(js, dict)
+                    else 0
+                )
+            except Exception:
+                snap_server_now = 0
+
+            # lastClosedTs must not be ahead of serverNow
+            # by a large margin.
+            #
+            # IMPORTANT:
+            # Use serverNow/current clock to decide which
+            # candle is closed.
+            #
+            # Do NOT use lastClosedTs as now_ms_pick,
+            # otherwise picker can lag by 1-2 candles.
+            _snap_server_now = (
+                int(snap_server_now)
+                if snap_server_now > 0
+                else 0
+            )
+
+            _last_bar_close_ms = 0
+
+            try:
+                if isinstance(bars, list) and bars:
+                    _lb = bars[-1]
+
+                    _lb_t = _to_ms_any(
+                        _lb.get("t_close_ms")
+                        or _lb.get("tCloseMs")
+                        or _lb.get("t")
+                        or _lb.get("ts")
+                        or _lb.get("time")
+                        or 0
+                    )
+
+                    if _lb_t and int(_lb_t) > 0:
+                        _lb_close = int(_lb_t)
+
+                        # If bar key is open time, add tf_ms
+                        # to get its close time.
+                        if (
+                            _lb_close
+                            < int(now_ms) - tf_ms
+                        ):
+                            _lb_close = (
+                                _lb_close
+                                + int(tf_ms)
+                            )
+
+                        _last_bar_close_ms = _lb_close
+
+            except Exception:
+                _last_bar_close_ms = 0
+
+            # Use the freshest REAL clock:
+            # snap serverNow or current server now.
+            #
+            # Do NOT max in _last_bar_close_ms.
+            # MT5 can emit future bars whose close time
+            # would incorrectly push RC timestamps forward.
+            now_ms_pick = max(
+                _snap_server_now,
+                int(now_ms or 0),
+            )
+
+            if now_ms_pick <= 0:
+                now_ms_pick = int(now_ms)
+
+            snap_repaired = False
+
+            # lastClosedTs is debug/reference only.
+            if (
+                snap_last_closed > 0
+                and snap_server_now > 0
+                and snap_last_closed
+                > (snap_server_now + 120_000)
+            ):
+                snap_repaired = True
+
+            if debug_gate:
+                gate["dbg_h1_bars_src"] = (
+                    "caller_authoritative_snap"
+                    if bool(
+                        gate.get(
+                            "dbg_h1_authoritative_reuse"
+                        )
+                    )
+                    else "dev_snap"
+                )
+
+                gate["dbg_h1_snap_key"] = k
+                gate["dbg_h1_bars_n"] = int(
+                    len(bars)
+                )
+
+                gate["dbg_h1_snap_serverNow"] = (
+                    js.get("serverNow")
+                    if isinstance(js, dict)
+                    else None
+                )
+
+                gate["dbg_lastClosedTs"] = (
+                    js.get("lastClosedTs")
+                    if isinstance(js, dict)
+                    else None
+                )
+
+                gate["dbg_h1_snap_clock_delta_ms"] = int(
+                    (snap_last_closed or 0)
+                    - (snap_server_now or 0)
+                )
+
+                gate["dbg_h1_snap_clock_repaired"] = bool(
+                    snap_repaired
+                )
+
+        else:
+            if debug_gate:
+                gate["dbg_h1_bars_src"] = "dev_snap_empty"
+                gate["dbg_h1_snap_key"] = k
 
     if not isinstance(bars, list) or not bars:
         gate["reason"] = "no_h1_bars"
@@ -6606,7 +6866,13 @@ def zone_reversal_gate(
                                 _wst_inv = ""
                             if _wst_inv in ("ORDER_PENDING", "TRADE_ACTIVE"):
                                 continue
-                            R.delete(_wk_inv)
+                            zone_watch_delete(
+                                R,
+                                uid_u,
+                                sym_u,
+                                _s,
+                                tf=_t,
+                            )
                 except Exception:
                     pass
                 gate["reason"] = f"INVALIDATED | REV_OK_CANCELLED | {_inv_consec} closes beyond zone | FZ {float(zl):.5f}-{float(zh):.5f}"
@@ -7089,14 +7355,14 @@ def zone_reversal_gate(
                     _clear_side = "SELL" if _active_side == "BUY" else "BUY"
 
                     try:
-                        R.delete(
-                            _watch_key(
+                        zone_watch_delete(
+                            R,
                             uid_u,
                             sym_u,
                             _clear_side,
-                            "H1",
+                            tf="H1",
                         )
-                    )
+                    
                         R.delete(
                             break_state_key(
                                 uid_u,
@@ -7340,7 +7606,13 @@ def zone_reversal_gate(
                         _wst_inv2 = ""
                     if _wst_inv2 in ("REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE"):
                         continue
-                    R.delete(_wk_inv2)
+                    zone_watch_delete(
+                        R,
+                        uid_u,
+                        sym_u,
+                        _s,
+                        tf=_t,
+                    )
         except Exception:
             pass
         gate["reason"] = (
