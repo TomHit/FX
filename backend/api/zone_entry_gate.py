@@ -6956,41 +6956,36 @@ def zone_reversal_gate(
         and int(closed_ms or 0) == int(touch_close_ms)
     )
 
+    
+    # Do not return here.
+    #
+    # The currently selected closed candle may pre-date a
+    # late-created watch while a valid same-touch/later RC
+    # already exists inside `bars`.
+    #
+    # The historical RC scan below is authoritative and
+    # applies all timing/touch/close rules candle-by-candle.
     if int(closed_ms or 0) <= int(started_ms or 0) and not same_touch_candle:
-        gate["reason"] = "REV_WATCH | WAIT_TOUCH_CANDLE_CLOSE"
-        gate["stage"] = "WATCH"
-        gate["blocked"] = False
-        gate["zone_used"] = zone_used
-        gate["watch_key"] = str(wkey)
-        gate["rev_state"] = {
-            "state": "WATCH",
-            "started_ms": int(started_ms or 0),
-            "touch_close_ms": int(touch_close_ms or 0),
-            "same_touch_candle": bool(same_touch_candle),
-            "current_closed_ms": int(closed_ms or 0),
-            "min_reclaim_close_ms": int(min_reclaim_close_ms or 0),
-            "direction": resolved_dir,
-            "tf": tfu,
-        }
-        return False, gate
-
-    if min_reclaim_close_ms > 0 and int(closed_ms or 0) < int(min_reclaim_close_ms):
-        gate["reason"] = "REV_WATCH | WAIT_TOUCH_CANDLE_CLOSE"
-        gate["stage"] = "WATCH"
-        gate["blocked"] = False
-        gate["zone_used"] = zone_used
-        gate["watch_key"] = str(wkey)
-        gate["rev_state"] = {
-            "state": "WATCH",
-            "started_ms": int(started_ms or 0),
-            "touch_open_ms": int((watch or {}).get("touch_open_ms") or 0),
-            "touch_close_ms": int((watch or {}).get("touch_close_ms") or 0),
-            "min_reclaim_close_ms": int(min_reclaim_close_ms),
-            "current_closed_ms": int(closed_ms or 0),
-            "direction": resolved_dir,
-            "tf": tfu,
-        }
-        return False, gate
+        if debug_gate:
+            gate["dbg_current_candle_before_watch"] = {
+                "started_ms": int(started_ms or 0),
+                "current_closed_ms": int(closed_ms or 0),
+                "touch_close_ms": int(touch_close_ms or 0),
+                "same_touch_candle": bool(same_touch_candle),
+            }
+    # Likewise, do not abort before the historical scan merely
+    # because the currently selected candle is older than the
+    # minimum reclaim close. A qualifying candle may already
+    # exist later in `bars`.
+    if (
+        min_reclaim_close_ms > 0
+        and int(closed_ms or 0) < int(min_reclaim_close_ms)
+    ):
+        if debug_gate:
+            gate["dbg_current_candle_before_min_reclaim"] = {
+                "current_closed_ms": int(closed_ms or 0),
+                "min_reclaim_close_ms": int(min_reclaim_close_ms),
+            }
 
     # RC CANDLE HARD RULES:
     # 1. Same touch candle CAN become RC if it closes reclaiming the frozen zone.
@@ -7040,6 +7035,19 @@ def zone_reversal_gate(
         )
     except Exception:
         _rev_watch_retired_rc_floor_ms = 0
+
+    # Point-A PRICE_TOO_FAR retired RC floor must also
+    # apply to the fallback/current-candle RC path.
+    #
+    # The full bars scan below already enforces this floor,
+    # but _rc_time_valid was computed before the floor was
+    # loaded and can otherwise resurrect the retired RC.
+    if (
+        _rev_watch_retired_rc_floor_ms > 0
+        and int(closed_ms or 0)
+        <= int(_rev_watch_retired_rc_floor_ms)
+    ):
+        _rc_time_valid = False
     # Scan ALL closed bars after freeze for RC — not just last picked bar
     # This finds the FIRST bar after freeze that meets RC condition
     import time as _t6

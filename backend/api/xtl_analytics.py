@@ -270,7 +270,502 @@ def _json_load(value, default=None):
     except Exception:
         return default
 
+def capture_real_dxy_bias_snapshot(
+    *,
+    device_id: str,
+    captured_ms: int,
+    snapshot_role: str,
+) -> dict:
+    """
+    Freeze canonical native REAL_DXY D1/H4/H1 directional bias
+    at one exact historical/live timestamp.
 
+    ANALYTICS ONLY:
+      - canonical REAL_DXY only
+      - native broker D1/H4/H1 candles only
+      - only candles CLOSED by captured_ms
+      - no SYNTHETIC_DXY
+      - no usd_bias_h4 / synthetic USD basket
+      - no gate / risk / execution effect
+    """
+    capture_ms = int(captured_ms or _now_ms())
+
+    out = {
+        "engine_version": "XTL_BIAS_ENGINE_V1_SHADOW_20260823",
+        "role": "DXY_BIAS",
+        "snapshot_role": str(snapshot_role or "UNKNOWN").upper(),
+        "source": "REAL_DXY",
+        "canonical_device_id": None,
+        "captured_at_ms": capture_ms,
+
+        "data_ok": False,
+        "data_quality": "NONE",
+        "direction": "UNKNOWN",
+        "score": 0.0,
+        "confidence": "NONE",
+        "timeframes": {},
+        "agreements": [],
+        "conflicts": [],
+        "reasons": [],
+
+        "analytics_only": True,
+        "execution_wired": False,
+        "entry_gate_wired": False,
+        "risk_wired": False,
+    }
+
+    try:
+        R = from_app_R()
+
+        canonical = resolve_canonical_dxy_source(
+            R,
+            str(device_id or "").strip(),
+        )
+
+        real_dev = str(
+            canonical.get("real_device_id") or ""
+        ).strip()
+
+        if not real_dev:
+            out["reasons"] = [
+                "CANONICAL_REAL_DXY_DEVICE_MISSING"
+            ]
+            return out
+
+        out["canonical_device_id"] = real_dev
+
+        # ---------------------------------------------------------
+        # Load native broker bars only.
+        # ---------------------------------------------------------
+        bars_d1 = load_real_dxy_bars(
+            real_dev,
+            tf="D1",
+            max_bars=60,
+        )
+
+        bars_h4 = load_real_dxy_bars(
+            real_dev,
+            tf="H4",
+            max_bars=100,
+        )
+
+        bars_h1 = load_real_dxy_bars(
+            real_dev,
+            tf="H1",
+            max_bars=150,
+        )
+
+        # ---------------------------------------------------------
+        # Historical safety:
+        #
+        # load_real_dxy_bars() returns completed bars as of NOW.
+        # For an older broker-close timestamp, remove any bar that
+        # had not yet CLOSED at captured_ms.
+        #
+        # This prevents future information leaking into a repaired
+        # / reconciled historical exit snapshot.
+        # ---------------------------------------------------------
+        TF_MS = {
+            "D1": 24 * 60 * 60 * 1000,
+            "H4": 4 * 60 * 60 * 1000,
+            "H1": 60 * 60 * 1000,
+        }
+
+        def _closed_by(bars, tf):
+            tf_ms = TF_MS[tf]
+            kept = []
+
+            for bar in bars or []:
+                if not isinstance(bar, dict):
+                    continue
+
+                open_ms = _norm_ms(
+                    bar.get("t_open_ms")
+                    or bar.get("t")
+                    or bar.get("time")
+                    or 0
+                )
+
+                if not open_ms:
+                    continue
+
+                close_ms = _norm_ms(
+                    bar.get("t_close_ms")
+                    or bar.get("close_time_ms")
+                    or 0
+                )
+
+                if not close_ms:
+                    close_ms = int(open_ms) + int(tf_ms)
+
+                if int(close_ms) <= capture_ms:
+                    kept.append(bar)
+
+            return kept
+
+        bars_d1 = _closed_by(bars_d1, "D1")
+        bars_h4 = _closed_by(bars_h4, "H4")
+        bars_h1 = _closed_by(bars_h1, "H1")
+
+        from api.bias_engine import (
+            BIAS_ENGINE_VERSION,
+            compute_dxy_bias,
+        )
+
+        bias = compute_dxy_bias(
+            bars_d1=bars_d1,
+            bars_h4=bars_h4,
+            bars_h1=bars_h1,
+            as_of_ms=capture_ms,
+            source="REAL_DXY",
+        )
+
+        if not isinstance(bias, dict):
+            out["reasons"] = [
+                "REAL_DXY_BIAS_INVALID_RESULT"
+            ]
+            return out
+
+        out.update(bias)
+
+        out.update({
+            "engine_version": BIAS_ENGINE_VERSION,
+            "snapshot_role": str(
+                snapshot_role or "UNKNOWN"
+            ).upper(),
+            "source": "REAL_DXY",
+            "canonical_device_id": real_dev,
+            "captured_at_ms": capture_ms,
+
+            "bars_available": {
+                "D1": len(bars_d1),
+                "H4": len(bars_h4),
+                "H1": len(bars_h1),
+            },
+
+            "analytics_only": True,
+            "execution_wired": False,
+            "entry_gate_wired": False,
+            "risk_wired": False,
+        })
+
+        return out
+
+    except Exception as exc:
+        out["reasons"] = [
+            f"REAL_DXY_BIAS_CAPTURE_ERROR:{type(exc).__name__}"
+        ]
+        out["capture_error"] = (
+            f"{type(exc).__name__}:{exc}"
+        )
+        return out
+
+
+def _build_tp_bias_shadow(
+    *,
+    symbol: str,
+    side: str,
+    dxy_bias: dict,
+    pair_regime_h4: dict | None = None,
+    pair_regime_d1: dict | None = None,
+) -> dict:
+    """
+    Higher-timeframe TP research context.
+
+    Uses:
+      - canonical REAL_DXY D1/H4/H1 bias
+      - existing traded-symbol H4/D1 regime analytics
+
+    SHADOW ONLY.
+    No TP/SL/entry/Point-A/position-manager authority.
+    """
+
+    sym = str(symbol or "").upper().strip()
+    side_u = str(side or "").upper().strip()
+
+    out = {
+        "schema_version": 1,
+        "analytics_only": True,
+        "execution_authority": False,
+
+        "symbol": sym,
+        "side": side_u,
+
+        "dxy_d1": "UNKNOWN",
+        "dxy_h4": "UNKNOWN",
+        "dxy_h1": "UNKNOWN",
+
+        "dxy_d1_score": None,
+        "dxy_h4_score": None,
+        "dxy_h1_score": None,
+
+        "dxy_d1_regime": None,
+        "dxy_h4_regime": None,
+        "dxy_h1_regime": None,
+
+        "dxy_d1_trade_relation": "UNAVAILABLE",
+        "dxy_h4_trade_relation": "UNAVAILABLE",
+        "dxy_h1_trade_relation": "UNAVAILABLE",
+
+        "dxy_d1_h4_agree": None,
+        "dxy_h4_h1_agree": None,
+
+        "pair_h4_regime": None,
+        "pair_d1_regime": None,
+        "pair_h4_adx": None,
+        "pair_h4_er": None,
+        "pair_d1_adx": None,
+        "pair_d1_er": None,
+
+        "tp_research_class": "UNAVAILABLE",
+        "reason_codes": [],
+    }
+
+    try:
+        bias = (
+            dxy_bias
+            if isinstance(dxy_bias, dict)
+            else {}
+        )
+
+        tfs = (
+            bias.get("timeframes")
+            if isinstance(
+                bias.get("timeframes"),
+                dict,
+            )
+            else {}
+        )
+
+        d1 = tfs.get("D1") or {}
+        h4 = tfs.get("H4") or {}
+        h1 = tfs.get("H1") or {}
+
+        def _dir(ctx):
+            return str(
+                ctx.get("direction") or "UNKNOWN"
+            ).upper().strip()
+
+        def _score(ctx):
+            return _safe_float(
+                ctx.get("score")
+            )
+
+        def _regime(ctx):
+            v = str(
+                ctx.get("regime") or ""
+            ).upper().strip()
+            return v or None
+
+        def _agree(a, b):
+            if (
+                a not in ("BULLISH", "BEARISH")
+                or b not in ("BULLISH", "BEARISH")
+            ):
+                return None
+            return a == b
+
+        def _dxy_relation(direction):
+            if side_u not in ("BUY", "SELL"):
+                return "UNAVAILABLE"
+
+            if direction == "NEUTRAL":
+                return "NEUTRAL"
+
+            if direction not in (
+                "BULLISH",
+                "BEARISH",
+            ):
+                return "UNAVAILABLE"
+
+            usd_positive = {
+                ("EURUSD", "SELL"),
+                ("GBPUSD", "SELL"),
+                ("USDJPY", "BUY"),
+                ("USDCAD", "BUY"),
+                ("USDCHF", "BUY"),
+                ("XAUUSD", "SELL"),
+            }
+
+            usd_negative = {
+                ("EURUSD", "BUY"),
+                ("GBPUSD", "BUY"),
+                ("USDJPY", "SELL"),
+                ("USDCAD", "SELL"),
+                ("USDCHF", "SELL"),
+                ("XAUUSD", "BUY"),
+            }
+
+            key = (sym, side_u)
+
+            if key in usd_positive:
+                expected = "BULLISH"
+            elif key in usd_negative:
+                expected = "BEARISH"
+            else:
+                return "UNAVAILABLE"
+
+            return (
+                "ALIGNED"
+                if direction == expected
+                else "CONFLICT"
+            )
+
+        dd1 = _dir(d1)
+        dh4 = _dir(h4)
+        dh1 = _dir(h1)
+
+        out["dxy_d1"] = dd1
+        out["dxy_h4"] = dh4
+        out["dxy_h1"] = dh1
+
+        out["dxy_d1_score"] = _score(d1)
+        out["dxy_h4_score"] = _score(h4)
+        out["dxy_h1_score"] = _score(h1)
+
+        out["dxy_d1_regime"] = _regime(d1)
+        out["dxy_h4_regime"] = _regime(h4)
+        out["dxy_h1_regime"] = _regime(h1)
+
+        out["dxy_d1_trade_relation"] = (
+            _dxy_relation(dd1)
+        )
+        out["dxy_h4_trade_relation"] = (
+            _dxy_relation(dh4)
+        )
+        out["dxy_h1_trade_relation"] = (
+            _dxy_relation(dh1)
+        )
+
+        out["dxy_d1_h4_agree"] = _agree(
+            dd1,
+            dh4,
+        )
+        out["dxy_h4_h1_agree"] = _agree(
+            dh4,
+            dh1,
+        )
+
+        ph4 = (
+            pair_regime_h4
+            if isinstance(pair_regime_h4, dict)
+            else {}
+        )
+
+        pd1 = (
+            pair_regime_d1
+            if isinstance(pair_regime_d1, dict)
+            else {}
+        )
+
+        out["pair_h4_regime"] = (
+            str(
+                ph4.get("label") or ""
+            ).upper().strip()
+            or None
+        )
+
+        out["pair_d1_regime"] = (
+            str(
+                pd1.get("label") or ""
+            ).upper().strip()
+            or None
+        )
+
+        out["pair_h4_adx"] = _safe_float(
+            ph4.get("adx")
+        )
+        out["pair_h4_er"] = _safe_float(
+            ph4.get("er")
+        )
+
+        out["pair_d1_adx"] = _safe_float(
+            pd1.get("adx")
+        )
+        out["pair_d1_er"] = _safe_float(
+            pd1.get("er")
+        )
+
+        d1_rel = out[
+            "dxy_d1_trade_relation"
+        ]
+        h4_rel = out[
+            "dxy_h4_trade_relation"
+        ]
+        h1_rel = out[
+            "dxy_h1_trade_relation"
+        ]
+
+        # -------------------------------------------------
+        # Research bucket only.
+        #
+        # H4 is primary.
+        # D1 is slower anchor.
+        # H1 is current confirmation.
+        #
+        # These names describe conditions only.
+        # They DO NOT prescribe a TP.
+        # -------------------------------------------------
+
+        if (
+            h4_rel == "ALIGNED"
+            and d1_rel == "ALIGNED"
+            and h1_rel == "ALIGNED"
+        ):
+            cls = "DXY_FULL_HTF_ALIGNMENT"
+
+        elif (
+            h4_rel == "ALIGNED"
+            and d1_rel == "ALIGNED"
+        ):
+            cls = "DXY_D1_H4_ALIGNED"
+
+        elif (
+            h4_rel == "ALIGNED"
+            and d1_rel in (
+                "NEUTRAL",
+                "UNAVAILABLE",
+            )
+        ):
+            cls = "DXY_H4_ALIGNED_D1_NEUTRAL"
+
+        elif (
+            h4_rel == "ALIGNED"
+            and d1_rel == "CONFLICT"
+        ):
+            cls = "DXY_H4_ALIGNED_D1_CONFLICT"
+
+        elif (
+            h4_rel == "CONFLICT"
+            and d1_rel == "CONFLICT"
+        ):
+            cls = "DXY_D1_H4_CONFLICT"
+
+        elif h4_rel == "CONFLICT":
+            cls = "DXY_H4_CONFLICT"
+
+        else:
+            cls = "DXY_HTF_NEUTRAL"
+
+        out["tp_research_class"] = cls
+
+        out["reason_codes"] = [
+            f"DXY_D1_{d1_rel}",
+            f"DXY_H4_{h4_rel}",
+            f"DXY_H1_{h1_rel}",
+            f"TP_CLASS_{cls}",
+        ]
+
+        return out
+
+    except Exception as exc:
+        out["tp_research_class"] = "ERROR"
+        out["reason_codes"] = [
+            "TP_BIAS_SHADOW_ERROR:"
+            f"{type(exc).__name__}"
+        ]
+        out["error"] = str(exc)[:300]
+        return out
 
 def _new_trade_milestone_state() -> dict:
     return {
@@ -1363,6 +1858,7 @@ def _capture_dxy_point_a_shadow_context(
 
 
 
+
 def capture_dxy_order_block_shadow(
     *,
     device_id: str,
@@ -2213,6 +2709,904 @@ def capture_dxy_order_block_shadow(
             exc,
         )
 
+        return out
+
+
+
+def capture_pair_ob_choch_shadow(
+    *,
+    symbol: str,
+    side: str,
+    device_id: str,
+    entry_ms: int,
+    entry_price: float,
+    entry_zone: dict | None,
+    shadow_bias_snapshot: dict | None,
+) -> dict:
+    """
+    Freeze traded-symbol H1/H4 Order-Block + CHOCH context
+    at broker-confirmed entry.
+
+    ANALYTICS / SHADOW ONLY.
+
+    Reuses:
+      - api.liq_structure.find_order_blocks()
+      - already-frozen shadow_bias_snapshot["choch"]
+
+    Does NOT:
+      - select/change SR
+      - change RC
+      - change Point-A
+      - block/allow entry
+      - change TP/SL
+      - affect execution
+    """
+
+    sym = str(symbol or "").upper().strip()
+    side_u = str(side or "").upper().strip()
+    captured_ms = int(entry_ms or _now_ms())
+
+    out = {
+        "schema_version": 1,
+        "analytics_only": True,
+        "execution_authority": False,
+        "symbol": sym,
+        "side": side_u,
+        "captured_at_ms": captured_ms,
+
+        "bar_device_id": None,
+        "entry_price": _safe_float(entry_price),
+        "atr_h1": None,
+
+        "supporting": {
+            "H1": [],
+            "H4": [],
+            "nearest": None,
+        },
+        "opposing": {
+            "H1": [],
+            "H4": [],
+            "nearest": None,
+        },
+
+        "choch": None,
+
+        "choch_trade_relation": "UNAVAILABLE",
+        "supporting_ob_choch_confluence": False,
+
+        "entry_inside_supporting_ob": False,
+        "entry_inside_opposing_ob": False,
+
+        "entry_zone_supporting_ob_overlap": False,
+        "entry_zone_opposing_ob_overlap": False,
+
+        "nearest_supporting_ob_distance_atr": None,
+        "nearest_opposing_ob_distance_atr": None,
+
+        "research_class": "UNAVAILABLE",
+        "reason_codes": [],
+    }
+
+    try:
+        if (
+            not sym
+            or side_u not in ("BUY", "SELL")
+        ):
+            out["reason_codes"] = [
+                "PAIR_OB_INVALID_IDENTITY"
+            ]
+            return out
+
+        px = _safe_float(entry_price)
+
+        if px is None:
+            out["reason_codes"] = [
+                "PAIR_OB_ENTRY_PRICE_MISSING"
+            ]
+            return out
+
+        from api.trend_endpoints import (
+            _get_closed_h1_bars,
+            _get_closed_h4_bars,
+        )
+        from api.liq_structure import (
+            find_order_blocks,
+        )
+
+        dev = _resolve_bar_device(
+            sym,
+            device_id,
+            allow_scan_fallback=False,
+        )
+
+        out["bar_device_id"] = dev or None
+
+        if not dev:
+            out["reason_codes"] = [
+                "PAIR_OB_BAR_DEVICE_MISSING"
+            ]
+            return out
+
+        bars_h1 = (
+            _get_closed_h1_bars(sym, dev)
+            or []
+        )
+
+        bars_h4 = (
+            _get_closed_h4_bars(sym, dev)
+            or []
+        )
+
+        if not bars_h1:
+            out["reason_codes"] = [
+                "PAIR_OB_H1_BARS_MISSING"
+            ]
+            return out
+
+        # Historical/causal safety.
+        #
+        # Entry capture is normally live, but filtering makes this
+        # safe for repair/replay as well.
+        TF_MS = {
+            "H1": 60 * 60 * 1000,
+            "H4": 4 * 60 * 60 * 1000,
+        }
+
+        def _bar_ms(bar):
+            if not isinstance(bar, dict):
+                return 0
+
+            return _norm_ms(
+                bar.get("t_open_ms")
+                or bar.get("tOpenMs")
+                or bar.get("open_time_ms")
+                or bar.get("t")
+                or bar.get("time")
+                or 0
+            )
+
+        def _closed_by(bars, tf):
+            kept = []
+            tf_ms = TF_MS[tf]
+
+            for bar in bars or []:
+                if not isinstance(bar, dict):
+                    continue
+
+                if bar.get("complete") is False:
+                    continue
+
+                open_ms = _bar_ms(bar)
+
+                if not open_ms:
+                    continue
+
+                close_ms = _norm_ms(
+                    bar.get("t_close_ms")
+                    or bar.get("close_time_ms")
+                    or 0
+                )
+
+                if not close_ms:
+                    close_ms = (
+                        int(open_ms)
+                        + int(tf_ms)
+                    )
+
+                if int(close_ms) <= captured_ms:
+                    kept.append(bar)
+
+            return kept
+
+        bars_h1 = _closed_by(
+            bars_h1,
+            "H1",
+        )
+
+        bars_h4 = _closed_by(
+            bars_h4,
+            "H4",
+        )
+
+        atr_h1 = _atr_from_bars(
+            bars_h1
+        )
+
+        out["atr_h1"] = (
+            atr_h1
+            if atr_h1 and atr_h1 > 0
+            else None
+        )
+
+        if not atr_h1 or atr_h1 <= 0:
+            out["reason_codes"] = [
+                "PAIR_OB_ATR_MISSING"
+            ]
+            return out
+
+        # -------------------------------------------------
+        # Existing detector.
+        #
+        # IMPORTANT:
+        # Do not change find_order_blocks() behavior.
+        # -------------------------------------------------
+
+        h1_bull = find_order_blocks(
+            bars_h1,
+            "BUY",
+            atr=atr_h1,
+        )
+
+        h1_bear = find_order_blocks(
+            bars_h1,
+            "SELL",
+            atr=atr_h1,
+        )
+
+        # Preserve current detector semantics:
+        # existing code supplies H1 ATR to H4 detector too.
+        h4_bull = (
+            find_order_blocks(
+                bars_h4,
+                "BUY",
+                atr=atr_h1,
+            )
+            if bars_h4
+            else []
+        )
+
+        h4_bear = (
+            find_order_blocks(
+                bars_h4,
+                "SELL",
+                atr=atr_h1,
+            )
+            if bars_h4
+            else []
+        )
+
+        zone = (
+            entry_zone
+            if isinstance(entry_zone, dict)
+            else {}
+        )
+
+        zone_low = _safe_float(
+            zone.get("low")
+            if zone.get("low") is not None
+            else zone.get("zone_low")
+        )
+
+        zone_high = _safe_float(
+            zone.get("high")
+            if zone.get("high") is not None
+            else zone.get("zone_high")
+        )
+
+        def _match_source_index(
+            bars,
+            ob,
+        ):
+            """
+            Match OB detector output back to its source candle.
+            Analytics only.
+            """
+            try:
+                for i in range(
+                    len(bars) - 1,
+                    -1,
+                    -1,
+                ):
+                    b = bars[i]
+
+                    if (
+                        round(
+                            float(b.get("o")),
+                            5,
+                        )
+                        == round(
+                            float(ob.get("open")),
+                            5,
+                        )
+                        and round(
+                            float(b.get("h")),
+                            5,
+                        )
+                        == round(
+                            float(ob.get("high")),
+                            5,
+                        )
+                        and round(
+                            float(b.get("l")),
+                            5,
+                        )
+                        == round(
+                            float(ob.get("low")),
+                            5,
+                        )
+                        and round(
+                            float(b.get("c")),
+                            5,
+                        )
+                        == round(
+                            float(ob.get("close")),
+                            5,
+                        )
+                    ):
+                        return i
+
+            except Exception:
+                pass
+
+            return None
+
+        def _overlap_metrics(
+            a_low,
+            a_high,
+            b_low,
+            b_high,
+        ):
+            try:
+                if None in (
+                    a_low,
+                    a_high,
+                    b_low,
+                    b_high,
+                ):
+                    return {
+                        "overlaps": False,
+                        "overlap_width": None,
+                        "overlap_ratio_ob": None,
+                    }
+
+                alo = min(
+                    float(a_low),
+                    float(a_high),
+                )
+                ahi = max(
+                    float(a_low),
+                    float(a_high),
+                )
+                blo = min(
+                    float(b_low),
+                    float(b_high),
+                )
+                bhi = max(
+                    float(b_low),
+                    float(b_high),
+                )
+
+                overlap = max(
+                    0.0,
+                    min(ahi, bhi)
+                    - max(alo, blo),
+                )
+
+                width = max(
+                    ahi - alo,
+                    1e-12,
+                )
+
+                return {
+                    "overlaps": overlap > 0,
+                    "overlap_width": round(
+                        overlap,
+                        8,
+                    ),
+                    "overlap_ratio_ob": round(
+                        overlap / width,
+                        4,
+                    ),
+                }
+
+            except Exception:
+                return {
+                    "overlaps": False,
+                    "overlap_width": None,
+                    "overlap_ratio_ob": None,
+                }
+
+        def _decorate(
+            ob,
+            bars,
+            tf,
+            relation,
+        ):
+            rec = dict(ob)
+
+            low = _safe_float(
+                rec.get("low")
+            )
+            high = _safe_float(
+                rec.get("high")
+            )
+
+            if None in (low, high):
+                return None
+
+            lo = min(low, high)
+            hi = max(low, high)
+
+            idx = _match_source_index(
+                bars,
+                rec,
+            )
+
+            formed_at_ms = (
+                _bar_ms(bars[idx])
+                if idx is not None
+                else None
+            )
+
+            impulse_at_ms = (
+                _bar_ms(bars[idx + 1])
+                if (
+                    idx is not None
+                    and idx + 1 < len(bars)
+                )
+                else None
+            )
+
+            age_bars = (
+                len(bars) - 1 - idx
+                if idx is not None
+                else None
+            )
+
+            # Distance from entry to first edge that price
+            # would encounter.
+            if lo <= px <= hi:
+                distance = 0.0
+                inside = True
+
+            elif px < lo:
+                distance = lo - px
+                inside = False
+
+            else:
+                distance = px - hi
+                inside = False
+
+            distance_atr = (
+                distance / atr_h1
+                if atr_h1 > 0
+                else None
+            )
+
+            overlap = _overlap_metrics(
+                lo,
+                hi,
+                zone_low,
+                zone_high,
+            )
+
+            # -------------------------------------------------
+            # Post-formation interaction diagnostics.
+            #
+            # Existing detector exposes only mitigated bool.
+            # Here we preserve extra evidence without altering it.
+            # -------------------------------------------------
+            mitigation_count = 0
+            first_mitigation_ms = None
+            last_mitigation_ms = None
+            max_penetration_ratio = 0.0
+
+            if idx is not None:
+                width = max(
+                    hi - lo,
+                    1e-12,
+                )
+
+                for b in bars[idx + 2:]:
+                    try:
+                        bh = float(b.get("h"))
+                        bl = float(b.get("l"))
+
+                        overlap_width = max(
+                            0.0,
+                            min(hi, bh)
+                            - max(lo, bl),
+                        )
+
+                        if overlap_width <= 0:
+                            continue
+
+                        mitigation_count += 1
+
+                        b_ms = _bar_ms(b)
+
+                        if first_mitigation_ms is None:
+                            first_mitigation_ms = (
+                                b_ms or None
+                            )
+
+                        last_mitigation_ms = (
+                            b_ms or last_mitigation_ms
+                        )
+
+                        max_penetration_ratio = max(
+                            max_penetration_ratio,
+                            min(
+                                1.0,
+                                overlap_width / width,
+                            ),
+                        )
+
+                    except Exception:
+                        continue
+
+            rec.update({
+                "tf": tf,
+                "relation_to_trade": relation,
+
+                "formed_at_ms": formed_at_ms,
+                "impulse_at_ms": impulse_at_ms,
+                "age_bars": age_bars,
+
+                "distance_from_entry": round(
+                    distance,
+                    8,
+                ),
+                "distance_atr": round(
+                    distance_atr,
+                    4,
+                )
+                if distance_atr is not None
+                else None,
+
+                "entry_inside_ob": inside,
+
+                "entry_zone_overlap": (
+                    overlap["overlaps"]
+                ),
+                "entry_zone_overlap_width": (
+                    overlap["overlap_width"]
+                ),
+                "entry_zone_overlap_ratio_ob": (
+                    overlap["overlap_ratio_ob"]
+                ),
+
+                "mitigation_count": (
+                    mitigation_count
+                ),
+                "first_mitigation_ms": (
+                    first_mitigation_ms
+                ),
+                "last_mitigation_ms": (
+                    last_mitigation_ms
+                ),
+                "max_penetration_ratio": round(
+                    max_penetration_ratio,
+                    4,
+                ),
+
+                "analytics_only": True,
+            })
+
+            return rec
+
+        if side_u == "BUY":
+            supporting_raw = {
+                "H1": h1_bull,
+                "H4": h4_bull,
+            }
+            opposing_raw = {
+                "H1": h1_bear,
+                "H4": h4_bear,
+            }
+
+        else:
+            supporting_raw = {
+                "H1": h1_bear,
+                "H4": h4_bear,
+            }
+            opposing_raw = {
+                "H1": h1_bull,
+                "H4": h4_bull,
+            }
+
+        for relation, raw_map in (
+            ("SUPPORTING", supporting_raw),
+            ("OPPOSING", opposing_raw),
+        ):
+            dest = (
+                out["supporting"]
+                if relation == "SUPPORTING"
+                else out["opposing"]
+            )
+
+            all_rows = []
+
+            for tf in ("H1", "H4"):
+                tf_bars = (
+                    bars_h1
+                    if tf == "H1"
+                    else bars_h4
+                )
+
+                rows = []
+
+                for ob in raw_map.get(tf) or []:
+                    if not isinstance(ob, dict):
+                        continue
+
+                    rec = _decorate(
+                        ob,
+                        tf_bars,
+                        tf,
+                        relation,
+                    )
+
+                    if rec:
+                        rows.append(rec)
+                        all_rows.append(rec)
+
+                # Nearest first for analytics readability.
+                rows.sort(
+                    key=lambda x: float(
+                        x.get("distance_atr")
+                        if x.get(
+                            "distance_atr"
+                        ) is not None
+                        else 9999.0
+                    )
+                )
+
+                dest[tf] = rows
+
+            if all_rows:
+                dest["nearest"] = min(
+                    all_rows,
+                    key=lambda x: float(
+                        x.get("distance_atr")
+                        if x.get(
+                            "distance_atr"
+                        ) is not None
+                        else 9999.0
+                    ),
+                )
+
+        supporting_nearest = (
+            out["supporting"].get(
+                "nearest"
+            )
+            or {}
+        )
+
+        opposing_nearest = (
+            out["opposing"].get(
+                "nearest"
+            )
+            or {}
+        )
+
+        out[
+            "nearest_supporting_ob_distance_atr"
+        ] = supporting_nearest.get(
+            "distance_atr"
+        )
+
+        out[
+            "nearest_opposing_ob_distance_atr"
+        ] = opposing_nearest.get(
+            "distance_atr"
+        )
+
+        out[
+            "entry_inside_supporting_ob"
+        ] = bool(
+            supporting_nearest.get(
+                "entry_inside_ob"
+            )
+        )
+
+        out[
+            "entry_inside_opposing_ob"
+        ] = bool(
+            opposing_nearest.get(
+                "entry_inside_ob"
+            )
+        )
+
+        out[
+            "entry_zone_supporting_ob_overlap"
+        ] = any(
+            bool(
+                x.get(
+                    "entry_zone_overlap"
+                )
+            )
+            for tf in ("H1", "H4")
+            for x in (
+                out["supporting"].get(tf)
+                or []
+            )
+        )
+
+        out[
+            "entry_zone_opposing_ob_overlap"
+        ] = any(
+            bool(
+                x.get(
+                    "entry_zone_overlap"
+                )
+            )
+            for tf in ("H1", "H4")
+            for x in (
+                out["opposing"].get(tf)
+                or []
+            )
+        )
+
+        # -------------------------------------------------
+        # Reuse frozen CHOCH.
+        # Do not recompute another CHOCH engine here.
+        # -------------------------------------------------
+
+        sb = (
+            shadow_bias_snapshot
+            if isinstance(
+                shadow_bias_snapshot,
+                dict,
+            )
+            else {}
+        )
+
+        choch = (
+            sb.get("choch")
+            if isinstance(
+                sb.get("choch"),
+                dict,
+            )
+            else None
+        )
+
+        out["choch"] = (
+            dict(choch)
+            if choch
+            else None
+        )
+
+        choch_state = str(
+            (choch or {}).get("state")
+            or "NONE"
+        ).upper().strip()
+
+        if choch_state == "BULLISH_CHOCH":
+            choch_side = "BUY"
+        elif choch_state == "BEARISH_CHOCH":
+            choch_side = "SELL"
+        else:
+            choch_side = None
+
+        if choch_side is None:
+            choch_relation = "NONE"
+        elif choch_side == side_u:
+            choch_relation = "ALIGNED"
+        else:
+            choch_relation = "CONFLICT"
+
+        out[
+            "choch_trade_relation"
+        ] = choch_relation
+
+        # Entry-side OB + same-side confirmed CHOCH.
+        supporting_confluence = bool(
+            out[
+                "entry_zone_supporting_ob_overlap"
+            ]
+            and choch_relation == "ALIGNED"
+            and bool(
+                (choch or {}).get(
+                    "confirmed_by_close"
+                )
+            )
+        )
+
+        out[
+            "supporting_ob_choch_confluence"
+        ] = supporting_confluence
+
+        # -------------------------------------------------
+        # Descriptive research bucket ONLY.
+        # Do not map this to live TP.
+        # -------------------------------------------------
+
+        opp_dist = out.get(
+            "nearest_opposing_ob_distance_atr"
+        )
+
+        opp_unmitigated = bool(
+            opposing_nearest
+            and not opposing_nearest.get(
+                "mitigated",
+                False,
+            )
+        )
+
+        opp_tf = str(
+            opposing_nearest.get("tf")
+            or ""
+        ).upper()
+
+        if supporting_confluence:
+            cls = "SUPPORTING_OB_CHOCH_CONFLUENCE"
+
+        elif (
+            opp_dist is not None
+            and opp_dist <= 0.50
+            and opp_unmitigated
+            and opp_tf == "H4"
+        ):
+            cls = "NEAR_UNMITIGATED_H4_OPPOSING_OB"
+
+        elif (
+            opp_dist is not None
+            and opp_dist <= 0.50
+            and opp_unmitigated
+        ):
+            cls = "NEAR_UNMITIGATED_OPPOSING_OB"
+
+        elif (
+            opp_dist is not None
+            and opp_dist <= 0.75
+        ):
+            cls = "NEAR_OPPOSING_OB"
+
+        elif (
+            out[
+                "entry_zone_supporting_ob_overlap"
+            ]
+        ):
+            cls = "SUPPORTING_OB_OVERLAP"
+
+        else:
+            cls = "NO_STRONG_OB_CONFLUENCE"
+
+        out["research_class"] = cls
+
+        out["reason_codes"] = [
+            (
+                "CHOCH_"
+                + choch_relation
+            ),
+            (
+                "SUPPORTING_OB_ZONE_OVERLAP_"
+                + (
+                    "YES"
+                    if out[
+                        "entry_zone_supporting_ob_overlap"
+                    ]
+                    else "NO"
+                )
+            ),
+            (
+                "OPPOSING_OB_DISTANCE_ATR_"
+                + (
+                    str(
+                        round(
+                            float(opp_dist),
+                            2,
+                        )
+                    )
+                    if opp_dist is not None
+                    else "NA"
+                )
+            ),
+            f"PAIR_OB_CLASS_{cls}",
+        ]
+
+        return out
+
+    except Exception as exc:
+        out["research_class"] = "ERROR"
+        out["reason_codes"] = [
+            "PAIR_OB_CHOCH_CAPTURE_ERROR:"
+            f"{type(exc).__name__}"
+        ]
+        out["capture_error"] = (
+            f"{type(exc).__name__}:{exc}"
+        )
         return out
 
 def _discover_freshest_real_dxy_device(
@@ -3721,6 +5115,154 @@ def compute_setup_quality_flags(snap_like: dict) -> list:
         log.warning("analytics: quality flags failed: %s", e)
     return flags
 
+
+# ---------------------------------------------------------
+# Finnhub market-news relevance map.
+#
+# Analytics/shadow only. ZERO execution authority.
+# ---------------------------------------------------------
+
+_MARKET_NEWS_TOPICS_BY_SYMBOL = {
+    "XAUUSD": {
+        "USD",
+        "FED_RATES",
+        "US_RATES_BONDS",
+        "US_INFLATION",
+        "US_LABOR",
+        "US_ACTIVITY",
+        "GOLD",
+        "GEOPOLITICAL",
+    },
+    "EURUSD": {
+        "USD",
+        "FED_RATES",
+        "US_RATES_BONDS",
+        "US_INFLATION",
+        "US_LABOR",
+        "US_ACTIVITY",
+        "ECB_EUR",
+    },
+    "GBPUSD": {
+        "USD",
+        "FED_RATES",
+        "US_RATES_BONDS",
+        "US_INFLATION",
+        "US_LABOR",
+        "US_ACTIVITY",
+        "BOE_GBP",
+    },
+    "USDJPY": {
+        "USD",
+        "FED_RATES",
+        "US_RATES_BONDS",
+        "US_INFLATION",
+        "US_LABOR",
+        "US_ACTIVITY",
+        "BOJ_JPY",
+    },
+    "USDCAD": {
+        "USD",
+        "FED_RATES",
+        "US_RATES_BONDS",
+        "US_INFLATION",
+        "US_LABOR",
+        "US_ACTIVITY",
+        "BOC_CAD",
+        "OIL",
+    },
+    "USDCHF": {
+        "USD",
+        "FED_RATES",
+        "US_RATES_BONDS",
+        "US_INFLATION",
+        "US_LABOR",
+        "US_ACTIVITY",
+        "SNB_CHF",
+    },
+}
+
+
+def _filter_market_news_for_symbol(
+    symbol: str,
+    market_news: dict,
+) -> dict:
+    """
+    Build a symbol-relevant subset from an existing Finnhub
+    market-news snapshot.
+
+    Analytics/shadow only.
+    Never affects entry, Point-A, sizing, SL/TP or exits.
+    """
+    sym = str(symbol or "").upper().strip()
+
+    relevant_topics = _MARKET_NEWS_TOPICS_BY_SYMBOL.get(
+        sym,
+        set(),
+    )
+
+    out = {
+        "status": "OK",
+        "symbol": sym,
+        "execution_authority": False,
+        "relevant_topics": sorted(relevant_topics),
+        "article_count": 0,
+        "articles": [],
+    }
+
+    try:
+        if not isinstance(market_news, dict):
+            out["status"] = "NO_SOURCE"
+            return out
+
+        articles = market_news.get("articles") or []
+
+        if not isinstance(articles, list):
+            out["status"] = "NO_SOURCE"
+            return out
+
+        selected = []
+
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+
+            article_topics = article.get("topics") or []
+
+            if isinstance(article_topics, str):
+                article_topics = [article_topics]
+
+            article_topics = {
+                str(x).upper().strip()
+                for x in article_topics
+                if str(x or "").strip()
+            }
+
+            matched = sorted(
+                article_topics.intersection(
+                    relevant_topics
+                )
+            )
+
+            if not matched:
+                continue
+
+            item = dict(article)
+
+            # Preserve why this article was considered
+            # relevant to this particular trade symbol.
+            item["matched_symbol_topics"] = matched
+
+            selected.append(item)
+
+        out["articles"] = selected
+        out["article_count"] = len(selected)
+
+        return out
+
+    except Exception as exc:
+        out["status"] = "ERROR"
+        out["error"] = str(exc)[:300]
+        return out
 
 # -- Market-news context from local PostgreSQL (shadow analytics only) -------
 def read_market_news_at_entry(
@@ -9218,6 +10760,17 @@ def _apply_phase1_entry_analytics(snap: dict) -> None:
     except Exception as exc:
         log.warning("analytics: Phase-1 entry analytics failed: %s", exc)
 
+def capture_real_dxy_bias_at_entry(
+    *,
+    device_id: str,
+    entry_ms: int,
+) -> dict:
+    return capture_real_dxy_bias_snapshot(
+        device_id=device_id,
+        captured_ms=entry_ms,
+        snapshot_role="ENTRY",
+    )
+
 
 def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
     """Map a pos (clean) or repaired record -> frozen entry snapshot.
@@ -9355,6 +10908,44 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             entry_zone=(z or None),
             computed_ms=ets,
         )
+        # -------------------------------------------------
+        # Pair H1/H4 Order Block + CHOCH research context.
+        #
+        # Analytics only. Zero execution authority.
+        # -------------------------------------------------
+        try:
+            pair_ob_choch_shadow = (
+                capture_pair_ob_choch_shadow(
+                    symbol=sym,
+                    side=side,
+                    device_id=p.get(
+                        "device_id"
+                    ),
+                    entry_ms=ets,
+                    entry_price=entry,
+                    entry_zone=(z or None),
+                    shadow_bias_snapshot=(
+                        shadow_bias_snapshot
+                    ),
+                )
+            )
+        except Exception as _pair_ob_exc:
+            pair_ob_choch_shadow = {
+                "schema_version": 1,
+                "analytics_only": True,
+                "execution_authority": False,
+                "symbol": sym,
+                "side": side,
+                "captured_at_ms": ets,
+                "research_class": "ERROR",
+                "reason_codes": [
+                    "PAIR_OB_CHOCH_CAPTURE_ERROR:"
+                    f"{type(_pair_ob_exc).__name__}"
+                ],
+                "capture_error": str(
+                    _pair_ob_exc
+                )[:300],
+            }
 
         drift = _drift_lookup(
             sym,
@@ -9393,6 +10984,12 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             ets,
             lookback_h=24,
             limit=20,
+        )
+        entry_market_news_relevant = (
+            _filter_market_news_for_symbol(
+                sym,
+                entry_market_news,
+            )
         )
 
         # -- derivations (no new source) --
@@ -9579,6 +11176,60 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             # Also expose the most important fields flat for easy pandas/
             # dashboard filtering.
             "shadow_bias_snapshot": shadow_bias_snapshot,
+            # -- Pair OB + CHOCH research (shadow only) --
+            "pair_ob_choch_shadow": (
+                pair_ob_choch_shadow
+            ),
+
+            "pair_ob_research_class": (
+                pair_ob_choch_shadow.get(
+                    "research_class"
+                )
+                if isinstance(
+                    pair_ob_choch_shadow,
+                    dict,
+                )
+                else "UNAVAILABLE"
+            ),
+
+            "pair_ob_supporting_overlap": (
+                bool(
+                    pair_ob_choch_shadow.get(
+                        "entry_zone_supporting_ob_overlap"
+                    )
+                )
+                if isinstance(
+                    pair_ob_choch_shadow,
+                    dict,
+                )
+                else False
+            ),
+
+            "pair_ob_choch_confluence": (
+                bool(
+                    pair_ob_choch_shadow.get(
+                        "supporting_ob_choch_confluence"
+                    )
+                )
+                if isinstance(
+                    pair_ob_choch_shadow,
+                    dict,
+                )
+                else False
+            ),
+
+            "pair_ob_nearest_opposing_atr": (
+                _safe_float(
+                    pair_ob_choch_shadow.get(
+                        "nearest_opposing_ob_distance_atr"
+                    )
+                )
+                if isinstance(
+                    pair_ob_choch_shadow,
+                    dict,
+                )
+                else None
+            ),
 
             "shadow_bias": (
                 shadow_bias_snapshot.get("shadow_bias")
@@ -9740,6 +11391,9 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
 
             # -- market-news context @ entry (shadow analytics only) --
             "entry_market_news": entry_market_news,
+            "entry_market_news_relevant": (
+                entry_market_news_relevant
+            ),
 
             # -- scheduled economic-event context @ entry
             #    (shadow observed; existing behavior unchanged) --
@@ -9943,6 +11597,12 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             snap.update(
                 dxy_market
             )
+            snap["dxy_bias_entry"] = (
+                capture_real_dxy_bias_at_entry(
+                    device_id=p.get("device_id"),
+                    entry_ms=ets,
+                )
+            )
             snap["dxy_structure_entry"] = (
                 capture_dxy_structure_snapshot(
                     device_id=(
@@ -9980,6 +11640,8 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                 usd_reference
             )
 
+            
+
         except Exception as _de:
             log.warning(
                 "analytics: USD reference capture failed: %s",
@@ -10000,6 +11662,43 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                 "usd_reference_alignment_at_entry",
                 "UNAVAILABLE",
             )
+        # -------------------------------------------------
+        # TP higher-timeframe research context.
+        #
+        # Analytics only. Zero execution authority.
+        # -------------------------------------------------
+        try:
+            snap["tp_bias_shadow"] = (
+                _build_tp_bias_shadow(
+                    symbol=sym,
+                    side=side,
+                    dxy_bias=snap.get(
+                        "dxy_bias_entry"
+                    ),
+                    pair_regime_h4=(
+                        (regime or {}).get("h4")
+                    ),
+                    pair_regime_d1=(
+                        (regime or {}).get("d1")
+                    ),
+                )
+            )
+        except Exception as _tp_bias_exc:
+            snap["tp_bias_shadow"] = {
+                "schema_version": 1,
+                "analytics_only": True,
+                "execution_authority": False,
+                "symbol": sym,
+                "side": side,
+                "tp_research_class": "ERROR",
+                "reason_codes": [
+                    "TP_BIAS_SHADOW_CAPTURE_ERROR:"
+                    f"{type(_tp_bias_exc).__name__}"
+                ],
+                "error": str(
+                    _tp_bias_exc
+                )[:300],
+            }
 
         # -- Unified M15 DXY evidence snapshot (REAL + SYNTHETIC) --
         # Frozen at entry and strictly shadow-only. No execution effect.
@@ -10107,6 +11806,77 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                 capture_quality.get(
                     "m15_sr_present"
                 )
+            )
+            # -------------------------------------------------
+            # Canonical REAL_DXY D1/H4/H1 bias completeness.
+            # Analytics-only observability so a missing stream
+            # cannot silently look like a valid learning row.
+            # -------------------------------------------------
+            _bias = (
+                snap.get("dxy_bias_entry")
+                if isinstance(
+                    snap.get("dxy_bias_entry"),
+                    dict,
+                )
+                else {}
+            )
+
+            _bias_tfs = (
+                _bias.get("timeframes")
+                if isinstance(
+                    _bias.get("timeframes"),
+                    dict,
+                )
+                else {}
+            )
+
+            capture_status[
+                "dxy_bias_entry_captured"
+            ] = bool(_bias)
+
+            capture_status[
+                "dxy_bias_entry_data_ok"
+            ] = bool(
+                _bias.get("data_ok")
+                and str(
+                    _bias.get("source") or ""
+                ).upper() == "REAL_DXY"
+            )
+
+            capture_status[
+                "dxy_bias_d1_available"
+            ] = bool(
+                isinstance(
+                    _bias_tfs.get("D1"),
+                    dict,
+                )
+                and (
+                    _bias_tfs.get("D1") or {}
+                ).get("data_ok")
+            )
+
+            capture_status[
+                "dxy_bias_h4_available"
+            ] = bool(
+                isinstance(
+                    _bias_tfs.get("H4"),
+                    dict,
+                )
+                and (
+                    _bias_tfs.get("H4") or {}
+                ).get("data_ok")
+            )
+
+            capture_status[
+                "dxy_bias_h1_available"
+            ] = bool(
+                isinstance(
+                    _bias_tfs.get("H1"),
+                    dict,
+                )
+                and (
+                    _bias_tfs.get("H1") or {}
+                ).get("data_ok")
             )
 
             snap["capture_status"] = (
@@ -12856,12 +14626,19 @@ def _apply_market_news_during_trade(snap: dict) -> None:
                     - (broker_offset_min * 60_000)
                 )
 
-        snap["during_trade_market_news"] = (
-            read_market_news_during_trade(
+        market_news = read_market_news_during_trade(
+            snap.get("symbol"),
+            entry_ms,
+            close_ms,
+            limit=50,
+        )
+
+        snap["during_trade_market_news"] = market_news
+
+        snap["during_trade_market_news_relevant"] = (
+            _filter_market_news_for_symbol(
                 snap.get("symbol"),
-                entry_ms,
-                close_ms,
-                limit=50,
+                market_news,
             )
         )
 
@@ -12883,6 +14660,17 @@ def _apply_market_news_during_trade(snap: dict) -> None:
             "entry_cutoff_ms": 0,
             "close_cutoff_ms": 0,
             "captured_at_ms": _now_ms(),
+            "article_count": 0,
+            "articles": [],
+            "error": str(exc)[:300],
+        }
+        snap["during_trade_market_news_relevant"] = {
+            "status": "ERROR",
+            "symbol": str(
+                snap.get("symbol") or ""
+            ).upper(),
+            "execution_authority": False,
+            "relevant_topics": [],
             "article_count": 0,
             "articles": [],
             "error": str(exc)[:300],
@@ -13417,6 +15205,69 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
 
         except Exception:
             snap["broker_holding_minutes"] = None
+                
+
+        # ---------------------------------------------------------
+        # Canonical REAL_DXY D1/H4/H1 bias at ACTUAL trade close.
+        #
+        # Analytics only.
+        # No exit decision, order, SL/TP, Point-A or risk effect.
+        # ---------------------------------------------------------
+        try:
+            _bias_exit_ms = _safe_int(
+                snap.get("broker_close_time_utc_ms")
+                or snap.get("broker_close_time_ms")
+                or snap.get("close_timestamp"),
+                0,
+            ) or 0
+
+            if _bias_exit_ms > 0:
+                snap["dxy_bias_exit"] = (
+                    capture_real_dxy_bias_snapshot(
+                        device_id=snap.get("device_id"),
+                        captured_ms=_bias_exit_ms,
+                        snapshot_role="EXIT",
+                    )
+                )
+            else:
+                snap["dxy_bias_exit"] = {
+                    "source": "REAL_DXY",
+                    "snapshot_role": "EXIT",
+                    "data_ok": False,
+                    "captured_at_ms": None,
+                    "reasons": [
+                        "BROKER_CLOSE_TIMESTAMP_MISSING"
+                    ],
+                    "analytics_only": True,
+                    "execution_wired": False,
+                    "entry_gate_wired": False,
+                    "risk_wired": False,
+                }
+
+        except Exception as _bias_exit_exc:
+            log.warning(
+                "analytics: REAL_DXY exit bias capture "
+                "failed ticket=%s err=%r",
+                ticket,
+                _bias_exit_exc,
+            )
+
+            snap["dxy_bias_exit"] = {
+                "source": "REAL_DXY",
+                "snapshot_role": "EXIT",
+                "data_ok": False,
+                "captured_at_ms": None,
+                "capture_error": (
+                    f"{type(_bias_exit_exc).__name__}:"
+                    f"{_bias_exit_exc}"
+                ),
+                "analytics_only": True,
+                "execution_wired": False,
+                "entry_gate_wired": False,
+                "risk_wired": False,
+            }
+
+       
         # --  18: trade classification from data on hand --
         try:
             _apply_realized_r_net_and_outcome(snap)
@@ -13459,6 +15310,52 @@ def finalize_ticket(ticket: str, bars_h1: list) -> bool:
             )
 
             cs["exit_snapshot_complete"] = True
+            _bias_exit = (
+                snap.get("dxy_bias_exit")
+                if isinstance(
+                    snap.get("dxy_bias_exit"),
+                    dict,
+                )
+                else {}
+            )
+
+            _bias_exit_tfs = (
+                _bias_exit.get("timeframes")
+                if isinstance(
+                    _bias_exit.get("timeframes"),
+                    dict,
+                )
+                else {}
+            )
+
+            cs["dxy_bias_exit_captured"] = bool(
+                _bias_exit
+            )
+
+            cs["dxy_bias_exit_data_ok"] = bool(
+                _bias_exit.get("data_ok")
+                and str(
+                    _bias_exit.get("source") or ""
+                ).upper() == "REAL_DXY"
+            )
+
+            cs["dxy_bias_exit_d1_available"] = bool(
+                (_bias_exit_tfs.get("D1") or {}).get(
+                    "data_ok"
+                )
+            )
+
+            cs["dxy_bias_exit_h4_available"] = bool(
+                (_bias_exit_tfs.get("H4") or {}).get(
+                    "data_ok"
+                )
+            )
+
+            cs["dxy_bias_exit_h1_available"] = bool(
+                (_bias_exit_tfs.get("H1") or {}).get(
+                    "data_ok"
+                )
+            )
             cs["broker_verified"] = bool(
                 snap.get("broker_verified")
                 and snap.get("exit_source")
@@ -13647,6 +15544,105 @@ def reconcile_pending_broker_truth(fetch_h1_bars=None) -> dict:
                                 # until the broker result is validated.
                                 upgraded_row = dict(r)
                                 upgraded_row.update(be)
+                                try:
+                                    _bias_exit_ms = _safe_int(
+                                        upgraded_row.get(
+                                            "broker_close_time_utc_ms"
+                                        )
+                                        or upgraded_row.get(
+                                            "broker_close_time_ms"
+                                        )
+                                        or upgraded_row.get(
+                                            "close_timestamp"
+                                        ),
+                                        0,
+                                    ) or 0
+
+                                    if _bias_exit_ms > 0:
+                                        upgraded_row[
+                                            "dxy_bias_exit"
+                                        ] = (
+                                            capture_real_dxy_bias_snapshot(
+                                                device_id=upgraded_row.get(
+                                                    "device_id"
+                                                ),
+                                                captured_ms=_bias_exit_ms,
+                                                snapshot_role="EXIT",
+                                            )
+                                        )
+
+                                    _bias_exit = (
+                                        upgraded_row.get("dxy_bias_exit")
+                                        if isinstance(
+                                            upgraded_row.get("dxy_bias_exit"),
+                                            dict,
+                                        )
+                                        else {}
+                                    )
+
+                                    _bias_exit_tfs = (
+                                        _bias_exit.get("timeframes")
+                                        if isinstance(
+                                            _bias_exit.get("timeframes"),
+                                            dict,
+                                        )
+                                        else {}
+                                    )
+
+                                    capture_status[
+                                        "dxy_bias_exit_captured"
+                                    ] = bool(_bias_exit)
+
+                                    capture_status[
+                                        "dxy_bias_exit_data_ok"
+                                    ] = bool(
+                                        _bias_exit.get("data_ok")
+                                        and str(
+                                            _bias_exit.get("source") or ""
+                                        ).upper() == "REAL_DXY"
+                                    )
+
+                                    capture_status[
+                                        "dxy_bias_exit_d1_available"
+                                    ] = bool(
+                                        (_bias_exit_tfs.get("D1") or {}).get(
+                                            "data_ok"
+                                        )
+                                    )
+
+                                    capture_status[
+                                        "dxy_bias_exit_h4_available"
+                                    ] = bool(
+                                        (_bias_exit_tfs.get("H4") or {}).get(
+                                            "data_ok"
+                                        )
+                                    )
+
+                                    capture_status[
+                                        "dxy_bias_exit_h1_available"
+                                    ] = bool(
+                                        (_bias_exit_tfs.get("H1") or {}).get(
+                                            "data_ok"
+                                        )
+                                    )
+
+                                    upgraded_row[
+                                        "capture_status"
+                                    ] = capture_status
+
+                                except Exception as _bias_exc:
+                                    log.warning(
+                                        "reconcile: REAL_DXY exit bias "
+                                        "rebuild failed ticket=%s err=%r",
+                                        tk,
+                                        _bias_exc,
+                                    )
+                                    log.warning(
+                                        "reconcile: REAL_DXY exit bias "
+                                        "rebuild failed ticket=%s err=%r",
+                                        tk,
+                                        _bias_exc,
+                                    )
 
                                 if (
                                     str(
@@ -16522,6 +18518,69 @@ def capture_point_a_event(
                 )
             ),
 
+            # Peak excursion observed during the entire Point-A WAIT.
+            #
+            # Unlike missed_move_r above, which describes the current/final
+            # evaluation, these values are monotonic watch-level evidence.
+            # They preserve how far price actually ran before Point-A
+            # eventually PASSed / BLOCKed / EXPIRED.
+            #
+            # Analytics only -- no execution/gate effect.
+            "max_missed_r_seen": _safe_float(
+                w.get(
+                    "point_a_max_missed_r_seen"
+                )
+            ),
+
+            "max_favorable_price_seen": _safe_float(
+                w.get(
+                    "point_a_max_favorable_price_seen"
+                )
+            ),
+
+            "max_favorable_seen_at_ms": _safe_int(
+                w.get(
+                    "point_a_max_favorable_seen_at_ms"
+                )
+            ),
+
+            # Difference between the worst excursion reached during WAIT
+            # and the missed-move value visible at this lifecycle event.
+            #
+            # Positive value means price ran farther away earlier and then
+            # retraced before this Point-A event was recorded.
+            "peak_minus_event_missed_r": (
+                round(
+                    float(
+                        w.get(
+                            "point_a_max_missed_r_seen"
+                        )
+                    )
+                    - float(
+                        pa.get("missed_move_r")
+                        if pa.get("missed_move_r") is not None
+                        else w.get(
+                            "point_a_missed_move_r"
+                        )
+                    ),
+                    4,
+                )
+                if (
+                    w.get(
+                        "point_a_max_missed_r_seen"
+                    ) is not None
+                    and (
+                        pa.get("missed_move_r") is not None
+                        or w.get(
+                            "point_a_missed_move_r"
+                        ) is not None
+                    )
+                )
+                else None
+            ),
+
+            
+
             "wait_age_ms": _safe_int(
                 pa.get("wait_age_ms")
             ),
@@ -16830,13 +18889,13 @@ def load_real_dxy_bars(
     Load completed real broker DXY bars from one exact device/timeframe.
 
     Supported native REAL_DXY timeframes:
-    M15, H1, H4
+    M15, H1, H4, D1
     Never scans another device and never falls back to synthetic DXY.
     """
     dev = str(device_id or "").strip()
     tf_u = str(tf or "H1").upper().strip()
 
-    if not dev or tf_u not in ("M15", "H1", "H4"):
+    if not dev or tf_u not in ("M15", "H1", "H4", "D1"):
         return []
 
     try:
