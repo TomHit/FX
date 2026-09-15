@@ -1160,6 +1160,23 @@ class Mt5CalendarPayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
+class Mt5CalendarResultPayload(BaseModel):
+    schema_version: int = 1
+    source: str
+    account: Mt5CalendarAccount
+
+    first_result_seen_utc_ms: int
+
+    broker_tz_offset_minutes: int
+    broker_timezone: str = ""
+    broker_timezone_source: str
+    reason: str = ""
+    calendar_change_id: Optional[int] = None
+
+    event: dict
+
+    model_config = ConfigDict(extra="ignore")
+
 class Mt5AccountPayload(BaseModel):
     account: dict = {}
     mt5_account: str = "demo"
@@ -1673,7 +1690,895 @@ def mt5_calendar(
         "server_received_ms": server_received_ms,
     }
 
-@r.post("/{dev_id}/mt5/ack")
+
+@r.post("/{dev_id}/mt5/calendar/result")
+def mt5_calendar_result(
+    dev_id: str,
+    payload: Mt5CalendarResultPayload,
+    authorization: Optional[str] = Header(default=None),
+):
+    # ---------------------------------------------------------
+    # Fast MT5 calendar result ingestion for Strategy-B.
+    #
+    # IMPORTANT:
+    # - does NOT modify the canonical 7-day Strategy-A calendar
+    # - does NOT modify Strategy-A gate state
+    # - immutable first-seen result by calendar_owner_id/value_id
+    # ---------------------------------------------------------
+
+    # ---------------------------------------------------------
+    # 1. Authenticate device and resolve authoritative owner.
+    # ---------------------------------------------------------
+    token = ""
+    if authorization:
+        parts = authorization.split()
+        token = parts[-1] if parts else authorization.strip()
+
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="missing token",
+        )
+
+    owner_id, auth_source = _authenticate_device_cached(
+        dev_id,
+        token,
+    )
+
+    # ---------------------------------------------------------
+    # 2. Protocol validation.
+    # ---------------------------------------------------------
+    if int(payload.schema_version or 0) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="unsupported_calendar_result_schema",
+        )
+
+    if (
+        str(payload.source or "").upper().strip()
+        != "MT5_CALENDAR_RESULT_OBSERVER"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid_calendar_result_source",
+        )
+
+    incoming_login = str(
+        payload.account.login or ""
+    ).strip()
+
+    incoming_server = str(
+        payload.account.server or ""
+    ).strip()
+
+    incoming_company = str(
+        payload.account.company or ""
+    ).strip()
+
+    if not incoming_login or not incoming_server:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_result_account_identity_missing",
+        )
+
+    # ---------------------------------------------------------
+    # 3. Require trusted broker timezone.
+    # ---------------------------------------------------------
+    tz_source = str(
+        payload.broker_timezone_source or ""
+    ).strip().lower()
+
+    if tz_source != "auto_detected":
+        raise HTTPException(
+            status_code=409,
+            detail="calendar_result_timezone_not_trusted",
+        )
+
+    try:
+        offset_min = int(
+            payload.broker_tz_offset_minutes
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_result_timezone_invalid",
+        )
+
+    if offset_min < -14 * 60 or offset_min > 14 * 60:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_result_timezone_out_of_range",
+        )
+
+    # ---------------------------------------------------------
+    # 4. Cross-check CURRENT account attached to this device.
+    #
+    # Same protection as /mt5/calendar:
+    # reject stale result from account A after device moved to B.
+    # ---------------------------------------------------------
+    try:
+        current_raw = R.get(
+            f"xtl:mt5:account:last_user:{dev_id}"
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"redis_error:{type(exc).__name__}",
+        )
+
+    if not current_raw:
+        raise HTTPException(
+            status_code=409,
+            detail="calendar_result_current_account_unavailable",
+        )
+
+    try:
+        current_account = json.loads(current_raw)
+    except Exception:
+        raise HTTPException(
+            status_code=409,
+            detail="calendar_result_current_account_invalid",
+        )
+
+    current_login = str(
+        current_account.get("login") or ""
+    ).strip()
+
+    current_server = str(
+        current_account.get("server") or ""
+    ).strip()
+
+    current_company = str(
+        current_account.get("company") or ""
+    ).strip()
+
+    if (
+        incoming_login != current_login
+        or incoming_server.casefold()
+        != current_server.casefold()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="calendar_result_account_mismatch",
+        )
+
+    if (
+        incoming_company
+        and current_company
+        and incoming_company.casefold()
+        != current_company.casefold()
+    ):
+        log.warning(
+            "[MT5_CAL_RESULT] COMPANY_MISMATCH "
+            "dev=%s owner=%s login=%s "
+            "incoming=%r current=%r",
+            dev_id,
+            owner_id,
+            incoming_login,
+            incoming_company,
+            current_company,
+        )
+
+    # ---------------------------------------------------------
+    # 5. Validate first-result-seen timestamp.
+    # ---------------------------------------------------------
+    server_received_ms = int(
+        time.time() * 1000
+    )
+
+    try:
+        first_seen_ms = int(
+            payload.first_result_seen_utc_ms or 0
+        )
+    except Exception:
+        first_seen_ms = 0
+
+    if first_seen_ms <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_result_first_seen_missing",
+        )
+
+    # Reject only clearly impossible future timestamps.
+    if first_seen_ms > server_received_ms + 5 * 60_000:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_result_first_seen_future",
+        )
+
+    # ---------------------------------------------------------
+    # 6. Validate normalized event.
+    # ---------------------------------------------------------
+    ev = (
+        dict(payload.event)
+        if isinstance(payload.event, dict)
+        else {}
+    )
+
+    event_id = str(
+        ev.get("event_id") or ""
+    ).strip()
+
+    value_id = str(
+        ev.get("value_id") or ""
+    ).strip()
+
+    event_name = str(
+        ev.get("event_name") or ""
+    ).strip()
+
+    currency = str(
+        ev.get("currency") or ""
+    ).upper().strip()
+
+    importance = str(
+        ev.get("importance") or "NONE"
+    ).upper().strip()
+
+    allowed_ccy = {
+        "USD",
+        "EUR",
+        "GBP",
+        "JPY",
+        "CAD",
+        "CHF",
+    }
+
+    if currency not in allowed_ccy:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_result_currency_invalid",
+        )
+
+    allowed_importance = {
+        "NONE",
+        "LOW",
+        "MODERATE",
+        "HIGH",
+    }
+
+    if importance not in allowed_importance:
+        importance = "NONE"
+
+    try:
+        event_time_utc_ms = int(
+            ev.get("event_time_utc_ms") or 0
+        )
+    except Exception:
+        event_time_utc_ms = 0
+
+    if (
+        not event_id
+        or not value_id
+        or not event_name
+        or event_time_utc_ms <= 0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_result_event_identity_invalid",
+        )
+    # ---------------------------------------------------------
+    
+    # Actual must be present. Zero is a valid value.
+    actual_raw = ev.get("actual")
+
+    actual_value = (
+        actual_raw.get("value")
+        if isinstance(actual_raw, dict)
+        else actual_raw
+    )
+
+    if actual_value is None:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_result_actual_missing",
+        )
+
+    try:
+        actual_float = float(actual_value)
+        if not math.isfinite(actual_float):
+            raise ValueError("non_finite")
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="calendar_result_actual_invalid",
+        )
+
+    # Force authoritative normalized fields.
+    ev["event_id"] = event_id
+    ev["value_id"] = value_id
+    ev["event_name"] = event_name
+    ev["currency"] = currency
+    ev["importance"] = importance
+    ev["event_time_utc_ms"] = event_time_utc_ms
+    ev["source"] = "MT5_CALENDAR"
+
+    # ---------------------------------------------------------
+    # 7. Derive SAME broker-account ownership as /mt5/calendar.
+    #
+    # Device ID is deliberately NOT part of the owner identity.
+    # ---------------------------------------------------------
+    owner_material = (
+        f"{owner_id}|"
+        f"{incoming_server.casefold()}|"
+        f"{incoming_login}"
+    )
+
+    calendar_owner_id = hashlib.sha256(
+        owner_material.encode("utf-8")
+    ).hexdigest()[:32]
+
+    # ---------------------------------------------------------
+    # Synthetic/replay isolation.
+    #
+    # Test observations must never claim a genuine broker
+    # value_id in the immutable production release namespace.
+    # ACK-and-ignore prevents Agent retry loops while creating
+    # no release, index, cursor, evidence, or Strategy-B state.
+    # ---------------------------------------------------------
+    result_reason = str(
+        getattr(payload, "reason", "") or ""
+    ).strip().upper()
+
+    if result_reason in {
+        "SYNTHETIC_TEST",
+        "REPLAY_TEST",
+        "TEST",
+    }:
+        log.warning(
+            "[MT5_CAL_RESULT] NONPRODUCTION_IGNORED "
+            "owner=%s calendar_owner=%s dev=%s "
+            "value_id=%s event_id=%s reason=%s",
+            owner_id,
+            calendar_owner_id,
+            dev_id,
+            value_id,
+            event_id,
+            result_reason,
+        )
+
+        return {
+            "ok": True,
+            "source": "MT5_CALENDAR_RESULT_OBSERVER",
+            "calendar_owner_id": calendar_owner_id,
+            "event_id": event_id,
+            "value_id": value_id,
+            "stored": False,
+            "duplicate": False,
+            "ignored": True,
+            "ignore_reason": "NONPRODUCTION_RESULT",
+            "server_received_ms": server_received_ms,
+        }
+    # Causal release-time integrity.
+    #
+    # A genuine result cannot be observed before the event's
+    # own normalized scheduled UTC timestamp.
+    #
+    # This must be enforced BEFORE the immutable release is
+    # created; otherwise one premature/bad observation becomes
+    # canonical through SET NX and contaminates Strategy-B
+    # research until expiry.
+    # ---------------------------------------------------------
+    if first_seen_ms < event_time_utc_ms:
+        log.warning(
+            "[MT5_CAL_RESULT] PREMATURE_RESULT_REJECTED "
+            "dev=%s owner=%s value_id=%s event_id=%s "
+            "event_time_utc_ms=%s first_seen_ms=%s "
+            "lead_ms=%s",
+            dev_id,
+            owner_id,
+            value_id,
+            event_id,
+            event_time_utc_ms,
+            first_seen_ms,
+            event_time_utc_ms - first_seen_ms,
+        )
+
+        raise HTTPException(
+            status_code=409,
+            detail="calendar_result_before_scheduled_event",
+        )
+
+
+    # ---------------------------------------------------------
+    # 8. Best-effort verification against the corresponding
+    #    canonical scheduled calendar.
+    #
+    # IMPORTANT:
+    # - Schedule membership is diagnostic only.
+    # - A just-released event can legitimately disappear from
+    #   the rolling "now -> +7d" calendar snapshot.
+    # - Broker/account ownership, source, value_id/event_id,
+    #   event timestamp and actual value are already validated
+    #   above and remain mandatory.
+    # - If the schedule DOES contain this value_id and its
+    #   event_id conflicts, reject it as an identity conflict.
+    # ---------------------------------------------------------
+    calendar_key = (
+        f"xtl:news:calendar:mt5:"
+        f"{calendar_owner_id}"
+    )
+
+    schedule_match = False
+    schedule_check_reason = "SCHEDULE_UNAVAILABLE"
+    scheduled_event = None
+
+    try:
+        calendar_raw = R.get(calendar_key)
+
+    except Exception as exc:
+        # Do not reject a valid fast result only because the
+        # rolling schedule cannot be read at this instant.
+        calendar_raw = None
+
+        log.warning(
+            "[MT5_CAL_RESULT] SCHEDULE_CHECK_REDIS_ERROR "
+            "owner=%s calendar_owner=%s value_id=%s err=%r",
+            owner_id,
+            calendar_owner_id,
+            value_id,
+            exc,
+        )
+
+        schedule_check_reason = "SCHEDULE_REDIS_ERROR"
+
+    if calendar_raw:
+        try:
+            calendar_data = json.loads(calendar_raw)
+
+        except Exception:
+            calendar_data = None
+            schedule_check_reason = "SCHEDULE_INVALID"
+
+        calendar_events = (
+            calendar_data.get("events")
+            if isinstance(calendar_data, dict)
+            else None
+        )
+
+        if isinstance(calendar_events, list):
+            schedule_check_reason = (
+                "VALUE_ID_NOT_IN_CURRENT_SCHEDULE"
+            )
+
+            for candidate in calendar_events:
+                if not isinstance(candidate, dict):
+                    continue
+
+                if (
+                    str(
+                        candidate.get("value_id") or ""
+                    ).strip()
+                    != value_id
+                ):
+                    continue
+
+                scheduled_event = candidate
+                break
+
+            if isinstance(scheduled_event, dict):
+                scheduled_event_id = str(
+                    scheduled_event.get("event_id") or ""
+                ).strip()
+
+                # If the value_id is still present, event
+                # identity must agree exactly.
+                if (
+                    scheduled_event_id
+                    and scheduled_event_id != event_id
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "calendar_result_event_id_mismatch"
+                        ),
+                    )
+
+                try:
+                    scheduled_event_time_utc_ms = int(
+                        scheduled_event.get(
+                            "event_time_utc_ms"
+                        ) or 0
+                    )
+                except Exception:
+                    scheduled_event_time_utc_ms = 0
+
+                # When the canonical broker schedule still has
+                # this value_id, its timestamp is authoritative.
+                #
+                # Same value_id + event_id but a different
+                # scheduled timestamp must not silently become
+                # a canonical result release.
+                if (
+                    scheduled_event_time_utc_ms > 0
+                    and scheduled_event_time_utc_ms
+                    != event_time_utc_ms
+                ):
+                    log.warning(
+                        "[MT5_CAL_RESULT] "
+                        "SCHEDULE_TIME_MISMATCH "
+                        "dev=%s owner=%s "
+                        "calendar_owner=%s "
+                        "value_id=%s event_id=%s "
+                        "incoming_event_ms=%s "
+                        "scheduled_event_ms=%s",
+                        dev_id,
+                        owner_id,
+                        calendar_owner_id,
+                        value_id,
+                        event_id,
+                        event_time_utc_ms,
+                        scheduled_event_time_utc_ms,
+                    )
+
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "calendar_result_event_time_mismatch"
+                        ),
+                    )
+
+                # Defensive second causal check against the
+                # canonical scheduled calendar timestamp.
+                if (
+                    scheduled_event_time_utc_ms > 0
+                    and first_seen_ms
+                    < scheduled_event_time_utc_ms
+                ):
+                    log.warning(
+                        "[MT5_CAL_RESULT] "
+                        "PREMATURE_SCHEDULED_RESULT_REJECTED "
+                        "dev=%s owner=%s "
+                        "calendar_owner=%s "
+                        "value_id=%s event_id=%s "
+                        "scheduled_event_ms=%s "
+                        "first_seen_ms=%s lead_ms=%s",
+                        dev_id,
+                        owner_id,
+                        calendar_owner_id,
+                        value_id,
+                        event_id,
+                        scheduled_event_time_utc_ms,
+                        first_seen_ms,
+                        (
+                            scheduled_event_time_utc_ms
+                            - first_seen_ms
+                        ),
+                    )
+
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "calendar_result_before_"
+                            "scheduled_event"
+                        ),
+                    )    
+
+                schedule_match = True
+                schedule_check_reason = (
+                    "MATCHED_CURRENT_SCHEDULE"
+                )
+
+        elif isinstance(calendar_data, dict):
+            schedule_check_reason = (
+                "SCHEDULE_EVENTS_INVALID"
+            )
+
+    # No rejection merely because the rolling calendar is
+    # unavailable or no longer contains this value_id.
+
+    
+    # ---------------------------------------------------------
+    # 9. Canonical immutable MT5 macro release.
+    #
+    # This is transport/canonical storage only.
+    # Strategy-A scheduled calendar is NOT rewritten.
+    # Strategy-B interpretation happens in a separate consumer.
+    # ---------------------------------------------------------
+    release_key = (
+        "xtl:news:calendar:mt5:release:"
+        f"{calendar_owner_id}:"
+        f"{value_id}"
+    )
+
+    release_record = {
+        "schema_version": 1,
+        "source": "MT5_CALENDAR_RESULT_OBSERVER",
+
+        "calendar_owner_id": calendar_owner_id,
+        # Diagnostic only. This never determines whether the
+        # canonical release itself is valid.
+        "schedule_match": bool(schedule_match),
+        "schedule_check_reason": schedule_check_reason,
+
+        "owner": {
+            "uid": owner_id,
+            "account_login": incoming_login,
+            "account_server": incoming_server,
+            "broker_company": incoming_company,
+            "published_by_device_id": dev_id,
+        },
+
+        "timezone": {
+            "broker_tz_offset_minutes": offset_min,
+            "broker_timezone": str(
+                payload.broker_timezone or ""
+            ),
+            "broker_timezone_source": tz_source,
+        },
+
+        # Preserve the complete normalized MT5 event payload.
+        "event": ev,
+
+        # Promote stable identity fields for cheap exact validation.
+        "event_id": event_id,
+        "value_id": value_id,
+
+        "event_time_utc_ms": event_time_utc_ms,
+
+        # Preserve the EA's first observation timestamp exactly.
+        "first_result_seen_ms": first_seen_ms,
+
+        # Server transport/provenance timestamp only.
+        "server_received_ms": server_received_ms,
+
+        # Fast-observer provenance.
+        "reason": str(
+            getattr(payload, "reason", "") or ""
+        ).strip(),
+
+        "calendar_change_id": getattr(
+            payload,
+            "calendar_change_id",
+            None,
+        ),
+    }
+
+    encoded_release = json.dumps(
+        release_record,
+        separators=(",", ":"),
+        default=str,
+    )
+
+    try:
+        created = bool(
+            R.set(
+                release_key,
+                encoded_release,
+                nx=True,
+                ex=14 * 86_400,
+            )
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"redis_error:{type(exc).__name__}",
+        )
+
+    duplicate = False
+
+    # Canonical index score must always follow the immutable
+    # release's first observation time. For a first write this
+    # is the incoming first_seen_ms; a verified duplicate below
+    # replaces it with the stored immutable value.
+    index_first_seen_ms = first_seen_ms
+
+    # ---------------------------------------------------------
+    # 10. Idempotency verification.
+    #
+    # SET NX == False only proves that a key already exists.
+    # Verify that the existing immutable record belongs to the
+    # same canonical broker event before acknowledging it.
+    # ---------------------------------------------------------
+    if not created:
+        try:
+            existing_raw = R.get(release_key)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"redis_error:{type(exc).__name__}",
+            )
+
+        # Extremely small race: key disappeared after SET NX.
+        # Treat as retryable transport failure, not as duplicate.
+        if not existing_raw:
+            raise HTTPException(
+                status_code=503,
+                detail="calendar_release_idempotency_race",
+            )
+
+        try:
+            existing = json.loads(existing_raw)
+        except Exception:
+            raise HTTPException(
+                status_code=409,
+                detail="calendar_release_existing_record_invalid",
+            )
+
+        if (
+            str(existing.get("source") or "")
+            != "MT5_CALENDAR_RESULT_OBSERVER"
+            or str(existing.get("calendar_owner_id") or "")
+            != calendar_owner_id
+            or str(existing.get("value_id") or "")
+            != value_id
+            or str(existing.get("event_id") or "")
+            != event_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="calendar_release_idempotency_conflict",
+            )
+
+        # Important:
+        # Do NOT replace the first captured actual/result with
+        # a later MT5 revision. First write remains immutable.
+        duplicate = True
+
+        try:
+            index_first_seen_ms = int(
+                existing.get("first_result_seen_ms") or 0
+            )
+        except Exception:
+            index_first_seen_ms = 0
+
+        if index_first_seen_ms <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "calendar_release_existing_first_seen_invalid"
+                ),
+            )
+
+    # ---------------------------------------------------------
+    # 11. Strategy-B canonical release discovery index.
+    #
+    # Transport/index only:
+    # - NO Strategy-B interpretation here
+    # - NO MacroEvidence construction here
+    # - NO Strategy-A mutation
+    # - NO Redis SCAN required by the consumer
+    #
+    # Owner-scoped sorted set:
+    #   score  = first_result_seen_ms
+    #   member = value_id
+    #
+    # A small owner registry allows the Strategy-B observer to
+    # discover active broker/account release indexes through
+    # SMEMBERS instead of Redis keyspace SCAN.
+    #
+    # IMPORTANT FAILURE PROPERTY:
+    # If release SET succeeds but indexing fails, return 503.
+    # Agent retries. The next request verifies the immutable
+    # duplicate and re-runs this ZADD, repairing the index.
+    # ---------------------------------------------------------
+    release_owners_key = (
+        "xtl:strategy_b:macro:release_owners"
+    )
+
+    release_index_key = (
+        "xtl:strategy_b:macro:release_index:"
+        f"{calendar_owner_id}"
+    )
+
+    # Release records live for 14 days. Keep the discovery
+    # index slightly longer, but trim scores older than the
+    # release-retention horizon so it stays naturally bounded.
+    release_retention_ms = 14 * 86_400_000
+    index_ttl_sec = 21 * 86_400
+
+    index_trim_before_ms = (
+        server_received_ms - release_retention_ms
+    )
+
+    try:
+        pipe = R.pipeline(transaction=True)
+
+        # Small bounded registry of canonical broker/account
+        # owners that have produced macro releases.
+        pipe.sadd(
+            release_owners_key,
+            calendar_owner_id,
+        )
+
+        # Idempotent for both first write and Agent retry.
+        pipe.zadd(
+            release_index_key,
+            {
+                value_id: float(index_first_seen_ms),
+            },
+        )
+
+        # Remove members whose underlying 14-day release has
+        # already expired.
+        pipe.zremrangebyscore(
+            release_index_key,
+            "-inf",
+            index_trim_before_ms,
+        )
+
+        # Prevent an abandoned broker/account index from
+        # remaining forever.
+        pipe.expire(
+            release_index_key,
+            index_ttl_sec,
+        )
+
+        pipe.execute()
+
+    except Exception as exc:
+        log.exception(
+            "[MT5_CAL_RESULT] STRATEGY_B_INDEX_FAILED "
+            "calendar_owner=%s value_id=%s",
+            calendar_owner_id,
+            value_id,
+        )
+
+        # Do NOT ACK the Agent yet.
+        #
+        # The immutable release may already exist. Agent retry
+        # is safe because SET NX + identity verification above
+        # converts it into a verified duplicate, then this
+        # indexing block executes again.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "calendar_result_strategy_b_index_failed:"
+                f"{type(exc).__name__}"
+            ),
+        )
+
+    # ---------------------------------------------------------
+    # 12. Logging / ACK.
+    #
+    # No Strategy-B imports or evidence construction here.
+    # ---------------------------------------------------------
+    log.info(
+        "[MT5_CAL_RESULT] ACCEPT "
+        "owner=%s calendar_owner=%s "
+        "dev=%s login=%s server=%s "
+        "value_id=%s event_id=%s "
+        "currency=%s event=%r "
+        "first_seen_ms=%s "
+        "stored=%s duplicate=%s auth=%s",
+        owner_id,
+        calendar_owner_id,
+        dev_id,
+        incoming_login,
+        incoming_server,
+        value_id,
+        event_id,
+        currency,
+        event_name,
+        first_seen_ms,
+        created,
+        duplicate,
+        auth_source,
+    )
+
+    return {
+        "ok": True,
+        "source": "MT5_CALENDAR_RESULT_OBSERVER",
+
+        "calendar_owner_id": calendar_owner_id,
+
+        "event_id": event_id,
+        "value_id": value_id,
+
+        "stored": created,
+        "duplicate": duplicate,
+
+        "release_key": release_key,
+        "schedule_match": bool(schedule_match),
+        "schedule_check_reason": schedule_check_reason,
+
+        "release_index_key": release_index_key,
+        "release_index_score": index_first_seen_ms,
+
+        "server_received_ms": server_received_ms,
+    }
+
+
 def mt5_ack(
     dev_id: str,
     payload: Mt5AckPayload,
@@ -1786,14 +2691,22 @@ def mt5_last_ack(
 
 
 class OhlcBar(BaseModel):
-    t: int   # epoch seconds
+    # Legacy MT5 candle OPEN timestamp in epoch seconds.
+    t: int
+
+    # Explicit canonical candle boundaries supplied by the Agent.
+    # Keep optional for backward compatibility with older Agents/snapshots.
+    t_open_ms: Optional[int] = None
+    t_close_ms: Optional[int] = None
+
     o: float
     h: float
     l: float
     c: float
     v: int = 0
     complete: Optional[bool] = True
-    # make sure we never reject unknown/extra fields
+
+    # Still tolerate unrelated future Agent fields.
     model_config = ConfigDict(extra="ignore")
 
 class Mt5CmdResp(BaseModel):
@@ -2047,13 +2960,19 @@ def post_ohlc(
 
             # store legacy 't' as **seconds** (your existing snapshot shape)
             d = {
-                "t": int(t_open_ms // 1000),         # seconds (OPEN)
+                # Legacy compatibility: MT5 candle OPEN in seconds.
+                "t": int(t_open_ms // 1000),
+
+                # Canonical explicit boundaries.
+                "t_open_ms": int(t_open_ms),
+                "t_close_ms": int(t_close_ms),
+
                 "o": float(getattr(b, "o", 0.0)),
                 "h": float(getattr(b, "h", 0.0)),
                 "l": float(getattr(b, "l", 0.0)),
                 "c": float(getattr(b, "c", 0.0)),
                 "v": int(getattr(b, "v", 0) or 0),
-                "complete": True,                    # agent sends CLOSED bars
+                "complete": True,
             }
             bars_sec.append(d)
 

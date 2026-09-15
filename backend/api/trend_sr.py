@@ -185,6 +185,9 @@ def _count_distinct_touches(
 def _cluster_levels(
     levels: List[float],
     tol: float,
+    *,
+    max_span: float | None = None,
+    max_band_width: float | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Cluster raw levels within 'tol'.
@@ -202,7 +205,24 @@ def _cluster_levels(
     clusters: List[List[float]] = []
     current: List[float] = [levels_sorted[0]]
 
-    max_cluster_span = max(2.0 * float(tol), 12.0 * 0.0001)
+    # Default preserves all existing callers exactly.
+    #
+    # Selected callers (notably RECENT_HIGH/LOW_CLUSTER) may provide
+    # a tighter structural span so separate nearby SR structures do
+    # not chain into one oversized executable zone.
+    if max_span is not None:
+        try:
+            max_cluster_span = max(float(max_span), 1e-9)
+        except Exception:
+            max_cluster_span = max(
+                2.0 * float(tol),
+                12.0 * 0.0001,
+            )
+    else:
+        max_cluster_span = max(
+            2.0 * float(tol),
+            12.0 * 0.0001,
+        )
 
     for lvl in levels_sorted[1:]:
         if abs(lvl - current[-1]) <= tol and abs(lvl - current[0]) <= max_cluster_span:
@@ -269,6 +289,38 @@ def _cluster_levels(
             zone_low = float(lvl) - float(min_half_width)
             zone_high = float(lvl) + float(min_half_width)
             band_type = f"{band_type}_expanded"
+
+        # ---------------------------------------------------------
+        # Optional maximum zone-width safety.
+        #
+        # This is NOT the primary clustering mechanism. max_span
+        # above prevents structurally separate levels from becoming
+        # one cluster in the first place.
+        #
+        # This guard only prevents IQR geometry from producing an
+        # excessively wide final band from an otherwise valid cluster.
+        #
+        # Existing callers remain unchanged unless they explicitly
+        # pass max_band_width.
+        # ---------------------------------------------------------
+        if max_band_width is not None:
+            try:
+                _max_bw = float(max_band_width)
+            except Exception:
+                _max_bw = 0.0
+
+            if _max_bw > 0:
+                _bw = float(zone_high - zone_low)
+
+                if _bw > _max_bw:
+                    _half_cap = _max_bw / 2.0
+
+                    zone_low = float(lvl) - _half_cap
+                    zone_high = float(lvl) + _half_cap
+
+                    band_type = (
+                        f"{band_type}_max_width_capped"
+                    )
 
         # Debug cluster stats (use original cluster, not filtered)
         cmin = float(np.min(xs)) if xs.size else lvl
@@ -655,8 +707,54 @@ def compute_sr_for_frame(
         raw_recent_lows = []
         raw_recent_highs = []
 
-    recent_low_clusters = _cluster_levels(raw_recent_lows, tol=max(0.75 * atr, 10.0 * pip_factor))
-    recent_high_clusters = _cluster_levels(raw_recent_highs, tol=max(0.75 * atr, 10.0 * pip_factor))
+    
+   
+    # ------------------------------------------------------------
+    # RECENT H1/H4 HIGH/LOW CLUSTER GEOMETRY
+    #
+    # These clusters use every recent candle high/low, so a broad
+    # tolerance can otherwise "chain" nearby but structurally
+    # distinct price regions into one oversized SR band.
+    #
+    # Primary protection:
+    #   - neighbour tolerance: ~0.35 ATR
+    #   - total cluster span:  ~0.60 ATR
+    #
+    # Secondary safety:
+    #   - final IQR band may not exceed ~0.60 ATR
+    #
+    # This is deliberately scoped to RECENT_HIGH_CLUSTER /
+    # RECENT_LOW_CLUSTER. Swing, reaction, base-impulse,
+    # current-structure and other SR sources retain existing logic.
+    # ------------------------------------------------------------
+    _recent_tol = max(
+        0.35 * float(atr),
+        10.0 * float(pip_factor),
+    )
+
+    _recent_max_span = max(
+        0.60 * float(atr),
+        12.0 * float(pip_factor),
+    )
+
+    _recent_max_band_width = max(
+        0.60 * float(atr),
+        12.0 * float(pip_factor),
+    )
+
+    recent_low_clusters = _cluster_levels(
+        raw_recent_lows,
+        tol=_recent_tol,
+        max_span=_recent_max_span,
+        max_band_width=_recent_max_band_width,
+    )
+
+    recent_high_clusters = _cluster_levels(
+        raw_recent_highs,
+        tol=_recent_tol,
+        max_span=_recent_max_span,
+        max_band_width=_recent_max_band_width,
+    )
 
     # FIX: recent clusters were built from EVERY bar's high/low, so 'touches'
     # equalled bars-in-band. Recompute as DISTINCT approaches.
@@ -701,7 +799,22 @@ def compute_sr_for_frame(
             bounce_after_low = float(np.max(highs_arr[min_idx:]) - min_low)
             drop_after_high = float(max_high - np.min(lows_arr[max_idx:]))
 
-            half = max(0.20 * float(atr), 10.0 * float(pip_factor))
+            # CURRENT_STRUCTURE executable band.
+            #
+            # Preserve the existing ATR intent:
+            #     old ATR-dominant total width = 2 * 0.20 ATR = 0.40 ATR
+            #
+            # But fix the pip-floor semantics:
+            #     old pip-dominant total width = 2 * 10 pips = 20 pips
+            #     new pip-dominant total width = 10 pips
+            #
+            # Structural extreme itself remains unchanged.
+            _current_total_width = max(
+                0.40 * float(atr),
+                10.0 * float(pip_factor),
+            )
+
+            half = 0.50 * _current_total_width
 
             if bounce_after_low >= max(0.75 * float(atr), 20.0 * float(pip_factor)):
                 current_structure_supports.append({

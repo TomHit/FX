@@ -4543,6 +4543,80 @@ def _point_a_evaluate(
     return {**base, "decision": "WAIT", "action": "HOLD", "reason": "DXY_UNRESOLVED", "reason_codes": ["POINT_A_DXY_UNRESOLVED", *dxy_codes]}
 
 
+def _point_a_update_peak_analytics(
+    *,
+    watch: dict,
+    point_a: dict,
+    trigger_level: float,
+    now_e: int,
+) -> None:
+    """
+    Analytics-only Point-A WAIT peak tracker.
+
+    Tracks the maximum favorable displacement reached from the
+    frozen RC trigger during the full WAIT lifecycle.
+
+    Never changes Point-A decision, expiry, release, claims,
+    execution, sizing, SL/TP, or risk.
+    """
+    if not isinstance(watch, dict) or not isinstance(point_a, dict):
+        return
+
+    _current_missed_r = _sf(
+        point_a.get("missed_move_r"),
+        0.0,
+    )
+
+    _previous_max_missed_r_seen = _sf(
+        watch.get("point_a_max_missed_r_seen"),
+        0.0,
+    )
+
+    # New high-water mark only.
+    if _current_missed_r <= _previous_max_missed_r_seen:
+        return
+
+    watch["point_a_max_missed_r_seen"] = float(
+        _current_missed_r
+    )
+
+    _current_favorable_move = _sf(
+        point_a.get("favorable_move"),
+        0.0,
+    )
+
+    _trigger_for_peak = _sf(
+        watch.get("point_a_trigger_level")
+        or trigger_level,
+        0.0,
+    )
+
+    _side_for_peak = str(
+        watch.get("direction")
+        or watch.get("side")
+        or ""
+    ).upper().strip()
+
+    if (
+        _trigger_for_peak <= 0
+        or _side_for_peak not in ("BUY", "SELL")
+    ):
+        return
+
+    _current_favorable_price = (
+        _trigger_for_peak + _current_favorable_move
+        if _side_for_peak == "BUY"
+        else _trigger_for_peak - _current_favorable_move
+    )
+
+    watch["point_a_max_favorable_price_seen"] = float(
+        _current_favorable_price
+    )
+
+    watch["point_a_max_favorable_seen_at_ms"] = int(
+        now_e
+    )
+
 def _point_a_persist_wait(
     *,
     watch: dict,
@@ -4573,10 +4647,18 @@ def _point_a_persist_wait(
         watch["point_a_trigger_level"] = float(
             trigger_level
         )
+        watch["point_a_max_missed_r_seen"] = 0.0
+        watch["point_a_max_favorable_price_seen"] = float(
+            trigger_level
+        )
+        watch["point_a_max_favorable_seen_at_ms"] = int(
+            now_e
+        )
     watch["state"] = POINT_A_WAIT_STATE
     watch["trade_state"] = POINT_A_WAIT_STATE
     watch["entry_blocked"] = True
     watch["entry_block_reason"] = str(point_a.get("reason") or "POINT_A_WAIT")
+    
     watch["point_a"] = point_a
     watch["point_a_decision"] = "WAIT"
     watch["point_a_action"] = "HOLD"
@@ -4602,9 +4684,20 @@ def _point_a_persist_wait(
     watch["point_a_original_risk_distance"] = (
         point_a.get("original_risk_distance")
     )
+    
+    
+    
     watch["point_a_missed_move_r"] = (
         point_a.get("missed_move_r")
     )
+
+    _point_a_update_peak_analytics(
+        watch=watch,
+        point_a=point_a,
+        trigger_level=float(trigger_level),
+        now_e=int(now_e),
+    )
+
     watch["point_a_max_missed_r"] = float(
         point_a.get("max_missed_r")
         or POINT_A_MAX_MISSED_R
@@ -5017,6 +5110,12 @@ DXY_H1_EARLY_EXIT_REASON = "DXY_H1_EARLY_TURN_OPPOSITE"
 DXY_H1_EARLY_EXIT_CLAIM_TTL_SEC = 30 * 60
 DXY_H1_EARLY_EXIT_MAX_STATE_AGE_MS = 2 * 60 * 60 * 1000
 
+# Generic hard defensive loss boundary.
+# Broker -1R SL remains the emergency/failsafe protection.
+EARLY_LOSS_REVIEW_R = -0.15
+EARLY_LOSS_HARD_EXIT_R = -0.50
+EARLY_LOSS_HARD_EXIT_REASON = "DEFENSIVE_LOSS_050R"
+
 # Explicit USD relationship map. Do not infer from symbol text at runtime.
 # Value = REAL_DXY H1 direction that is adverse to the active trade.
 DXY_H1_ADVERSE_DIRECTION: dict[str, dict[str, str]] = {
@@ -5032,55 +5131,113 @@ DXY_H1_ADVERSE_DIRECTION: dict[str, dict[str, str]] = {
 }
 
 
-def _latest_real_dxy_h1_turn_state(preferred_device_id: str = "") -> dict | None:
-    """Return the freshest REAL_DXY H1 turn-state snapshot, fail-closed."""
-    candidates: list[tuple[int, dict]] = []
+def _latest_real_dxy_h1_turn_state(
+    preferred_device_id: str = "",
+) -> dict | None:
+    """
+    Return REAL_DXY H1 turn state.
 
-    def _load_key(key: str) -> None:
+    Priority:
+      1. Preferred device when it has a usable/fresh state.
+      2. Global freshest REAL_DXY fallback only when preferred is unavailable.
+
+    Fail-closed. A different Agent must not silently override a healthy
+    preferred REAL_DXY source merely because its detected_at_ms is newer.
+    """
+
+    now = now_ms()
+
+    def _load_key(key: str) -> dict | None:
         try:
             raw = R.get(key)
             if not raw:
-                return
+                return None
+
             obj = _sj(raw, {})
-            if not isinstance(obj, dict):
-                return
-            rank = int(
+            if not isinstance(obj, dict) or not obj:
+                return None
+
+            obj = dict(obj)
+            obj["_redis_key"] = key
+
+            detected_ms = int(
                 obj.get("detected_at_ms")
                 or obj.get("updated_ms")
                 or obj.get("last_evaluated_bar_close_ms")
                 or 0
             )
-            obj = dict(obj)
-            obj["_redis_key"] = key
-            candidates.append((rank, obj))
+
+            if detected_ms <= 0:
+                return None
+
+            # Do not accept a future timestamp.
+            if detected_ms > now:
+                return None
+
+            # Preferred source is only usable while monitoring is alive.
+            if (now - detected_ms) > DXY_H1_EARLY_EXIT_MAX_STATE_AGE_MS:
+                return None
+
+            return obj
+
         except Exception:
-            return
+            return None
 
     pref = str(preferred_device_id or "").strip()
-    if pref:
-        _load_key(f"xtl:dxy:turn:state:H1:REAL_DXY:{pref}")
 
-    # Global REAL_DXY fallback is intentional. FundingPips/FundedNext devices
-    # may not expose a native DXY symbol while FTMO does; Point-A already treats
-    # REAL_DXY as global macro context.
+    # ---------------------------------------------------------
+    # P0: deterministic preferred REAL_DXY source.
+    # If the active trade's device has a healthy REAL_DXY H1
+    # state, do NOT let another Agent replace it by timestamp.
+    # ---------------------------------------------------------
+    if pref:
+        preferred_key = f"xtl:dxy:turn:state:H1:REAL_DXY:{pref}"
+        preferred = _load_key(preferred_key)
+        if isinstance(preferred, dict):
+            preferred["_dxy_source_selection"] = "PREFERRED_DEVICE"
+            return preferred
+
+    # ---------------------------------------------------------
+    # Global fallback.
+    # Required for brokers/devices that do not expose REAL_DXY.
+    # Existing SCAN is retained temporarily for compatibility.
+    # We can replace it with an explicit pointer later.
+    # ---------------------------------------------------------
+    candidates: list[tuple[int, dict]] = []
+
     try:
         for key in R.scan_iter(
             match="xtl:dxy:turn:state:H1:REAL_DXY:*",
             count=50,
         ):
             key_s = str(key or "")
+
             if pref and key_s.endswith(":" + pref):
                 continue
-            _load_key(key_s)
+
+            obj = _load_key(key_s)
+            if not isinstance(obj, dict):
+                continue
+
+            rank = int(
+                obj.get("detected_at_ms")
+                or obj.get("updated_ms")
+                or obj.get("last_evaluated_bar_close_ms")
+                or 0
+            )
+
+            candidates.append((rank, obj))
+
     except Exception:
-        return candidates[-1][1] if candidates else None
+        return None
 
     if not candidates:
         return None
 
     candidates.sort(key=lambda x: x[0])
-    return candidates[-1][1]
-
+    selected = candidates[-1][1]
+    selected["_dxy_source_selection"] = "GLOBAL_REAL_DXY_FALLBACK"
+    return selected
 
 def _patch_open_trade_fields(uid: str, trade_id: str, patch: dict) -> bool:
     """Merge audit fields into one current open-ledger row without stale overwrite."""
@@ -5210,12 +5367,12 @@ def _maybe_dxy_h1_early_close_loss(
 
     # Price must confirm meaningful deterioration.
     # Being 1-2 ticks below entry is no longer sufficient.
-    if current_r > -0.15:
+    if current_r > EARLY_LOSS_REVIEW_R:
         return {
             "action": "SKIP",
             "reason": "DXY_EARLY_LOSS_THRESHOLD_NOT_REACHED",
             "current_r": round(float(current_r), 4),
-            "threshold_r": -0.15,
+            "threshold_r": EARLY_LOSS_REVIEW_R,
             "max_r_seen": round(float(max_r_seen), 4),
         }
 
@@ -5229,6 +5386,162 @@ def _maybe_dxy_h1_early_close_loss(
         )
         if protected:
             return {"action": "SKIP", "reason": "BROKER_SL_ALREADY_PROTECTS"}
+
+    # -------------------------------------------------
+    # Hard defensive loss boundary.
+    #
+    # DXY remains the intelligent early-close path from -0.15R.
+    # However, a trade that deteriorates to -0.50R must not require
+    # a new adverse DXY H1 turn in order to protect the remaining risk.
+    #
+    # Broker -1R SL remains emergency/failsafe protection only.
+    #
+    # This path is unreachable after +0.50R MFE because the one-way
+    # ownership boundary above has already returned.
+    # -------------------------------------------------
+    if current_r <= EARLY_LOSS_HARD_EXIT_R:
+        trade_id = str(pos.get("trade_id") or "").strip()
+        profile_id = str(pos.get("profile_id") or "").strip().lower()
+        mt5_account = str(pos.get("mt5_account") or "demo").lower().strip()
+        qty = _sf(broker_pos.get("volume") or pos.get("qty"), 0.0)
+
+        if not trade_id or not profile_id or qty <= 0:
+            return {
+                "action": "SKIP",
+                "reason": "TRADE_ROUTE_METADATA_MISSING",
+                "current_r": round(float(current_r), 4),
+                "max_r_seen": round(float(max_r_seen), 4),
+            }
+
+        generation = "LOSS_050R"
+        claim_key = (
+            f"xtl:oppt:defensive_loss_close:"
+            f"{uid}:{ticket}:{generation}"
+        )
+
+        try:
+            claimed = bool(
+                R.set(
+                    claim_key,
+                    "1",
+                    nx=True,
+                    ex=DXY_H1_EARLY_EXIT_CLAIM_TTL_SEC,
+                )
+            )
+        except Exception:
+            return {
+                "action": "SKIP",
+                "reason": "CLAIM_REDIS_ERROR",
+                "current_r": round(float(current_r), 4),
+            }
+
+        if not claimed:
+            return {
+                "action": "SKIP",
+                "reason": "DUPLICATE_CLOSE_CLAIM",
+                "current_r": round(float(current_r), 4),
+            }
+
+        close_trade_id = (
+            f"DEFENSIVE_LOSS_CLOSE:{ticket}:{generation}"
+        )
+
+        close_res = _enqueue_mt5_close_position(
+            uid=uid,
+            symbol=symbol,
+            ticket=ticket,
+            qty=qty,
+            comment="XTL LOSS_050R",
+            trade_id=close_trade_id,
+            exit_reason=EARLY_LOSS_HARD_EXIT_REASON,
+            mt5_account=mt5_account,
+            profile_id=profile_id,
+        )
+
+        if not bool(close_res.get("ok")):
+            try:
+                R.delete(claim_key)
+            except Exception:
+                pass
+
+            log.error(
+                "[OPPT] DEFENSIVE_LOSS_CLOSE_ENQUEUE_FAILED "
+                "uid=%s tid=%s ticket=%s sym=%s side=%s "
+                "current_r=%s max_r_seen=%s err=%s",
+                uid,
+                trade_id,
+                ticket,
+                symbol,
+                side,
+                round(float(current_r), 4),
+                round(float(max_r_seen), 4),
+                close_res.get("error"),
+            )
+
+            return {
+                "action": "ERROR",
+                "reason": "DEFENSIVE_LOSS_ENQUEUE_FAILED",
+                "current_r": round(float(current_r), 4),
+                "close_res": close_res,
+            }
+
+        patch = {
+            "requested_exit_reason": EARLY_LOSS_HARD_EXIT_REASON,
+            "requested_exit_at_ms": now_ms(),
+            "defensive_loss_exit_requested": True,
+            "defensive_loss_exit_action": "EARLY_CLOSE_LOSS",
+            "defensive_loss_exit_job_id": close_res.get("job_id"),
+            "defensive_loss_exit_claim_key": claim_key,
+            "defensive_loss_observed_price": float(price),
+            "defensive_loss_observed_r": round(float(current_r), 4),
+            "defensive_loss_max_r_seen": round(float(max_r_seen), 4),
+            "defensive_loss_threshold_r": EARLY_LOSS_HARD_EXIT_R,
+        }
+
+        patch_ok = _patch_open_trade_fields(
+            uid,
+            trade_id,
+            patch,
+        )
+
+        if patch_ok:
+            pos.update(patch)
+        else:
+            log.error(
+                "[OPPT] DEFENSIVE_LOSS_CLOSE_AUDIT_PATCH_FAILED "
+                "uid=%s tid=%s ticket=%s job=%s",
+                uid,
+                trade_id,
+                ticket,
+                close_res.get("job_id"),
+            )
+
+        log.warning(
+            "[OPPT] DEFENSIVE_LOSS_CLOSE_ENQUEUED "
+            "uid=%s tid=%s ticket=%s sym=%s side=%s "
+            "entry=%s price=%s current_r=%s max_r_seen=%s "
+            "threshold_r=%s job=%s",
+            uid,
+            trade_id,
+            ticket,
+            symbol,
+            side,
+            entry,
+            price,
+            round(float(current_r), 4),
+            round(float(max_r_seen), 4),
+            EARLY_LOSS_HARD_EXIT_R,
+            close_res.get("job_id"),
+        )
+
+        return {
+            "action": "CLOSE_ENQUEUED",
+            "reason": EARLY_LOSS_HARD_EXIT_REASON,
+            "current_r": round(float(current_r), 4),
+            "max_r_seen": round(float(max_r_seen), 4),
+            "threshold_r": EARLY_LOSS_HARD_EXIT_R,
+            "job_id": close_res.get("job_id"),
+        }
 
     dxy = _latest_real_dxy_h1_turn_state(
         str(pos.get("device_id") or broker_pos.get("device_id") or "")
@@ -5250,8 +5563,13 @@ def _maybe_dxy_h1_early_close_loss(
         return {
             "action": "SKIP",
             "reason": "DXY_H1_NO_DIRECTIONAL_TURN",
+            "current_r": round(float(current_r), 4),
+            "max_r_seen": round(float(max_r_seen), 4),
+            "threshold_r": EARLY_LOSS_REVIEW_R,
             "short_state": h1_direction,
             "confidence": h1_confidence,
+            "source_key": dxy.get("_redis_key"),
+            "source_selection": dxy.get("_dxy_source_selection"),
         }
 
     # Directional H1 short_state is already qualified by dxy_tracker's
@@ -5292,8 +5610,14 @@ def _maybe_dxy_h1_early_close_loss(
         return {
             "action": "SKIP",
             "reason": "DXY_H1_NOT_OPPOSITE",
+            "current_r": round(float(current_r), 4),
+            "max_r_seen": round(float(max_r_seen), 4),
             "direction": h1_direction,
+            "confidence": h1_confidence,
             "required_opposite": opposite,
+            "turn_ms": h1_turn_ms,
+            "source_key": dxy.get("_redis_key"),
+            "source_selection": dxy.get("_dxy_source_selection"),
         }
 
     # The adverse H1 TURN itself must be newer than this trade. Do not use
@@ -5309,8 +5633,15 @@ def _maybe_dxy_h1_early_close_loss(
         return {
             "action": "SKIP",
             "reason": "DXY_H1_TURN_PREDATES_TRADE",
+            "current_r": round(float(current_r), 4),
+            "max_r_seen": round(float(max_r_seen), 4),
+            "direction": h1_direction,
+            "confidence": h1_confidence,
             "turn_ms": h1_turn_ms,
             "opened_at_ms": opened_at_ms,
+            "required_opposite": opposite,
+            "source_key": dxy.get("_redis_key"),
+            "source_selection": dxy.get("_dxy_source_selection"),
         }
 
     
@@ -5418,7 +5749,7 @@ def _maybe_dxy_h1_early_close_loss(
         "[OPPT] DXY_H1_EARLY_CLOSE_ENQUEUED "
         "uid=%s tid=%s ticket=%s sym=%s side=%s "
         "entry=%s price=%s current_r=%s sl=%s "
-        "h1_status=%s h1_direction=%s h1_bar=%s "
+        "h1_direction=%s h1_bar=%s "
         "h1_detected=%s job_id=%s device_id=%s",
         uid,
         trade_id,
@@ -8515,11 +8846,85 @@ def tick_user(uid: str) -> None:
                     # -------------------------------------------------
                     try:
                         if broker_pos:
-                            _maybe_dxy_h1_early_close_loss(
+                            _dxy_exit_res = _maybe_dxy_h1_early_close_loss(
                                 uid=uid,
                                 pos=pos,
                                 broker_pos=broker_pos,
                             )
+
+                            # -------------------------------------------------
+                            # P0 OBSERVABILITY:
+                            # Make DXY early-loss decisions visible without
+                            # flooding logs. Trading behaviour is unchanged.
+                            # -------------------------------------------------
+                            if isinstance(_dxy_exit_res, dict):
+                                _dxy_exit_action = str(
+                                    _dxy_exit_res.get("action") or ""
+                                ).upper().strip()
+
+                                _dxy_exit_reason = str(
+                                    _dxy_exit_res.get("reason") or "UNKNOWN"
+                                ).upper().strip()
+
+                                # Successful close enqueue already has its own
+                                # DXY_H1_EARLY_CLOSE_ENQUEUED log.
+                                # Rate-limit SKIP/audit decisions per ticket+reason.
+                                if _dxy_exit_action == "SKIP":
+                                    _dxy_audit_key = (
+                                        f"xtl:oppt:dxy_h1_early_audit:"
+                                        f"{uid}:{ticket}:{_dxy_exit_reason}"
+                                    )
+
+                                    _dxy_should_log = False
+
+                                    try:
+                                        _dxy_should_log = bool(
+                                            R.set(
+                                                 _dxy_audit_key,
+                                                 "1",
+                                                 nx=True,
+                                                 ex=60,
+                                            )
+                                        )
+                                    except Exception:
+                                        # Audit failure must never affect execution.
+                                        _dxy_should_log = False
+
+                                    if _dxy_should_log:
+                                        log.warning(
+                                            "[OPPT] DXY_H1_EARLY_CHECK "
+                                            "uid=%s tid=%s ticket=%s sym=%s side=%s "
+                                            "action=%s reason=%s "
+                                            "current_r=%s max_r_seen=%s "
+                                            "threshold_r=%s "
+                                            "h1_state=%s confidence=%s "
+                                            "turn_ms=%s opened_at_ms=%s "
+                                            "required_opposite=%s "
+                                            "source_selection=%s source_key=%s",
+                                            uid,
+                                            pos.get("trade_id"),
+                                            ticket,
+                                            pos.get("symbol"),
+                                            pos.get("side"),
+                                            _dxy_exit_action,
+                                            _dxy_exit_reason,
+                                            _dxy_exit_res.get("current_r"),
+                                            _dxy_exit_res.get("max_r_seen"),
+                                            _dxy_exit_res.get("threshold_r"),
+                                            (
+                                                _dxy_exit_res.get("short_state")
+                                                or _dxy_exit_res.get("direction")
+                                            ),
+                                            _dxy_exit_res.get("confidence"),
+                                            (
+                                                _dxy_exit_res.get("turn_ms")
+                                                or _dxy_exit_res.get("h1_turn_ms")
+                                            ),
+                                            _dxy_exit_res.get("opened_at_ms"),
+                                            _dxy_exit_res.get("required_opposite"),
+                                            _dxy_exit_res.get("source_selection"),
+                                            _dxy_exit_res.get("source_key"),
+                                       )
                     except Exception as _dxy_exit_exc:
                         log.exception(
                             "[OPPT] DXY_H1_EARLY_CLOSE_CHECK_FAILED "
@@ -11089,6 +11494,12 @@ def tick_user(uid: str) -> None:
 
                         watch.pop("next_retry_ms", None)
                         watch.pop("late_entry_max_move", None)
+                        _point_a_update_peak_analytics(
+                            watch=watch,
+                            point_a=point_a,
+                            trigger_level=float(trigger_level),
+                            now_e=int(now_e),
+                        )
 
                         # ---------------------------------------------
                         # Terminal analytics MUST see the complete
@@ -11209,6 +11620,14 @@ def tick_user(uid: str) -> None:
                         continue
 
                     if point_a_decision == "BLOCK":
+                        # Include final WAIT -> BLOCK evaluation
+                        # in the Point-A analytics high-water mark.
+                        _point_a_update_peak_analytics(
+                            watch=watch,
+                            point_a=point_a,
+                            trigger_level=float(trigger_level),
+                            now_e=int(now_e),
+                        )
                         watch["state"] = POINT_A_BLOCK_STATE
                         watch["trade_state"] = POINT_A_BLOCK_STATE
                         watch["entry_blocked"] = True
@@ -11333,6 +11752,14 @@ def tick_user(uid: str) -> None:
                     # ALLOW continues into the normal post-Point-A
                     # entry path below.
                     if point_a_decision == "ALLOW":
+                        # Include final WAIT -> ALLOW evaluation
+                        # in the Point-A analytics high-water mark.
+                        _point_a_update_peak_analytics(
+                            watch=watch,
+                            point_a=point_a,
+                            trigger_level=float(trigger_level),
+                            now_e=int(now_e),
+                        )
                         watch["point_a"] = point_a
                         watch["point_a_decision"] = "ALLOW"
                         watch["point_a_action"] = "RELEASE"
@@ -12485,6 +12912,7 @@ def tick_user(uid: str) -> None:
                     continue
 
                 if point_a_decision == "BLOCK":
+                    
                     watch["state"] = POINT_A_BLOCK_STATE
                     watch["trade_state"] = POINT_A_BLOCK_STATE
                     watch["entry_blocked"] = True
@@ -12616,7 +13044,7 @@ def tick_user(uid: str) -> None:
                     )
                     continue
 
-                # ALLOW: preserve the final gate snapshot for event/open/close analytics.
+                
                 watch["point_a"] = point_a
                 watch["point_a_decision"] = "ALLOW"
                 watch["point_a_action"] = "RELEASE"
@@ -13933,7 +14361,7 @@ def tick_user(uid: str) -> None:
                 prop_check = compute_prop_check(
                     firm=str(prop_cfg.get("firm") or "ftmo"),
                     phase=str(prop_cfg.get("phase") or "challenge"),
-                    account_size=float(prop_cfg.get("account_size") or 25000),
+                    account_size=float(prop_cfg.get("account_size") or 0.0),
                     symbol=sym,
                     side=side,
                     entry=float(entry_price),

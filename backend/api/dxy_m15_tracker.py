@@ -2565,7 +2565,20 @@ def _evaluate_one(
                 "outcome": outcome,
             }
 
-    elif old_status in ("REJECTED", "EXPIRED", "INVALIDATED", "COMPLETED", "WEAK_COMPLETION"):
+    elif old_status in (
+        "REJECTED",
+        "EXPIRED",
+        "INVALIDATED",
+        "COMPLETED",
+        "WEAK_COMPLETION",
+    ):
+        # -------------------------------------------------
+        # Terminal lifecycle reset.
+        #
+        # Do not consume an entire completed M15 merely
+        # resetting the old terminal state. Reset and allow
+        # the CURRENT completed M15 to seed a fresh candidate.
+        # -------------------------------------------------
         status = "IDLE"
         direction = "NEUTRAL"
         started_ms = 0
@@ -2580,6 +2593,48 @@ def _evaluate_one(
         peak_favorable_ms = 0
         bars_to_peak = 0
         confirmed_ms = 0
+
+        if (
+            basket_ok
+            and start_direction in ("BULLISH", "BEARISH")
+            and start_score >= start_score_required
+            and score_margin >= start_margin_required
+        ):
+            direction = start_direction
+            started_ms = close_ms
+            start_price = current_close
+            start_atr = current_atr
+            support_bars = 1
+            age_bars = 0
+            accumulated_score = float(start_score)
+            max_favorable_atr = 0.0
+            max_adverse_atr = 0.0
+            peak_favorable_ms = close_ms
+            bars_to_peak = 0
+
+            if impulse_early_confirm:
+                status = "CONFIRMED"
+                confirmed_ms = close_ms
+
+                event = {
+                    "status": "CONFIRMED",
+                    "direction": direction,
+                    "reason": (
+                        "SINGLE_M15_IMPULSE_CONFIRMED"
+                    ),
+                }
+
+            else:
+                status = "PENDING"
+                confirmed_ms = 0
+
+                event = {
+                    "status": "PENDING",
+                    "direction": direction,
+                    "reason": (
+                        "EARLY_EVIDENCE_CANDIDATE"
+                    ),
+                }
 
     else:  # IDLE / unknown
         status = "IDLE"
@@ -2603,15 +2658,6 @@ def _evaluate_one(
             peak_favorable_ms = close_ms
             bars_to_peak = 0
 
-            # -------------------------------------------------
-            # Exceptional one-M15 impulse.
-            #
-            # Skip ONLY the second-candle confirmation wait.
-            #
-            # This does NOT imply Point-A PASS.
-            # Existing DXY SR / room / structure logic still
-            # decides whether the confirmed direction is safe.
-            # -------------------------------------------------
             if impulse_early_confirm:
                 status = "CONFIRMED"
                 confirmed_ms = close_ms

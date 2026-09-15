@@ -1340,8 +1340,101 @@ def _discover_missing_prop_profiles(uid: str) -> None:
         )
 
         if current_match is not None:
-            continue
+            # Exact live MT5 account is already bound.
+            #
+            # Profile remains the authority for firm / phase / risk rules.
+            # The bound MT5 account is used only to reconcile stale nominal
+            # account-tier metadata.
+            _matched_account = (
+                current_match.get("account")
+                if isinstance(current_match.get("account"), dict)
+                else {}
+            )
 
+            try:
+                _live_balance = float(
+                    _matched_account.get("balance")
+                    or _matched_account.get("account_size")
+                    or 0.0
+                )
+            except Exception:
+                _live_balance = 0.0
+
+            _nominal_size = _infer_prop_nominal_account_size(
+                _live_balance
+            )
+
+            try:
+                _stored_size = float(
+                    current_cfg.get("account_size")
+                    or 0.0
+                )
+            except Exception:
+                _stored_size = 0.0
+
+            if (
+                _nominal_size is not None
+                and float(_nominal_size) > 0.0
+                and abs(
+                    _stored_size - float(_nominal_size)
+                ) > 0.01
+            ):
+                _old_size = _stored_size
+                _nominal_size = float(_nominal_size)
+
+                _updated_cfg = dict(current_cfg)
+
+                _updated_cfg["account_size"] = _nominal_size
+                _updated_cfg["account_name"] = (
+                    _prop_account_size_label(
+                        current_cfg.get("firm"),
+                        _nominal_size,
+                        current_cfg.get("account_name"),
+                    )
+                )
+                _updated_cfg["account_size_reconciled"] = True
+                _updated_cfg[
+                    "account_size_reconciled_from"
+                ] = (
+                    _old_size
+                    if _old_size > 0.0
+                    else None
+                )
+                _updated_cfg[
+                    "account_size_reconciled_to"
+                ] = _nominal_size
+                _updated_cfg[
+                    "account_size_reconciled_balance"
+                ] = _live_balance
+                _updated_cfg[
+                    "account_size_reconciled_at_ms"
+                ] = int(now_ms)
+                _updated_cfg[
+                    "account_size_reconciled_reason"
+                ] = "BOUND_MT5_ACCOUNT_NOMINAL_TIER"
+
+                _save_prop_config(
+                    uid_u,
+                    _updated_cfg,
+                    profile_id=pid,
+                )
+
+                log.warning(
+                    "[PROP] PROFILE_ACCOUNT_SIZE_RECONCILED "
+                    "uid=%s profile=%s login=%s "
+                    "server=%s old_size=%s "
+                    "new_size=%s broker_balance=%s "
+                    "reason=BOUND_MT5_ACCOUNT_NOMINAL_TIER",
+                    uid_u,
+                    pid,
+                    current_match.get("login"),
+                    current_match.get("server"),
+                    _old_size,
+                    _nominal_size,
+                    _live_balance,
+                )
+
+            continue
         # Never guess between two currently connected accounts belonging
         # to the same firm.
         if len(unique_rows) != 1:
@@ -2157,9 +2250,15 @@ def _save_prop_config(
         out.get("enabled")
     )
 
-    out["account_size"] = float(
-        out.get("account_size") or 25000
-    )
+    try:
+        out["account_size"] = float(
+            out.get("account_size") or 0.0
+        )
+    except (TypeError, ValueError):
+        out["account_size"] = 0.0
+
+    if out["enabled"] and out["account_size"] <= 0.0:
+        raise ValueError("PROP_ACCOUNT_SIZE_UNRESOLVED")
 
     out["risk_pct"] = float(
         out.get("risk_pct") or 1.0
@@ -9229,10 +9328,19 @@ def prop_enable_and_activate_profile(
 
         normalized_cfg["enabled"] = True
 
-        normalized_cfg["account_size"] = float(
-            normalized_cfg.get("account_size")
-            or 25000
-        )
+        try:
+            normalized_cfg["account_size"] = float(
+                normalized_cfg.get("account_size") or 0.0
+            )
+        except (TypeError, ValueError):
+            normalized_cfg["account_size"] = 0.0
+
+        if normalized_cfg["account_size"] <= 0.0:
+            return {
+                "ok": False,
+                "error": "PROP_ACCOUNT_SIZE_UNRESOLVED",
+                "profile_id": requested_profile_id,
+            }
 
         normalized_cfg["risk_pct"] = float(
             normalized_cfg.get("risk_pct")
@@ -16946,71 +17054,157 @@ def _rows_to_df(rows):
     except Exception:
         return None
 
-def _normalize_snap_bars_to_ms(bars: Any, tf_ms: int) -> list[dict]:
+def _normalize_snap_bars_to_ms(
+    bars: Any,
+    tf_ms: int,
+) -> list[dict]:
     """
-    Normalize snapshot bars into a standard list of dict bars with:
-      - t_close_ms (ms)
-      - t_open_ms (ms) = t_close_ms - tf_ms
+    Normalize snapshot bars to the canonical candle schema:
+
+      - t_open_ms  : candle OPEN in ms
+      - t_close_ms : candle CLOSE in ms
       - o,h,l,c,v,complete
-    Also: sort by t_close_ms and drop invalid/future bars.
+
+    Timestamp contract:
+      1) Explicit t_close_ms/tCloseMs/tClose/t_close is authoritative.
+      2) Explicit t_open_ms/tOpenMs/tOpen/open_time_ms is OPEN time.
+      3) Legacy snapshot field `t` is MT5 candle OPEN time, never CLOSE.
+      4) When only OPEN is available:
+             t_close_ms = t_open_ms + tf_ms
+
+    This supports both new and legacy Redis snapshots.
     """
     if not isinstance(bars, list):
         return []
 
+    try:
+        tf_ms = int(tf_ms or 0)
+    except Exception:
+        tf_ms = 0
+
+    if tf_ms <= 0:
+        return []
+
+    def _to_ms(value) -> int:
+        try:
+            v = int(value or 0)
+        except Exception:
+            return 0
+
+        if v <= 0:
+            return 0
+
+        # ns -> ms
+        if v >= 1_000_000_000_000_000_000:
+            return v // 1_000_000
+
+        # us -> ms
+        if v >= 1_000_000_000_000_000:
+            return v // 1_000
+
+        # already ms
+        if v >= 1_000_000_000_000:
+            return v
+
+        # seconds -> ms
+        return v * 1000
+
     out: list[dict] = []
+
     for b in bars:
         if not isinstance(b, dict):
             continue
 
-        # Accept multiple possible timestamp fields
-        t_close = (
+        # ---------------------------------------------------------
+        # 1. Explicit CLOSE timestamp wins.
+        # ---------------------------------------------------------
+        t_close_ms = _to_ms(
             b.get("t_close_ms")
+            or b.get("tCloseMs")
             or b.get("tClose")
             or b.get("t_close")
-            or b.get("t")
-            or 0
+            or b.get("close_time_ms")
         )
 
-        # Convert seconds -> ms if needed
-        try:
-            t_close = int(t_close)
-        except Exception:
-            t_close = 0
-        if 0 < t_close < 10_000_000_000:  # looks like seconds
-            t_close *= 1000
+        # ---------------------------------------------------------
+        # 2. Explicit/legacy OPEN timestamp.
+        #
+        # IMPORTANT:
+        # Redis snapshot `t` is MT5 candle OPEN time.
+        # ---------------------------------------------------------
+        t_open_ms = _to_ms(
+            b.get("t_open_ms")
+            or b.get("tOpenMs")
+            or b.get("tOpen")
+            or b.get("open_time_ms")
+            or b.get("t")
+            or b.get("time")
+            or b.get("ts")
+        )
 
-        # Build normalized bar
+        # ---------------------------------------------------------
+        # 3. Reconstruct whichever boundary is absent.
+        # ---------------------------------------------------------
+        if t_close_ms <= 0 and t_open_ms > 0:
+            t_close_ms = int(t_open_ms + tf_ms)
+
+        if t_open_ms <= 0 and t_close_ms > 0:
+            t_open_ms = int(t_close_ms - tf_ms)
+
+        if t_open_ms <= 0 or t_close_ms <= 0:
+            continue
+
+        # Defensive consistency:
+        # candle close must be exactly one TF after open.
+        #
+        # If legacy/malformed input copied OPEN into t_close_ms,
+        # repair from the trusted OPEN timestamp.
+        if t_close_ms <= t_open_ms:
+            t_close_ms = int(t_open_ms + tf_ms)
+
         nb = {
-            "t_close_ms": t_close,
+            "t_open_ms": int(t_open_ms),
+            "t_close_ms": int(t_close_ms),
+
             "o": b.get("o"),
             "h": b.get("h"),
             "l": b.get("l"),
             "c": b.get("c"),
-            "v": b.get("v") if b.get("v") is not None else b.get("vol"),
+
+            "v": (
+                b.get("v")
+                if b.get("v") is not None
+                else b.get("vol")
+            ),
+
             "complete": b.get("complete", True),
         }
 
-        # If any OHLC missing, skip (prevents BOS/ATR weirdness)
-        if nb["t_close_ms"] <= 0:
-            continue
+        # OHLC validation remains unchanged in principle.
         if nb["c"] is None or nb["h"] is None or nb["l"] is None:
             continue
+
         if nb["o"] is None:
             nb["o"] = nb["c"]
 
-        # ? CRITICAL FIX: ensure t_open_ms is always correct (never 0)
-        nb["t_open_ms"] = int(nb["t_close_ms"] - tf_ms)
-
         out.append(nb)
 
-    # Sort and remove duplicates by t_close_ms
-    out.sort(key=lambda x: x.get("t_close_ms", 0))
+    # Sort and deduplicate by canonical CLOSE timestamp.
+    out.sort(
+        key=lambda x: int(
+            x.get("t_close_ms") or 0
+        )
+    )
+
     dedup: list[dict] = []
-    seen = set()
+    seen: set[int] = set()
+
     for b in out:
-        tc = b["t_close_ms"]
-        if tc in seen:
+        tc = int(b.get("t_close_ms") or 0)
+
+        if tc <= 0 or tc in seen:
             continue
+
         seen.add(tc)
         dedup.append(b)
 

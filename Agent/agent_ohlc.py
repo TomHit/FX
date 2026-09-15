@@ -1420,6 +1420,7 @@ def api_post(api_base: str, path: str, payload: dict, token: str, timeout: int =
       path.rstrip("/").endswith("/mt5/account")
       or path.rstrip("/").endswith("/mt5/positions")
       or path.rstrip("/").endswith("/mt5/calendar")
+      or path.rstrip("/").endswith("/mt5/calendar/result")
     )
 
     # Non-critical traffic may use the shared backoff.
@@ -3373,6 +3374,11 @@ _XTL_CALENDAR_CHECK_SEC = 300.0          # cheap local check every 5 min
 _XTL_CALENDAR_RETRY_SEC = 300.0          # retry failed API delivery
 _XTL_CALENDAR_MAX_EVENTS = 5000
 
+_XTL_CALENDAR_RESULT_CHECK_SEC = 2.0
+_XTL_CALENDAR_RESULT_IDENTITY_REFRESH_SEC = 30.0
+_XTL_CALENDAR_RESULT_MAX_FILES_PER_PASS = 50
+_XTL_CALENDAR_RESULT_MAX_FILE_BYTES = 1_000_000
+
 _XTL_CALENDAR_ALLOWED_CCY = {
     "USD", "EUR", "GBP",
     "JPY", "CAD", "CHF",
@@ -4369,6 +4375,801 @@ def _mt5_calendar_worker_loop(
             + period
         )
         
+def _calendar_result_ack_path(
+    result_path: str,
+) -> str:
+    """
+    Durable Agent-side ACK marker.
+
+    Keep the original EA result JSON untouched because the EA uses
+    that filename to protect immutable first-result semantics.
+    """
+    return f"{result_path}.acked"
+
+
+def _calendar_result_is_acked(
+    result_path: str,
+) -> bool:
+    import os
+
+    try:
+        return os.path.isfile(
+            _calendar_result_ack_path(
+                result_path
+            )
+        )
+    except Exception:
+        return False
+
+
+def _calendar_result_write_ack(
+    result_path: str,
+    *,
+    value_id: str,
+    event_id: str,
+    server_received_ms=None,
+) -> bool:
+    """
+    Persist ACK only AFTER the API returned HTTP 200.
+
+    Atomic temp -> replace prevents partial ACK state.
+    """
+    import json
+    import os
+    import time
+
+    ack_path = _calendar_result_ack_path(
+        result_path
+    )
+
+    tmp_path = f"{ack_path}.tmp"
+
+    payload = {
+        "schema_version": 1,
+        "acked_at_ms": int(
+            time.time() * 1000
+        ),
+        "value_id": str(
+            value_id or ""
+        ).strip(),
+        "event_id": str(
+            event_id or ""
+        ).strip(),
+        "server_received_ms": (
+            int(server_received_ms)
+            if server_received_ms is not None
+            else None
+        ),
+    }
+
+    try:
+        with open(
+            tmp_path,
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(
+                payload,
+                fh,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            fh.flush()
+
+            try:
+                os.fsync(fh.fileno())
+            except Exception:
+                pass
+
+        os.replace(
+            tmp_path,
+            ack_path,
+        )
+
+        return True
+
+    except Exception as exc:
+        log.warning(
+            "[MT5_CAL_RESULT] ACK_WRITE_FAILED "
+            "path=%s ack_path=%s "
+            "value_id=%s err=%s",
+            result_path,
+            ack_path,
+            value_id,
+            exc,
+        )
+
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+        return False
+        
+def _calendar_result_paths(identity: dict) -> list[str]:
+    """
+    Discover finalized immutable result files for the current
+    broker account only.
+
+    MQL writes atomically, so only the final *.json pattern is read.
+    """
+    import glob
+    import os
+
+    login = str(identity.get("login") or "").strip()
+    server = _calendar_safe_file_part(
+        identity.get("server") or ""
+    )
+    commondata_path = str(
+        identity.get("commondata_path") or ""
+    ).strip()
+
+    if not login or not server or not commondata_path:
+        return []
+
+    pattern = os.path.join(
+        commondata_path,
+        "Files",
+        "XTL",
+        f"mt5_calendar_{server}_{login}_result_*.json",
+    )
+
+    try:
+        paths = glob.glob(pattern)
+    except Exception:
+        return []
+
+    # Oldest first gives deterministic startup recovery.
+    try:
+        paths.sort(
+            key=lambda p: (
+                os.path.getmtime(p),
+                p,
+            )
+        )
+    except Exception:
+        paths.sort()
+
+    pending = []
+
+    for path in paths:
+        if _calendar_result_is_acked(path):
+            continue
+
+        pending.append(path)
+
+        if (
+            len(pending)
+            >= _XTL_CALENDAR_RESULT_MAX_FILES_PER_PASS
+        ):
+            break
+
+    return pending
+
+
+def _calendar_load_result_json(path: str) -> dict:
+    import json
+    import os
+
+    if not path or not os.path.isfile(path):
+        return {}
+
+    try:
+        size = int(os.path.getsize(path))
+    except Exception:
+        return {}
+
+    if (
+        size <= 0
+        or size > _XTL_CALENDAR_RESULT_MAX_FILE_BYTES
+    ):
+        log.warning(
+            "[MT5_CAL_RESULT] FILE_SIZE_INVALID "
+            "path=%s bytes=%s",
+            path,
+            size,
+        )
+        return {}
+
+    try:
+        with open(
+            path,
+            "r",
+            encoding="utf-8-sig",
+        ) as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        log.warning(
+            "[MT5_CAL_RESULT] FILE_READ_FAILED "
+            "path=%s err=%s",
+            path,
+            exc,
+        )
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def _calendar_numeric_present(value) -> bool:
+    if isinstance(value, dict):
+        return (
+            value.get("raw") is not None
+            or value.get("value") is not None
+        )
+
+    return value is not None
+
+
+def _calendar_normalize_result(
+    raw: dict,
+    identity: dict,
+) -> tuple[dict | None, str]:
+    """
+    Convert one immutable EA result file into the API payload.
+
+    first_result_seen_utc_ms is copied exactly from the EA.
+    No Strategy-B interpretation happens here.
+    """
+    if not isinstance(raw, dict):
+        return None, "invalid_payload"
+
+    try:
+        schema_version = int(
+            raw.get("schema_version") or 0
+        )
+    except Exception:
+        schema_version = 0
+
+    if schema_version != 1:
+        return None, "schema_version_invalid"
+
+    if (
+        str(raw.get("source") or "").strip()
+        != "MT5_CALENDAR_RESULT_OBSERVER"
+    ):
+        return None, "source_invalid"
+
+    account = raw.get("account") or {}
+
+    if not isinstance(account, dict):
+        return None, "account_invalid"
+
+    incoming_login = str(
+        account.get("login") or ""
+    ).strip()
+    incoming_server = str(
+        account.get("server") or ""
+    ).strip()
+
+    current_login = str(
+        identity.get("login") or ""
+    ).strip()
+    current_server = str(
+        identity.get("server") or ""
+    ).strip()
+
+    if (
+        not incoming_login
+        or incoming_login != current_login
+    ):
+        return None, "account_login_mismatch"
+
+    if (
+        not incoming_server
+        or incoming_server.casefold()
+        != current_server.casefold()
+    ):
+        return None, "account_server_mismatch"
+
+    try:
+        first_seen_ms = int(
+            raw.get("first_result_seen_utc_ms")
+            or 0
+        )
+    except Exception:
+        first_seen_ms = 0
+
+    if first_seen_ms <= 0:
+        return None, "first_result_seen_missing"
+
+    try:
+        offset_min = int(
+            raw.get("broker_tz_offset_minutes")
+        )
+    except Exception:
+        return None, "broker_offset_invalid"
+
+    tz_source = str(
+        raw.get("broker_timezone_source")
+        or ""
+    ).strip()
+
+    if (
+        tz_source != "auto_detected"
+        or offset_min < -840
+        or offset_min > 840
+    ):
+        return None, "broker_timezone_invalid"
+
+    event = raw.get("event") or {}
+
+    if not isinstance(event, dict):
+        return None, "event_invalid"
+
+    value_id = str(
+        event.get("value_id") or ""
+    ).strip()
+    event_id = str(
+        event.get("event_id") or ""
+    ).strip()
+    event_name = str(
+        event.get("event_name") or ""
+    ).strip()
+    currency = str(
+        event.get("currency") or ""
+    ).upper().strip()
+
+    if not value_id:
+        return None, "value_id_missing"
+
+    if not event_id:
+        return None, "event_id_missing"
+
+    if not event_name:
+        return None, "event_name_missing"
+
+    if currency not in _XTL_CALENDAR_ALLOWED_CCY:
+        return None, "currency_invalid"
+
+    if not _calendar_numeric_present(
+        event.get("actual")
+    ):
+        return None, "actual_missing"
+
+    # Result file contains MT5 server-time event epoch.
+    # Normalize exactly as the scheduled-calendar path does.
+    try:
+        event_time_server_epoch = int(
+            event.get("event_time_server_epoch")
+            or 0
+        )
+    except Exception:
+        event_time_server_epoch = 0
+
+    if event_time_server_epoch <= 0:
+        return None, "event_time_server_missing"
+
+    event_time_utc_ms = (
+        event_time_server_epoch * 1000
+        - offset_min * 60_000
+    )
+
+    normalized_event = dict(event)
+    normalized_event["value_id"] = value_id
+    normalized_event["event_id"] = event_id
+    normalized_event["event_name"] = event_name
+    normalized_event["currency"] = currency
+    normalized_event[
+        "event_time_utc_ms"
+    ] = int(event_time_utc_ms)
+
+    # Server owns canonical source naming.
+    normalized_event["source"] = (
+        "MT5_CALENDAR_RESULT_OBSERVER"
+    )
+
+    payload = {
+        "schema_version": 1,
+        "source": "MT5_CALENDAR_RESULT_OBSERVER",
+
+        "account": {
+            "login": incoming_login,
+            "server": incoming_server,
+            "company": str(
+                account.get("company")
+                or identity.get("company")
+                or ""
+            ).strip(),
+        },
+
+        "first_result_seen_utc_ms": first_seen_ms,
+
+        "broker_tz_offset_minutes": offset_min,
+        "broker_timezone": str(
+            raw.get("broker_timezone") or ""
+        ).strip(),
+        "broker_timezone_source": tz_source,
+
+        "reason": str(
+            raw.get("reason") or ""
+        ).strip(),
+
+        "calendar_change_id": raw.get(
+            "calendar_change_id"
+        ),
+
+        "event": normalized_event,
+    }
+
+    return payload, ""
+
+
+def push_mt5_calendar_results_once(
+    api_base: str,
+    device_id: str,
+    token: str,
+    identity: dict,
+) -> tuple[bool, str, int]:
+    """
+    Upload current-account immutable result files.
+
+    Files are intentionally NOT deleted after ACK.
+    Server SET-NX idempotency makes restart replay safe.
+    """
+    paths = _calendar_result_paths(identity)
+
+    if not paths:
+        return True, "no_results", 0
+
+    acked = 0
+
+    for path in paths:
+        raw = _calendar_load_result_json(path)
+
+        if not raw:
+            return False, "result_file_invalid", acked
+
+        payload, err = _calendar_normalize_result(
+            raw,
+            identity,
+        )
+
+        if payload is None:
+            log.warning(
+                "[MT5_CAL_RESULT] SKIP "
+                "path=%s reason=%s",
+                path,
+                err,
+            )
+            return False, err or "normalize_failed", acked
+
+        response = api_post(
+            api_base,
+            f"/devices/{device_id}/mt5/calendar/result",
+            payload,
+            token=token,
+            timeout=8,
+        )
+
+        status_code = int(
+            getattr(
+                response,
+                "status_code",
+                0,
+            )
+            or 0
+        )
+
+        if status_code != 200:
+            return (
+                False,
+                f"api_status_{status_code}",
+                acked,
+            )
+
+        # HTTP 200 means either:
+        #   stored=true
+        # or
+        #   duplicate=true
+        #
+        # Both are durable server ACKs for this immutable value_id.
+        try:
+            response_body = (
+                response.json()
+                if hasattr(response, "json")
+                else {}
+            )
+        except Exception:
+            response_body = {}
+
+        if not isinstance(
+            response_body,
+            dict,
+        ):
+            response_body = {}
+
+        server_ok = (
+            response_body.get("ok")
+            is True
+        )
+
+        server_value_id = str(
+            response_body.get("value_id")
+            or ""
+        ).strip()
+
+        server_event_id = str(
+            response_body.get("event_id")
+            or ""
+        ).strip()
+
+        expected_value_id = str(
+            payload["event"].get(
+                "value_id"
+            )
+            or ""
+        ).strip()
+
+        expected_event_id = str(
+            payload["event"].get(
+                "event_id"
+            )
+            or ""
+        ).strip()
+
+        # Never create a local ACK merely because an arbitrary
+        # endpoint returned HTTP 200. Identity must agree.
+        if (
+            not server_ok
+            or server_value_id
+            != expected_value_id
+            or server_event_id
+            != expected_event_id
+        ):
+            log.warning(
+                "[MT5_CAL_RESULT] ACK_RESPONSE_INVALID "
+                "path=%s expected_value_id=%s "
+                "got_value_id=%s "
+                "expected_event_id=%s "
+                "got_event_id=%s body=%s",
+                path,
+                expected_value_id,
+                server_value_id,
+                expected_event_id,
+                server_event_id,
+                str(response_body)[:500],
+            )
+
+            return (
+                False,
+                "api_ack_identity_invalid",
+                acked,
+            )
+
+        server_received_ms = (
+            response_body.get(
+                "server_received_ms"
+            )
+        )
+
+        if not _calendar_result_write_ack(
+            path,
+            value_id=expected_value_id,
+            event_id=expected_event_id,
+            server_received_ms=(
+                server_received_ms
+            ),
+        ):
+            # Server already owns the release, but the Agent failed
+            # to persist its local ACK. Retry next pass; server
+            # idempotency makes that safe.
+            return (
+                False,
+                "local_ack_write_failed",
+                acked,
+            )
+        acked += 1
+
+        log.warning(
+            "[MT5_CAL_RESULT] PUBLISH_OK "
+            "dev=%s login=%s server=%s "
+            "value_id=%s event_id=%s "
+            "first_seen_ms=%s path=%s",
+            device_id,
+            identity.get("login"),
+            identity.get("server"),
+            payload["event"].get("value_id"),
+            payload["event"].get("event_id"),
+            payload.get(
+                "first_result_seen_utc_ms"
+            ),
+            path,
+        )
+
+    return True, "published", acked
+
+
+def _mt5_calendar_result_worker_loop(
+    api_base: str,
+    device_id: str,
+    token: str,
+    check_sec: float = (
+        _XTL_CALENDAR_RESULT_CHECK_SEC
+    ),
+):
+    """
+    Fast local-file observer.
+
+    No MT5 calendar API calls.
+    No Redis.
+    No Strategy-B interpretation.
+    No OHLC/tick integration.
+    """
+    name = threading.current_thread().name
+
+    period = max(
+        1.0,
+        float(
+            check_sec
+            or _XTL_CALENDAR_RESULT_CHECK_SEC
+        ),
+    )
+
+    identity = {}
+    identity_key = ""
+    next_identity_refresh = 0.0
+    next_run = time.monotonic()
+
+    consecutive_failures = 0
+
+    while True:
+        now_mono = time.monotonic()
+
+        if now_mono < next_run:
+            time.sleep(
+                min(
+                    1.0,
+                    max(
+                        0.1,
+                        next_run - now_mono,
+                    ),
+                )
+            )
+            continue
+
+        _worker_mark(
+            name,
+            "loop_started",
+            last_error="",
+        )
+
+        ok = False
+        reason = ""
+
+        try:
+            if (
+                not identity
+                or now_mono
+                >= next_identity_refresh
+            ):
+                new_identity = (
+                    _calendar_current_mt5_identity()
+                )
+
+                next_identity_refresh = (
+                    now_mono
+                    + _XTL_CALENDAR_RESULT_IDENTITY_REFRESH_SEC
+                )
+
+                if not new_identity:
+                    identity = {}
+                    identity_key = ""
+                    reason = "mt5_identity_unavailable"
+                else:
+                    new_key = (
+                        f"{new_identity.get('server')}|"
+                        f"{new_identity.get('login')}"
+                    )
+
+                    if (
+                        identity_key
+                        and new_key != identity_key
+                    ):
+                        log.warning(
+                            "[MT5_CAL_RESULT] "
+                            "ACCOUNT_SWITCH "
+                            "old=%s new=%s",
+                            identity_key,
+                            new_key,
+                        )
+
+                    identity = new_identity
+                    identity_key = new_key
+
+            if identity:
+                ok, reason, acked = (
+                    push_mt5_calendar_results_once(
+                        api_base,
+                        device_id,
+                        token,
+                        identity,
+                    )
+                )
+
+                if acked:
+                    log.info(
+                        "[MT5_CAL_RESULT] BATCH_OK "
+                        "dev=%s acked=%s",
+                        device_id,
+                        acked,
+                    )
+            else:
+                ok = False
+
+            if ok:
+                consecutive_failures = 0
+
+                _worker_mark(
+                    name,
+                    "loop_completed",
+                    last_success=time.monotonic(),
+                    consecutive_failures=0,
+                )
+            else:
+                consecutive_failures += 1
+
+                _worker_mark(
+                    name,
+                    "loop_completed",
+                    consecutive_failures=(
+                        consecutive_failures
+                    ),
+                    last_error=reason,
+                )
+
+        except Exception as exc:
+            consecutive_failures += 1
+
+            reason = (
+                f"{type(exc).__name__}:{exc}"
+            )
+
+            _worker_mark(
+                name,
+                "loop_completed",
+                consecutive_failures=(
+                    consecutive_failures
+                ),
+                last_error=reason,
+            )
+
+            log.exception(
+                "[MT5_CAL_RESULT] WORKER_EXC "
+                "dev=%s err=%s",
+                device_id,
+                exc,
+            )
+
+        next_run = time.monotonic() + period
+
+
+def start_mt5_calendar_result_worker(
+    api_base,
+    device_id,
+    token,
+    check_sec=2.0,
+):
+    log.info(
+        "[MT5_CAL_RESULT] starting worker "
+        "dev=%s check_sec=%s",
+        device_id,
+        check_sec,
+    )
+
+    _ensure_worker_supervisor()
+
+    return _start_supervised_thread(
+        "mt5-calendar-result-worker",
+        _mt5_calendar_result_worker_loop,
+        (
+            api_base,
+            device_id,
+            token,
+            float(check_sec),
+        ),
+    )
+        
 def start_mt5_calendar_worker(
     api_base,
     device_id,
@@ -4424,6 +5225,12 @@ def start_ohlc_worker(
         device_id,
         token,
         300.0,
+    )
+    start_mt5_calendar_result_worker(
+        api_base,
+        device_id,
+        token,
+        2.0,
     )
     return _start_supervised_thread(
         "ohlc-worker",

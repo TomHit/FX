@@ -409,6 +409,59 @@ def start_oppt_executor_manager() -> None:
                     pid,
                 )
 
+            # ---------------------------------------------------------
+            # Strategy-B Macro Reversal Swing observer.
+            #
+            # Independent of Strategy-A enabled users.
+            # Observation/shadow path only:
+            # - no broker/order authority here
+            # - no Strategy-A Redis mutation
+            # - service owns its cross-worker Redis tick lock
+            # - failure must never interrupt Strategy-A
+            # ---------------------------------------------------------
+            try:
+                from api.strategy_b_macro_service import (
+                    tick_strategy_b_macro_observer,
+                )
+
+                _strategy_b_stats = (
+                    tick_strategy_b_macro_observer(
+                        R=R,
+                        now_ms=int(now_ms),
+                    )
+                    or {}
+                )
+
+                if (
+                    int(_strategy_b_stats.get("release_consumed") or 0) > 0
+                    or int(_strategy_b_stats.get("active_evaluated") or 0) > 0
+                    or int(_strategy_b_stats.get("release_errors") or 0) > 0
+                    or int(_strategy_b_stats.get("active_errors") or 0) > 0
+                ):
+                    log.info(
+                        "[STRATEGY_B] macro tick "
+                        "owners=%s release_seen=%s release_consumed=%s "
+                        "active_checked=%s active_evaluated=%s "
+                        "active_wait=%s release_errors=%s "
+                        "active_errors=%s dxy_ok=%s dxy_reason=%s",
+                        _strategy_b_stats.get("owners"),
+                        _strategy_b_stats.get("release_seen"),
+                        _strategy_b_stats.get("release_consumed"),
+                        _strategy_b_stats.get("active_checked"),
+                        _strategy_b_stats.get("active_evaluated"),
+                        _strategy_b_stats.get("active_wait"),
+                        _strategy_b_stats.get("release_errors"),
+                        _strategy_b_stats.get("active_errors"),
+                        _strategy_b_stats.get("dxy_input_ok"),
+                        _strategy_b_stats.get("dxy_input_reason"),
+                    )
+
+            except Exception:
+                log.exception(
+                    "[STRATEGY_B] macro observer manager failure pid=%s",
+                    pid,
+                )
+
             # Strategy execution can sleep longer when nobody is enabled.
             # Global DXY and analytics maintenance above have already run.
             if enabled_n <= 0:

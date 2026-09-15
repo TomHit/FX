@@ -18262,6 +18262,51 @@ REJECTED_JSONL = "/opt/xauapi/api/trend/out/trades_rejected.jsonl"
 POINT_A_JSONL = "/opt/xauapi/api/trend/out/point_a_events.jsonl"
 POINT_A_JSONL_LOCK = POINT_A_JSONL + ".lock"
 
+# -----------------------------------------------------------------------------
+# Pre-entry DXY / symbol-response research
+#
+# Shadow-only dataset used to study:
+#
+#   DXY starts moving
+#       vs
+#   symbol WAIT_ZONE_TOUCH / REV_WATCH / REV_OK timing
+#
+# This dataset has NO execution authority.
+# -----------------------------------------------------------------------------
+
+PRE_ENTRY_DXY_JSONL = (
+    "/opt/xauapi/api/trend/out/pre_entry_dxy_response.jsonl"
+)
+
+PRE_ENTRY_DXY_JSONL_LOCK = PRE_ENTRY_DXY_JSONL + ".lock"
+
+# Marker TTL is deliberately short/bounded.
+# Identity is based on the actual canonical DXY M15 evaluated bar,
+# so this does not require Redis SCAN and does not create a hot loop.
+PRE_ENTRY_DXY_DEDUP_TTL_SEC = 2 * 24 * 60 * 60
+
+@contextmanager
+def _pre_entry_dxy_jsonl_lock():
+    lf = open(
+        PRE_ENTRY_DXY_JSONL_LOCK,
+        "a+",
+        encoding="utf-8",
+    )
+    try:
+        fcntl.flock(
+            lf.fileno(),
+            fcntl.LOCK_EX,
+        )
+        yield
+    finally:
+        try:
+            fcntl.flock(
+                lf.fileno(),
+                fcntl.LOCK_UN,
+            )
+        finally:
+            lf.close()
+
 
 @contextmanager
 def _point_a_jsonl_lock():
@@ -18284,6 +18329,639 @@ def _point_a_jsonl_lock():
             )
         finally:
             lf.close()
+
+def capture_pre_entry_dxy_response(
+    *,
+    R,
+    uid: str | None,
+    profile_id: str | None,
+    device_id: str | None,
+    symbol: str,
+    side: str,
+    lifecycle_stage: str,
+    watch: dict | None = None,
+    zone: dict | None = None,
+    live_price: float | None = None,
+    atr: float | None = None,
+    event_ms: int | None = None,
+) -> bool:
+    """
+    Capture one bounded pre-entry symbol/DXY observation.
+
+    SHADOW ANALYTICS ONLY.
+
+    Intended stages:
+        WAIT_ZONE_TOUCH
+        REV_WATCH
+
+    Important:
+      - canonical REAL_DXY only
+      - no synthetic fallback
+      - no gate / watch / order modification
+      - no Redis SCAN
+      - at most one record per:
+            setup + lifecycle stage + canonical DXY M15 evaluated bar
+      - failures are swallowed
+    """
+    dedup_key = None
+
+    try:
+        if R is None:
+            return False
+
+        sym_u = str(symbol or "").upper().strip()
+        side_u = str(
+            side
+            or (
+                watch.get("direction")
+                if isinstance(watch, dict)
+                else ""
+            )
+            or ""
+        ).upper().strip()
+
+        stage_u = str(
+            lifecycle_stage or ""
+        ).upper().strip()
+
+        if not sym_u:
+            return False
+
+        if side_u not in ("BUY", "SELL"):
+            return False
+
+        if stage_u not in (
+            "WAIT_ZONE_TOUCH",
+            "REV_WATCH",
+        ):
+            return False
+
+        w = (
+            watch
+            if isinstance(watch, dict)
+            else {}
+        )
+
+        z = (
+            zone
+            if isinstance(zone, dict)
+            else (
+                w.get("zone_used")
+                if isinstance(
+                    w.get("zone_used"),
+                    dict,
+                )
+                else {}
+            )
+        )
+
+        ts = int(
+            event_ms
+            or _now_ms()
+        )
+
+        # ---------------------------------------------------------
+        # Canonical REAL_DXY only.
+        #
+        # Match Point-A source philosophy. This research must not
+        # mix FTMO REAL_DXY with synthetic or per-trade-device DXY.
+        # ---------------------------------------------------------
+        raw_canonical = R.get(
+            DXY_CANONICAL_CONFIG_KEY
+        )
+
+        canonical = _json_load(
+            raw_canonical,
+            {},
+        )
+
+        if not isinstance(canonical, dict):
+            return False
+
+        canonical_source = str(
+            canonical.get("source")
+            or ""
+        ).upper().strip()
+
+        real_dev = str(
+            canonical.get("device_id")
+            or canonical.get("real_device_id")
+            or ""
+        ).strip()
+
+        if (
+            canonical_source != "REAL_DXY"
+            or not real_dev
+        ):
+            return False
+
+        # ---------------------------------------------------------
+        # Current canonical M15 turn state.
+        # ---------------------------------------------------------
+        dxy_state = _json_load(
+            R.get(
+                f"{DXY_M15_STATE_PREFIX}:"
+                f"REAL_DXY:{real_dev}"
+            ),
+            {},
+        )
+
+        if not isinstance(dxy_state, dict):
+            return False
+
+        if not dxy_state:
+            return False
+
+        dxy_status = str(
+            dxy_state.get("status")
+            or ""
+        ).upper().strip()
+
+        dxy_direction = str(
+            dxy_state.get("direction")
+            or dxy_state.get("candidate_direction")
+            or ""
+        ).upper().strip()
+
+        candidate_started_ms = _safe_int(
+            dxy_state.get("candidate_started_ms"),
+            0,
+        ) or 0
+
+        confirmed_ms = _safe_int(
+            dxy_state.get("confirmed_ms"),
+            0,
+        ) or 0
+
+        # ---------------------------------------------------------
+        # We are specifically studying a DXY directional lifecycle.
+        #
+        # IDLE/no-candidate periods add volume but no useful evidence.
+        # Keep PENDING/CONFIRMED/etc if they retain candidate identity.
+        # ---------------------------------------------------------
+        if (
+            candidate_started_ms <= 0
+            and confirmed_ms <= 0
+        ):
+            return False
+
+        dxy_bar_ms = _safe_int(
+            dxy_state.get(
+                "last_evaluated_bar_close_ms"
+            )
+            or dxy_state.get(
+                "broker_bar_close_ms"
+            )
+            or dxy_state.get(
+                "bar_close_ms"
+            ),
+            0,
+        ) or 0
+
+        if dxy_bar_ms <= 0:
+            return False
+
+        if 0 < dxy_bar_ms < 10_000_000_000:
+            dxy_bar_ms *= 1000
+
+        # ---------------------------------------------------------
+        # Setup identity.
+        #
+        # Pre-touch has no frozen watch yet, so use current planned
+        # zone geometry. Post-touch uses immutable started_ms.
+        # ---------------------------------------------------------
+        started_ms = _safe_int(
+            w.get("started_ms")
+            or w.get("watch_created_ms"),
+            0,
+        ) or 0
+
+        touch_open_ms = _safe_int(
+            w.get("touch_open_ms"),
+            0,
+        ) or 0
+
+        touch_close_ms = _safe_int(
+            w.get("touch_close_ms"),
+            0,
+        ) or 0
+
+        zone_low = _safe_float(
+            z.get("low")
+            if isinstance(z, dict)
+            else None
+        )
+
+        zone_high = _safe_float(
+            z.get("high")
+            if isinstance(z, dict)
+            else None
+        )
+
+        zone_level = _safe_float(
+            z.get("level")
+            if isinstance(z, dict)
+            else None
+        )
+
+        if started_ms > 0:
+            setup_identity = str(
+                started_ms
+            )
+        else:
+            setup_identity = (
+                f"{zone_low}:"
+                f"{zone_high}:"
+                f"{zone_level}"
+            )
+
+        # ---------------------------------------------------------
+        # One record per DXY M15 bar / stage / setup.
+        #
+        # No SCAN. NX marker makes repeated gate evaluations cheap
+        # after the first successful sample.
+        # ---------------------------------------------------------
+        dedup_key = (
+            "xtl:analytics:pre_entry_dxy:"
+            f"{str(uid or '').strip()}:"
+            f"{sym_u}:"
+            f"{side_u}:"
+            f"{stage_u}:"
+            f"{setup_identity}:"
+            f"{dxy_bar_ms}"
+        )
+
+        claimed = R.set(
+            dedup_key,
+            "1",
+            nx=True,
+            ex=PRE_ENTRY_DXY_DEDUP_TTL_SEC,
+        )
+
+        if not claimed:
+            return False
+
+        # ---------------------------------------------------------
+        # Required DXY direction for this proposed trade.
+        # Same six-symbol relationship used elsewhere in XTL.
+        # ---------------------------------------------------------
+        required_dxy_direction = None
+
+        if sym_u in (
+            "EURUSD",
+            "GBPUSD",
+            "XAUUSD",
+        ):
+            required_dxy_direction = (
+                "BEARISH"
+                if side_u == "BUY"
+                else "BULLISH"
+            )
+
+        elif sym_u in (
+            "USDJPY",
+            "USDCHF",
+            "USDCAD",
+        ):
+            required_dxy_direction = (
+                "BULLISH"
+                if side_u == "BUY"
+                else "BEARISH"
+            )
+
+        dxy_trade_alignment = None
+
+        if (
+            required_dxy_direction
+            and dxy_direction
+            in ("BULLISH", "BEARISH")
+        ):
+            dxy_trade_alignment = (
+                "ALIGNED"
+                if dxy_direction
+                == required_dxy_direction
+                else "OPPOSITE"
+            )
+
+        # ---------------------------------------------------------
+        # Symbol geometry at this exact observation.
+        # ---------------------------------------------------------
+        px = _safe_float(live_price)
+        atr_f = _safe_float(atr)
+
+        distance_to_zone = None
+        distance_to_zone_atr = None
+        zone_position = None
+
+        if (
+            px is not None
+            and zone_low is not None
+            and zone_high is not None
+        ):
+            zl = min(
+                float(zone_low),
+                float(zone_high),
+            )
+            zh = max(
+                float(zone_low),
+                float(zone_high),
+            )
+
+            if zl <= px <= zh:
+                distance_to_zone = 0.0
+                zone_position = "INSIDE_ZONE"
+
+            elif px < zl:
+                distance_to_zone = zl - px
+                zone_position = "BELOW_ZONE"
+
+            else:
+                distance_to_zone = px - zh
+                zone_position = "ABOVE_ZONE"
+
+            if (
+                atr_f is not None
+                and atr_f > 0
+            ):
+                distance_to_zone_atr = (
+                    distance_to_zone
+                    / atr_f
+                )
+
+        # ---------------------------------------------------------
+        # Compact M15 feature/context snapshot.
+        # Keep enough immutable evidence for later pandas analysis.
+        # ---------------------------------------------------------
+        features = (
+            dxy_state.get("features")
+            if isinstance(
+                dxy_state.get("features"),
+                dict,
+            )
+            else {}
+        )
+
+        market_flow = (
+            features.get("market_flow")
+            if isinstance(
+                features.get("market_flow"),
+                dict,
+            )
+            else {}
+        )
+
+        structure = (
+            market_flow.get("structure")
+            if isinstance(
+                market_flow.get("structure"),
+                dict,
+            )
+            else {}
+        )
+
+        rec = {
+            "schema_version": 1,
+            "analytics_only": True,
+            "dataset": "PRE_ENTRY_DXY_RESPONSE",
+
+            "event_ms": ts,
+
+            "uid": (
+                str(uid or "").strip()
+                or None
+            ),
+            "profile_id": (
+                str(
+                    profile_id or ""
+                ).strip().lower()
+                or None
+            ),
+            "trade_device_id": (
+                str(device_id or "").strip()
+                or None
+            ),
+
+            "symbol": sym_u,
+            "side": side_u,
+            "lifecycle_stage": stage_u,
+
+            # ---------------------------------------------
+            # Symbol lifecycle clock.
+            # ---------------------------------------------
+            "watch_state": (
+                str(
+                    w.get("state") or ""
+                ).upper().strip()
+                or None
+            ),
+            "watch_started_ms": (
+                started_ms or None
+            ),
+            "touch_open_ms": (
+                touch_open_ms or None
+            ),
+            "touch_close_ms": (
+                touch_close_ms or None
+            ),
+            "touch_source": (
+                w.get("touch_source")
+            ),
+
+            # ---------------------------------------------
+            # Symbol state at this DXY M15 observation.
+            # ---------------------------------------------
+            "symbol_price": px,
+            "symbol_atr": atr_f,
+
+            "zone": {
+                "low": zone_low,
+                "high": zone_high,
+                "level": zone_level,
+                "tf": (
+                    z.get("tf")
+                    if isinstance(z, dict)
+                    else None
+                ),
+                "kind": (
+                    z.get("kind")
+                    if isinstance(z, dict)
+                    else None
+                ),
+                "zone_source": (
+                    z.get("zone_source")
+                    if isinstance(z, dict)
+                    else None
+                ),
+                "source_type": (
+                    z.get("source_type")
+                    if isinstance(z, dict)
+                    else None
+                ),
+            },
+
+            "zone_position": zone_position,
+            "distance_to_zone": (
+                round(
+                    distance_to_zone,
+                    10,
+                )
+                if distance_to_zone
+                is not None
+                else None
+            ),
+            "distance_to_zone_atr": (
+                round(
+                    distance_to_zone_atr,
+                    4,
+                )
+                if distance_to_zone_atr
+                is not None
+                else None
+            ),
+
+            # ---------------------------------------------
+            # DXY macro clock.
+            # ---------------------------------------------
+            "dxy": {
+                "source": "REAL_DXY",
+                "device_id": real_dev,
+
+                "m15_bar_close_ms": dxy_bar_ms,
+
+                "status": (
+                    dxy_status or None
+                ),
+                "direction": (
+                    dxy_direction or None
+                ),
+
+                "required_direction_for_trade": (
+                    required_dxy_direction
+                ),
+                "trade_alignment": (
+                    dxy_trade_alignment
+                ),
+
+                "candidate_started_ms": (
+                    candidate_started_ms
+                    or None
+                ),
+                "confirmed_ms": (
+                    confirmed_ms
+                    or None
+                ),
+                "candidate_age_bars": (
+                    dxy_state.get(
+                        "candidate_age_bars"
+                    )
+                ),
+                "candidate_start_price": (
+                    dxy_state.get(
+                        "candidate_start_price"
+                    )
+                ),
+                "candidate_start_atr": (
+                    dxy_state.get(
+                        "candidate_start_atr"
+                    )
+                ),
+
+                "directional_move_atr": (
+                    dxy_state.get(
+                        "directional_move_atr"
+                    )
+                ),
+                "max_favorable_atr": (
+                    dxy_state.get(
+                        "max_favorable_atr"
+                    )
+                ),
+                "max_adverse_atr": (
+                    dxy_state.get(
+                        "max_adverse_atr"
+                    )
+                ),
+
+                "revoke_score": (
+                    dxy_state.get(
+                        "revoke_score"
+                    )
+                ),
+                "revoke_reasons": list(
+                    dxy_state.get(
+                        "revoke_reasons"
+                    )
+                    or []
+                ),
+
+                "recent_net_atr": (
+                    features.get(
+                        "recent_net_atr"
+                    )
+                ),
+
+                "structure_pressure": (
+                    structure.get(
+                        "structure_pressure"
+                    )
+                ),
+                "structure_pressure_reason": (
+                    structure.get(
+                        "structure_pressure_reason"
+                    )
+                ),
+                "directional_room_atr": (
+                    structure.get(
+                        "directional_room_atr"
+                    )
+                ),
+            },
+        }
+
+        os.makedirs(
+            os.path.dirname(
+                PRE_ENTRY_DXY_JSONL
+            ),
+            exist_ok=True,
+        )
+
+        with _pre_entry_dxy_jsonl_lock():
+            with open(
+                PRE_ENTRY_DXY_JSONL,
+                "a",
+                encoding="utf-8",
+            ) as f:
+                f.write(
+                    json.dumps(
+                        rec,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                    + "\n"
+                )
+                f.flush()
+
+        return True
+
+    except Exception as exc:
+        # If append/capture failed after claiming this sample,
+        # release the marker so a later gate evaluation may retry.
+        if dedup_key and R is not None:
+            try:
+                R.delete(dedup_key)
+            except Exception:
+                pass
+
+        log.warning(
+            "analytics: pre-entry DXY capture failed "
+            "symbol=%s side=%s stage=%s err=%r",
+            symbol,
+            side,
+            lifecycle_stage,
+            exc,
+        )
+
+        return False
 
 
 def capture_point_a_event(

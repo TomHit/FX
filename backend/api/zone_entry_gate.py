@@ -3918,6 +3918,225 @@ def zone_reversal_gate(
         except Exception:
             return None
 
+    def _execution_zone_geometry(
+        z: dict,
+        side: str,
+        atr_value: float,
+        symbol: str,
+    ) -> dict:
+        """
+        Convert overly broad structural SR regions into a tighter
+        H1 execution band without destroying the original structure.
+
+        Only STRUCTURE_ORIGIN / BASE_IMPULSE are normalized here.
+
+        SUPPORT:
+            keep proximal HIGH edge, slice downward.
+
+        RESISTANCE:
+            keep proximal LOW edge, slice upward.
+
+        Existing source geometry remains available in:
+            structural_low
+            structural_high
+            structural_width
+            structural_level
+        """
+        zz = dict(z or {})
+
+        if not isinstance(zz, dict):
+            return zz
+
+        try:
+            zl = float(
+                zz.get("low")
+                if zz.get("low") is not None
+                else zz.get("level")
+            )
+            zh = float(
+                zz.get("high")
+                if zz.get("high") is not None
+                else zz.get("level")
+            )
+        except Exception:
+            return zz
+
+        if zl > zh:
+            zl, zh = zh, zl
+
+        if zh <= zl:
+            return zz
+
+        # ---------------------------------------------------------
+        # Resolve original structural source.
+        #
+        # zone_source may already have been rewritten to
+        # BEST_SCORED_SR / H1_DISPLAY_ZONE, so source_type and
+        # merged_source_types remain the important provenance.
+        # ---------------------------------------------------------
+        sources = set()
+
+        try:
+            src = str(
+                zz.get("source_type")
+                or zz.get("source")
+                or ""
+            ).upper().strip()
+
+            if src:
+                sources.add(src)
+        except Exception:
+            pass
+
+        try:
+            merged = zz.get("merged_source_types") or []
+
+            if isinstance(merged, (list, tuple, set)):
+                for src in merged:
+                    s = str(src or "").upper().strip()
+                    if s:
+                        sources.add(s)
+        except Exception:
+            pass
+
+        # ---------------------------------------------------------
+        # Compress only genuinely broad structural geometry.
+        #
+        # A merged/refined zone may retain STRUCTURE_ORIGIN or
+        # BASE_IMPULSE in merged_source_types as provenance even
+        # though its current low/high geometry was already refined
+        # by another SR model.
+        #
+        # Do NOT re-compress those refined geometries merely because
+        # structural provenance remains in the merged source list.
+        # ---------------------------------------------------------
+        primary_source = str(
+            zz.get("source_type")
+            or zz.get("source")
+            or ""
+        ).upper().strip()
+
+        refined_sources = {
+            "TIGHT_IQR",
+            "TIGHT_IQR_EXPANDED",
+            "WIDE_IQR_EXPANDED",
+            "CURRENT_STRUCTURE_HIGH",
+            "CURRENT_STRUCTURE_LOW",
+            "RECENT_HIGH_CLUSTER",
+            "RECENT_LOW_CLUSTER",
+            "REACTION_ZONE",
+        }
+
+        primary_is_broad_structural = (
+            primary_source in {
+                "STRUCTURE_ORIGIN",
+                "BASE_IMPULSE",
+            }
+        )
+
+        primary_is_refined = (
+            primary_source in refined_sources
+        )
+
+        broad_structural_source = bool(
+            primary_is_broad_structural
+            and not primary_is_refined
+        )
+
+        if not broad_structural_source:
+            return zz
+
+        structural_width = float(zh - zl)
+
+        try:
+            atr_v = float(atr_value or 0.0)
+        except Exception:
+            atr_v = 0.0
+
+        if atr_v <= 0:
+            return zz
+
+        sym = str(symbol or "").upper().strip()
+
+        # Match XTL's existing pip semantics.
+        pip = (
+            0.01
+            if sym == "XAUUSD"
+            else (
+                0.01
+                if sym.endswith("JPY")
+                else 0.0001
+            )
+        )
+
+        # Same total-width philosophy as corrected CURRENT_STRUCTURE:
+        #     max(0.40 ATR, 10 pips)
+        execution_width = max(
+            0.40 * atr_v,
+            10.0 * pip,
+        )
+
+        # Do not widen an already-small structural zone.
+        if structural_width <= execution_width:
+            return zz
+
+        side_u = str(side or "").upper().strip()
+
+        if side_u == "BUY":
+            # Support is approached from above:
+            # preserve proximal/high edge.
+            actionable_high = float(zh)
+            actionable_low = max(
+                float(zl),
+                float(zh) - float(execution_width),
+            )
+
+        elif side_u == "SELL":
+            # Resistance is approached from below:
+            # preserve proximal/low edge.
+            actionable_low = float(zl)
+            actionable_high = min(
+                float(zh),
+                float(zl) + float(execution_width),
+            )
+
+        else:
+            return zz
+
+        if actionable_high <= actionable_low:
+            return zz
+
+        # Preserve original structural truth.
+        zz["structural_level"] = zz.get("level")
+        zz["structural_low"] = float(zl)
+        zz["structural_high"] = float(zh)
+        zz["structural_width"] = float(structural_width)
+
+        # Execution truth.
+        zz["actionable_low"] = float(actionable_low)
+        zz["actionable_high"] = float(actionable_high)
+        zz["actionable_width"] = float(
+            actionable_high - actionable_low
+        )
+        zz["actionable_geometry_applied"] = True
+        zz["actionable_geometry_source"] = (
+            "PROXIMAL_SLICE_MAX_0.40ATR_10PIP"
+        )
+
+        # IMPORTANT:
+        # From this point downstream gate lifecycle uses low/high.
+        zz["low"] = float(actionable_low)
+        zz["high"] = float(actionable_high)
+
+        # Keep band_width consistent with executable low/high,
+        # while retaining original width above.
+        zz["structural_band_width"] = zz.get("band_width")
+        zz["band_width"] = float(
+            actionable_high - actionable_low
+        )
+
+        return zz
+
     def _actionable_cap(sym_u: str, atr: float) -> float:
         base = float(move_away_atr) * float(atr)
         s = str(sym_u or "").upper().strip()
@@ -3990,12 +4209,26 @@ def zone_reversal_gate(
             if not isinstance(z, dict):
                 continue
 
-            d0 = _zone_band_dist(z, float(decision_px))
+            zz = _execution_zone_geometry(
+                z,
+                side,
+                float(atr),
+                sym_u,
+            )
+
+            zz["kind"] = (
+                "support"
+                if side == "BUY"
+                else "resistance"
+            )
+
+            d0 = _zone_band_dist(
+                zz,
+                float(decision_px),
+            )
+
             if d0 is None:
                 continue
-
-            zz = dict(z)
-            zz["kind"] = "support" if side == "BUY" else "resistance"
 
             # PHASE-1: H1 execution only.
             # H4 may be displayed separately, but must not win direction resolver
@@ -4012,11 +4245,124 @@ def zone_reversal_gate(
                 "tf_rank": 0,
             })
 
-        candidates.sort(key=lambda x: (float(x["dist"]), int(x["tf_rank"])))
+        candidates.sort(
+            key=lambda x: (
+                float(x["dist"]),
+                int(x["tf_rank"]),
+            )
+        )
 
-        if candidates and float(candidates[0]["dist"]) <= float(cap):
+        # --------------------------------------------------------
+        # ACTIONABLE SR COMPRESSION
+        #
+        # If price is simultaneously INSIDE the nearest actionable
+        # H1 support AND resistance, both sides have dist == 0.
+        #
+        # Previous behavior:
+        #   BUY candidates are appended before SELL candidates.
+        #   Python sort is stable.
+        #   Therefore a genuine 0-vs-0 conflict could become BUY
+        #   simply because BUY was inserted first.
+        #
+        # Never allow list ordering to choose market direction.
+        #
+        # This rule is intentionally conservative:
+        #   - only exact/near-exact 0-vs-0 containment is blocked
+        #   - ordinary nearby BUY/SELL competition is unchanged
+        # --------------------------------------------------------
+        _nearest_buy_candidate = next(
+            (
+                x
+                for x in candidates
+                if str(x.get("side") or "").upper() == "BUY"
+            ),
+            None,
+        )
+
+        _nearest_sell_candidate = next(
+            (
+                x
+                for x in candidates
+                if str(x.get("side") or "").upper() == "SELL"
+            ),
+            None,
+        )
+
+        _compression_eps = 1e-12
+
+        _actionable_sr_compression = bool(
+            isinstance(_nearest_buy_candidate, dict)
+            and isinstance(_nearest_sell_candidate, dict)
+            and float(
+                _nearest_buy_candidate.get("dist")
+                or 0.0
+            )
+            <= float(_compression_eps)
+            and float(
+                _nearest_sell_candidate.get("dist")
+                or 0.0
+            )
+            <= float(_compression_eps)
+        )
+
+        if _actionable_sr_compression:
+            resolved_dir = "WATCHING"
+            preferred_zone = None
+
+            gate["actionable_sr_compression"] = True
+            gate["actionable_sr_compression_reason"] = (
+                "PRICE_INSIDE_BOTH_H1_SUPPORT_AND_RESISTANCE"
+            )
+
+            gate["actionable_sr_compression_buy"] = {
+                "level": (
+                    _nearest_buy_candidate["zone"].get("level")
+                ),
+                "low": (
+                    _nearest_buy_candidate["zone"].get("low")
+                ),
+                "high": (
+                    _nearest_buy_candidate["zone"].get("high")
+                ),
+                "dist": float(
+                    _nearest_buy_candidate.get("dist")
+                    or 0.0
+                ),
+                "source_type": (
+                    _nearest_buy_candidate["zone"].get(
+                        "source_type"
+                    )
+                ),
+            }
+
+            gate["actionable_sr_compression_sell"] = {
+                "level": (
+                    _nearest_sell_candidate["zone"].get("level")
+                ),
+                "low": (
+                    _nearest_sell_candidate["zone"].get("low")
+                ),
+                "high": (
+                    _nearest_sell_candidate["zone"].get("high")
+                ),
+                "dist": float(
+                    _nearest_sell_candidate.get("dist")
+                    or 0.0
+                ),
+                "source_type": (
+                    _nearest_sell_candidate["zone"].get(
+                        "source_type"
+                    )
+                ),
+            }
+
+        elif (
+            candidates
+            and float(candidates[0]["dist"]) <= float(cap)
+        ):
             resolved_dir = candidates[0]["side"]
             preferred_zone = candidates[0]["zone"]
+
         else:
             resolved_dir = "WATCHING"
         if resolved_dir in ("BUY", "SELL"):
@@ -4025,8 +4371,17 @@ def zone_reversal_gate(
 
             if isinstance(best_zone, dict):
                 try:
-                    bz = dict(best_zone)
-                    _bz_dist = _zone_band_dist(bz, float(decision_px))
+                    bz = _execution_zone_geometry(
+                        best_zone,
+                        resolved_dir,
+                        float(atr),
+                        sym_u,
+                    )
+
+                    _bz_dist = _zone_band_dist(
+                        bz,
+                        float(decision_px),
+                    )
                     if (
                         bz.get("level") is not None
                         and bz.get("low") is not None
@@ -4088,9 +4443,67 @@ def zone_reversal_gate(
 
     def _is_protected_watch_state(st: str) -> bool:
         st_u = str(st or "").upper().strip()
-        return (
-            st_u in ("REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE")
+
+        return bool(
+            st_u in (
+                "REV_OK",
+                "ENTRY_READY",
+                "ORDER_PENDING",
+                "TRADE_ACTIVE",
+                "BROKER_CLOSE_PENDING",
+                "MISSED_BREAKOUT",
+                "ORDER_FAILED",
+                "ZONE_INVALIDATED",
+            )
             or st_u.startswith("ENTRY_BLOCKED")
+        )
+    def _is_touch_frozen_watch(w: dict) -> bool:
+        """
+        True only after an actual execution-zone touch has frozen the
+        structural setup.
+
+        IMPORTANT:
+        A freshly touched setup is currently persisted with state=WATCH,
+        even though gate semantics already call it REV_WATCH. Therefore
+        lifecycle ownership must use touch evidence, not only the state
+        string.
+
+        Point-A PRICE_TOO_FAR re-arm policy is handled separately by the
+        ownership resolver.
+        """
+        if not isinstance(w, dict):
+            return False
+
+        st_u = str(
+            w.get("state")
+            or w.get("trade_state")
+            or ""
+        ).upper().strip()
+
+        if st_u not in ("WATCH", "REV_WATCH"):
+            return False
+
+        if not isinstance(w.get("zone_used"), dict):
+            return False
+
+        try:
+            touch_open_ms = int(w.get("touch_open_ms") or 0)
+        except Exception:
+            touch_open_ms = 0
+
+        try:
+            touch_close_ms = int(w.get("touch_close_ms") or 0)
+        except Exception:
+            touch_close_ms = 0
+
+        touch_source = str(
+            w.get("touch_source") or ""
+        ).upper().strip()
+
+        return bool(
+            touch_open_ms > 0
+            or touch_close_ms > 0
+            or touch_source == "LIVE_TOUCH"
         )
 
     def _load_watch_for_dir(d: str):
@@ -4111,18 +4524,359 @@ def zone_reversal_gate(
         except Exception:
             return None, _watch_key(uid_u,sym_u, d, tfu)
 
-    # Prefer active frozen watch over newly resolved direction
+   
+    # ------------------------------------------------------------
+    # WATCH OWNERSHIP RESOLUTION
+    #
+    # HARD ownership:
+    #   confirmed / blocked / order / active / terminal lifecycle
+    #
+    # CONDITIONAL ownership:
+    #   WATCH / REV_WATCH
+    #
+    # Never allow BUY-before-SELL iteration order alone to choose
+    # lifecycle ownership.
+    # ------------------------------------------------------------
+    _watch_candidates = []
+
     for d0 in ("BUY", "SELL"):
         w0, k0 = _load_watch_for_dir(d0)
-        if isinstance(w0, dict) and isinstance(w0.get("zone_used"), dict):
-            watch = w0
-            wkey = k0
-            zone_used = w0.get("zone_used")
-            resolved_dir = str(w0.get("direction") or d0).upper()
-            gate["resolved_dir"] = resolved_dir
-            gate["watch_key"] = str(wkey)
-            gate["watch_reused"] = True
-            break
+
+        if not isinstance(w0, dict):
+            continue
+
+        zu0 = w0.get("zone_used")
+
+        if not isinstance(zu0, dict):
+            continue
+
+        st0 = str(
+            w0.get("state")
+            or w0.get("trade_state")
+            or ""
+        ).upper().strip()
+
+        dir0 = str(
+            w0.get("direction")
+            or d0
+        ).upper().strip()
+
+        try:
+            dist0 = _zone_band_dist(
+                zu0,
+                float(decision_px),
+            )
+        except Exception:
+            dist0 = None
+
+       
+        # --------------------------------------------------------
+        # Point-A PRICE_TOO_FAR RC re-arm ownership.
+        #
+        # The re-arm must survive ordinary distance eviction while
+        # waiting for a genuinely newer RC on the SAME setup.
+        #
+        # But it must NOT become unconditional direction ownership:
+        # if fresh H1 structure now resolves definitively to the
+        # opposite side, the retired setup must yield so fresh
+        # discovery can own the symbol.
+        #
+        # WATCHING / ambiguous fresh structure does not constitute
+        # an opposite structural decision, so preserve the re-arm.
+        # --------------------------------------------------------
+        point_a_rearm0 = bool(
+            st0 == "REV_WATCH"
+            and str(
+                w0.get("point_a_rc_rearm_reason")
+                or ""
+            ).upper().strip()
+            == "PRICE_TOO_FAR"
+            and int(
+                w0.get("point_a_last_retired_rc_ms")
+                or 0
+            ) > 0
+        )
+
+        _point_a_rearm_opposite_fresh_dir0 = bool(
+            point_a_rearm0
+            and resolved_dir in ("BUY", "SELL")
+            and dir0 in ("BUY", "SELL")
+            and dir0 != resolved_dir
+        )
+
+        # --------------------------------------------------------
+        # POST-TOUCH FROZEN OWNERSHIP
+        #
+        # WATCH is not necessarily "pre-touch". The live-touch
+        # creation path persists state=WATCH together with
+        # touch_open_ms/touch_close_ms/touch_source and zone_used.
+        #
+        # Once an actual zone touch has occurred, that direction
+        # and frozen zone own the lifecycle until normal lifecycle
+        # release/invalidation.
+        #
+        # Sole exception:
+        # Point-A PRICE_TOO_FAR is a retired-RC re-arm. It may yield
+        # when fresh H1 structure definitively resolves opposite.
+        # --------------------------------------------------------
+        touch_frozen0 = _is_touch_frozen_watch(w0)
+
+        hard0 = bool(
+            _is_protected_watch_state(st0)
+            or (
+                touch_frozen0
+                and not _point_a_rearm_opposite_fresh_dir0
+            )
+            or (
+                point_a_rearm0
+                and not _point_a_rearm_opposite_fresh_dir0
+            )
+        )
+
+        try:
+            started0 = int(
+                w0.get("started_ms")
+                or w0.get("watch_created_ms")
+                or 0
+            )
+        except Exception:
+            started0 = 0
+
+        _watch_candidates.append({
+            "watch": w0,
+            "key": k0,
+            "direction": dir0,
+            "state": st0,
+            "dist": dist0,
+            "hard": hard0,
+            "touch_frozen": touch_frozen0,
+            "point_a_rearm": point_a_rearm0,
+            "started_ms": started0,
+            "point_a_rearm_opposite_fresh_dir":
+                _point_a_rearm_opposite_fresh_dir0,
+        })
+
+    _selected_watch_candidate = None
+
+    # --------------------------------------------------------
+    # 1) HARD ownership always wins.
+    #
+    # In the abnormal case where both BUY and SELL hard watches
+    # exist, choose lifecycle importance first, then newest.
+    # --------------------------------------------------------
+    _hard_watch_candidates = [
+        x
+        for x in _watch_candidates
+        if bool(x.get("hard"))
+    ]
+
+    if _hard_watch_candidates:
+
+        def _hard_watch_rank(x):
+            st = str(
+                x.get("state")
+                or ""
+            ).upper().strip()
+
+            if st == "TRADE_ACTIVE":
+                rank = 100
+            elif st == "BROKER_CLOSE_PENDING":
+                rank = 95
+            elif st == "ORDER_PENDING":
+                rank = 90
+            elif st == "ENTRY_READY":
+                rank = 80
+            elif st.startswith("ENTRY_BLOCKED"):
+                rank = 70
+            elif st == "REV_OK":
+                rank = 60
+            elif bool(x.get("touch_frozen")):
+                rank = 55
+            elif bool(x.get("point_a_rearm")):
+                rank = 50
+            elif st in (
+                "MISSED_BREAKOUT",
+                "ORDER_FAILED",
+                "ZONE_INVALIDATED",
+            ):
+                rank = 40
+            else:
+                rank = 0
+
+            return (
+                int(rank),
+                int(x.get("started_ms") or 0),
+            )
+
+        _selected_watch_candidate = max(
+            _hard_watch_candidates,
+            key=_hard_watch_rank,
+        )
+
+    else:
+        # ----------------------------------------------------
+        # 2) CONDITIONAL ownership for WATCH / REV_WATCH.
+        #
+        # A watch must still be within the same actionable
+        # distance envelope used by discovery.
+        #
+        # This prevents a stale unconfirmed watch far away from
+        # price from overriding current H1 structure forever.
+        # ----------------------------------------------------
+        _conditional_watch_candidates = []
+
+        for x in _watch_candidates:
+            st = str(
+                x.get("state")
+                or ""
+            ).upper().strip()
+
+            if st not in ("WATCH", "REV_WATCH"):
+                continue
+
+            d = x.get("dist")
+
+            if d is None:
+                continue
+
+            if float(d) > float(cap):
+                continue
+
+            _conditional_watch_candidates.append(x)
+
+        # If fresh H1 direction has a same-side active watch,
+        # preserve that setup first.
+        if resolved_dir in ("BUY", "SELL"):
+            _same_side = [
+                x
+                for x in _conditional_watch_candidates
+                if str(
+                    x.get("direction")
+                    or ""
+                ).upper()
+                == resolved_dir
+            ]
+
+            if _same_side:
+                _selected_watch_candidate = min(
+                    _same_side,
+                    key=lambda x: (
+                        float(x.get("dist") or 0.0),
+                        -int(x.get("started_ms") or 0),
+                    ),
+                )
+
+        
+        # If fresh structure has a definite BUY/SELL direction,
+        # an opposite unconfirmed WATCH/REV_WATCH must NOT override it.
+        #
+        # Only when fresh structure is WATCHING/ambiguous may the
+        # nearest still-actionable frozen unconfirmed setup retain
+        # temporary ownership.
+        if (
+            _selected_watch_candidate is None
+            and resolved_dir not in ("BUY", "SELL")
+            and _conditional_watch_candidates
+        ):
+            _selected_watch_candidate = min(
+                _conditional_watch_candidates,
+                key=lambda x: (
+                    float(x.get("dist") or 0.0),
+                    -int(x.get("started_ms") or 0),
+                ),
+            )
+    # ------------------------------------------------------------
+    # Retire obsolete Point-A PRICE_TOO_FAR re-arms.
+    #
+    # A re-arm preserves the original structural setup only while
+    # fresh H1 discovery has not definitively selected the opposite
+    # direction.
+    #
+    # Once fresh structure flips BUY <-> SELL, the old REV_WATCH
+    # must not remain in Redis and later regain ownership through
+    # DIST_GUARD.
+    #
+    # Never applies to true protected lifecycle states.
+    # ------------------------------------------------------------
+    if resolved_dir in ("BUY", "SELL"):
+        for _cand in _watch_candidates:
+            if not bool(
+                _cand.get("point_a_rearm_opposite_fresh_dir")
+            ):
+                continue
+
+            _old_watch = _cand.get("watch")
+            _old_key = _cand.get("key")
+            _old_dir = str(
+                _cand.get("direction") or ""
+            ).upper().strip()
+
+            try:
+                if _old_key:
+                    R.delete(str(_old_key))
+            except Exception:
+                pass
+
+            if debug_gate:
+                gate.setdefault(
+                    "dbg_point_a_rearm_retired_direction_flip",
+                    [],
+                ).append({
+                    "key": str(_old_key or ""),
+                    "old_direction": _old_dir,
+                    "fresh_direction": resolved_dir,
+                    "state": str(
+                        _cand.get("state") or ""
+                    ),
+                    "retired_rc_ms": int(
+                        (_old_watch or {}).get(
+                            "point_a_last_retired_rc_ms"
+                        )
+                        or 0
+                    ),
+                    "reason":
+                        "FRESH_H1_DIRECTION_FLIPPED",
+                })
+    if isinstance(_selected_watch_candidate, dict):
+        watch = _selected_watch_candidate["watch"]
+        wkey = _selected_watch_candidate["key"]
+        zone_used = watch.get("zone_used")
+
+        resolved_dir = str(
+            watch.get("direction")
+            or _selected_watch_candidate.get("direction")
+            or resolved_dir
+        ).upper().strip()
+
+        gate["resolved_dir"] = resolved_dir
+        gate["watch_key"] = str(wkey)
+        gate["watch_reused"] = True
+
+        if debug_gate:
+            gate["dbg_watch_ownership"] = {
+                "state": _selected_watch_candidate.get("state"),
+                "direction": resolved_dir,
+                "hard": bool(
+                    _selected_watch_candidate.get("hard")
+                ),
+                "point_a_rearm": bool(
+                    _selected_watch_candidate.get(
+                        "point_a_rearm"
+                    )
+                ),
+                "dist": (
+                    float(
+                        _selected_watch_candidate.get("dist")
+                    )
+                    if _selected_watch_candidate.get("dist")
+                    is not None
+                    else None
+                ),
+                "actionable_cap": float(cap),
+                "model": (
+                    "HARD_OR_CONDITIONAL_WATCH_OWNERSHIP"
+                ),
+            }
     
 
     # If no frozen watch exists, use newly resolved direction
@@ -5660,9 +6414,18 @@ def zone_reversal_gate(
                         R,
                         uid_u,
                         sym_u,
-                        str(watch.get("direction") or resolved_dir).upper(),
+                        str(
+                            watch.get("direction")
+                            or resolved_dir
+                        ).upper(),
                         tf=tfu,
                     )
+
+                    # The Redis lifecycle no longer exists.
+                    # Do not allow the stale in-memory object to
+                    # regain ownership later in this same call.
+                    watch = None
+                    zone_used = None
                 else:
                     if debug_gate:
                         gate["dbg_delete_skipped_protected_watch"] = {
@@ -5697,7 +6460,55 @@ def zone_reversal_gate(
                             _st = str(_raw_watch.get("state") or "").upper()
             except Exception:
                 pass
-            _has_frozen = _st in ("WATCH", "REV_WATCH", "REV_OK", "ENTRY_READY", "ORDER_PENDING", "TRADE_ACTIVE")
+            # ----------------------------------------------------
+            # DIST_GUARD must obey the SAME ownership contract as
+            # the primary watch resolver.
+            #
+            # WATCH / REV_WATCH are conditional only BEFORE an
+            # actual execution-zone touch.
+            #
+            # After LIVE_TOUCH freezes zone_used, that watch owns
+            # the lifecycle and DIST_GUARD must preserve its frozen
+            # direction + zone until normal lifecycle release /
+            # invalidation.
+            #
+            # Later lifecycle states remain protected by
+            # _is_protected_watch_state().
+            #
+            # Point-A PRICE_TOO_FAR re-arm keeps its separate
+            # opposite-direction structural-flip exception in the
+            # primary ownership resolver.
+            # ----------------------------------------------------
+            _has_frozen = bool(
+                _is_protected_watch_state(_st)
+                or _is_touch_frozen_watch(watch)
+            )
+
+            # Point-A PRICE_TOO_FAR RC re-arm is intentionally
+            # protected even while represented as REV_WATCH.
+            if (
+                not _has_frozen
+                and isinstance(watch, dict)
+                and _st == "REV_WATCH"
+            ):
+                try:
+                    _has_frozen = bool(
+                        str(
+                            watch.get(
+                                "point_a_rc_rearm_reason"
+                            )
+                            or ""
+                        ).upper().strip()
+                        == "PRICE_TOO_FAR"
+                        and int(
+                            watch.get(
+                                "point_a_last_retired_rc_ms"
+                            )
+                            or 0
+                        ) > 0
+                    )
+                except Exception:
+                    _has_frozen = False
 
             if not _has_frozen:
                 gate["zone"] = None
@@ -5863,11 +6674,61 @@ def zone_reversal_gate(
             gate["reason"] = "WAIT_ZONE_TOUCH"
             gate["stage"] = "TOUCH"
             gate["blocked"] = False
-           
+
             # show planned major zone before touch
             gate["zone"] = dict(zone)
             gate["planned_zone"] = dict(zone)
             gate["zone_used"] = None
+
+            # --------------------------------------------------------
+            # SHADOW ANALYTICS:
+            # DXY may begin moving before this symbol has touched its
+            # actionable execution zone.
+            #
+            # Observation only. Never affects gate/zone/direction.
+            # The analytics function internally de-duplicates by the
+            # canonical REAL_DXY M15 evaluated bar.
+            # --------------------------------------------------------
+            try:
+                from api.xtl_analytics import (
+                    capture_pre_entry_dxy_response,
+                )
+
+                capture_pre_entry_dxy_response(
+                    R=R,
+                    uid=uid_u,
+                    profile_id=(
+                        _kwargs.get("profile_id")
+                    ),
+                    device_id=(
+                        str(x_device_id or "").strip()
+                        or str(
+                            pinned_device or ""
+                        ).strip()
+                        or None
+                    ),
+                    symbol=sym_u,
+                    side=resolved_dir,
+                    lifecycle_stage="WAIT_ZONE_TOUCH",
+                    watch=None,
+                    zone=zone,
+                    live_price=float(px_live),
+                    atr=float(atr or 0.0),
+                    event_ms=int(
+                        now_ms_pick or now_ms or 0
+                    ),
+                )
+
+            except Exception as exc:
+                log.debug(
+                    "[ZONE_GATE] PRE_ENTRY_DXY_SHADOW_FAIL "
+                    "sym=%s side=%s stage=WAIT_ZONE_TOUCH "
+                    "err=%r",
+                    sym_u,
+                    resolved_dir,
+                    exc,
+                )
+
             return False, gate
 
         zone_used = dict(zone)
@@ -5988,6 +6849,53 @@ def zone_reversal_gate(
             )
         except Exception:
              pass
+
+        # --------------------------------------------------------
+        # SHADOW ANALYTICS:
+        # First actual zone touch / frozen REV_WATCH observation.
+        #
+        # Runtime state remains WATCH by current schema; analytics
+        # labels the semantic stage REV_WATCH.
+        # --------------------------------------------------------
+        try:
+            from api.xtl_analytics import (
+                capture_pre_entry_dxy_response,
+            )
+
+            capture_pre_entry_dxy_response(
+                R=R,
+                uid=uid_u,
+                profile_id=(
+                    _kwargs.get("profile_id")
+                ),
+                device_id=(
+                    str(x_device_id or "").strip()
+                    or str(
+                        pinned_device or ""
+                    ).strip()
+                    or None
+                ),
+                symbol=sym_u,
+                side=resolved_dir,
+                lifecycle_stage="REV_WATCH",
+                watch=watch,
+                zone=zone_used,
+                live_price=float(px_live),
+                atr=float(atr or 0.0),
+                event_ms=int(
+                    now_ms_pick or now_ms or 0
+                ),
+            )
+
+        except Exception as exc:
+            log.debug(
+                "[ZONE_GATE] PRE_ENTRY_DXY_SHADOW_FAIL "
+                "sym=%s side=%s stage=REV_WATCH "
+                "err=%r",
+                sym_u,
+                resolved_dir,
+                exc,
+            )
         gate["zone_used"] = zone_used
         gate["watch_key"] = str(wkey)
         gate["rev_state"] = {
@@ -6027,6 +6935,93 @@ def zone_reversal_gate(
     zl = float(zone_used.get("low") or zone_used.get("level") or 0.0)
     zh = float(zone_used.get("high") or zone_used.get("level") or 0.0)
     started_ms = int((watch or {}).get("started_ms") or 0)
+    # ------------------------------------------------------------
+    # SHADOW ANALYTICS:
+    # Sample a genuine touched/frozen watch against each newly
+    # evaluated canonical DXY M15 bar while REV_OK is still absent.
+    #
+    # The analytics function performs Redis NX de-duplication,
+    # therefore frequent gate evaluation does NOT append repeatedly
+    # for the same DXY M15 bar.
+    # ------------------------------------------------------------
+    try:
+        _shadow_watch_state = str(
+            (watch or {}).get("state")
+            or ""
+        ).upper().strip()
+
+        _shadow_touch_frozen = bool(
+            isinstance(watch, dict)
+            and isinstance(
+                watch.get("zone_used"),
+                dict,
+            )
+            and (
+                int(
+                    watch.get("touch_open_ms")
+                    or 0
+                ) > 0
+                or int(
+                    watch.get("touch_close_ms")
+                    or 0
+                ) > 0
+                or str(
+                    watch.get("touch_source")
+                    or ""
+                ).upper().strip()
+                == "LIVE_TOUCH"
+            )
+        )
+
+        _shadow_pre_rc = bool(
+            _shadow_touch_frozen
+            and not bool(
+                (watch or {}).get("rev_ok")
+            )
+            and _shadow_watch_state
+            in ("WATCH", "REV_WATCH")
+        )
+
+        if _shadow_pre_rc:
+            from api.xtl_analytics import (
+                capture_pre_entry_dxy_response,
+            )
+
+            capture_pre_entry_dxy_response(
+                R=R,
+                uid=uid_u,
+                profile_id=(
+                    _kwargs.get("profile_id")
+                ),
+                device_id=(
+                    str(x_device_id or "").strip()
+                    or str(
+                        pinned_device or ""
+                    ).strip()
+                    or None
+                ),
+                symbol=sym_u,
+                side=str(
+                    watch.get("direction")
+                    or resolved_dir
+                ).upper(),
+                lifecycle_stage="REV_WATCH",
+                watch=watch,
+                zone=zone_used,
+                live_price=float(px_live),
+                atr=float(atr or 0.0),
+                event_ms=int(
+                    now_ms_pick or now_ms or 0
+                ),
+            )
+
+    except Exception as exc:
+        log.debug(
+            "[ZONE_GATE] PRE_ENTRY_DXY_SHADOW_FAIL "
+            "sym=%s stage=REV_WATCH err=%r",
+            sym_u,
+            exc,
+        )
     # ------------------------------------------------------------
     # LOCK REV_OK:
     # REV_OK remains armed, but latest valid RC can refresh trigger.
