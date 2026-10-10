@@ -144,6 +144,13 @@ class StrategyBExpressionCalibrationSnapshot:
     resolved_preferred_htf_owner: Optional[str] = None
     buffer_calibration_reason: str = "UNKNOWN"
     buffer_calibration_owner_timeframe: Optional[str] = None
+
+    # Immutable identity of the actual structural owner/pivot whose
+    # post-pivot excursion is measured by buffer calibration.
+    # These are observation-only fields; they grant no buffer authority.
+    buffer_pivot_ms: int = 0
+    buffer_pivot_atr: Optional[float] = None
+
     buffer_entry_to_pivot_distance_price: Optional[float] = None
     buffer_entry_to_pivot_distance_atr: Optional[float] = None
     buffer_bars_after_pivot_count: int = 0
@@ -405,6 +412,12 @@ def build_strategy_b_expression_calibration_snapshot(
             str(buffer_cal.get("owner_timeframe"))
             if buffer_cal.get("owner_timeframe") is not None
             else None
+        ),
+        buffer_pivot_ms=int(
+            buffer_cal.get("pivot_ms") or 0
+        ),
+        buffer_pivot_atr=_num(
+            buffer_cal.get("pivot_atr")
         ),
         buffer_entry_to_pivot_distance_price=_num(
             buffer_cal.get("entry_to_pivot_distance_price")

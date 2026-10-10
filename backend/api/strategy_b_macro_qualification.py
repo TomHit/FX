@@ -57,6 +57,171 @@ def _opposite(direction: str) -> str:
         return "BULLISH"
     return "UNKNOWN"
 
+def _strategy_b_macro_directions_from_d1_leg(
+    dxy_bias: Mapping[str, Any],
+):
+    """
+    Strategy-B macro-direction authority.
+
+    The existing D1 structural macro-leg establishes the OLD/current
+    macro-leg direction.  Strategy B is reversal-after-maturity, so the
+    expected reversal direction is the opposite of that established leg.
+
+    H1/M15 do not create the macro thesis here.  They remain downstream
+    reversal/reaction confirmation.
+    """
+    leg = _mapping(
+        _mapping(dxy_bias).get(
+            "strategy_b_d1_macro_leg"
+        )
+    )
+
+    leg_data_ok = bool(leg.get("data_ok") is True)
+    old_direction = (
+        _upper(leg.get("direction"))
+        or "UNKNOWN"
+    )
+
+    diag = {
+        "model": "D1_STRUCTURAL_MACRO_LEG_DIRECTION",
+        "data_ok": leg_data_ok,
+        "old_macro_direction": old_direction,
+        "state": _upper(leg.get("state")) or "NOT_ESTABLISHED",
+        "structural_leg_atr": _num(
+            leg.get("structural_leg_atr")
+        ),
+        "reason": leg.get("reason"),
+    }
+
+    if not leg_data_ok:
+        return (
+            "UNKNOWN",
+            "UNKNOWN",
+            "D1_STRUCTURAL_MACRO_LEG_UNAVAILABLE",
+            diag,
+        )
+
+    if old_direction not in DIRECTIONS:
+        return (
+            "UNKNOWN",
+            "UNKNOWN",
+            "D1_STRUCTURAL_MACRO_DIRECTION_UNKNOWN",
+            diag,
+        )
+
+    expected = _opposite(old_direction)
+
+    return (
+        old_direction,
+        expected,
+        "D1_STRUCTURAL_MACRO_LEG_ESTABLISHES_REVERSAL_DIRECTION",
+        diag,
+    )
+
+def _phase8_market_direction(
+    *,
+    fundamental: Any,
+    dxy_m15: Mapping[str, Any],
+):
+    """
+    Strategy-B Phase 8A shadow direction establishment.
+
+    Fundamental direction remains authoritative when available.
+
+    When fundamental direction is UNKNOWN, market expression may establish
+    a research/qualification direction only from a formally CONFIRMED M15
+    turn whose direction agrees with canonical market-flow direction.
+
+    Market-flow alone is never sufficient.
+    """
+    fundamental_expected = _expected_dxy_direction_from_fundamental(fundamental)
+
+    if fundamental_expected in DIRECTIONS:
+        return (
+            fundamental_expected,
+            "FUNDAMENTAL",
+            "FUNDAMENTAL_DIRECTION_AVAILABLE",
+            {
+                "fundamental_direction": _upper(fundamental) or "UNKNOWN",
+                "fundamental_expected_direction": fundamental_expected,
+            },
+        )
+
+    m15 = _mapping(dxy_m15)
+    turn = _mapping(m15.get("turn"))
+
+    status = _upper(
+        m15.get("status")
+        or m15.get("turn_status")
+        or turn.get("status")
+    ) or "UNKNOWN"
+
+    turn_direction = _upper(
+        m15.get("direction")
+        or m15.get("turn_direction")
+        or turn.get("direction")
+    ) or "UNKNOWN"
+
+    flow_direction = _upper(
+        _mapping(_mapping(m15.get("features")).get("market_flow")).get("direction")
+        or m15.get("flow_direction")
+    ) or "UNKNOWN"
+
+    diag = {
+        "fundamental_direction": _upper(fundamental) or "UNKNOWN",
+        "fundamental_expected_direction": fundamental_expected,
+        "m15_status": status,
+        "m15_turn_direction": turn_direction,
+        "m15_flow_direction": flow_direction,
+    }
+
+    if (
+        status == "CONFIRMED"
+        and turn_direction in DIRECTIONS
+        and flow_direction == turn_direction
+    ):
+        return (
+            turn_direction,
+            "MARKET_EXPRESSION",
+            "M15_CONFIRMED_TURN_AND_FLOW_ESTABLISH_CANDIDATE_DIRECTION",
+            diag,
+        )
+
+    if (
+        status == "CONFIRMED"
+        and turn_direction in DIRECTIONS
+        and flow_direction in DIRECTIONS
+        and flow_direction != turn_direction
+    ):
+        return (
+            "UNKNOWN",
+            "NONE",
+            "M15_CONFIRMED_TURN_FLOW_CONFLICT",
+            diag,
+        )
+
+    if status in ("REJECTED", "INVALIDATED"):
+        return (
+            "UNKNOWN",
+            "NONE",
+            f"M15_{status}_CANNOT_ESTABLISH_DIRECTION",
+            diag,
+        )
+
+    if flow_direction in DIRECTIONS:
+        return (
+            "UNKNOWN",
+            "NONE",
+            "M15_FLOW_ONLY_AWAIT_FORMAL_CONFIRMATION",
+            diag,
+        )
+
+    return (
+        "UNKNOWN",
+        "NONE",
+        "MARKET_DIRECTION_NOT_ESTABLISHED",
+        diag,
+    )
 
 @dataclass(frozen=True)
 class StrategyBMacroConfig:
@@ -74,6 +239,8 @@ class StrategyBMacroQualification:
     schema_version: int
     model: str
     expected_dxy_direction: str
+    direction_source: str
+    direction_reason: str
     old_macro_direction: str
     macro_leg_established: bool
     macro_leg_reason: str
@@ -89,6 +256,9 @@ class StrategyBMacroQualification:
     market_reaction_reason: str
     market_reaction_status: str
     market_reaction_direction: str
+    reaction_capacity_ok: bool
+    reaction_capacity_state: str
+    reaction_capacity_reason: str
     h1_reversal_confirmed: bool
     h1_reversal_reason: str
     h1_turn_ms: int
@@ -104,6 +274,7 @@ class StrategyBMacroQualification:
     observation_only: bool = True
     execution_authority: bool = False
     strategy_a_mutation: bool = False
+    
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -161,45 +332,123 @@ def _macro_leg(dxy_bias: Mapping[str, Any], *, old_direction: str, cfg: Strategy
     return ok, ("H4_OLD_LEG_D1_NOT_OPPOSING" if ok else "OLD_MACRO_LEG_NOT_ESTABLISHED"), diag
 
 
-def _maturity(dxy_bias: Mapping[str, Any], *, old_direction: str, macro_leg_established: bool, cfg: StrategyBMacroConfig):
-    d1_net = _signed_net_atr(dxy_bias, "D1")
-    h4_net = _signed_net_atr(dxy_bias, "H4")
+def _maturity(
+    dxy_bias: Mapping[str, Any],
+    *,
+    old_direction: str,
+    macro_leg_established: bool,
+    cfg: StrategyBMacroConfig,
+):
+    leg = _mapping(
+        _mapping(dxy_bias).get(
+            "strategy_b_d1_macro_leg"
+        )
+    )
+
+    leg_state = _upper(leg.get("state")) or "NOT_ESTABLISHED"
+    leg_direction = (
+        _upper(leg.get("direction"))
+        or "UNKNOWN"
+    )
+    leg_atr = _num(leg.get("structural_leg_atr"))
+    leg_data_ok = bool(leg.get("data_ok") is True)
+
     diag = {
-        "d1_net_atr": d1_net,
-        "h4_net_atr": h4_net,
-        "d1_regime": _upper(_tf_row(dxy_bias, "D1").get("regime")) or "UNKNOWN",
-        "h4_regime": _upper(_tf_row(dxy_bias, "H4").get("regime")) or "UNKNOWN",
+        "model": "D1_STRUCTURAL_MACRO_LEG",
+        "data_ok": leg_data_ok,
+        "state": leg_state,
+        "direction": leg_direction,
+        "structural_leg_atr": leg_atr,
+        "origin_type": leg.get("origin_type"),
+        "origin_index": leg.get("origin_index"),
+        "origin_time_ms": leg.get("origin_time_ms"),
+        "origin_price": leg.get("origin_price"),
+        "origin_confirmed_index": (
+            leg.get("origin_confirmed_index")
+        ),
+        "origin_confirmed_time_ms": (
+            leg.get("origin_confirmed_time_ms")
+        ),
+        "current_time_ms": leg.get("current_time_ms"),
+        "current_price": leg.get("current_price"),
+        "atr": leg.get("atr"),
+        "calculator_reason": leg.get("reason"),
         "thresholds": {
-            "d1_extended_net_atr": cfg.d1_extended_net_atr,
-            "h4_extended_net_atr": cfg.h4_extended_net_atr,
-            "d1_mature_net_atr": cfg.d1_mature_net_atr,
-            "h4_mature_net_atr": cfg.h4_mature_net_atr,
+            "mature_atr": 3.0,
+            "extended_atr": 4.0,
         },
     }
 
+    if not leg_data_ok:
+        return (
+            "NOT_ESTABLISHED",
+            False,
+            "D1_STRUCTURAL_MACRO_LEG_UNAVAILABLE",
+            diag,
+        )
+
     if not macro_leg_established:
-        return "NOT_ESTABLISHED", False, "OLD_MACRO_LEG_NOT_ESTABLISHED", diag
+        return (
+            "NOT_ESTABLISHED",
+            False,
+            "OLD_MACRO_LEG_NOT_ESTABLISHED",
+            diag,
+        )
 
-    thresholds = (
-        cfg.d1_extended_net_atr,
-        cfg.h4_extended_net_atr,
-        cfg.d1_mature_net_atr,
-        cfg.h4_mature_net_atr,
+    if old_direction not in DIRECTIONS:
+        return (
+            "NOT_ESTABLISHED",
+            False,
+            "OLD_MACRO_DIRECTION_UNKNOWN",
+            diag,
+        )
+
+    if leg_direction != old_direction:
+        return (
+            "NOT_ESTABLISHED",
+            False,
+            "D1_STRUCTURAL_LEG_DIRECTION_MISMATCH",
+            diag,
+        )
+
+    if leg_atr is None:
+        return (
+            "NOT_ESTABLISHED",
+            False,
+            "D1_STRUCTURAL_LEG_ATR_MISSING",
+            diag,
+        )
+
+    if leg_state == "EXTENDED":
+        return (
+            "EXTENDED",
+            True,
+            "D1_STRUCTURAL_LEG_EXTENDED",
+            diag,
+        )
+
+    if leg_state == "MATURE":
+        return (
+            "MATURE",
+            True,
+            "D1_STRUCTURAL_LEG_MATURE",
+            diag,
+        )
+
+    if leg_state == "EXPANDING":
+        return (
+            "EXPANDING",
+            False,
+            "D1_STRUCTURAL_LEG_NOT_YET_MATURE",
+            diag,
+        )
+
+    return (
+        "NOT_ESTABLISHED",
+        False,
+        "D1_STRUCTURAL_LEG_STATE_INVALID",
+        diag,
     )
-    if any(v is None for v in thresholds):
-        return "CALIBRATION_REQUIRED", False, "STRATEGY_B_MATURITY_THRESHOLDS_NOT_CALIBRATED", diag
-
-    if not (_direction_matches_signed_move(old_direction, d1_net) and _direction_matches_signed_move(old_direction, h4_net)):
-        return "NOT_ESTABLISHED", False, "D1_H4_NET_ATR_NOT_OLD_LEG_DIRECTION", diag
-
-    d1_abs = abs(float(d1_net))
-    h4_abs = abs(float(h4_net))
-
-    if d1_abs >= float(cfg.d1_mature_net_atr) and h4_abs >= float(cfg.h4_mature_net_atr):
-        return "MATURE", True, "D1_H4_MATURE_THRESHOLDS_MET", diag
-    if d1_abs >= float(cfg.d1_extended_net_atr) and h4_abs >= float(cfg.h4_extended_net_atr):
-        return "EXTENDED", False, "D1_H4_EXTENDED_AWAIT_MATURITY", diag
-    return "EXPANDING", False, "D1_H4_MOVE_NOT_YET_EXTENDED", diag
 
 
 def _level_tf_role(level: Any):
@@ -243,6 +492,171 @@ def _catalyst_first_seen_ms(evidence: Any) -> int:
         or _field(evidence, "event_time_ms")
     )
 
+
+def _reaction_directional_capacity(
+    structure: Mapping[str, Any],
+    *,
+    expected_direction: str,
+):
+    """
+    Strategy-B Phase 8A.2 reaction directional-capacity gate.
+
+    This is separate from the existing D1/H4 macro reversal-location gate.
+
+    Purpose:
+      After a candidate event-expression direction exists, determine whether
+      canonical DXY structure gives that direction immediate structural room.
+
+    V1 intentionally has no calibrated positive ATR threshold.
+
+    Hard BLOCK only when:
+      - price is inside the blocking opposite zone, AND
+      - directional room is known and <= 0.
+
+    Everything else is either CLEAR, CONSTRAINED, or UNKNOWN for telemetry
+    and later genuine-event calibration.
+    """
+    expected = _upper(expected_direction)
+    s = _mapping(structure)
+
+    if expected not in DIRECTIONS:
+        return False, "UNKNOWN", "REACTION_DIRECTION_UNKNOWN", {
+            "expected_direction": expected,
+            "directional_room_atr": None,
+            "inside_blocking_zone": None,
+            "structure_pressure": "UNKNOWN",
+            "structure_reason": None,
+        }
+
+    # Canonical structure may expose these directly or through a nested
+    # structure/safety object. Read only; do not calculate SR here.
+    nested = _mapping(s.get("structure"))
+    safety = _mapping(s.get("sr_safety"))
+
+    def first(*values):
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    if expected == "BULLISH":
+        room_raw = first(
+            s.get("room_up_atr"),
+            nested.get("room_up_atr"),
+            safety.get("room_up_atr"),
+            s.get("bullish_room_atr"),
+            nested.get("bullish_room_atr"),
+        )
+        inside_raw = first(
+            s.get("inside_resistance"),
+            nested.get("inside_resistance"),
+            safety.get("inside_resistance"),
+            _mapping(s.get("nearest_resistance")).get("inside"),
+            _mapping(nested.get("nearest_resistance")).get("inside"),
+        )
+        blocking_role = "RESISTANCE"
+    else:
+        room_raw = first(
+            s.get("room_down_atr"),
+            nested.get("room_down_atr"),
+            safety.get("room_down_atr"),
+            s.get("bearish_room_atr"),
+            nested.get("bearish_room_atr"),
+        )
+        inside_raw = first(
+            s.get("inside_support"),
+            nested.get("inside_support"),
+            safety.get("inside_support"),
+            _mapping(s.get("nearest_support")).get("inside"),
+            _mapping(nested.get("nearest_support")).get("inside"),
+        )
+        blocking_role = "SUPPORT"
+
+    pressure = _upper(
+        first(
+            s.get("structure_pressure"),
+            nested.get("structure_pressure"),
+            safety.get("structure_pressure"),
+        )
+    ) or "UNKNOWN"
+
+    structure_reason = first(
+        s.get("reason"),
+        nested.get("reason"),
+        safety.get("reason"),
+    )
+
+    try:
+        room = float(room_raw) if room_raw is not None else None
+    except (TypeError, ValueError):
+        room = None
+
+    if isinstance(inside_raw, Mapping):
+        # Production trend_sr/live-input contract:
+        # inside_support / inside_resistance are level mappings.
+        inside_blocking = bool(inside_raw)
+    elif isinstance(inside_raw, bool):
+        # Retain boolean compatibility for deterministic fixtures and
+        # any explicitly normalized future producer.
+        inside_blocking = inside_raw
+    elif inside_raw is None:
+        inside_blocking = None
+    else:
+        inside_blocking = _upper(inside_raw) in (
+            "1", "TRUE", "YES", "Y", "INSIDE",
+        )
+
+    diag = {
+
+        "blocking_level": (
+            dict(inside_raw)
+            if isinstance(inside_raw, Mapping)
+            else None
+        ),
+        "expected_direction": expected,
+        "blocking_role": blocking_role,
+        "directional_room_atr": room,
+        "inside_blocking_zone": inside_blocking,
+        "structure_pressure": pressure,
+        "structure_reason": structure_reason,
+    }
+
+    
+
+    # Deterministic hard-block only. No invented positive ATR threshold.
+    if inside_blocking is True and room is not None and room <= 0.0:
+        return (
+            False,
+            "BLOCKED",
+            f"REACTION_{expected}_BLOCKED_INSIDE_{blocking_role}_NO_ROOM",
+            diag,
+        )
+
+    # Missing structural evidence must fail closed.
+    if room is None or inside_blocking is None:
+        return (
+            False,
+            "UNKNOWN",
+            "REACTION_DIRECTIONAL_CAPACITY_INCOMPLETE",
+            diag,
+        )
+
+    # Preserve pressure as calibration evidence. Do not turn EXTREME into
+    # another hard veto until genuine-event evidence calibrates it.
+    if inside_blocking is True:
+        return (
+            True,
+            "CONSTRAINED",
+            f"REACTION_{expected}_INSIDE_{blocking_role}_WITH_POSITIVE_ROOM",
+            diag,
+        )
+
+    return (
+        True,
+        "CLEAR",
+        f"REACTION_{expected}_HAS_DIRECTIONAL_ROOM",
+        diag,
+    )
 
 def _m15_market_reaction(*, expected_direction: str, dxy_m15: Mapping[str, Any]):
     m15 = _mapping(dxy_m15)
@@ -330,10 +744,95 @@ def evaluate_strategy_b_macro_qualification(
     cfg = config or StrategyBMacroConfig()
     reasons: list[str] = []
 
-    fundamental = _field(evidence, "fundamental_direction", "UNKNOWN")
-    expected = _expected_dxy_direction_from_fundamental(fundamental)
-    old_direction = _opposite(expected)
-    catalyst_ms = _catalyst_first_seen_ms(evidence)
+    fundamental = _field(
+        evidence,
+        "fundamental_direction",
+        "UNKNOWN",
+    )
+
+    (
+        old_direction,
+        expected,
+        direction_reason,
+        direction_diag,
+    ) = _strategy_b_macro_directions_from_d1_leg(
+        dxy_bias
+    )
+
+    direction_source = (
+        "D1_STRUCTURAL_MACRO_LEG"
+        if expected in DIRECTIONS
+        else "NONE"
+    )
+
+    catalyst_expected = (
+        _expected_dxy_direction_from_fundamental(
+            fundamental
+        )
+    )
+
+    direction_diag = {
+        **dict(direction_diag),
+        "fundamental_direction": (
+            _upper(fundamental)
+            or "UNKNOWN"
+        ),
+        "fundamental_expected_direction": (
+            catalyst_expected
+        ),
+        "expected_reversal_direction": expected,
+    }
+
+    catalyst_ms = _catalyst_first_seen_ms(
+        evidence
+    )
+
+    reasons.append(direction_reason)
+
+    if expected not in DIRECTIONS:
+        catalyst_direction_ok = False
+        catalyst_direction_reason = (
+            "REVERSAL_DIRECTION_NOT_ESTABLISHED"
+        )
+
+    elif catalyst_ms <= 0:
+        catalyst_direction_ok = False
+        catalyst_direction_reason = (
+            "CATALYST_FIRST_SEEN_TIME_MISSING"
+        )
+
+    elif (
+        catalyst_expected in DIRECTIONS
+        and catalyst_expected != expected
+    ):
+        catalyst_direction_ok = False
+        catalyst_direction_reason = (
+            "CATALYST_DIRECTION_OPPOSES_EXPECTED_REVERSAL"
+        )
+
+    elif catalyst_expected in DIRECTIONS:
+        catalyst_direction_ok = True
+        catalyst_direction_reason = (
+            "CATALYST_DIRECTION_ALIGNED_WITH_EXPECTED_REVERSAL"
+        )
+
+    else:
+        catalyst_direction_ok = True
+        catalyst_direction_reason = (
+            "CATALYST_PRESENT_DIRECTION_PENDING_MARKET_CONFIRMATION"
+        )
+
+    reasons.append(catalyst_direction_reason)
+
+    direction_diag = {
+        **dict(direction_diag),
+        "catalyst_direction_ok": (
+            catalyst_direction_ok
+        ),
+        "catalyst_direction_reason": (
+            catalyst_direction_reason
+        ),
+    }
 
     macro_leg_ok, macro_leg_reason, macro_diag = _macro_leg(dxy_bias, old_direction=old_direction, cfg=cfg)
     reasons.append(macro_leg_reason)
@@ -359,6 +858,14 @@ def evaluate_strategy_b_macro_qualification(
     )
     reasons.append(reaction_reason)
 
+    capacity_ok, capacity_state, capacity_reason, capacity_diag = (
+        _reaction_directional_capacity(
+            structure,
+            expected_direction=expected,
+        )
+    )
+    reasons.append(capacity_reason)
+
     h1_ok, h1_reason, h1_diag = _h1_reversal(
         expected_direction=expected,
         evidence=evidence,
@@ -369,17 +876,33 @@ def evaluate_strategy_b_macro_qualification(
     reasons.append(h1_reason)
 
     if expected not in DIRECTIONS:
-        state = "WAIT_CATALYST_DIRECTION"
+        state = "WAIT_MACRO_DIRECTION"
+
     elif not macro_leg_ok:
         state = "WAIT_MACRO_LEG"
+
     elif not maturity_ok:
-        state = "WAIT_MATURITY_CALIBRATION" if maturity_state == "CALIBRATION_REQUIRED" else "WAIT_MATURITY"
+        state = (
+            "WAIT_MATURITY_CALIBRATION"
+            if maturity_state == "CALIBRATION_REQUIRED"
+            else "WAIT_MATURITY"
+        )
+
     elif not location_ok:
         state = "WAIT_HTF_LOCATION"
+
+    elif not catalyst_direction_ok:
+        state = "WAIT_CATALYST_DIRECTION"
+
     elif not reaction_ok:
         state = "WAIT_MARKET_REACTION"
+
+    elif not capacity_ok:
+        state = "WAIT_REACTION_LOCATION"
+
     elif not h1_ok:
         state = "WAIT_H1_REVERSAL"
+
     else:
         state = "MACRO_QUALIFIED"
 
@@ -388,14 +911,18 @@ def evaluate_strategy_b_macro_qualification(
         and macro_leg_ok
         and maturity_ok
         and location_ok
+        and catalyst_direction_ok
         and reaction_ok
+        and capacity_ok
         and h1_ok
     )
 
     return StrategyBMacroQualification(
-        schema_version=2,
-        model="STRATEGY_B_MACRO_QUALIFICATION_V2",
+        schema_version=3,
+        model="STRATEGY_B_MACRO_QUALIFICATION_V3_PHASE8A2",
         expected_dxy_direction=expected,
+        direction_source=direction_source,
+        direction_reason=direction_reason,
         old_macro_direction=old_direction,
         macro_leg_established=macro_leg_ok,
         macro_leg_reason=macro_leg_reason,
@@ -411,6 +938,9 @@ def evaluate_strategy_b_macro_qualification(
         market_reaction_reason=reaction_reason,
         market_reaction_status=reaction_status,
         market_reaction_direction=reaction_direction,
+        reaction_capacity_ok=capacity_ok,
+        reaction_capacity_state=capacity_state,
+        reaction_capacity_reason=capacity_reason,
         h1_reversal_confirmed=h1_ok,
         h1_reversal_reason=h1_reason,
         h1_turn_ms=_int(h1_diag.get("last_turn_ms")),
@@ -424,9 +954,11 @@ def evaluate_strategy_b_macro_qualification(
         reasons=tuple(dict.fromkeys(reasons)),
         diagnostics={
             "macro_leg": macro_diag,
+            "direction": direction_diag,
             "maturity": maturity_diag,
             "location": location_diag,
             "market_reaction": reaction_diag,
+            "reaction_capacity": capacity_diag,
             "h1_reversal": h1_diag,
         },
     )

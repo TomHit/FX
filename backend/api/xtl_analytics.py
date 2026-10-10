@@ -10793,6 +10793,24 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             else {}
         )
 
+        # Immutable Analysis-1 audit captured from the execution-owned
+        # position record. Preserve PRE_POINT_A + PLACEMENT exactly as
+        # evaluated; analytics has zero execution authority.
+        analysis1_entry = (
+            json.loads(
+                json.dumps(
+                    p.get("analysis1"),
+                    separators=(",", ":"),
+                    default=str,
+                )
+            )
+            if isinstance(
+                p.get("analysis1"),
+                dict,
+            )
+            else {}
+        )
+
         point_a_wait_bars = _safe_int(
             point_a_entry.get(
                 "wait_m15_bars"
@@ -10851,12 +10869,21 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
                           or str(p.get("trade_id") or "").startswith("BROKER_REPAIR:")) else "clean")
         is_repair = (provenance == "broker_repair")
 
+        # Entry-reference time used by the existing frozen entry analytics.
+        # Keep its historical semantics unchanged: it may originate from raw
+        # broker/MT5 entry time and is consumed by session/news/context capture.
         ets = int(
             p.get("broker_open_time_ms")
             or p.get("opened_at_ms")
             or p.get("enqueue_timestamp")
             or _now_ms()
         )
+
+        # Lifecycle ownership time is a different clock domain.
+        # enqueue_timestamp is server UTC and is used by analytics lifecycle
+        # guards such as ORPHAN_AGE_MS. Never alias raw broker-wall time here.
+        analytics_enqueued_at_ms = _now_ms()
+
         session = _session_for_ts_ms(ets, LIVE_TZ_OFFSET_H)
         # Analytics-only trading-window tag.
         # 16:00 UTC = 21:30 IST.
@@ -11126,7 +11153,7 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             ),
             "selected_strategy": ((p.get("setup_analysis") or {}).get("selected_production_strategy") if isinstance(p.get("setup_analysis"), dict) else None),
             "predicted_market_behavior": ((p.get("setup_analysis") or {}).get("predicted_market_behavior") if isinstance(p.get("setup_analysis"), dict) else None),
-            "enqueue_timestamp": ets,
+            "enqueue_timestamp": analytics_enqueued_at_ms,
             "session":          session,
             # Analytics-only candidate trading window.
             # No execution behavior is changed by these fields.
@@ -11438,6 +11465,9 @@ def build_entry_snapshot(pos: dict, capture_source: str = "normal") -> dict:
             "rc_found":     rc.get("rc_found"),
             "rc_source":    rc.get("rc_source"),
             "rc_capture_note": rc.get("rc_capture_note"),
+
+            # -- immutable Analysis-1 decision audit (analytics only) --
+            "analysis1": analysis1_entry,
 
             # -- RC / Point-A lifecycle identity (analytics only) --
             "rev_ok_ms": rc.get("rev_ok_ms"),
@@ -18964,6 +18994,450 @@ def capture_pre_entry_dxy_response(
         return False
 
 
+
+def _point_a_po3_shadow(
+    *,
+    redis_client,
+    symbol: str,
+    side: str,
+    event_ms: int,
+    point_a_decision: str | None,
+) -> dict:
+    """
+    Read the compact PO3 live-shadow projection for analytics only.
+
+    This function:
+      - performs no PO3 evaluation
+      - performs no Redis writes
+      - has no execution authority
+      - never changes Point-A / RC / watch / gate state
+    """
+    out = {
+        "available": False,
+        "causal": False,
+        "reason": None,
+        "device_id": None,
+        "as_of_ms": None,
+        "age_ms": None,
+        "generation_id": None,
+        "semantic": None,
+        "active_distribution": None,
+        "continuation_shadow_candidate": False,
+        "qualification_reason": None,
+        "analytics_only": True,
+        "execution_authority": False,
+    }
+
+    try:
+        R = redis_client
+
+        if R is None:
+            out["reason"] = "REDIS_CLIENT_UNAVAILABLE"
+            out["qualification_reason"] = (
+                "REDIS_CLIENT_UNAVAILABLE"
+            )
+            return out
+
+        sym = str(symbol or "").upper().strip()
+        trade_side = str(side or "").upper().strip()
+        ts = _safe_int(event_ms, 0) or 0
+        decision = str(
+            point_a_decision or ""
+        ).upper().strip()
+
+        if not sym or ts <= 0:
+            out["reason"] = "INVALID_EVENT_CONTEXT"
+            out["qualification_reason"] = (
+                "INVALID_EVENT_CONTEXT"
+            )
+            return out
+
+        # Resolve the PO3 owner from canonical OHLC pointers.
+        # Never assume the trading device owns the PO3 stream.
+        dev_m15 = str(
+            R.get(
+                f"xtl:ohlc:latest:{sym}:M15"
+            )
+            or ""
+        ).strip()
+
+        dev_h1 = str(
+            R.get(
+                f"xtl:ohlc:latest:{sym}:H1"
+            )
+            or ""
+        ).strip()
+
+        if not dev_m15 or not dev_h1:
+            out["reason"] = "PO3_DEVICE_POINTER_MISSING"
+            out["qualification_reason"] = (
+                "PO3_DEVICE_POINTER_MISSING"
+            )
+            return out
+
+        if dev_m15 != dev_h1:
+            out["reason"] = "PO3_DEVICE_MISMATCH"
+            out["qualification_reason"] = (
+                "PO3_DEVICE_MISMATCH"
+            )
+            return out
+
+        out["device_id"] = dev_m15
+
+        raw = R.get(
+            f"xtl:po3:shadow:latest:"
+            f"{dev_m15}:{sym}"
+        )
+
+        if not raw:
+            out["reason"] = "PO3_SNAPSHOT_MISSING"
+            out["qualification_reason"] = (
+                "PO3_SNAPSHOT_MISSING"
+            )
+            return out
+
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode(
+                "utf-8",
+                "ignore",
+            )
+
+        snap = json.loads(raw)
+
+        if isinstance(snap, str):
+            snap = json.loads(snap)
+
+        if not isinstance(snap, dict):
+            out["reason"] = "PO3_SNAPSHOT_INVALID"
+            out["qualification_reason"] = (
+                "PO3_SNAPSHOT_INVALID"
+            )
+            return out
+
+        if (
+            snap.get("analytics_only") is not True
+            or snap.get("execution_authority") is not False
+        ):
+            out["reason"] = (
+                "PO3_AUTHORITY_CONTRACT_INVALID"
+            )
+            out["qualification_reason"] = (
+                "PO3_AUTHORITY_CONTRACT_INVALID"
+            )
+            return out
+
+        snap_sym = str(
+            snap.get("symbol") or ""
+        ).upper().strip()
+
+        snap_dev = str(
+            snap.get("device_id") or ""
+        ).strip()
+
+        if (
+            snap_sym != sym
+            or snap_dev != dev_m15
+        ):
+            out["reason"] = (
+                "PO3_SNAPSHOT_IDENTITY_MISMATCH"
+            )
+            out["qualification_reason"] = (
+                "PO3_SNAPSHOT_IDENTITY_MISMATCH"
+            )
+            return out
+
+        as_of_ms = _safe_int(
+            snap.get("as_of_ms"),
+            0,
+        ) or 0
+
+        out["as_of_ms"] = as_of_ms or None
+
+        if as_of_ms <= 0:
+            out["reason"] = "PO3_AS_OF_MISSING"
+            out["qualification_reason"] = (
+                "PO3_AS_OF_MISSING"
+            )
+            return out
+
+        if as_of_ms > ts:
+            out["reason"] = "PO3_FUTURE_SNAPSHOT"
+            out["qualification_reason"] = (
+                "PO3_FUTURE_SNAPSHOT"
+            )
+            return out
+
+        out["causal"] = True
+        out["age_ms"] = int(ts - as_of_ms)
+
+        out["generation_id"] = (
+            str(
+                snap.get("generation_id")
+                or ""
+            ).strip()
+            or None
+        )
+
+        semantic = (
+            snap.get("semantic")
+            if isinstance(
+                snap.get("semantic"),
+                dict,
+            )
+            else {}
+        )
+
+        semantic_evidence_ms = _safe_int(
+            semantic.get("evidence_ms"),
+            0,
+        ) or 0
+
+        if semantic_evidence_ms > ts:
+            out["causal"] = False
+            out["reason"] = (
+                "PO3_FUTURE_SEMANTIC_EVIDENCE"
+            )
+            out["qualification_reason"] = (
+                "PO3_FUTURE_SEMANTIC_EVIDENCE"
+            )
+            return out
+
+        out["semantic"] = {
+            "available": semantic.get("available"),
+            "state": semantic.get("state"),
+            "substate": semantic.get("substate"),
+            "direction": semantic.get("direction"),
+            "evidence_ms": (
+                semantic_evidence_ms
+                or None
+            ),
+            "provenance": semantic.get("provenance"),
+            "link_status": semantic.get("link_status"),
+            "reason": semantic.get("reason"),
+        }
+
+        d = (
+            snap.get("active_distribution")
+            if isinstance(
+                snap.get("active_distribution"),
+                dict,
+            )
+            else None
+        )
+
+        if d is None:
+            out["available"] = True
+            out["reason"] = "NO_ACTIVE_DISTRIBUTION"
+            out["qualification_reason"] = (
+                "NO_ACTIVE_DISTRIBUTION"
+            )
+            return out
+
+        d_times = {
+            "started_ms": (
+                _safe_int(d.get("started_ms"), 0)
+                or 0
+            ),
+            "acceptance_ms": (
+                _safe_int(d.get("acceptance_ms"), 0)
+                or 0
+            ),
+            "last_new_extreme_ms": (
+                _safe_int(
+                    d.get("last_new_extreme_ms"),
+                    0,
+                )
+                or 0
+            ),
+            "max_outside_ms": (
+                _safe_int(
+                    d.get("max_outside_ms"),
+                    0,
+                )
+                or 0
+            ),
+        }
+
+        for name, value in d_times.items():
+            if value > ts:
+                out["causal"] = False
+                out["reason"] = (
+                    "PO3_FUTURE_DISTRIBUTION_EVIDENCE:"
+                    + name
+                )
+                out["qualification_reason"] = (
+                    out["reason"]
+                )
+                return out
+
+        d_direction = str(
+            d.get("direction") or ""
+        ).upper().strip()
+
+        d_maturity = str(
+            d.get("maturity") or ""
+        ).upper().strip()
+
+        d_status = str(
+            d.get("status") or ""
+        ).upper().strip()
+
+        active_d = {
+            "episode_id": (
+                str(
+                    d.get("episode_id")
+                    or ""
+                ).strip()
+                or None
+            ),
+            "generation_id": (
+                str(
+                    d.get("generation_id")
+                    or ""
+                ).strip()
+                or None
+            ),
+            "direction": d_direction or None,
+            "status": d_status or None,
+            "maturity": d_maturity or None,
+            "started_ms": (
+                d_times["started_ms"]
+                or None
+            ),
+            "acceptance_ms": (
+                d_times["acceptance_ms"]
+                or None
+            ),
+            "last_new_extreme_ms": (
+                d_times["last_new_extreme_ms"]
+                or None
+            ),
+            "max_outside_ms": (
+                d_times["max_outside_ms"]
+                or None
+            ),
+            "current_outside_distance": (
+                _safe_float(
+                    d.get(
+                        "current_outside_distance"
+                    )
+                )
+            ),
+            "max_outside_distance": (
+                _safe_float(
+                    d.get(
+                        "max_outside_distance"
+                    )
+                )
+            ),
+            "progress_retention": (
+                _safe_float(
+                    d.get("progress_retention")
+                )
+            ),
+            "giveback_fraction": (
+                _safe_float(
+                    d.get("giveback_fraction")
+                )
+            ),
+            "below_high_water": (
+                d.get("below_high_water")
+                if isinstance(
+                    d.get("below_high_water"),
+                    bool,
+                )
+                else None
+            ),
+            "bars_since_acceptance": (
+                _safe_int(
+                    d.get(
+                        "bars_since_acceptance"
+                    )
+                )
+            ),
+            "bars_since_extreme": (
+                _safe_int(
+                    d.get("bars_since_extreme")
+                )
+            ),
+            "outside_close_count": (
+                _safe_int(
+                    d.get("outside_close_count")
+                )
+            ),
+            "accepted_outside_close_count": (
+                _safe_int(
+                    d.get(
+                        "accepted_outside_close_count"
+                    )
+                )
+            ),
+        }
+
+        out["active_distribution"] = active_d
+        out["available"] = True
+        out["reason"] = "PO3_SNAPSHOT_AVAILABLE"
+
+        # Task 5E candidate classification is descriptive only.
+        if decision != "ALLOW":
+            out["qualification_reason"] = (
+                "POINT_A_NOT_ALLOW"
+            )
+            return out
+
+        if d_maturity != "EXTENDED":
+            out["qualification_reason"] = (
+                "D_NOT_EXTENDED"
+            )
+            return out
+
+        required_d_direction = {
+            "BUY": "BULLISH",
+            "SELL": "BEARISH",
+        }.get(trade_side)
+
+        if required_d_direction is None:
+            out["qualification_reason"] = (
+                "INVALID_TRADE_SIDE"
+            )
+            return out
+
+        if d_direction != required_d_direction:
+            out["qualification_reason"] = (
+                "D_NOT_ALIGNED_WITH_TRADE"
+            )
+            return out
+
+        if active_d["below_high_water"] is not True:
+            out["qualification_reason"] = (
+                "D_AT_OR_ABOVE_HIGH_WATER"
+            )
+            return out
+
+        out["continuation_shadow_candidate"] = True
+        out["qualification_reason"] = (
+            "ACTIVE_EXTENDED_ALIGNED_D_BELOW_HIGH_WATER"
+        )
+
+        return out
+
+    except Exception as exc:
+        out["reason"] = "PO3_SHADOW_READ_FAILED"
+        out["qualification_reason"] = (
+            "PO3_SHADOW_READ_FAILED"
+        )
+
+        log.warning(
+            "analytics: Point-A PO3 shadow read failed "
+            "symbol=%s side=%s err=%r",
+            symbol,
+            side,
+            exc,
+        )
+
+        return out
+
+
 def capture_point_a_event(
     *,
     event_type: str,
@@ -18977,6 +19451,7 @@ def capture_point_a_event(
     live_price: float | None = None,
     trigger_level: float | None = None,
     event_ms: int | None = None,
+    redis_client=None,
 ) -> bool:
     """
     Permanently record one meaningful Point-A lifecycle transition.
@@ -19103,6 +19578,23 @@ def capture_point_a_event(
             f"{ts}"
         )
 
+        point_a_decision = (
+            str(
+                pa.get("decision")
+                or w.get("point_a_decision")
+                or ""
+            ).upper().strip()
+            or None
+        )
+
+        po3_shadow = _point_a_po3_shadow(
+            redis_client=redis_client,
+            symbol=sym_u,
+            side=side_u,
+            event_ms=ts,
+            point_a_decision=point_a_decision,
+        )
+
         rec = {
             "schema_version": 1,
             "analytics_only": True,
@@ -19138,14 +19630,7 @@ def capture_point_a_event(
             ),
 
             # Final Point-A verdict for this transition.
-            "decision": (
-                str(
-                    pa.get("decision")
-                    or w.get("point_a_decision")
-                    or ""
-                ).upper().strip()
-                or None
-            ),
+            "decision": point_a_decision,
             "action": (
                 str(
                     pa.get("action")
@@ -19480,6 +19965,9 @@ def capture_point_a_event(
                     default=str,
                 )
             ),
+
+            # Task 5E analytics-only causal PO3 context.
+            "po3_shadow": po3_shadow,
         }
 
         os.makedirs(

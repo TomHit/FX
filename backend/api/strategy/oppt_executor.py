@@ -19,7 +19,76 @@ import logging
 from typing import Any, Dict, List, Optional
 from redis.exceptions import AuthenticationError, ConnectionError, TimeoutError
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from api.prop_firms.prop_guard import compute_prop_check
+from api.prop_firms.prop_guard import (
+    compute_loss_per_lot_at_stop,
+    compute_prop_check,
+    normalize_lots_for_symbol,
+    validate_prop_capacity,
+)
+from api.strategy_b_execution_assignment import (
+    build_strategy_b_execution_assignment,
+)
+from api.strategy_b_execution_ownership import (
+    ownership_from_assignment,
+)
+from api.strategy_b_point3_composer import (
+    compose_strategy_b_point3,
+)
+from api.strategy_b_lifecycle_evidence import (
+    StrategyBOrderAcceptedEvidence,
+    StrategyBPositionOpenedEvidence,
+    StrategyBPositionClosedEvidence,
+)
+from api.strategy_b_lifecycle_evidence_envelope import (
+    append_strategy_b_lifecycle_evidence,
+    empty_strategy_b_lifecycle_evidence_envelope,
+)
+from api.strategy_b_lifecycle_evidence_redis_adapter import (
+    load_strategy_b_lifecycle_evidence,
+    persist_strategy_b_lifecycle_evidence_atomic,
+)
+from api.strategy_b_lifecycle_state_redis_adapter import (
+    load_strategy_b_lifecycle_state,
+    persist_strategy_b_lifecycle_state_atomic,
+)
+from api.strategy_b_exit_authorization import (
+    authorize_strategy_b_exit_intent,
+)
+from api.strategy_b_lifecycle_state import (
+    apply_strategy_b_lifecycle_transition,
+)
+from api.strategy_b_lifecycle_coordinator import (
+    coordinate_strategy_b_lifecycle,
+)
+from api.strategy_b_closed_r_metrics import (
+    build_strategy_b_closed_r_metrics,
+)
+from api.strategy_b_live_calibration_outcome_runtime import (
+    capture_strategy_b_runtime_outcome,
+)
+from api.strategy_b_symbol_live_loader import (
+    load_strategy_b_symbol_snapshot_live,
+)
+from api.strategy_b_post_entry_dxy_loader import (
+    load_strategy_b_post_entry_dxy,
+)
+from api.strategy_b_post_entry_validity import (
+    evaluate_strategy_b_post_entry_validity,
+)
+from api.strategy_b_post_entry_evidence_adapter import (
+    build_strategy_b_post_entry_evidence_from_validity,
+)
+from api.strategy_b_position_thesis import (
+    evaluate_strategy_b_position_thesis,
+)
+from api.strategy_b_shadow_orchestrator import (
+    compose_strategy_b_shadow_decision,
+)
+from api.strategy_execution_ownership import (
+    STRATEGY_A,
+    STRATEGY_B,
+    execution_strategy_from_record,
+)
 from api.trend_endpoints import (
     _get_prop_config_safe,
     _get_prop_risk_state,
@@ -735,6 +804,588 @@ def _mt5_cancel_queued_job(
 
     return removed, True
 
+def _record_strategy_b_broker_evidence(
+    *,
+    pos: dict,
+    accepted_at_ms: int,
+    broker_order_id: str,
+    broker_position_id: str | None = None,
+    opened_at_ms: int | None = None,
+    entry_price: float | None = None,
+) -> dict:
+    """
+    Persist externally-proven Strategy-B broker evidence and advance
+    the canonical Strategy-B lifecycle.
+
+    Evidence only:
+    - does not submit/modify/cancel broker orders;
+    - does not reserve/release risk;
+    - does not mutate Strategy-A;
+    - does not infer broker identity.
+
+    At most two lifecycle boundaries are coordinated here:
+        ENTRY_READY -> ORDER_PENDING
+        ORDER_PENDING -> TRADE_ACTIVE
+
+    The second boundary is attempted only when externally-proven
+    position-open evidence is supplied.
+    """
+
+    strategy = execution_strategy_from_record(pos)
+
+    if strategy != STRATEGY_B:
+        return {
+            "ok": False,
+            "reason": "NOT_STRATEGY_B",
+        }
+
+    thesis_id = str(
+        pos.get("thesis_id") or ""
+    ).strip()
+
+    selected_capture_id = str(
+        pos.get("selected_capture_id") or ""
+    ).strip()
+
+    symbol = str(
+        pos.get("symbol") or ""
+    ).upper().strip()
+
+    side = str(
+        pos.get("side") or ""
+    ).upper().strip()
+
+    order_intent_id = str(
+        pos.get("mt5_job_id") or ""
+    ).strip()
+
+    broker_order_id = str(
+        broker_order_id or ""
+    ).strip()
+
+    if not all(
+        (
+            thesis_id,
+            selected_capture_id,
+            symbol,
+            side,
+            order_intent_id,
+            broker_order_id,
+        )
+    ):
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EVIDENCE_IDENTITY_INCOMPLETE",
+        }
+
+    try:
+        accepted_ms = int(accepted_at_ms or 0)
+    except Exception:
+        accepted_ms = 0
+
+    if accepted_ms <= 0:
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_ACCEPTED_AT_REQUIRED",
+        }
+
+    try:
+        envelope = load_strategy_b_lifecycle_evidence(
+            R,
+            thesis_id,
+        )
+
+        if envelope is None:
+            envelope = empty_strategy_b_lifecycle_evidence_envelope(
+                thesis_id=thesis_id,
+                selected_capture_id=selected_capture_id,
+            )
+
+        accepted = StrategyBOrderAcceptedEvidence(
+            thesis_id=thesis_id,
+            selected_capture_id=selected_capture_id,
+            symbol=symbol,
+            side=side,
+            order_intent_id=order_intent_id,
+            broker_order_id=broker_order_id,
+            accepted_at_ms=accepted_ms,
+        )
+
+        envelope = append_strategy_b_lifecycle_evidence(
+            envelope,
+            accepted,
+        )
+
+        persisted = persist_strategy_b_lifecycle_evidence_atomic(
+            R,
+            envelope,
+        )
+
+        if not bool(getattr(persisted, "ok", False)):
+            return {
+                "ok": False,
+                "reason": (
+                    "STRATEGY_B_ACCEPTED_EVIDENCE_PERSIST_FAILED:"
+                    f"{getattr(persisted, 'reason', 'UNKNOWN')}"
+                ),
+            }
+
+        order_coord = coordinate_strategy_b_lifecycle(
+            redis_client=R,
+            thesis_id=thesis_id,
+            selected_symbol=symbol,
+            selected_side=side,
+            load_state=load_strategy_b_lifecycle_state,
+            load_evidence=load_strategy_b_lifecycle_evidence,
+            persist_state=persist_strategy_b_lifecycle_state_atomic,
+        )
+
+        result = {
+            "ok": True,
+            "reason": "STRATEGY_B_ACCEPTED_EVIDENCE_RECORDED",
+            "order_coord_advanced": bool(
+                getattr(order_coord, "advanced", False)
+            ),
+            "order_coord_persisted": bool(
+                getattr(order_coord, "persisted", False)
+            ),
+            "order_coord_reason": str(
+                getattr(order_coord, "reason", "")
+            ),
+        }
+
+        # Accepted-order evidence only.
+        if not broker_position_id:
+            return result
+
+        broker_position_id = str(
+            broker_position_id
+        ).strip()
+
+        try:
+            opened_ms = int(opened_at_ms or 0)
+        except Exception:
+            opened_ms = 0
+
+        try:
+            opened_price = float(entry_price or 0.0)
+        except Exception:
+            opened_price = 0.0
+
+        if (
+            not broker_position_id
+            or opened_ms <= 0
+            or opened_price <= 0.0
+        ):
+            return {
+                **result,
+                "ok": False,
+                "reason": "STRATEGY_B_OPENED_EVIDENCE_INCOMPLETE",
+            }
+
+        # Reload after accepted evidence commit so the next CAS is
+        # based on the exact current serialized envelope.
+        envelope = load_strategy_b_lifecycle_evidence(
+            R,
+            thesis_id,
+        )
+
+        if envelope is None:
+            return {
+                **result,
+                "ok": False,
+                "reason": "STRATEGY_B_EVIDENCE_RELOAD_MISSING",
+            }
+
+        opened = StrategyBPositionOpenedEvidence(
+            thesis_id=thesis_id,
+            selected_capture_id=selected_capture_id,
+            symbol=symbol,
+            side=side,
+            broker_order_id=broker_order_id,
+            broker_position_id=broker_position_id,
+            opened_at_ms=opened_ms,
+            entry_price=opened_price,
+        )
+
+        envelope = append_strategy_b_lifecycle_evidence(
+            envelope,
+            opened,
+        )
+
+        persisted = persist_strategy_b_lifecycle_evidence_atomic(
+            R,
+            envelope,
+        )
+
+        if not bool(getattr(persisted, "ok", False)):
+            return {
+                **result,
+                "ok": False,
+                "reason": (
+                    "STRATEGY_B_OPENED_EVIDENCE_PERSIST_FAILED:"
+                    f"{getattr(persisted, 'reason', 'UNKNOWN')}"
+                ),
+            }
+
+        open_coord = coordinate_strategy_b_lifecycle(
+            redis_client=R,
+            thesis_id=thesis_id,
+            selected_symbol=symbol,
+            selected_side=side,
+            load_state=load_strategy_b_lifecycle_state,
+            load_evidence=load_strategy_b_lifecycle_evidence,
+            persist_state=persist_strategy_b_lifecycle_state_atomic,
+        )
+
+        return {
+            **result,
+            "ok": True,
+            "reason": "STRATEGY_B_BROKER_EVIDENCE_RECORDED",
+            "open_coord_advanced": bool(
+                getattr(open_coord, "advanced", False)
+            ),
+            "open_coord_persisted": bool(
+                getattr(open_coord, "persisted", False)
+            ),
+            "open_coord_reason": str(
+                getattr(open_coord, "reason", "")
+            ),
+        }
+
+    except Exception as exc:
+        log.exception(
+            "[OPPT] STRATEGY_B_BROKER_EVIDENCE_FAILED "
+            "thesis=%s capture=%s sym=%s side=%s "
+            "order_intent=%s broker_order=%s",
+            thesis_id,
+            selected_capture_id,
+            symbol,
+            side,
+            order_intent_id,
+            broker_order_id,
+        )
+
+        return {
+            "ok": False,
+            "reason": (
+                "STRATEGY_B_BROKER_EVIDENCE_EXCEPTION:"
+                f"{type(exc).__name__}"
+            ),
+        }
+
+
+def _record_strategy_b_closed_evidence(
+    *,
+    pos: dict,
+    exit_price: float,
+    close_reason: str,
+    broker_meta: dict,
+) -> dict:
+    """
+    Persist broker-confirmed Strategy-B position-close evidence and
+    coordinate the canonical lifecycle to CLOSED.
+
+    Evidence/lifecycle only:
+    - does not call _close_trade();
+    - does not release risk;
+    - does not mutate Strategy-A;
+    - does not infer missing broker-close facts.
+
+    The caller may finalize the shared trade ledger only when this
+    function returns ok=True.
+    """
+    if execution_strategy_from_record(pos) != STRATEGY_B:
+        return {
+            "ok": False,
+            "reason": "NOT_STRATEGY_B",
+        }
+
+    thesis_id = str(
+        pos.get("thesis_id") or ""
+    ).strip()
+    selected_capture_id = str(
+        pos.get("selected_capture_id") or ""
+    ).strip()
+    symbol = str(
+        pos.get("symbol") or ""
+    ).upper().strip()
+    side = str(
+        pos.get("side") or ""
+    ).upper().strip()
+
+    broker_position_id = str(
+        pos.get("mt5_ticket")
+        or pos.get("broker_ticket")
+        or ""
+    ).strip()
+
+    if not all(
+        (
+            thesis_id,
+            selected_capture_id,
+            symbol,
+            side,
+            broker_position_id,
+        )
+    ):
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_CLOSED_EVIDENCE_IDENTITY_INCOMPLETE",
+        }
+
+    try:
+        broker_fill_price = float(
+            pos.get("mt5_fill_price")
+            or 0.0
+        )
+    except Exception:
+        broker_fill_price = 0.0
+
+    try:
+        original_sl_price = float(
+            pos.get("original_sl_price")
+            or 0.0
+        )
+    except Exception:
+        original_sl_price = 0.0
+
+    try:
+        observed_price_min = float(
+            pos.get("strategy_b_observed_price_min")
+            or 0.0
+        )
+    except Exception:
+        observed_price_min = 0.0
+
+    try:
+        observed_price_max = float(
+            pos.get("strategy_b_observed_price_max")
+            or 0.0
+        )
+    except Exception:
+        observed_price_max = 0.0
+
+    try:
+        broker_exit_price = float(exit_price or 0.0)
+    except Exception:
+        broker_exit_price = 0.0
+
+    try:
+        closed_at_ms = int(
+            broker_meta.get("broker_close_time_ms")
+            or 0
+        )
+    except Exception:
+        closed_at_ms = 0
+
+    try:
+        net_profit = float(
+            broker_meta.get("broker_net_profit")
+        )
+    except Exception:
+        net_profit = float("nan")
+
+    if closed_at_ms <= 0:
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_CLOSED_AT_REQUIRED",
+        }
+
+    # The terminal broker deal is one additional exact observed price.
+    # Fold it into the snapshot-observed excursion bounds before deriving
+    # closed R metrics. This does not claim tick-perfect intraperiod MFE/MAE.
+    if broker_exit_price > 0.0:
+        if observed_price_min > 0.0:
+            observed_price_min = min(
+                observed_price_min,
+                broker_exit_price,
+            )
+        if observed_price_max > 0.0:
+            observed_price_max = max(
+                observed_price_max,
+                broker_exit_price,
+            )
+
+    metrics = build_strategy_b_closed_r_metrics(
+        side=side,
+        broker_fill_price=broker_fill_price,
+        original_sl_price=original_sl_price,
+        exit_price=broker_exit_price,
+        observed_price_min=observed_price_min,
+        observed_price_max=observed_price_max,
+    )
+
+    if not bool(getattr(metrics, "data_ok", False)):
+        return {
+            "ok": False,
+            "reason": (
+                "STRATEGY_B_CLOSED_R_METRICS_INVALID:"
+                f"{getattr(metrics, 'reason', 'UNKNOWN')}"
+            ),
+        }
+
+    try:
+        envelope = load_strategy_b_lifecycle_evidence(
+            R,
+            thesis_id,
+        )
+
+        if envelope is None:
+            return {
+                "ok": False,
+                "reason": "STRATEGY_B_CLOSED_EVIDENCE_ENVELOPE_MISSING",
+            }
+
+        opened = getattr(
+            envelope,
+            "opened_position",
+            None,
+        )
+        if opened is None:
+            return {
+                "ok": False,
+                "reason": "STRATEGY_B_OPENED_EVIDENCE_REQUIRED_FOR_CLOSE",
+            }
+
+        closed = StrategyBPositionClosedEvidence(
+            thesis_id=thesis_id,
+            selected_capture_id=selected_capture_id,
+            symbol=symbol,
+            side=side,
+            broker_position_id=broker_position_id,
+            closed_at_ms=closed_at_ms,
+            entry_price=broker_fill_price,
+            exit_price=broker_exit_price,
+            close_reason=str(close_reason or "").strip(),
+            net_profit=net_profit,
+            net_r=float(metrics.net_r),
+            mfe_r=float(metrics.mfe_r),
+            mae_r=float(metrics.mae_r),
+        )
+
+        envelope = append_strategy_b_lifecycle_evidence(
+            envelope,
+            closed,
+        )
+
+        persisted = persist_strategy_b_lifecycle_evidence_atomic(
+            R,
+            envelope,
+        )
+
+        if not bool(getattr(persisted, "ok", False)):
+            return {
+                "ok": False,
+                "reason": (
+                    "STRATEGY_B_CLOSED_EVIDENCE_PERSIST_FAILED:"
+                    f"{getattr(persisted, 'reason', 'UNKNOWN')}"
+                ),
+            }
+
+        close_coord = coordinate_strategy_b_lifecycle(
+            redis_client=R,
+            thesis_id=thesis_id,
+            selected_symbol=symbol,
+            selected_side=side,
+            load_state=load_strategy_b_lifecycle_state,
+            load_evidence=load_strategy_b_lifecycle_evidence,
+            persist_state=persist_strategy_b_lifecycle_state_atomic,
+        )
+
+        # Do not trust only coordinator flags. Reload durable lifecycle
+        # truth and prove CLOSED before allowing shared finalization.
+        final_state = load_strategy_b_lifecycle_state(
+            R,
+            thesis_id,
+        )
+
+        final_state_name = str(
+            getattr(final_state, "current_state", "")
+            or ""
+        ).upper().strip()
+
+        if final_state_name != "CLOSED":
+            return {
+                "ok": False,
+                "reason": "STRATEGY_B_CLOSED_LIFECYCLE_NOT_COMMITTED",
+                "close_coord_advanced": bool(
+                    getattr(close_coord, "advanced", False)
+                ),
+                "close_coord_persisted": bool(
+                    getattr(close_coord, "persisted", False)
+                ),
+                "close_coord_reason": str(
+                    getattr(close_coord, "reason", "")
+                ),
+                "final_state": final_state_name,
+            }
+
+        return {
+            "ok": True,
+            "reason": "STRATEGY_B_CLOSED_EVIDENCE_RECORDED",
+            # Analytics handoff only. The durable lifecycle evidence
+            # schema remains unchanged.
+            "closed": closed,
+            "original_sl_price": float(original_sl_price),
+            "initial_r_price": float(metrics.initial_risk_distance),
+            "close_coord_advanced": bool(
+                getattr(close_coord, "advanced", False)
+            ),
+            "close_coord_persisted": bool(
+                getattr(close_coord, "persisted", False)
+            ),
+            "close_coord_reason": str(
+                getattr(close_coord, "reason", "")
+            ),
+            "final_state": final_state_name,
+            "net_r": float(metrics.net_r),
+            "mfe_r": float(metrics.mfe_r),
+            "mae_r": float(metrics.mae_r),
+        }
+
+    except ValueError as exc:
+        # Canonical evidence-envelope continuity/identity validators
+        # report deterministic domain reasons as ValueError messages.
+        # Preserve that reason for fail-closed reconciliation and logs.
+        reason = str(exc or "").strip()
+        log.error(
+            "[OPPT] STRATEGY_B_CLOSED_EVIDENCE_REJECTED "
+            "thesis=%s capture=%s sym=%s side=%s ticket=%s reason=%s",
+            thesis_id,
+            selected_capture_id,
+            symbol,
+            side,
+            broker_position_id,
+            reason,
+        )
+        return {
+            "ok": False,
+            "reason": (
+                reason
+                or "STRATEGY_B_CLOSED_EVIDENCE_VALUE_ERROR"
+            ),
+        }
+
+    except Exception as exc:
+        log.exception(
+            "[OPPT] STRATEGY_B_CLOSED_EVIDENCE_FAILED "
+            "thesis=%s capture=%s sym=%s side=%s ticket=%s",
+            thesis_id,
+            selected_capture_id,
+            symbol,
+            side,
+            broker_position_id,
+        )
+        return {
+            "ok": False,
+            "reason": (
+                "STRATEGY_B_CLOSED_EVIDENCE_EXCEPTION:"
+                f"{type(exc).__name__}"
+            ),
+        }
+
+
 def _mt5_ack_key(job_id: str) -> str:
     return f"xtl:mt5:ack:{job_id}"
 def _get_mt5_ack(job_id: str) -> dict | None:
@@ -1128,27 +1779,104 @@ def _promote_pending_from_broker_position(
         )
 
         # -------------------------------------------------
+        # Strategy-B broker evidence from recovery truth.
+        #
+        # The broker position proves that the market order
+        # executed and that the corresponding position exists.
+        # Prefer the broker's original open timestamp.
+        # -------------------------------------------------
+        _promotion_strategy = execution_strategy_from_record(pos)
+
+        if _promotion_strategy == STRATEGY_B:
+            _b_recovery_fact_ms = (
+                broker_open_time_ms
+                if broker_open_time_ms > 0
+                else repair_ms
+            )
+
+            _b_recovery_ev = _record_strategy_b_broker_evidence(
+                pos=pos,
+                accepted_at_ms=_b_recovery_fact_ms,
+                broker_order_id=str(broker_ticket),
+                broker_position_id=str(broker_ticket),
+                opened_at_ms=_b_recovery_fact_ms,
+                entry_price=broker_entry_price,
+            )
+
+            if not bool(_b_recovery_ev.get("ok")):
+                log.error(
+                    "[OPPT] STRATEGY_B_RECOVERY_EVIDENCE_FAILED "
+                    "uid=%s tid=%s thesis=%s capture=%s "
+                    "sym=%s side=%s ticket=%s source=%s reason=%s",
+                    uid,
+                    trade_id,
+                    pos.get("thesis_id"),
+                    pos.get("selected_capture_id"),
+                    symbol,
+                    side,
+                    broker_ticket,
+                    recovery_source,
+                    _b_recovery_ev.get("reason"),
+                )
+            else:
+                log.warning(
+                    "[OPPT] STRATEGY_B_RECOVERY_EVIDENCE_RECORDED "
+                    "uid=%s tid=%s thesis=%s capture=%s "
+                    "sym=%s side=%s ticket=%s "
+                    "order_coord=%s open_coord=%s",
+                    uid,
+                    trade_id,
+                    pos.get("thesis_id"),
+                    pos.get("selected_capture_id"),
+                    symbol,
+                    side,
+                    broker_ticket,
+                    _b_recovery_ev.get("order_coord_reason"),
+                    _b_recovery_ev.get("open_coord_reason"),
+                )
+
+        # -------------------------------------------------
         # Synchronize watch lifecycle using broker truth.
         # Same side -> TRADE_ACTIVE.
         # Opposite side -> removed.
         # -------------------------------------------------
-        try:
-            _sync_watches_for_broker_active_position(
-                uid,
-                broker_pos,
-                recovery_source,
-            )
-        except Exception as watch_exc:
-            log.warning(
-                "[OPPT] PENDING_BROKER_PROMOTION_WATCH_SYNC_FAILED "
-                "uid=%s tid=%s sym=%s ticket=%s "
-                "source=%s err=%r",
+        if _promotion_strategy == STRATEGY_A:
+            try:
+                _sync_watches_for_broker_active_position(
+                    uid,
+                    broker_pos,
+                    recovery_source,
+                )
+            except Exception as watch_exc:
+                log.warning(
+                    "[OPPT] PENDING_BROKER_PROMOTION_WATCH_SYNC_FAILED "
+                    "uid=%s tid=%s sym=%s ticket=%s "
+                    "source=%s err=%r",
+                    uid,
+                    trade_id,
+                    symbol,
+                    broker_ticket,
+                    recovery_source,
+                    watch_exc,
+                )
+        elif _promotion_strategy == STRATEGY_B:
+            log.debug(
+                "[OPPT] STRATEGY_B_SKIP_A_PROMOTION_WATCH_SYNC "
+                "uid=%s tid=%s sym=%s ticket=%s",
                 uid,
                 trade_id,
                 symbol,
                 broker_ticket,
-                recovery_source,
-                watch_exc,
+            )
+        else:
+            log.error(
+                "[OPPT] UNKNOWN_STRATEGY_SKIP_A_PROMOTION_WATCH_SYNC "
+                "uid=%s tid=%s sym=%s ticket=%s strategy=%r",
+                uid,
+                trade_id,
+                symbol,
+                broker_ticket,
+                pos.get("strategy"),
             )
 
         # -------------------------------------------------
@@ -1205,7 +1933,10 @@ def _promote_pending_from_broker_position(
                 ),
             }
 
-            if zone_meta.get("trade_id"):
+            if (
+                _promotion_strategy == STRATEGY_A
+                and zone_meta.get("trade_id")
+            ):
                 R.set(
                     f"xtl:trade:zone_by_ticket:{broker_ticket}",
                     json.dumps(
@@ -2809,12 +3540,107 @@ def _sync_open_trade_broker_sl_tp(uid: str, bp: dict) -> None:
             # Uses authoritative broker price_open and preserves
             # the original structural SL.
             # -------------------------------------------------
-            _reconcile_market_fill_tp(
-                uid,
-                trade_id,
-                pos,
-                bp,
-            )
+            _fill_strategy = execution_strategy_from_record(pos)
+
+            # -------------------------------------------------
+            # Strategy-B broker-observed excursion tracking.
+            #
+            # Preserve raw broker-observed price extrema only.
+            # R-multiple analytics are derived later from broker
+            # fill + structural risk distance at close.
+            #
+            # These are snapshot-observed extrema, not tick-perfect
+            # intraperiod market extrema.
+            # -------------------------------------------------
+            if _fill_strategy == STRATEGY_B:
+                try:
+                    _b_current_price = float(
+                        bp.get("price_current")
+                        or 0.0
+                    )
+                except Exception:
+                    _b_current_price = 0.0
+
+                try:
+                    _b_fill_price = float(
+                        pos.get("mt5_fill_price")
+                        or pos.get("entry_price")
+                        or bp.get("price_open")
+                        or 0.0
+                    )
+                except Exception:
+                    _b_fill_price = 0.0
+
+                if _b_current_price > 0.0:
+                    _b_obs_ms = int(
+                        pos.get("broker_sl_tp_synced_at_ms")
+                        or now_ms()
+                    )
+
+                    try:
+                        _b_old_min = float(
+                            pos.get("strategy_b_observed_price_min")
+                            or 0.0
+                        )
+                    except Exception:
+                        _b_old_min = 0.0
+
+                    try:
+                        _b_old_max = float(
+                            pos.get("strategy_b_observed_price_max")
+                            or 0.0
+                        )
+                    except Exception:
+                        _b_old_max = 0.0
+
+                    if _b_old_min <= 0.0:
+                        _b_seed_min = (
+                            min(_b_fill_price, _b_current_price)
+                            if _b_fill_price > 0.0
+                            else _b_current_price
+                        )
+                        pos["strategy_b_observed_price_min"] = _b_seed_min
+                        pos["strategy_b_observed_price_min_at_ms"] = _b_obs_ms
+                    elif _b_current_price < _b_old_min:
+                        pos["strategy_b_observed_price_min"] = _b_current_price
+                        pos["strategy_b_observed_price_min_at_ms"] = _b_obs_ms
+
+                    if _b_old_max <= 0.0:
+                        _b_seed_max = (
+                            max(_b_fill_price, _b_current_price)
+                            if _b_fill_price > 0.0
+                            else _b_current_price
+                        )
+                        pos["strategy_b_observed_price_max"] = _b_seed_max
+                        pos["strategy_b_observed_price_max_at_ms"] = _b_obs_ms
+                    elif _b_current_price > _b_old_max:
+                        pos["strategy_b_observed_price_max"] = _b_current_price
+                        pos["strategy_b_observed_price_max_at_ms"] = _b_obs_ms
+
+            if _fill_strategy == STRATEGY_A:
+                _reconcile_market_fill_tp(
+                    uid,
+                    trade_id,
+                    pos,
+                    bp,
+                )
+            elif _fill_strategy == STRATEGY_B:
+                log.debug(
+                    "[OPPT] STRATEGY_B_SKIP_A_FILL_TP_RECONCILE "
+                    "uid=%s tid=%s sym=%s",
+                    uid,
+                    trade_id,
+                    pos.get("symbol"),
+                )
+            else:
+                log.error(
+                    "[OPPT] UNKNOWN_STRATEGY_SKIP_A_FILL_TP_RECONCILE "
+                    "uid=%s tid=%s sym=%s strategy=%r",
+                    uid,
+                    trade_id,
+                    pos.get("symbol"),
+                    pos.get("strategy"),
+                )
 
             broker_price_step = _broker_price_step(bp)
 
@@ -3407,6 +4233,649 @@ def _strategy_sl_buffer(sym: str) -> float:
 
     return 0.00030
 
+
+
+# -----------------------------------------------------------------------------
+# Analysis-1 final pre-Point-A production gate (2026-10-04)
+# -----------------------------------------------------------------------------
+# Final validated policy P2:
+#
+#   A  03:00-05:00 UTC -> TAKE
+#      subject to B-WEAK quality rule
+#
+#   B  05:00-07:00 UTC -> TAKE only when TP is before
+#      the valid opposing liquidity pool
+#
+#   C  07:00-09:00 UTC -> SKIP
+#
+#   D  09:00-15:00 UTC ->
+#      ALIGNED
+#      AND (structure >= 15 OR SR >= 30)
+#      AND TP before opposing pool
+#
+#   E  09:00-15:00 UTC -> NEUTRAL -> SKIP
+#
+#   F  09:00-15:00 UTC -> CONFLICT -> TAKE
+#
+#   G  outside 03:00-15:00 UTC -> SKIP
+#
+#   B-WEAK:
+#      03:00-07:00 UTC
+#      pool distance < 5.5R
+#      AND shadow confidence MEDIUM
+#      -> SKIP
+#
+# Important:
+# This gate runs BEFORE Point-A, entry claim and MT5 enqueue.
+# Existing Point-A behavior is untouched.
+# -----------------------------------------------------------------------------
+
+ANALYSIS1_POLICY_VERSION = "A1_P2_PLACEMENT_20261004"
+
+ANALYSIS1_POLICY = str(
+    os.getenv(
+        "XTL_ANALYSIS1_POLICY",
+        "P2",
+    )
+).upper().strip()
+
+if ANALYSIS1_POLICY not in ("P0", "P2"):
+    ANALYSIS1_POLICY = "P2"
+
+
+def _analysis1_evaluate_pre_point_a(
+    *,
+    watch: dict,
+    sym: str,
+    side: str,
+    live_price: float,
+    device_id: str | None,
+    now_e: int,
+    decision_stage: str = "pre_point_a",
+    entry_price: float | None = None,
+    sl_price: float | None = None,
+    tp_price: float | None = None,
+    a1_policy: str | None = None,
+) -> dict:
+    """
+    Final Analysis-1 P2 pre-Point-A decision.
+
+    Fail closed on genuine analytics/calculation failure.
+    """
+
+    stage = str(
+        decision_stage or "pre_point_a"
+    ).lower().strip()
+
+    if stage not in (
+        "pre_point_a",
+        "placement",
+    ):
+        stage = "pre_point_a"
+
+    policy = str(
+        a1_policy
+        or ANALYSIS1_POLICY
+    ).upper().strip()
+
+    if policy not in ("P0", "P2"):
+        policy = "P2"
+
+    decision_utc_ms = int(now_e)
+
+    result = {
+        "schema_version": 1,
+        "policy_version": ANALYSIS1_POLICY_VERSION,
+        "decision": "SKIP",
+        "scenario": "UNKNOWN",
+        "reason": "ANALYSIS1_UNAVAILABLE",
+        "evaluated_at_ms": int(now_e),
+        "entry_price": float(live_price or 0.0),
+        "shadow_relation": "UNKNOWN",
+        "shadow_confidence": "NONE",
+        "structure_points": 0.0,
+        "sr_points": 0.0,
+        "target_liquidity_type": None,
+        "target_liquidity_level": None,
+        "target_liquidity_distance_r": None,
+        "tp_before_pool": None,
+        "planned_structural_sl": None,
+        "planned_tp": None,
+         
+        "a1_decision_stage": stage,
+        "decision_utc_ms": decision_utc_ms,
+        "clock_source": "SYSTEM_UTC",
+        "a1_policy": policy,
+        # Counterfactual audit only.
+        # Shows whether frozen P0 would reject a setup that P2 allows.
+        # Never used for the live TAKE/SKIP decision.
+        "a1_p0_would_skip": False,
+        "a1_p0_skip_reason": None,
+    }
+
+    try:
+        side_u = str(side or "").upper().strip()
+        sym_u = str(sym or "").upper().strip()
+
+        px = float(
+            entry_price
+            if entry_price is not None
+            else live_price
+            or 0.0
+        )
+
+        if side_u not in ("BUY", "SELL") or px <= 0:
+            result["reason"] = "INVALID_ENTRY_INPUT"
+            return result
+
+        # ---------------------------------------------------------
+        # Structural geometry.
+        #
+        # PRE_POINT_A:
+        #   reconstruct prospective structural SL / 2R TP.
+        #
+        # PLACEMENT:
+        #   consume the exact final entry / SL / TP calculated by
+        #   the execution path immediately before entry claim.
+        # ---------------------------------------------------------
+        zone = (
+            watch.get("zone_used")
+            if isinstance(watch.get("zone_used"), dict)
+            else {}
+        )
+
+        z_low = float(zone.get("low") or 0.0)
+        z_high = float(zone.get("high") or 0.0)
+
+        if stage == "placement":
+            try:
+                sl = float(sl_price or 0.0)
+                tp = float(tp_price or 0.0)
+            except Exception:
+                sl = 0.0
+                tp = 0.0
+
+            if side_u == "BUY":
+                risk = px - sl
+            else:
+                risk = sl - px
+
+            if sl <= 0 or risk <= 0 or tp <= 0:
+                result["reason"] = "PLACEMENT_GEOMETRY_MISSING"
+                return result
+
+        else:
+            sl_buf = _strategy_sl_buffer(sym_u)
+
+            if side_u == "BUY" and z_low > 0:
+                sl = z_low - sl_buf
+                risk = px - sl
+                tp = (
+                    px + (2.0 * risk)
+                    if risk > 0
+                    else 0.0
+                )
+
+            elif side_u == "SELL" and z_high > 0:
+                sl = z_high + sl_buf
+                risk = sl - px
+                tp = (
+                    px - (2.0 * risk)
+                    if risk > 0
+                    else 0.0
+                )
+
+            else:
+                sl = 0.0
+                risk = 0.0
+                tp = 0.0
+
+            if sl <= 0 or risk <= 0 or tp <= 0:
+                result["reason"] = "STRUCTURAL_RISK_UNAVAILABLE"
+                return result
+
+        result["entry_price"] = float(px)
+        result["planned_structural_sl"] = float(sl)
+        result["planned_tp"] = float(tp)
+
+        # ---------------------------------------------------------
+        # Unconditional UTC scenarios.
+        #
+        # C and G are determined entirely by true UTC time. They do
+        # not require Shadow Bias or liquidity analytics.
+        #
+        # Keep this AFTER geometry validation so malformed placement
+        # geometry still fails closed with its existing reason.
+        # ---------------------------------------------------------
+        from datetime import datetime, timezone
+
+        hour_utc = datetime.fromtimestamp(
+            int(now_e) / 1000.0,
+            tz=timezone.utc,
+        ).hour
+
+        result["utc_hour"] = int(hour_utc)
+
+        # G: outside the production Analysis-1 session.
+        if hour_utc < 3 or hour_utc >= 15:
+            result.update(
+                decision="SKIP",
+                scenario="G",
+                reason="OUTSIDE_03_15_UTC",
+            )
+            return result
+
+        # C: unconditional 07:00-09:00 UTC skip.
+        if 7 <= hour_utc < 9:
+            result.update(
+                decision="SKIP",
+                scenario="C",
+                reason="07_09_UTC_SKIP",
+            )
+            return result
+
+        # ---------------------------------------------------------
+        # Use existing production analytics.
+        #
+        # No change to shadow_bias.py / liquidity implementation.
+        # ---------------------------------------------------------
+        from api.xtl_analytics import (
+            read_shadow_bias_at_ack,
+            read_liquidity_at_ack,
+        )
+
+        shadow = read_shadow_bias_at_ack(
+            sym_u,
+            side_u,
+            device_id,
+            px,
+            entry_zone=zone,
+            computed_ms=int(now_e),
+        ) or {}
+
+        # Genuine Shadow calculation/data failure -> fail closed.
+        if not bool(shadow.get("shadow_bias_data_ok")):
+            result["reason"] = "SHADOW_DATA_UNAVAILABLE"
+            result["shadow_data_errors"] = list(
+                shadow.get("data_errors") or []
+            )
+            return result
+
+        relation = str(
+            shadow.get("shadow_bias_relation") or "UNKNOWN"
+        ).upper().strip()
+
+        confidence = str(
+            shadow.get("shadow_bias_confidence") or "NONE"
+        ).upper().strip()
+
+        evidence = (
+            (shadow.get("evidence") or {})
+            .get(side_u.lower(), [])
+        )
+
+        structure_points = sum(
+            float(x.get("points") or 0.0)
+            for x in evidence
+            if (
+                isinstance(x, dict)
+                and str(
+                    x.get("source") or ""
+                ).lower() == "structure"
+            )
+        )
+
+        sr_points = sum(
+            float(x.get("points") or 0.0)
+            for x in evidence
+            if (
+                isinstance(x, dict)
+                and str(
+                    x.get("source") or ""
+                ).lower() == "sr"
+            )
+        )
+
+        result["shadow_relation"] = relation
+        result["shadow_confidence"] = confidence
+        result["structure_points"] = round(
+            float(structure_points),
+            4,
+        )
+        result["sr_points"] = round(
+            float(sr_points),
+            4,
+        )
+        result["shadow_bias"] = shadow.get("shadow_bias")
+        result["shadow_bias_score"] = shadow.get(
+            "shadow_bias_score"
+        )
+
+        # ---------------------------------------------------------
+        # Opposing liquidity pool.
+        #
+        # BUY  -> BSL
+        # SELL -> SSL
+        # ---------------------------------------------------------
+        liq = read_liquidity_at_ack(
+            sym_u,
+            side_u,
+            zone,
+            device_id,
+            px,
+        ) or {}
+
+        
+        # ---------------------------------------------------------
+        # Liquidity availability.
+        #
+        # IMPORTANT P2 semantics:
+        #   A and F do NOT universally require liquidity.
+        #   B and D DO require valid liquidity.
+        #
+        # Therefore liquidity failure is recorded here but must
+        # NOT return before the scenario-specific decision.
+        # ---------------------------------------------------------
+        liquidity_data_ok = (
+            liq.get("atr") is not None
+        )
+
+        result["liquidity_data_ok"] = bool(
+            liquidity_data_ok
+        )
+
+        bsl_ssl = (
+            liq.get("_bsl_ssl")
+            if (
+                liquidity_data_ok
+                and isinstance(
+                    liq.get("_bsl_ssl"),
+                    dict,
+                )
+            )
+            else {}
+        )
+
+        target = (
+            bsl_ssl.get("bsl")
+            if side_u == "BUY"
+            else bsl_ssl.get("ssl")
+        )
+
+        target_level = None
+        target_type = (
+            "BSL"
+            if side_u == "BUY"
+            else "SSL"
+        )
+
+        if isinstance(target, dict):
+            try:
+                target_level = (
+                    float(target.get("level") or 0.0)
+                    or None
+                )
+            except Exception:
+                target_level = None
+
+        result["target_liquidity_type"] = target_type
+        result["target_liquidity_level"] = target_level
+
+        # ---------------------------------------------------------
+        # Pool distance in R and TP-before-pool.
+        # ---------------------------------------------------------
+        pool_r = None
+        tp_before_pool = False
+
+        if target_level is not None:
+            pool_r = (
+                abs(float(target_level) - px)
+                / float(risk)
+            )
+
+            if side_u == "BUY":
+                tp_before_pool = (
+                    float(tp) <= float(target_level)
+                )
+            else:
+                tp_before_pool = (
+                    float(tp) >= float(target_level)
+                )
+
+        result["target_liquidity_distance_r"] = (
+            round(float(pool_r), 4)
+            if pool_r is not None
+            else None
+        )
+
+        result["tp_before_pool"] = (
+            bool(tp_before_pool)
+            if target_level is not None
+            else None
+        )
+
+        
+        
+
+        # ---------------------------------------------------------
+        # A / B / B-WEAK
+        # ---------------------------------------------------------
+        if 3 <= hour_utc < 7:
+
+            # B-WEAK overrides normal A/B TAKE.
+            if (
+                pool_r is not None
+                and pool_r < 5.5
+                and confidence == "MEDIUM"
+            ):
+                result.update(
+                    decision="SKIP",
+                    scenario="B-WEAK",
+                    reason="POOL_LT_5_5R_AND_MEDIUM",
+                )
+                return result
+
+            
+            # A.
+            #
+            if hour_utc < 5:
+
+                # -------------------------------------------------
+                # P0 counterfactual audit.
+                #
+                # Compute from the SAME already-captured liquidity
+                # snapshot. This metadata must never control P2.
+                # -------------------------------------------------
+                p0_skip_reason = None
+
+                if (
+                    not liquidity_data_ok
+                    or target_level is None
+                    or pool_r is None
+                    or result.get("tp_before_pool") is None
+                ):
+                    p0_skip_reason = "A_LIQUIDITY_MISSING_P0"
+
+                elif not tp_before_pool:
+                    p0_skip_reason = "A_TP_BEYOND_POOL_P0"
+
+                result["a1_p0_would_skip"] = bool(
+                    p0_skip_reason
+                )
+                result["a1_p0_skip_reason"] = (
+                    p0_skip_reason
+                )
+
+                # Actual execution policy remains unchanged.
+                if policy == "P0" and p0_skip_reason:
+                    result.update(
+                        decision="SKIP",
+                        scenario="A",
+                        reason=p0_skip_reason,
+                    )
+                    return result
+
+                result.update(
+                    decision="TAKE",
+                    scenario="A",
+                    reason="EARLY_SESSION_A",
+                )
+                return result
+
+            
+            # B requires complete liquidity geometry.
+            if (
+                not liquidity_data_ok
+                or target_level is None
+                or pool_r is None
+                or result.get("tp_before_pool") is None
+            ):
+                result.update(
+                    decision="SKIP",
+                    scenario="B",
+                    reason="B_LIQUIDITY_MISSING",
+                )
+                return result
+
+            # B requires TP before pool.
+            if not tp_before_pool:
+                result.update(
+                    decision="SKIP",
+                    scenario="B",
+                    reason="B_TP_BEYOND_POOL",
+                )
+                return result
+                
+            result.update(
+                decision="TAKE",
+                scenario="B",
+                reason="B_TP_BEFORE_POOL",
+            )
+            return result
+
+        # ---------------------------------------------------------
+        # 09:00-15:00 UTC
+        # ---------------------------------------------------------
+
+        # E
+        if relation == "NEUTRAL":
+            result.update(
+                decision="SKIP",
+                scenario="E",
+                reason="SHADOW_NEUTRAL",
+            )
+            return result
+
+        
+        # F
+        #
+        
+        if relation == "CONFLICT":
+
+            # -----------------------------------------------------
+            # P0 counterfactual audit.
+            #
+            # P2 intentionally has no universal liquidity veto for
+            # F. Record what P0 would have done without changing P2.
+            # -----------------------------------------------------
+            p0_skip_reason = None
+
+            if (
+                not liquidity_data_ok
+                or target_level is None
+                or pool_r is None
+                or result.get("tp_before_pool") is None
+            ):
+                p0_skip_reason = "F_LIQUIDITY_MISSING_P0"
+
+            elif not tp_before_pool:
+                p0_skip_reason = "F_TP_BEYOND_POOL_P0"
+
+            result["a1_p0_would_skip"] = bool(
+                p0_skip_reason
+            )
+            result["a1_p0_skip_reason"] = (
+                p0_skip_reason
+            )
+
+            # Actual execution policy remains unchanged.
+            if policy == "P0" and p0_skip_reason:
+                result.update(
+                    decision="SKIP",
+                    scenario="F",
+                    reason=p0_skip_reason,
+                )
+                return result
+
+            result.update(
+                decision="TAKE",
+                scenario="F",
+                reason="SHADOW_CONFLICT_OBSERVE",
+            )
+            return result
+
+        # D
+        if relation == "ALIGNED":
+
+            # D-WEAK
+            if (
+                structure_points < 15.0
+                and sr_points < 30.0
+            ):
+                result.update(
+                    decision="SKIP",
+                    scenario="D-WEAK",
+                    reason="D_STRUCTURE_SR_WEAK",
+                )
+                return result
+            
+            # Strong D requires valid liquidity analytics.
+            if not liquidity_data_ok:
+                result.update(
+                    decision="SKIP",
+                    scenario="D",
+                    reason="D_LIQUIDITY_DATA_UNAVAILABLE",
+                )
+                return result
+            # Strong D still requires opposing pool.
+            if target_level is None:
+                result.update(
+                    decision="SKIP",
+                    scenario="D",
+                    reason="D_NO_OPPOSING_POOL",
+                )
+                return result
+
+            # Strong D requires TP before pool.
+            if not tp_before_pool:
+                result.update(
+                    decision="SKIP",
+                    scenario="D",
+                    reason="D_TP_BEYOND_POOL",
+                )
+                return result
+
+            result.update(
+                decision="TAKE",
+                scenario="D",
+                reason="D_STRONG_TP_BEFORE_POOL",
+            )
+            return result
+
+        # Anything genuinely unexpected fails closed.
+        result.update(
+            decision="SKIP",
+            scenario="UNKNOWN",
+            reason="SHADOW_RELATION_UNKNOWN",
+        )
+        return result
+
+    except Exception as exc:
+        result["reason"] = (
+            f"ANALYSIS1_EXCEPTION:{type(exc).__name__}"
+        )
+        result["error"] = str(exc)
+        return result
 
 def _point_a_planned_risk(
     *,
@@ -4290,6 +5759,8 @@ def _point_a_evaluate(
     if atr <= 0:
         return {**base, "decision": "WAIT", "action": "HOLD", "reason": "ATR_UNAVAILABLE", "reason_codes": ["POINT_A_ATR_UNAVAILABLE"]}
 
+    
+
     # -------------------------------------------------------------
     # PRICE_TOO_FAR
     #
@@ -4526,6 +5997,297 @@ def _point_a_evaluate(
         }
 
     if dxy_status == "PASS":
+        # -----------------------------------------------------
+        # POINT-A RULE B
+        #
+        # Historical Rule-B replay:
+        # when canonical REAL_DXY 20H context is SIDEWAYS,
+        # do not rely on directional DXY confirmation unless
+        # all three independent short-flow observations agree
+        # with the DXY direction required by this trade.
+        #
+        # This is a WAIT veto only:
+        #   - it does not BLOCK/REJECT
+        #   - passing it does not independently ALLOW
+        #   - existing Point-A logic continues unchanged
+        #   - symbol room is NOT a Rule-B condition
+        #   - canonical REAL_DXY only; no synthetic fallback
+        # -----------------------------------------------------
+        h1_20_direction = str(
+            snap.get("h1_20_direction")
+            or ""
+        ).upper().strip()
+
+        required_direction = str(
+            snap.get("required_direction_for_trade")
+            or ""
+        ).upper().strip()
+
+        try:
+            h1_slope_5_atr = float(
+                snap.get("h1_slope_5_atr")
+            )
+        except (TypeError, ValueError):
+            h1_slope_5_atr = None
+
+        try:
+            h1_bullish_bodies = int(
+                snap.get("h1_bullish_bodies")
+            )
+            h1_bearish_bodies = int(
+                snap.get("h1_bearish_bodies")
+            )
+            h1_up_steps = int(
+                snap.get("h1_up_steps")
+            )
+            h1_down_steps = int(
+                snap.get("h1_down_steps")
+            )
+        except (TypeError, ValueError):
+            h1_bullish_bodies = None
+            h1_bearish_bodies = None
+            h1_up_steps = None
+            h1_down_steps = None
+
+        rule_b_applies = bool(
+            h1_20_direction == "SIDEWAYS"
+            and required_direction
+            in ("BULLISH", "BEARISH")
+        )
+
+        rule_b_short_flow_confirmed = None
+
+        if rule_b_applies:
+            if (
+                h1_slope_5_atr is None
+                or h1_bullish_bodies is None
+                or h1_bearish_bodies is None
+                or h1_up_steps is None
+                or h1_down_steps is None
+            ):
+                rule_b_short_flow_confirmed = False
+
+            elif required_direction == "BULLISH":
+                rule_b_short_flow_confirmed = bool(
+                    h1_slope_5_atr > 0.0
+                    and h1_bullish_bodies
+                    > h1_bearish_bodies
+                    and h1_up_steps
+                    > h1_down_steps
+                )
+
+            else:
+                rule_b_short_flow_confirmed = bool(
+                    h1_slope_5_atr < 0.0
+                    and h1_bearish_bodies
+                    > h1_bullish_bodies
+                    and h1_down_steps
+                    > h1_up_steps
+                )
+
+        base["dxy_rule_b"] = {
+            "applies": bool(rule_b_applies),
+            "source": "REAL_DXY",
+            "h1_20_direction": (
+                h1_20_direction or None
+            ),
+            "required_direction": (
+                required_direction or None
+            ),
+            "h1_slope_5_atr": h1_slope_5_atr,
+            "h1_bullish_bodies": h1_bullish_bodies,
+            "h1_bearish_bodies": h1_bearish_bodies,
+            "h1_up_steps": h1_up_steps,
+            "h1_down_steps": h1_down_steps,
+            "short_flow_confirmed": (
+                rule_b_short_flow_confirmed
+            ),
+        }
+
+        if (
+            rule_b_applies
+            and rule_b_short_flow_confirmed is not True
+        ):
+            return _point_a_result(
+                base,
+                verdict="WAIT",
+                action="HOLD",
+                reason=(
+                    "DXY_SIDEWAYS_SHORT_FLOW_UNCONFIRMED"
+                ),
+                reason_codes=list(dict.fromkeys(
+                    dxy_codes
+                    + [
+                        "DXY_20H_SIDEWAYS",
+                        "DXY_SHORT_FLOW_UNCONFIRMED",
+                    ]
+                )),
+            )
+
+        # -----------------------------------------------------
+        # POINT-A WEAK-ZONE / FAR-FROM-ZONE RC PROTECTION
+        #
+        # Historical production-trade replay showed that
+        # zone_score < 10 by itself is NOT a safe block:
+        # several strong winners came from low-score zones.
+        #
+        # The protective condition is intentionally narrow:
+        #
+        #   1) selected frozen zone score < 10
+        #   2) current Point-A price is >= 0.75 H1 ATR away
+        #      from the selected zone BAND
+        #   3) DXY/Point-A has otherwise reached PASS
+        #
+        # When true, retire ONLY this RC generation.
+        # Keep the structural H1 zone/watch alive and require
+        # a genuinely fresh RC before another entry attempt.
+        #
+        # IMPORTANT:
+        # - Existing PRICE_TOO_FAR >= 0.40R has already run.
+        # - Existing DXY WAIT/BLOCK logic has already run.
+        # - Missing/invalid telemetry fails open here and keeps
+        #   the existing Point-A behaviour unchanged.
+        # -----------------------------------------------------
+        weak_zone_far = False
+        weak_zone_score = None
+        weak_zone_distance_atr = None
+        weak_zone_distance_price = None
+        weak_zone_low = None
+        weak_zone_high = None
+
+        try:
+            weak_zone = (
+                watch.get("zone_used")
+                if isinstance(
+                    watch.get("zone_used"),
+                    dict,
+                )
+                else {}
+            )
+
+            weak_zone_score = _sf(
+                weak_zone.get("sr_score"),
+                0.0,
+            )
+
+            weak_zone_low = _sf(
+                weak_zone.get("low"),
+                0.0,
+            )
+
+            weak_zone_high = _sf(
+                weak_zone.get("high"),
+                0.0,
+            )
+
+            # Do not treat missing score as score=0.
+            # The selected zone must explicitly contain sr_score
+            # before this new protection is allowed to act.
+            weak_zone_score_available = (
+                weak_zone.get("sr_score")
+                is not None
+            )
+
+            if (
+                weak_zone_score_available
+                and weak_zone_score >= 0.0
+                and weak_zone_low > 0.0
+                and weak_zone_high > 0.0
+                and float(atr) > 0.0
+            ):
+                # Distance is measured from the actual frozen
+                # selected-zone BAND, not zone.level/centre.
+                #
+                # Price inside zone -> distance = 0.
+                if float(live_price) < weak_zone_low:
+                    weak_zone_distance_price = (
+                        weak_zone_low
+                        - float(live_price)
+                    )
+
+                elif float(live_price) > weak_zone_high:
+                    weak_zone_distance_price = (
+                        float(live_price)
+                        - weak_zone_high
+                    )
+
+                else:
+                    weak_zone_distance_price = 0.0
+
+                weak_zone_distance_atr = (
+                    float(weak_zone_distance_price)
+                    / float(atr)
+                )
+
+                weak_zone_far = bool(
+                    weak_zone_score < 10.0
+                    and weak_zone_distance_atr >= 0.75
+                )
+
+        except Exception as exc:
+            # This new protection must not accidentally block
+            # production because diagnostic inputs were malformed.
+            log.warning(
+                "[POINT_A] WEAK_ZONE_FAR_CHECK_FAILED "
+                "sym=%s side=%s err=%r",
+                sym,
+                side_u,
+                exc,
+            )
+
+            weak_zone_far = False
+
+        if weak_zone_far:
+            log.warning(
+                "[POINT_A] WAIT_FRESH_RC_WEAK_ZONE_TOO_FAR "
+                "sym=%s side=%s "
+                "zone_score=%.2f score_threshold=10.00 "
+                "zone_distance_atr=%.3f "
+                "distance_threshold_atr=0.750 "
+                "zone_distance_price=%s "
+                "zone_low=%s zone_high=%s "
+                "live_price=%s atr=%s "
+                "rev_ok_ms=%s trigger=%s "
+                "missed_move_r=%s "
+                "action=EXPIRE_CURRENT_RC_KEEP_ZONE",
+                sym,
+                side_u,
+                float(weak_zone_score),
+                float(weak_zone_distance_atr),
+                weak_zone_distance_price,
+                weak_zone_low,
+                weak_zone_high,
+                live_price,
+                atr,
+                rev_ok_ms,
+                trigger_level,
+                base.get("missed_move_r"),
+            )
+
+            return {
+                **base,
+                "decision": "WAIT",
+                "action": "EXPIRE",
+                "reason": "WEAK_ZONE_TOO_FAR",
+                "reason_codes": [
+                    "POINT_A_WEAK_ZONE_TOO_FAR_REARM",
+                ],
+
+                # Diagnostic fields.
+                "weak_zone_score": float(
+                    weak_zone_score
+                ),
+                "weak_zone_score_threshold": 10.0,
+                "zone_distance_price": float(
+                    weak_zone_distance_price
+                ),
+                "zone_distance_atr": round(
+                    float(weak_zone_distance_atr),
+                    4,
+                ),
+                "zone_distance_threshold_atr": 0.75,
+            }
+
         if symbol_room_class == "POOR":
             return {
                 **base,
@@ -5091,6 +6853,360 @@ def _enqueue_mt5_close_position(
     }
 
 
+
+def _submit_strategy_b_exit_pending_close(
+    *,
+    uid: str,
+    pos: dict,
+    shadow_decision: Any,
+    exit_reason: str,
+    mt5_account: str,
+    profile_id: str,
+) -> dict:
+    """
+    Commit an already-composed Strategy-B EXIT_PENDING lifecycle plan,
+    then enqueue the existing shared MT5 close-by-position command.
+
+    Important:
+    - Strategy-B only.
+    - Does not call _close_trade().
+    - Does not release risk.
+    - Does not mutate Strategy-A lifecycle/watch state.
+    - Broker enqueue success is not broker-close evidence.
+    """
+
+    if execution_strategy_from_record(pos) != STRATEGY_B:
+        return {
+            "ok": False,
+            "reason": "NOT_STRATEGY_B",
+        }
+
+    thesis_id = str(
+        pos.get("thesis_id") or ""
+    ).strip()
+
+    selected_capture_id = str(
+        pos.get("selected_capture_id") or ""
+    ).strip()
+
+    symbol = str(
+        pos.get("symbol") or ""
+    ).upper().strip()
+
+    side = str(
+        pos.get("side") or ""
+    ).upper().strip()
+
+    trade_id = str(
+        pos.get("trade_id") or ""
+    ).strip()
+
+    auth = authorize_strategy_b_exit_intent(
+        thesis_id=thesis_id,
+        selected_capture_id=selected_capture_id,
+        symbol=symbol,
+        side=side,
+        shadow_decision=shadow_decision,
+    )
+
+    if not auth.authorized:
+        return {
+            "ok": False,
+            "reason": str(auth.reason),
+        }
+
+    transition_plan = getattr(
+        shadow_decision,
+        "transition_plan",
+        None,
+    )
+
+    if not isinstance(
+        transition_plan,
+        (tuple, list),
+    ) or not transition_plan:
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EXIT_TRANSITION_PLAN_REQUIRED",
+        }
+
+    try:
+        state = load_strategy_b_lifecycle_state(
+            R,
+            thesis_id,
+        )
+    except Exception:
+        log.exception(
+            "[OPPT] STRATEGY_B_EXIT_STATE_LOAD_FAILED "
+            "uid=%s tid=%s thesis=%s",
+            uid,
+            trade_id,
+            thesis_id,
+        )
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EXIT_STATE_LOAD_FAILED",
+        }
+
+    if state is None:
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EXIT_STATE_NOT_FOUND",
+        }
+
+    if (
+        str(getattr(state, "thesis_id", ""))
+        != thesis_id
+        or str(
+            getattr(
+                state,
+                "selected_capture_id",
+                "",
+            )
+        )
+        != selected_capture_id
+    ):
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EXIT_STATE_IDENTITY_MISMATCH",
+        }
+
+    # Persist the frozen orchestrator plan exactly one canonical edge
+    # at a time. The lifecycle state adapter remains the CAS owner.
+    for plan in transition_plan:
+        if not bool(getattr(plan, "valid", False)):
+            return {
+                "ok": False,
+                "reason": "STRATEGY_B_EXIT_PLAN_EDGE_INVALID",
+            }
+
+        expected_from = str(
+            getattr(plan, "from_state", "") or ""
+        ).upper().strip()
+
+        target_state = str(
+            getattr(plan, "to_state", "") or ""
+        ).upper().strip()
+
+        if (
+            str(
+                getattr(
+                    state,
+                    "current_state",
+                    "",
+                )
+            ).upper().strip()
+            != expected_from
+        ):
+            return {
+                "ok": False,
+                "reason": "STRATEGY_B_EXIT_PLAN_FROM_STATE_MISMATCH",
+            }
+
+        at_ms = max(
+            now_ms(),
+            int(
+                getattr(
+                    state,
+                    "updated_at_ms",
+                    0,
+                )
+                or 0
+            ),
+        )
+
+        state = apply_strategy_b_lifecycle_transition(
+            state,
+            target_state=target_state,
+            reason=(
+                "PRODUCTION_EXIT_INTENT_"
+                f"{target_state}"
+            ),
+            at_ms=at_ms,
+            evidence_snapshot={
+                "strategy": "B",
+                "thesis_id": thesis_id,
+                "selected_capture_id": (
+                    selected_capture_id
+                ),
+                "symbol": symbol,
+                "side": side,
+                "trade_id": trade_id,
+                "decision": str(
+                    getattr(
+                        shadow_decision,
+                        "decision",
+                        "",
+                    )
+                    or ""
+                ),
+            },
+        )
+
+        persisted = (
+            persist_strategy_b_lifecycle_state_atomic(
+                R,
+                state,
+            )
+        )
+
+        if not bool(
+            getattr(
+                persisted,
+                "ok",
+                False,
+            )
+        ):
+            return {
+                "ok": False,
+                "reason": (
+                    "STRATEGY_B_EXIT_STATE_PERSIST_FAILED:"
+                    + str(
+                        getattr(
+                            persisted,
+                            "reason",
+                            "UNKNOWN",
+                        )
+                    )
+                ),
+            }
+
+    if (
+        str(
+            getattr(
+                state,
+                "current_state",
+                "",
+            )
+        ).upper().strip()
+        != "EXIT_PENDING"
+    ):
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EXIT_PENDING_NOT_COMMITTED",
+        }
+
+    try:
+        ticket = int(
+            pos.get("mt5_ticket")
+            or pos.get("broker_ticket")
+            or pos.get("position_ticket")
+            or 0
+        )
+    except Exception:
+        ticket = 0
+
+    if ticket <= 0:
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EXIT_BROKER_TICKET_REQUIRED",
+        }
+
+    try:
+        qty = float(
+            pos.get("qty")
+            or pos.get("lots")
+            or 0.0
+        )
+    except Exception:
+        qty = 0.0
+
+    if qty <= 0:
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EXIT_QTY_REQUIRED",
+        }
+
+    close_res = _enqueue_mt5_close_position(
+        uid=uid,
+        symbol=symbol,
+        ticket=ticket,
+        qty=qty,
+        comment=(
+            "strategy_b exit:"
+            + str(exit_reason or "EXIT_REVIEW")
+        ),
+        trade_id=trade_id,
+        exit_reason=str(
+            exit_reason or "EXIT_REVIEW"
+        ),
+        mt5_account=mt5_account,
+        profile_id=profile_id,
+    )
+
+    if not isinstance(
+        close_res,
+        dict,
+    ) or not close_res.get("ok"):
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EXIT_ENQUEUE_FAILED",
+            "close_result": close_res,
+        }
+
+    close_job_id = str(
+        close_res.get("job_id") or ""
+    ).strip()
+
+    close_device_id = str(
+        close_res.get("device_id") or ""
+    ).strip()
+
+    if not close_job_id:
+        return {
+            "ok": False,
+            "reason": "STRATEGY_B_EXIT_JOB_ID_REQUIRED",
+        }
+
+    patched = _patch_open_trade_fields(
+        uid,
+        trade_id,
+        {
+            "strategy_b_exit_state": "EXIT_PENDING",
+            "strategy_b_exit_job_id": close_job_id,
+            "strategy_b_exit_device_id": close_device_id,
+            "strategy_b_exit_reason": str(
+                exit_reason or "EXIT_REVIEW"
+            ),
+            "strategy_b_exit_requested_at_ms": now_ms(),
+        },
+    )
+
+    if not patched:
+        # The broker close command is already queued. Never pretend it
+        # was not submitted merely because local metadata persistence
+        # failed.
+        log.critical(
+            "[OPPT] STRATEGY_B_EXIT_ENQUEUED_OPEN_PATCH_FAILED "
+            "uid=%s tid=%s thesis=%s job_id=%s ticket=%s",
+            uid,
+            trade_id,
+            thesis_id,
+            close_job_id,
+            ticket,
+        )
+
+        return {
+            "ok": True,
+            "reason": (
+                "STRATEGY_B_EXIT_ENQUEUED_METADATA_PATCH_FAILED"
+            ),
+            "job_id": close_job_id,
+            "device_id": close_device_id,
+            "ticket": ticket,
+            "metadata_persisted": False,
+        }
+
+    return {
+        "ok": True,
+        "reason": "STRATEGY_B_EXIT_ENQUEUED",
+        "job_id": close_job_id,
+        "device_id": close_device_id,
+        "ticket": ticket,
+        "metadata_persisted": True,
+    }
+
+
 # -----------------------------------------------------------------------------
 # Generic DXY H1 confirmed-opposite early-loss protection
 #
@@ -5279,6 +7395,20 @@ def _maybe_dxy_h1_early_close_loss(
     """
     if not isinstance(pos, dict) or not isinstance(broker_pos, dict):
         return {"action": "SKIP", "reason": "BAD_INPUT"}
+
+    strategy_owner = execution_strategy_from_record(pos)
+
+    if strategy_owner == STRATEGY_B:
+        return {
+            "action": "SKIP",
+            "reason": "STRATEGY_B_SKIP_A_DXY_DEFENSIVE_EXIT",
+        }
+
+    if strategy_owner != STRATEGY_A:
+        return {
+            "action": "SKIP",
+            "reason": "UNKNOWN_STRATEGY_SKIP_A_DXY_DEFENSIVE_EXIT",
+        }
 
     symbol = str(pos.get("symbol") or broker_pos.get("symbol") or "").upper().strip()
     if symbol not in DXY_H1_ADVERSE_DIRECTION:
@@ -7069,6 +9199,31 @@ def _clear_watchlist_entry_block(ev: dict, reason: str = "ENTRY_BLOCKED_CAPACITY
       - late-entry distance check
     """
     try:
+        _entry_strategy = execution_strategy_from_record(ev)
+
+        if _entry_strategy == STRATEGY_B:
+            log.debug(
+                "[OPPT] STRATEGY_B_SKIP_A_WATCH_BLOCK_MUTATION "
+                "tid=%s sym=%s side=%s reason=%s",
+                ev.get("trade_id"),
+                ev.get("symbol"),
+                ev.get("side"),
+                reason,
+            )
+            return
+
+        if _entry_strategy != STRATEGY_A:
+            log.error(
+                "[OPPT] UNKNOWN_STRATEGY_SKIP_A_WATCH_BLOCK_MUTATION "
+                "tid=%s sym=%s side=%s strategy=%r reason=%s",
+                ev.get("trade_id"),
+                ev.get("symbol"),
+                ev.get("side"),
+                ev.get("strategy"),
+                reason,
+            )
+            return
+
         if str(ev.get("source") or "") != "watchlist":
             return
 
@@ -7398,6 +9553,7 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
             "SL",
             "STOP_OUT",
             "TRAILING_STOP",
+            "DEFENSIVE_LOSS_050R",
         }
 
         broker_deal = (
@@ -7569,6 +9725,7 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
             "TP",
             "SL",
             "TRAILING_STOP",
+            "DEFENSIVE_LOSS_050R",
         }
         
 
@@ -7692,7 +9849,39 @@ def _close_trade(uid: str, pos: Dict[str, Any], exit_price: float, reason: str, 
     
 
     _remove_open_trade(uid, str(pos.get("trade_id") or ""))
-    _clear_trade_lifecycle_keys(uid,pos)
+
+    _close_strategy = execution_strategy_from_record(pos)
+
+    if _close_strategy == STRATEGY_A:
+        _clear_trade_lifecycle_keys(uid, pos)
+    elif _close_strategy == STRATEGY_B:
+        log.debug(
+            "[OPPT] STRATEGY_B_SKIP_A_LIFECYCLE_CLEAR "
+            "uid=%s trade_id=%s sym=%s ticket=%s",
+            uid,
+            pos.get("trade_id"),
+            pos.get("symbol"),
+            (
+                pos.get("mt5_ticket")
+                or pos.get("broker_ticket")
+                or pos.get("position_ticket")
+            ),
+        )
+    else:
+        log.error(
+            "[OPPT] UNKNOWN_STRATEGY_SKIP_A_LIFECYCLE_CLEAR "
+            "uid=%s trade_id=%s strategy=%r sym=%s ticket=%s",
+            uid,
+            pos.get("trade_id"),
+            pos.get("strategy"),
+            pos.get("symbol"),
+            (
+                pos.get("mt5_ticket")
+                or pos.get("broker_ticket")
+                or pos.get("position_ticket")
+            ),
+        )
+
     _clear_exec_claim_for_trade(
         r=R,
         uid=uid,
@@ -8040,8 +10229,91 @@ def tick_user(uid: str) -> None:
                 # ticket/fill values have been attached to the trade.
                 _open_trade(uid, pos)
 
-                # Now synchronize the watch using the populated MT5 values.
+                # -------------------------------------------------
+                # Strategy-B broker evidence from positive ACK.
+                #
+                # The P0 guard above already proved _ack_ticket > 0.
+                # The transport job remains order_intent_id; the
+                # broker ticket is the external broker identity.
+                # -------------------------------------------------
+                _ack_strategy = execution_strategy_from_record(pos)
+
+                if _ack_strategy == STRATEGY_B:
+                    try:
+                        _b_ack_ms = int(
+                            ack.get("acked_at_ms")
+                            or pos.get("mt5_acked_at_ms")
+                            or 0
+                        )
+                    except Exception:
+                        _b_ack_ms = 0
+
+                    try:
+                        _b_open_ms = int(
+                            pos.get("broker_open_time_ms")
+                            or 0
+                        )
+                    except Exception:
+                        _b_open_ms = 0
+
+                    if _b_open_ms <= 0:
+                        _b_open_ms = _b_ack_ms
+
+                    try:
+                        _b_entry_price = float(
+                            pos.get("mt5_fill_price")
+                            or pos.get("entry_price")
+                            or 0.0
+                        )
+                    except Exception:
+                        _b_entry_price = 0.0
+
+                    _b_ack_ev = _record_strategy_b_broker_evidence(
+                        pos=pos,
+                        accepted_at_ms=_b_ack_ms,
+                        broker_order_id=str(_ack_ticket),
+                        broker_position_id=str(_ack_ticket),
+                        opened_at_ms=_b_open_ms,
+                        entry_price=_b_entry_price,
+                    )
+
+                    if not bool(_b_ack_ev.get("ok")):
+                        log.error(
+                            "[OPPT] STRATEGY_B_ACK_EVIDENCE_FAILED "
+                            "uid=%s tid=%s thesis=%s capture=%s "
+                            "sym=%s side=%s ticket=%s reason=%s",
+                            uid,
+                            pos.get("trade_id"),
+                            pos.get("thesis_id"),
+                            pos.get("selected_capture_id"),
+                            pos.get("symbol"),
+                            pos.get("side"),
+                            _ack_ticket,
+                            _b_ack_ev.get("reason"),
+                        )
+                    else:
+                        log.warning(
+                            "[OPPT] STRATEGY_B_ACK_EVIDENCE_RECORDED "
+                            "uid=%s tid=%s thesis=%s capture=%s "
+                            "sym=%s side=%s ticket=%s "
+                            "order_coord=%s open_coord=%s",
+                            uid,
+                            pos.get("trade_id"),
+                            pos.get("thesis_id"),
+                            pos.get("selected_capture_id"),
+                            pos.get("symbol"),
+                            pos.get("side"),
+                            _ack_ticket,
+                            _b_ack_ev.get("order_coord_reason"),
+                            _b_ack_ev.get("open_coord_reason"),
+                        )
+
+                # Strategy-A watch lifecycle only.
+                # Strategy-B owns no Strategy-A zone watch.
                 try:
+                    if _ack_strategy != STRATEGY_A:
+                        raise StopIteration("SKIP_NON_A_ACK_WATCH")
+
                     sym0 = str(
                         pos.get("symbol")
                         or ""
@@ -8129,10 +10401,12 @@ def tick_user(uid: str) -> None:
                         _ax,
                     )
 
-                # Durable ticket->zone map: persist entry zone keyed by MT5 ticket so that
-                # broker_repair can recover the zone after an agent restart (when the watch
-                # state may no longer hold zone_used). Independent of watch + trade record.
+                # Strategy-A durable ticket->zone map.
+                # Strategy-B has no Strategy-A entry-zone ownership.
                 try:
+                    if _ack_strategy != STRATEGY_A:
+                        raise StopIteration("SKIP_NON_A_ACK_ZONE_MAP")
+
                     _tk = int(pos.get("mt5_ticket") or 0)
                     if _tk > 0:
                         _zmeta = {
@@ -8837,6 +11111,204 @@ def tick_user(uid: str) -> None:
                         )
 
                     # -------------------------------------------------
+                    # Strategy-B post-entry thesis runtime.
+                    #
+                    # B owns its structural thesis and exit lifecycle.
+                    # Unknown/mixed live evidence is NOT an exit.
+                    # This path never calls _close_trade() directly.
+                    # -------------------------------------------------
+                    try:
+                        if (
+                            broker_pos
+                            and execution_strategy_from_record(pos)
+                            == STRATEGY_B
+                        ):
+                            _b_sym = str(
+                                pos.get("symbol") or ""
+                            ).upper().strip()
+                            _b_side = str(
+                                pos.get("side") or ""
+                            ).upper().strip()
+                            _b_expected_dxy = str(
+                                pos.get("expected_dxy_direction")
+                                or ""
+                            ).upper().strip()
+
+                            _b_symbol_obs = (
+                                load_strategy_b_symbol_snapshot_live(
+                                    R,
+                                    symbol=_b_sym,
+                                    side=_b_side,
+                                    as_of_ms=now_ms(),
+                                )
+                            )
+
+                            _b_dxy_live = (
+                                load_strategy_b_post_entry_dxy(
+                                    R,
+                                    as_of_ms=now_ms(),
+                                )
+                            )
+
+                            if (
+                                _b_symbol_obs.get("ok") is True
+                                and _b_dxy_live.get("data_ok") is True
+                            ):
+                                _b_validity = (
+                                    evaluate_strategy_b_post_entry_validity(
+                                        expected_dxy_direction=(
+                                            _b_expected_dxy
+                                        ),
+                                        dxy_h1_turn=(
+                                            _b_dxy_live.get(
+                                                "dxy_h1_turn"
+                                            )
+                                            or {}
+                                        ),
+                                        dxy_bias=(
+                                            _b_dxy_live.get(
+                                                "dxy_bias"
+                                            )
+                                            or {}
+                                        ),
+                                    )
+                                )
+
+                                if _b_validity.ready is True:
+                                    _b_evidence = (
+                                        build_strategy_b_post_entry_evidence_from_validity(
+                                            trade=pos,
+                                            symbol_observation=_b_symbol_obs,
+                                            live_inputs=_b_dxy_live,
+                                            validity=_b_validity,
+                                        )
+                                    )
+
+                                    if _b_evidence.ready is True:
+                                        _b_thesis = (
+                                            evaluate_strategy_b_position_thesis(
+                                                thesis_evidence=(
+                                                    _b_evidence.thesis_evidence
+                                                ),
+                                                event_evidence=(
+                                                    _b_evidence.event_evidence
+                                                ),
+                                                account_safety=(
+                                                    _b_evidence.account_safety
+                                                ),
+                                            )
+                                        )
+
+                                        _b_thesis_id = str(
+                                            pos.get("thesis_id") or ""
+                                        ).strip()
+                                        _b_capture_id = str(
+                                            pos.get(
+                                                "selected_capture_id"
+                                            )
+                                            or ""
+                                        ).strip()
+
+                                        _b_lifecycle = (
+                                            load_strategy_b_lifecycle_state(
+                                                R,
+                                                thesis_id=_b_thesis_id,
+                                                selected_capture_id=(
+                                                    _b_capture_id
+                                                ),
+                                            )
+                                        )
+
+                                        if _b_lifecycle is not None:
+                                            _b_shadow = (
+                                                compose_strategy_b_shadow_decision(
+                                                    current_state=(
+                                                        _b_lifecycle.current_state
+                                                    ),
+                                                    position_thesis=_b_thesis,
+                                                )
+                                            )
+
+                                            if (
+                                                str(
+                                                    _b_thesis.decision
+                                                    or ""
+                                                ).upper()
+                                                == "EXIT_REVIEW"
+                                            ):
+                                                _b_exit_result = (
+                                                    _submit_strategy_b_exit_pending_close(
+                                                        uid=uid,
+                                                        pos=pos,
+                                                        shadow_decision=(
+                                                            _b_shadow
+                                                        ),
+                                                        exit_reason=str(
+                                                            _b_thesis.reason
+                                                            or "STRATEGY_B_EXIT_REVIEW"
+                                                        ),
+                                                        mt5_account=(
+                                                            mt5_account
+                                                        ),
+                                                        profile_id=str(
+                                                            pos.get(
+                                                                "profile_id"
+                                                            )
+                                                            or ""
+                                                        ),
+                                                    )
+                                                )
+
+                                                log.warning(
+                                                    "[OPPT] STRATEGY_B_POST_ENTRY_EXIT "
+                                                    "uid=%s tid=%s ticket=%s "
+                                                    "sym=%s side=%s "
+                                                    "thesis_state=%s reason=%s "
+                                                    "submit_ok=%s submit_reason=%s",
+                                                    uid,
+                                                    pos.get("trade_id"),
+                                                    ticket,
+                                                    _b_sym,
+                                                    _b_side,
+                                                    _b_thesis.thesis_state,
+                                                    _b_thesis.reason,
+                                                    (
+                                                        _b_exit_result.get(
+                                                            "ok"
+                                                        )
+                                                        if isinstance(
+                                                            _b_exit_result,
+                                                            dict,
+                                                        )
+                                                        else None
+                                                    ),
+                                                    (
+                                                        _b_exit_result.get(
+                                                            "reason"
+                                                        )
+                                                        if isinstance(
+                                                            _b_exit_result,
+                                                            dict,
+                                                        )
+                                                        else None
+                                                    ),
+                                                )
+
+                    except Exception as _b_post_exc:
+                        # Fail closed for B thesis management:
+                        # observation/evaluation failure must never
+                        # manufacture a broker close.
+                        log.exception(
+                            "[OPPT] STRATEGY_B_POST_ENTRY_CHECK_FAILED "
+                            "uid=%s tid=%s ticket=%s sym=%s err=%r",
+                            uid,
+                            pos.get("trade_id"),
+                            ticket,
+                            pos.get("symbol"),
+                            _b_post_exc,
+                        )
+
+                    # -------------------------------------------------
                     # Generic losing-trade DXY H1 macro protection.
                     #
                     # Profit/BE protection remains owned by the dedicated
@@ -9136,6 +11608,101 @@ def tick_user(uid: str) -> None:
                             close_reason,
                             list(open_tickets),
                         )
+
+                        if (
+                            execution_strategy_from_record(pos)
+                            == STRATEGY_B
+                        ):
+                            b_close = _record_strategy_b_closed_evidence(
+                                pos=pos,
+                                exit_price=float(lp),
+                                close_reason=close_reason,
+                                broker_meta=broker_meta,
+                            )
+
+                            if not bool(b_close.get("ok")):
+                                log.error(
+                                    "[OPPT] STRATEGY_B_BROKER_CLOSE_DEFER "
+                                    "uid=%s sym=%s ticket=%s reason=%s",
+                                    uid,
+                                    pos.get("symbol"),
+                                    ticket,
+                                    b_close.get("reason"),
+                                )
+                                continue
+
+                            log.warning(
+                                "[OPPT] STRATEGY_B_BROKER_CLOSE_EVIDENCE_OK "
+                                "uid=%s sym=%s ticket=%s "
+                                "net_r=%s mfe_r=%s mae_r=%s",
+                                uid,
+                                pos.get("symbol"),
+                                ticket,
+                                b_close.get("net_r"),
+                                b_close.get("mfe_r"),
+                                b_close.get("mae_r"),
+                            )
+
+                            # Calibration is analytics-only and runs only
+                            # after canonical Strategy-B closed evidence has
+                            # durably proven lifecycle CLOSED.
+                            #
+                            # Fail open: calibration must never defer broker
+                            # close finalization.
+                            try:
+                                calibration_outcome = (
+                                    capture_strategy_b_runtime_outcome(
+                                        closed=b_close.get("closed"),
+                                        original_sl_price=b_close.get(
+                                            "original_sl_price"
+                                        ),
+                                        initial_r_price=b_close.get(
+                                            "initial_r_price"
+                                        ),
+                                    )
+                                )
+
+                                if not bool(
+                                    calibration_outcome.get("ok")
+                                ):
+                                    log.error(
+                                        "[OPPT] "
+                                        "STRATEGY_B_CALIBRATION_OUTCOME_FAILED "
+                                        "uid=%s sym=%s ticket=%s reason=%s",
+                                        uid,
+                                        pos.get("symbol"),
+                                        ticket,
+                                        calibration_outcome.get("reason"),
+                                    )
+                                else:
+                                    log.warning(
+                                        "[OPPT] "
+                                        "STRATEGY_B_CALIBRATION_OUTCOME_OK "
+                                        "uid=%s sym=%s ticket=%s "
+                                        "capture=%s written=%s duplicate=%s",
+                                        uid,
+                                        pos.get("symbol"),
+                                        ticket,
+                                        calibration_outcome.get(
+                                            "capture_id"
+                                        ),
+                                        calibration_outcome.get(
+                                            "written"
+                                        ),
+                                        calibration_outcome.get(
+                                            "duplicate"
+                                        ),
+                                    )
+
+                            except Exception:
+                                log.exception(
+                                    "[OPPT] "
+                                    "STRATEGY_B_CALIBRATION_OUTCOME_EXCEPTION "
+                                    "uid=%s sym=%s ticket=%s",
+                                    uid,
+                                    pos.get("symbol"),
+                                    ticket,
+                                )
 
                         _close_trade(
                             uid,
@@ -10306,6 +12873,11 @@ def tick_user(uid: str) -> None:
                 if live_px <= 0:
                     continue
 
+                # Stable timestamp for this valid watch evaluation.
+                # EVENT_WAIT re-evaluation occurs before the later
+                # Point-A/cross-specific now_e refreshes.
+                now_e = now_ms()
+
                 rev_ok_ms = _si(
                     watch.get("rev_ok_ms"),
                     0,
@@ -11255,7 +13827,33 @@ def tick_user(uid: str) -> None:
                             )
                         )
 
-                        if _pa_price_too_far:
+                        # ---------------------------------------------
+                        # Weak-zone / far-zone protection uses the
+                        # SAME lifecycle as PRICE_TOO_FAR:
+                        # retire current RC, preserve structural zone,
+                        # and wait for a genuinely newer RC.
+                        # ---------------------------------------------
+                        _pa_weak_zone_too_far = bool(
+                            _pa_expire_reason
+                            == "WEAK_ZONE_TOO_FAR"
+                            or (
+                                "POINT_A_WEAK_ZONE_TOO_FAR_REARM"
+                                in _pa_expire_codes
+                            )
+                        )
+
+                        _pa_rc_rearm = bool(
+                            _pa_price_too_far
+                            or _pa_weak_zone_too_far
+                        )
+
+                        _pa_rc_rearm_reason = (
+                            "WEAK_ZONE_TOO_FAR"
+                            if _pa_weak_zone_too_far
+                            else "PRICE_TOO_FAR"
+                        )
+
+                        if _pa_rc_rearm:
                             _retired_rev_ok_ms = int(
                                 watch.get("rev_ok_ms") or 0
                             )
@@ -11279,21 +13877,32 @@ def tick_user(uid: str) -> None:
                             )
 
                             log.warning(
-                                "[POINT_A] PRICE_TOO_FAR_RC_REARM "
+                                "[POINT_A] RC_REARM_KEEP_ZONE "
                                 "sym=%s side=%s "
+                                "reason=%s "
                                 "old_rev_ok_ms=%s "
                                 "old_trigger=%s "
                                 "old_cross_ms=%s "
                                 "missed_move_r=%s "
                                 "displacement_atr=%s "
-                                "action=RETIRE_RC_KEEP_ZONE",
+                                "zone_score=%s "
+                                "zone_distance_atr=%s "
+                                "action=RETIRE_RC_KEEP_ZONE "
+                                "next_state=REV_WATCH",
                                 sym_w,
                                 side_w,
+                                _pa_rc_rearm_reason,
                                 _retired_rev_ok_ms,
                                 _retired_trigger,
                                 _retired_cross_ms,
                                 _retired_missed_r,
                                 _retired_displacement_atr,
+                                point_a.get(
+                                    "weak_zone_score"
+                                ),
+                                point_a.get(
+                                    "zone_distance_atr"
+                                ),
                             )
 
                             # ---------------------------------------------
@@ -11403,7 +14012,7 @@ def tick_user(uid: str) -> None:
 
                             watch[
                                 "point_a_rc_rearm_reason"
-                            ] = "PRICE_TOO_FAR"
+                            ] = _pa_rc_rearm_reason
 
                             watch[
                                 "point_a_rc_rearm_at_ms"
@@ -11817,6 +14426,7 @@ def tick_user(uid: str) -> None:
                                 live_price=float(live_px),
                                 trigger_level=float(trigger_level),
                                 event_ms=int(now_e),
+                                redis_client=R,
                             )
                         except Exception as analytics_exc:
                             log.warning(
@@ -11995,12 +14605,22 @@ def tick_user(uid: str) -> None:
 
                 prev_px = 0.0
                 prev_ts = 0
+                prev_rev_ok_ms = 0
+                prev_trigger_level = 0.0
 
                 try:
                     bs = _sj(R.get(break_key), {}) or {}
                     if isinstance(bs, dict):
                         prev_px = _sf(bs.get("last_price"), 0.0)
                         prev_ts = _si(bs.get("updated_ms"), 0)
+                        prev_rev_ok_ms = _si(
+                            bs.get("rev_ok_ms"),
+                            0,
+                        )
+                        prev_trigger_level = _sf(
+                            bs.get("trigger_level"),
+                            0.0,
+                        )
                 except Exception:
                     pass
 
@@ -12024,6 +14644,23 @@ def tick_user(uid: str) -> None:
                 #    Do not chase and do not terminally invalidate.
                 # -------------------------------------------------
                 _cross_rev_ms = int(watch.get("rev_ok_ms") or 0)
+
+                # Normal-runtime continuity:
+                # an observation outside the short 120s freshness
+                # window may still prove a real crossing, but only
+                # when it belongs to this exact RC generation and
+                # exact trigger. Legacy/restart state without this
+                # identity remains recovery-only.
+                _same_rc_baseline = bool(
+                    prev_px > 0
+                    and prev_rev_ok_ms > 0
+                    and prev_rev_ok_ms == _cross_rev_ms
+                    and prev_trigger_level > 0
+                    and abs(
+                        float(prev_trigger_level)
+                        - float(trigger_level)
+                    ) <= 1e-12
+                )
 
                 _persisted_same_cross = bool(
                     watch.get("rc_trigger_crossed")
@@ -12050,7 +14687,7 @@ def tick_user(uid: str) -> None:
                     )
 
                     _fresh_cross = bool(
-                        prev_fresh
+                        (prev_fresh or _same_rc_baseline)
                         and prev_px <= trigger_level
                         and live_px > trigger_level
                     )
@@ -12061,7 +14698,7 @@ def tick_user(uid: str) -> None:
                     )
 
                     _fresh_cross = bool(
-                        prev_fresh
+                        (prev_fresh or _same_rc_baseline)
                         and prev_px >= trigger_level
                         and live_px < trigger_level
                     )
@@ -12084,6 +14721,7 @@ def tick_user(uid: str) -> None:
                 recovery_beyond = bool(
                     not crossed
                     and not prev_fresh
+                    and not _same_rc_baseline
                     and _live_beyond
                 )
 
@@ -12121,6 +14759,7 @@ def tick_user(uid: str) -> None:
                             "symbol": sym_w,
                             "side": side_w,
                             "trigger_level": float(trigger_level),
+                            "rev_ok_ms": int(_cross_rev_ms),
                             "last_price": float(live_px),
                             "prev_price": float(prev_px),
                             "prev_fresh": bool(prev_fresh),
@@ -12525,10 +15164,173 @@ def tick_user(uid: str) -> None:
                     continue
 
                 # -------------------------------------------------
-                # Point-A final pre-entry gate.
-                # Runs only after a valid RC trigger is beyond/crossed and
-                # before any watchlist entry claim or executor event exists.
+                # Analysis-1 final production gate.
+                #
+                # EVENT_GATE has already ALLOWED the setup.
+                # Analysis-1 MUST run before:
+                #   - Point-A
+                #   - entry claim
+                #   - ENTRY event
+                #   - MT5 enqueue
                 # -------------------------------------------------
+                analysis1 = _analysis1_evaluate_pre_point_a(
+                    watch=watch,
+                    sym=sym_w,
+                    side=side_w,
+                    live_price=float(live_px),
+                    device_id=(
+                        str(dev_for_px or "").strip()
+                        or None
+                    ),
+                    now_e=int(now_e),
+                )
+
+                # Freeze the decision into the watch for audit.
+                # -------------------------------------------------
+                # Analysis-1 audit history.
+                #
+                # Preserve the FIRST pre-Point-A evaluation for the
+                # lifetime of this watch/RC. Subsequent evaluations
+                # may update watch["analysis1"] as the latest/current
+                # result, but must never overwrite the initial sample.
+                #
+                # Analytics only: this field is never used to decide
+                # TAKE/SKIP, Point-A, claim ownership, or execution.
+                # -------------------------------------------------
+                if not isinstance(
+                    watch.get("analysis1_initial"),
+                    dict,
+                ):
+                    watch["analysis1_initial"] = dict(
+                        analysis1
+                    )
+
+                # Existing compatibility/current-value field.
+                watch["analysis1"] = analysis1
+                watch["analysis1_policy_version"] = (
+                    ANALYSIS1_POLICY_VERSION
+                )
+                watch["analysis1_decision"] = str(
+                    analysis1.get("decision") or "SKIP"
+                )
+                watch["analysis1_scenario"] = str(
+                    analysis1.get("scenario") or "UNKNOWN"
+                )
+                watch["analysis1_reason"] = str(
+                    analysis1.get("reason") or ""
+                )
+
+                try:
+                    R.set(
+                        str(wkey),
+                        json.dumps(
+                            watch,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+                except Exception:
+                    pass
+
+                log.warning(
+                    "[ANALYSIS1] EVAL "
+                    "sym=%s side=%s "
+                    "decision=%s scenario=%s reason=%s "
+                    "relation=%s confidence=%s "
+                    "structure=%s sr=%s "
+                    "pool=%s pool_r=%s "
+                    "tp_before_pool=%s",
+                    sym_w,
+                    side_w,
+                    analysis1.get("decision"),
+                    analysis1.get("scenario"),
+                    analysis1.get("reason"),
+                    analysis1.get("shadow_relation"),
+                    analysis1.get("shadow_confidence"),
+                    analysis1.get("structure_points"),
+                    analysis1.get("sr_points"),
+                    analysis1.get(
+                        "target_liquidity_level"
+                    ),
+                    analysis1.get(
+                        "target_liquidity_distance_r"
+                    ),
+                    analysis1.get("tp_before_pool"),
+                )
+
+                if (
+                    str(
+                        analysis1.get("decision")
+                        or "SKIP"
+                    ).upper()
+                    != "TAKE"
+                ):
+                    # Analysis-1 rejected this crossed setup.
+                    #
+                    # Reuse the EXISTING terminal-release machinery.
+                    # Do NOT create a new persistent lifecycle state.
+                    #
+                    # If release fails:
+                    #   - current REV_OK ownership remains
+                    #   - no Point-A is executed
+                    #   - no claim is acquired
+                    #   - no MT5 order is created
+                    #   - next cycle can retry safely
+                    _released = (
+                        _point_a_release_terminal_watch(
+                            uid=uid,
+                            sym=sym_w,
+                            side=side_w,
+                            wkey=str(wkey),
+                            rev_ok_ms=int(
+                                watch.get("rev_ok_ms")
+                                or 0
+                            ),
+                            trigger_level=float(
+                                trigger_level
+                            ),
+                            live_price=float(live_px),
+                            reason=(
+                                "ANALYSIS1_"
+                                + str(
+                                    analysis1.get(
+                                        "reason"
+                                    )
+                                    or "SKIP"
+                                )
+                            ),
+                            terminal_type="ANALYSIS1",
+                            profile_id=(
+                                str(
+                                    profile_id_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                            device_id=(
+                                str(
+                                    dev_for_px
+                                    or ""
+                                ).strip()
+                                or None
+                            ),
+                        )
+                    )
+
+                    if not _released:
+                        log.error(
+                            "[ANALYSIS1] "
+                            "TERMINAL_RELEASE_FAILED "
+                            "sym=%s side=%s "
+                            "key=%s reason=%s",
+                            sym_w,
+                            side_w,
+                            wkey,
+                            analysis1.get("reason"),
+                        )
+
+                    continue
                 # -------------------------------------------------
                 # Point-A final pre-entry gate.
                 # Runs only after a valid RC trigger is beyond/crossed and
@@ -12680,6 +15482,212 @@ def tick_user(uid: str) -> None:
                 )
 
                 if point_a_action == "EXPIRE":
+                    # -------------------------------------------------
+                    # WEAK_ZONE_TOO_FAR:
+                    #
+                    # This is NOT a terminal structural expiry.
+                    # Retire only this immediate RC generation,
+                    # preserve the frozen H1 structural zone/watch,
+                    # and require a genuinely fresh RC.
+                    # -------------------------------------------------
+                    _pa_immediate_reason = str(
+                        point_a.get("reason") or ""
+                    ).upper().strip()
+
+                    _pa_immediate_codes = {
+                        str(_x).upper().strip()
+                        for _x in (
+                            point_a.get("reason_codes") or []
+                        )
+                    }
+
+                    _pa_immediate_weak_zone_rearm = bool(
+                        _pa_immediate_reason
+                        == "WEAK_ZONE_TOO_FAR"
+                        or (
+                            "POINT_A_WEAK_ZONE_TOO_FAR_REARM"
+                            in _pa_immediate_codes
+                        )
+                    )
+
+                    if _pa_immediate_weak_zone_rearm:
+                        _retired_rev_ok_ms = int(
+                            watch.get("rev_ok_ms") or 0
+                        )
+
+                        _retired_trigger = watch.get(
+                            "trigger_level"
+                        )
+
+                        _retired_cross_ms = watch.get(
+                            "point_a_cross_ms"
+                        )
+
+                        log.warning(
+                            "[POINT_A] "
+                            "IMMEDIATE_WEAK_ZONE_TOO_FAR_RC_REARM "
+                            "sym=%s side=%s "
+                            "old_rev_ok_ms=%s "
+                            "old_trigger=%s "
+                            "zone_score=%s "
+                            "zone_distance_atr=%s "
+                            "action=RETIRE_RC_KEEP_ZONE "
+                            "next_state=REV_WATCH",
+                            sym_w,
+                            side_w,
+                            _retired_rev_ok_ms,
+                            _retired_trigger,
+                            point_a.get(
+                                "weak_zone_score"
+                            ),
+                            point_a.get(
+                                "zone_distance_atr"
+                            ),
+                        )
+
+                        # Clear Point-A transient ownership only.
+                        _point_a_clear_fields(watch)
+
+                        # Retire the current RC generation.
+                        # Structural zone fields are intentionally
+                        # NOT removed.
+                        for _k in (
+                            "rev_ok_ms",
+                            "rev_ok_bar_hi",
+                            "rev_ok_bar_lo",
+                            "rev_ok_bar_close",
+                            "rc_open_ms",
+                            "rc_close_ms",
+                            "rc_high",
+                            "rc_low",
+                            "rc_close",
+                            "rc_source",
+                            "rc_is_touch_candle",
+                            "trigger_level",
+                            "rc_trigger_crossed",
+                            "rc_trigger_crossed_ms",
+                            "rc_trigger_cross_price",
+                            "entry_triggered_ms",
+                        ):
+                            watch.pop(_k, None)
+
+                        watch.pop(
+                            "discord_rc_trigger_sent",
+                            None,
+                        )
+                        watch.pop(
+                            "discord_rc_trigger_sent_ms",
+                            None,
+                        )
+                        watch.pop(
+                            "discord_rc_trigger_price",
+                            None,
+                        )
+                        watch.pop(
+                            "discord_rc_trigger_error",
+                            None,
+                        )
+
+                        watch["state"] = "REV_WATCH"
+                        watch["trade_state"] = "REV_WATCH"
+
+                        watch["rev_ok"] = False
+                        watch["entry_ready"] = False
+                        watch["entry_triggered"] = False
+                        watch["entry_blocked"] = False
+
+                        watch.pop(
+                            "entry_block_reason",
+                            None,
+                        )
+                        watch.pop(
+                            "next_retry_ms",
+                            None,
+                        )
+                        watch.pop(
+                            "late_entry_max_move",
+                            None,
+                        )
+
+                        watch[
+                            "point_a_last_retired_rc_ms"
+                        ] = int(
+                            _retired_rev_ok_ms
+                        )
+
+                        watch[
+                            "point_a_last_retired_trigger"
+                        ] = (
+                            float(_retired_trigger)
+                            if _retired_trigger is not None
+                            else None
+                        )
+
+                        watch[
+                            "point_a_last_retired_cross_ms"
+                        ] = (
+                            int(_retired_cross_ms)
+                            if _retired_cross_ms is not None
+                            else None
+                        )
+
+                        watch[
+                            "point_a_rc_rearm_reason"
+                        ] = "WEAK_ZONE_TOO_FAR"
+
+                        watch[
+                            "point_a_rc_rearm_at_ms"
+                        ] = int(now_e)
+
+                        watch[
+                            "point_a_rc_rearm_missed_r"
+                        ] = point_a.get(
+                            "missed_move_r"
+                        )
+
+                        watch[
+                            "point_a_rc_rearm_displacement_atr"
+                        ] = point_a.get(
+                            "displacement_atr"
+                        )
+
+                        try:
+                            R.set(
+                                str(wkey),
+                                json.dumps(
+                                    watch,
+                                    separators=(",", ":"),
+                                    default=str,
+                                ),
+                                ex=7 * 24 * 3600,
+                            )
+
+                            log.warning(
+                                "[POINT_A] "
+                                "IMMEDIATE_RC_REARM_PERSISTED "
+                                "sym=%s side=%s "
+                                "reason=WEAK_ZONE_TOO_FAR "
+                                "retired_rc_ms=%s "
+                                "state=REV_WATCH "
+                                "structural_zone_preserved=1 "
+                                "waiting_for_fresh_rc=1",
+                                sym_w,
+                                side_w,
+                                _retired_rev_ok_ms,
+                            )
+
+                        except Exception:
+                            log.exception(
+                                "[POINT_A] "
+                                "IMMEDIATE_RC_REARM_PERSIST_FAILED "
+                                "sym=%s side=%s key=%s",
+                                sym_w,
+                                side_w,
+                                wkey,
+                            )
+
+                        # Absolutely no order from this retired RC.
+                        continue
                     # -------------------------------------------------
                     # P0-1 IMMEDIATE EXPIRED -> RELEASE
                     #
@@ -13090,6 +16098,7 @@ def tick_user(uid: str) -> None:
                         live_price=float(live_px),
                         trigger_level=float(trigger_level),
                         event_ms=int(now_e),
+                        redis_client=R,
                     )
 
                     except Exception as exc:
@@ -13126,7 +16135,218 @@ def tick_user(uid: str) -> None:
 
                 if state_now in ("ORDER_PENDING", "TRADE_ACTIVE"):
                     continue
+                 
+                # -------------------------------------------------
+                # FINAL PLACEMENT GEOMETRY
+                #
+                # Point-A has ALLOWED this setup.
+                # Resolve exact entry / SL / TP before acquiring
+                # the execution claim.
+                # -------------------------------------------------
+                placement_utc_ms = now_ms()
 
+                zone = (
+                    watch.get("zone_used")
+                    if isinstance(
+                        watch.get("zone_used"),
+                        dict,
+                    )
+                    else {}
+                )
+
+                z_low = _sf(
+                    zone.get("low")
+                    if isinstance(zone, dict)
+                    else 0.0,
+                    0.0,
+                )
+
+                z_high = _sf(
+                    zone.get("high")
+                    if isinstance(zone, dict)
+                    else 0.0,
+                    0.0,
+                )
+
+                entry_px = float(live_px)
+
+                sl_buf = _strategy_sl_buffer(sym_w)
+
+                sl_price = 0.0
+                tp_price = 0.0
+
+                if side_w == "BUY" and z_low > 0:
+                    sl_price = z_low - sl_buf
+                    risk_dist = entry_px - sl_price
+
+                    if risk_dist > 0:
+                        tp_price = (
+                            entry_px
+                            + (2.0 * risk_dist)
+                        )
+
+                elif side_w == "SELL" and z_high > 0:
+                    sl_price = z_high + sl_buf
+                    risk_dist = sl_price - entry_px
+
+                    if risk_dist > 0:
+                        tp_price = (
+                            entry_px
+                            - (2.0 * risk_dist)
+                        )
+
+                if sl_price <= 0 or tp_price <= 0:
+                    log.warning(
+                        "[WATCHLIST] SKIP_ENTRY no_structure_sl "
+                        "sym=%s side=%s entry=%s zone=%s key=%s",
+                        sym_w,
+                        side_w,
+                        entry_px,
+                        zone,
+                        wkey,
+                    )
+                    continue
+
+                # -------------------------------------------------
+                # Analysis-1 PLACEMENT re-check.
+                #
+                # Fresh system UTC + exact final placement
+                # entry / structural SL / 2R TP.
+                #
+                # This MUST remain before entry claim.
+                # -------------------------------------------------
+                analysis1_placement = (
+                    _analysis1_evaluate_pre_point_a(
+                        watch=watch,
+                        sym=sym_w,
+                        side=side_w,
+                        live_price=float(entry_px),
+                        device_id=(
+                            str(
+                                dev_for_px or ""
+                            ).strip()
+                            or None
+                        ),
+                        now_e=int(placement_utc_ms),
+                        decision_stage="placement",
+                        entry_price=float(entry_px),
+                        sl_price=float(sl_price),
+                        tp_price=float(tp_price),
+                        a1_policy=ANALYSIS1_POLICY,
+                    )
+                )
+
+                analysis1_pre = (
+                    watch.get("analysis1")
+                    if isinstance(
+                        watch.get("analysis1"),
+                        dict,
+                    )
+                    else None
+                )
+
+                analysis1_audit = {
+                    "a1_policy": ANALYSIS1_POLICY,
+                    "pre_point_a": analysis1_pre,
+                    "placement": analysis1_placement,
+                }
+
+                watch["analysis1_audit"] = analysis1_audit
+                watch["analysis1_placement"] = (
+                    analysis1_placement
+                )
+
+                try:
+                    R.set(
+                        str(wkey),
+                        json.dumps(
+                            watch,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+                except Exception:
+                    pass
+
+                log.warning(
+                    "[ANALYSIS1] PLACEMENT "
+                    "sym=%s side=%s "
+                    "decision=%s scenario=%s reason=%s "
+                    "utc_ms=%s entry=%s sl=%s tp=%s "
+                    "policy=%s",
+                    sym_w,
+                    side_w,
+                    analysis1_placement.get("decision"),
+                    analysis1_placement.get("scenario"),
+                    analysis1_placement.get("reason"),
+                    placement_utc_ms,
+                    entry_px,
+                    sl_price,
+                    tp_price,
+                    ANALYSIS1_POLICY,
+                )
+
+                if (
+                    str(
+                        analysis1_placement.get("decision")
+                        or "SKIP"
+                    ).upper()
+                    != "TAKE"
+                ):
+                    _released = (
+                        _point_a_release_terminal_watch(
+                            uid=uid,
+                            sym=sym_w,
+                            side=side_w,
+                            wkey=str(wkey),
+                            rev_ok_ms=int(
+                                watch.get("rev_ok_ms")
+                                or 0
+                            ),
+                            trigger_level=float(
+                                trigger_level
+                            ),
+                            live_price=float(entry_px),
+                            reason=(
+                                "ANALYSIS1_PLACEMENT_"
+                                + str(
+                                    analysis1_placement.get(
+                                        "reason"
+                                    )
+                                    or "SKIP"
+                                )
+                            ),
+                            terminal_type="ANALYSIS1",
+                            profile_id=(
+                                str(
+                                    profile_id_px or ""
+                                ).strip()
+                                or None
+                            ),
+                            device_id=(
+                                str(
+                                    dev_for_px or ""
+                                ).strip()
+                                or None
+                            ),
+                        )
+                    )
+
+                    if not _released:
+                        log.error(
+                            "[ANALYSIS1] "
+                            "PLACEMENT_RELEASE_FAILED "
+                            "sym=%s side=%s reason=%s",
+                            sym_w,
+                            side_w,
+                            analysis1_placement.get(
+                                "reason"
+                            ),
+                        )
+
+                    continue
+                
                 claim_rev_ms = int(
                     watch.get("rev_ok_ms")
                     or watch.get("started_ms")
@@ -13168,63 +16388,7 @@ def tick_user(uid: str) -> None:
                 now_e = now_ms()
                 trade_id = f"WATCH:{sym_w}:{side_w}:H1:{int(watch.get('rev_ok_ms') or watch.get('started_ms') or now_e)}"
 
-                zone = watch.get("zone_used") if isinstance(watch.get("zone_used"), dict) else {}
-                # -------------------------------------------------
-                # PROP-FIRM REQUIRED STRUCTURE SL / TP
-                # -------------------------------------------------
-                z_low = _sf(zone.get("low") if isinstance(zone, dict) else 0.0, 0.0)
-                z_high = _sf(zone.get("high") if isinstance(zone, dict) else 0.0, 0.0)
-                entry_px = float(live_px)
-
-                # small symbol-aware SL buffer
-                # Use the same structural SL buffer used by Point-A's
-                # pre-entry 0.40R PRICE_TOO_FAR calculation.
-                sl_buf = _strategy_sl_buffer(sym_w)
-
-                sl_price = 0.0
-                tp_price = 0.0
-
-                if side_w == "BUY" and z_low > 0:
-                    sl_price = z_low - sl_buf
-                    risk_dist = entry_px - sl_price
-                    if risk_dist > 0:
-                        tp_price = entry_px + (2.0 * risk_dist)
-
-                elif side_w == "SELL" and z_high > 0:
-                    sl_price = z_high + sl_buf
-                    risk_dist = sl_price - entry_px
-                    if risk_dist > 0:
-                        tp_price = entry_px - (2.0 * risk_dist)
-
-                if sl_price <= 0 or tp_price <= 0:
-                    log.warning(
-                        "[WATCHLIST] SKIP_ENTRY no_structure_sl "
-                        "sym=%s side=%s entry=%s zone=%s key=%s",
-                        sym_w,
-                        side_w,
-                        entry_px,
-                        zone,
-                        wkey,
-                    )
-
-                    try:
-                        tenant_delete_latest_entry_claim(
-                            R,
-                            uid,
-                            sym_w,
-                            side_w,
-                            tf="H1",
-                        )
-                    except Exception as claim_cleanup_exc:
-                        log.warning(
-                            "[WATCHLIST] ENTRY_CLAIM_CLEANUP_FAILED "
-                            "sym=%s side=%s reason=no_structure_sl err=%r",
-                            sym_w,
-                            side_w,
-                            claim_cleanup_exc,
-                        )
-
-                    continue
+                
                 log.warning(
                    "[WATCHLIST] BUILDING_ENTRY_EVENT sym=%s side=%s trade_id=%s",
                    sym_w,
@@ -13440,9 +16604,38 @@ def tick_user(uid: str) -> None:
                         else None
                     ),
                     "point_a": (
-                        json.loads(json.dumps(watch.get("point_a"), separators=(",", ":"), default=str))
-                        if isinstance(watch.get("point_a"), dict) else None
+                        json.loads(
+                            json.dumps(
+                                watch.get("point_a"),
+                                separators=(",", ":"),
+                                default=str,
+                            )
+                        )
+                        if isinstance(
+                            watch.get("point_a"),
+                            dict,
+                        )
+                        else None
                     ),
+
+                    
+                    # Preserve both Analysis-1 decisions:
+                    #   PRE_POINT_A
+                    #   PLACEMENT
+                    "analysis1": (
+                        json.loads(
+                            json.dumps(
+                                {
+                                    "a1_policy": ANALYSIS1_POLICY,
+                                    "pre_point_a": analysis1_pre,
+                                    "placement": analysis1_placement,
+                                },
+                                separators=(",", ":"),
+                                default=str,
+                            )
+                        )
+                    ),
+
                     "source": "watchlist",
                 })
 
@@ -13463,6 +16656,99 @@ def tick_user(uid: str) -> None:
     except Exception as e:
         log.warning("[WATCHLIST] scan_err err=%r", e)
    
+
+    # -------------------------------------------------
+    # Strategy-B global ENTRY_READY intent consumption.
+    #
+    # Strategy B is a global signal source. Each existing
+    # tick_user(uid) independently considers the same bounded
+    # canonical intents under that UID's existing profile,
+    # device, account, risk, capacity, cooldown, and execution
+    # claim rules.
+    #
+    # No Redis SCAN. No B-specific UID/profile/device routing.
+    # -------------------------------------------------
+    try:
+        from api.strategy_b_entry_intent_transport import (
+            load_strategy_b_entry_intents,
+        )
+
+        _b_entry_intents = load_strategy_b_entry_intents(
+            R,
+            limit=40,
+        )
+
+        for _b_intent in _b_entry_intents:
+            if not isinstance(_b_intent, dict):
+                continue
+
+            _b_thesis_id = str(
+                _b_intent.get("thesis_id") or ""
+            ).strip()
+            _b_capture_id = str(
+                _b_intent.get("selected_capture_id") or ""
+            ).strip()
+            _b_symbol = str(
+                _b_intent.get("symbol") or ""
+            ).upper().strip()
+            _b_side = str(
+                _b_intent.get("side") or ""
+            ).upper().strip()
+
+            if (
+                not _b_thesis_id
+                or not _b_capture_id
+                or not _b_symbol
+                or _b_side not in ("BUY", "SELL")
+            ):
+                continue
+
+            events.append(
+                {
+                    "type": "ENTRY",
+                    "trade_id": f"B:{_b_thesis_id}",
+                    "strategy": "B",
+                    "thesis_id": _b_thesis_id,
+                    "selected_capture_id": _b_capture_id,
+                    "symbol": _b_symbol,
+                    "side": _b_side,
+                    "entry_price": _b_intent.get(
+                        "setup_entry_price"
+                    ),
+                    "setup_entry_price": _b_intent.get(
+                        "setup_entry_price"
+                    ),
+                    "structural_invalidation_price": (
+                        _b_intent.get(
+                            "structural_invalidation_price"
+                        )
+                    ),
+                    "structural_buffer_price": (
+                        _b_intent.get(
+                            "structural_buffer_price"
+                        )
+                    ),
+                    "expected_dxy_direction": (
+                        _b_intent.get(
+                            "expected_dxy_direction"
+                        )
+                    ),
+                    "created_at_ms": _b_intent.get(
+                        "created_at_ms"
+                    ),
+                    "entry_ts_ms": _b_intent.get(
+                        "created_at_ms"
+                    ),
+                    "source": "strategy_b_entry_intent",
+                }
+            )
+
+    except Exception:
+        log.exception(
+            "[OPPT] STRATEGY_B_ENTRY_INTENT_LOAD_FAILED "
+            "uid=%s",
+            uid,
+        )
 
     # --- DEBUG: events summary ---
     try:
@@ -13650,6 +16936,24 @@ def tick_user(uid: str) -> None:
         ):
             continue
 
+        strategy = execution_strategy_from_record(ev)
+
+        if strategy not in (STRATEGY_A, STRATEGY_B):
+            log.error(
+                "[OPPT] BLOCK_ENTRY_UNKNOWN_STRATEGY "
+                "uid=%s tid=%s sym=%s side=%s strategy=%r",
+                uid,
+                tid,
+                sym,
+                side,
+                ev.get("strategy"),
+            )
+            continue
+
+        # Freeze normalized execution ownership.
+        # Legacy ENTRY events without strategy remain Strategy A.
+        ev["strategy"] = strategy
+
         if tid in open_by_id:
             continue
 
@@ -13748,7 +17052,7 @@ def tick_user(uid: str) -> None:
 
         if _same_sym_open or _broker_same_sym:
             try:
-                if _broker_same_sym:
+                if _broker_same_sym and strategy == STRATEGY_A:
                     _bp0 = dict(
                         _broker_same_sym[0]
                     )
@@ -13814,7 +17118,7 @@ def tick_user(uid: str) -> None:
 
         conf = str(ev.get("confidence") or "").lower().strip()
         
-        if score < min_score:
+        if strategy == STRATEGY_A and score < min_score:
             log.warning("[OPPT] SKIP_ENTRY score_lt_min uid=%s sym=%s tid=%s score=%s min_score=%s", uid, sym, tid, score, min_score)
             try:
                 from api.xtl_analytics import capture_rejection
@@ -13960,9 +17264,54 @@ def tick_user(uid: str) -> None:
         # Watchlist events use watch key only.
         # -------------------------------------------------
         is_watchlist_event = str(ev.get("source") or "").lower() == "watchlist"
+        # -------------------------------------------------------------
+        # Strategy-A execution ownership guard.
+        #
+        # Strategy-A live entries must originate only from the canonical
+        # watchlist pipeline:
+        #
+        #   RC
+        #   -> Event Gate
+        #   -> Analysis-1 PRE_POINT_A
+        #   -> Point-A
+        #   -> final geometry
+        #   -> Analysis-1 PLACEMENT
+        #   -> ENTRY
+        #
+        # Legacy OPPT/alert rows are advisory/history only. They must
+        # never create a second executable Strategy-A path that bypasses
+        # the live pre-entry gates.
+        #
+        # Strategy-B behavior is intentionally unchanged.
+        # -------------------------------------------------------------
+        if (
+            strategy == STRATEGY_A
+            and not is_watchlist_event
+        ):
+            log.warning(
+                "[OPPT] SKIP_ENTRY "
+                "reason=NON_WATCHLIST_STRATEGY_A "
+                "uid=%s sym=%s side=%s tid=%s source=%s",
+                uid,
+                sym,
+                side,
+                tid,
+                ev.get("source"),
+            )
+            continue
         alert_id = tid
 
-        if not is_watchlist_event:
+        if strategy == STRATEGY_B:
+            log.debug(
+                "[OPPT] STRATEGY_B_SKIP_A_PREENTRY_VALIDATION "
+                "uid=%s tid=%s sym=%s side=%s",
+                uid,
+                tid,
+                sym,
+                side,
+            )
+
+        elif not is_watchlist_event:
             try:
                 parts = str(tid or "").split(":")
                 alert_id = ":".join(parts[:-1]).strip() if len(parts) > 1 else str(tid or "").strip()
@@ -14056,7 +17405,7 @@ def tick_user(uid: str) -> None:
             )
         )
 
-        if not has_valid_entry_snapshot:
+        if strategy == STRATEGY_A and not has_valid_entry_snapshot:
             log.warning("[OPPT] SKIP_ENTRY bad_entry_snapshot uid=%s sym=%s side=%s tid=%s",
                         uid, sym, side, tid)
             continue
@@ -14358,101 +17707,102 @@ def tick_user(uid: str) -> None:
 
                     _clear_watchlist_entry_block(ev, "PROP_DAILY_R_BLOCK")
                     continue
-                prop_check = compute_prop_check(
-                    firm=str(prop_cfg.get("firm") or "ftmo"),
-                    phase=str(prop_cfg.get("phase") or "challenge"),
-                    account_size=float(prop_cfg.get("account_size") or 0.0),
-                    symbol=sym,
-                    side=side,
-                    entry=float(entry_price),
-                    sl=float(sl_price),
-                    risk_pct=float(prop_cfg.get("risk_pct") or 1.0),
-                    target_rr=float(prop_cfg.get("target_rr") or 2.0),
-                    daily_loss_used=float(risk_state.get("daily_loss_used") or 0),
-                    max_loss_used=float(risk_state.get("max_loss_used") or 0),
-                    open_risk_usd=float(risk_state.get("open_risk_usd") or 0),
-                    open_positions_count=len(risk_state.get("open_positions") or []),
-                    max_open_risk_pct=float(prop_cfg.get("max_open_risk_pct") or 3.0),
-                    max_open_positions=int(prop_cfg.get("max_open_positions") or 3),
-                )
-
-                if not isinstance(prop_check, dict) or prop_check.get("verdict") != "OK":
-                    log.warning(
-                        "[PROP] BLOCK_ENTRY uid=%s tid=%s sym=%s side=%s verdict=%s reasons=%s",
-                        uid, tid, sym, side,
-                        prop_check.get("verdict") if isinstance(prop_check, dict) else None,
-                        prop_check.get("reasons") if isinstance(prop_check, dict) else None,
+                if strategy == STRATEGY_A:
+                    prop_check = compute_prop_check(
+                        firm=str(prop_cfg.get("firm") or "ftmo"),
+                        phase=str(prop_cfg.get("phase") or "challenge"),
+                        account_size=float(prop_cfg.get("account_size") or 0.0),
+                        symbol=sym,
+                        side=side,
+                        entry=float(entry_price),
+                        sl=float(sl_price),
+                        risk_pct=float(prop_cfg.get("risk_pct") or 1.0),
+                        target_rr=float(prop_cfg.get("target_rr") or 2.0),
+                        daily_loss_used=float(risk_state.get("daily_loss_used") or 0),
+                        max_loss_used=float(risk_state.get("max_loss_used") or 0),
+                        open_risk_usd=float(risk_state.get("open_risk_usd") or 0),
+                        open_positions_count=len(risk_state.get("open_positions") or []),
+                        max_open_risk_pct=float(prop_cfg.get("max_open_risk_pct") or 3.0),
+                        max_open_positions=int(prop_cfg.get("max_open_positions") or 3),
                     )
-                    try:
-                        from api.xtl_analytics import capture_rejection
-                        _v = prop_check.get("verdict") if isinstance(prop_check, dict) else "NONE"
-                        capture_rejection(ev, f"prop_block:{_v}", gate="PROP", enrich=True)
-                    except Exception: pass
-                    try:
-                        R.delete(ENTRY_CLAIM_KEY.format(alert_id=alert_id))
-                    except Exception:
-                        pass
 
-                    try:
-                        R.delete(exec_claim_key)
-                    except Exception:
-                        pass
-
-                    _clear_watchlist_entry_block(ev, "PROP_CAPACITY_BLOCK")
-                    continue
-
-                # Override executor sizing with prop-calculated values.
-                if bool(prop_cfg.get("enabled")):
-                    lots0 = float(prop_check.get("lots") or 0)
-                    verdict0 = str(prop_check.get("verdict") or "").upper()
-
-                    if verdict0 != "OK" or lots0 <= 0:
+                    if not isinstance(prop_check, dict) or prop_check.get("verdict") != "OK":
                         log.warning(
-                            "[PROP] BLOCK_ENTRY_LOTS_MISSING sym=%s side=%s verdict=%s prop_check=%s",
-                            sym,
-                            side,
-                            verdict0,
-                            prop_check,
+                            "[PROP] BLOCK_ENTRY uid=%s tid=%s sym=%s side=%s verdict=%s reasons=%s",
+                            uid, tid, sym, side,
+                            prop_check.get("verdict") if isinstance(prop_check, dict) else None,
+                            prop_check.get("reasons") if isinstance(prop_check, dict) else None,
                         )
+                        try:
+                            from api.xtl_analytics import capture_rejection
+                            _v = prop_check.get("verdict") if isinstance(prop_check, dict) else "NONE"
+                            capture_rejection(ev, f"prop_block:{_v}", gate="PROP", enrich=True)
+                        except Exception: pass
+                        try:
+                            R.delete(ENTRY_CLAIM_KEY.format(alert_id=alert_id))
+                        except Exception:
+                            pass
+
                         try:
                             R.delete(exec_claim_key)
                         except Exception:
                             pass
-                        _clear_watchlist_entry_block(ev, "PROP_LOTS_MISSING")
+
+                        _clear_watchlist_entry_block(ev, "PROP_CAPACITY_BLOCK")
                         continue
 
-                qty_use = lots0
-                tp_price = float(prop_check.get("tp") or tp_price)
-                sl_price = float(prop_check.get("sl") or sl_price)
+                    # Override executor sizing with prop-calculated values.
+                    if bool(prop_cfg.get("enabled")):
+                        lots0 = float(prop_check.get("lots") or 0)
+                        verdict0 = str(prop_check.get("verdict") or "").upper()
+
+                        if verdict0 != "OK" or lots0 <= 0:
+                            log.warning(
+                                "[PROP] BLOCK_ENTRY_LOTS_MISSING sym=%s side=%s verdict=%s prop_check=%s",
+                                sym,
+                                side,
+                                verdict0,
+                                prop_check,
+                            )
+                            try:
+                                R.delete(exec_claim_key)
+                            except Exception:
+                                pass
+                            _clear_watchlist_entry_block(ev, "PROP_LOTS_MISSING")
+                            continue
+
+                    qty_use = lots0
+                    tp_price = float(prop_check.get("tp") or tp_price)
+                    sl_price = float(prop_check.get("sl") or sl_price)
 
                 
 
-                log.warning(
-                    "[PROP] OK_ENTRY uid=%s tid=%s sym=%s side=%s lots=%s risk_usd=%s tp=%s sl=%s",
-                    uid, tid, sym, side,
-                    prop_check.get("lots"),
-                    prop_check.get("risk_usd"),
-                    prop_check.get("tp"),
-                    prop_check.get("sl"),
-                )
-                try:
-                    msg = (
-                        f"**{sym} {side}**\n"
-                        f"Entry: `{entry_price}` | SL: `{sl_price}` | TP: `{tp_price}`\n"
-                        f"Lots: `{qty_use}`\n\n"
-                        f"**PROP [{prop_check.get('firm')} - {prop_check.get('phase')}]**\n"
-                        f"Risk: `${prop_check.get('risk_usd')}` "
-                        f"({prop_check.get('risk_pct')}%)\n"
-                        f"Daily room: `${prop_check.get('daily_room_usd')}` / "
-                        f"`${prop_check.get('daily_limit_usd')}`\n"
-                        f"Max room: `${prop_check.get('max_loss_room_usd')}` / "
-                        f"`${prop_check.get('max_loss_limit_usd')}`\n"
-                        f"Status: **OK TO PLACE MANUALLY**\n"
-                        f"Trade ID: `{tid}`"
+                    log.warning(
+                        "[PROP] OK_ENTRY uid=%s tid=%s sym=%s side=%s lots=%s risk_usd=%s tp=%s sl=%s",
+                        uid, tid, sym, side,
+                        prop_check.get("lots"),
+                        prop_check.get("risk_usd"),
+                        prop_check.get("tp"),
+                        prop_check.get("sl"),
                     )
-                    _discord_trade_post(msg)
-                except Exception:
-                    pass
+                    try:
+                        msg = (
+                            f"**{sym} {side}**\n"
+                            f"Entry: `{entry_price}` | SL: `{sl_price}` | TP: `{tp_price}`\n"
+                            f"Lots: `{qty_use}`\n\n"
+                            f"**PROP [{prop_check.get('firm')} - {prop_check.get('phase')}]**\n"
+                            f"Risk: `${prop_check.get('risk_usd')}` "
+                            f"({prop_check.get('risk_pct')}%)\n"
+                            f"Daily room: `${prop_check.get('daily_room_usd')}` / "
+                            f"`${prop_check.get('daily_limit_usd')}`\n"
+                            f"Max room: `${prop_check.get('max_loss_room_usd')}` / "
+                            f"`${prop_check.get('max_loss_limit_usd')}`\n"
+                            f"Status: **OK TO PLACE MANUALLY**\n"
+                            f"Trade ID: `{tid}`"
+                        )
+                        _discord_trade_post(msg)
+                    except Exception:
+                        pass
 
             except Exception as e:
                 log.exception(
@@ -14566,6 +17916,847 @@ def tick_user(uid: str) -> None:
             )
 
             continue
+
+        # -------------------------------------------------
+        # Strategy-B runtime sizing.
+        #
+        # Strategy B owns:
+        #   - execution-time structural stop geometry
+        #   - raw Point3 lot proposal
+        #
+        # Shared production infrastructure owns:
+        #   - UID/profile/device/account identity
+        #   - live executable price authority
+        #   - broker lot normalization
+        #   - account-level prop capacity
+        #
+        # Strategy B must never inherit Strategy-A generated
+        # SL/TP/lots.
+        # -------------------------------------------------
+        if strategy == STRATEGY_B:
+            b_thesis_id = str(
+                ev.get("thesis_id") or ""
+            ).strip()
+
+            b_capture_id = str(
+                ev.get("selected_capture_id") or ""
+            ).strip()
+
+            # ---------------------------------------------
+            # Bind this B thesis/capture to the production-
+            # resolved UID/profile/device/account identity.
+            # ---------------------------------------------
+            b_assignment = build_strategy_b_execution_assignment(
+                uid=uid,
+                thesis_id=b_thesis_id,
+                selected_capture_id=b_capture_id,
+                symbol=sym,
+                side=side,
+                prop_config=prop_cfg,
+                resolved_execution_context=resolved,
+            )
+
+            if (
+                not bool(getattr(b_assignment, "valid", False))
+                or str(
+                    getattr(b_assignment, "decision", "") or ""
+                ).upper() != "ASSIGNED"
+            ):
+                log.warning(
+                    "[OPPT] STRATEGY_B_ASSIGNMENT_BLOCK "
+                    "uid=%s profile=%s tid=%s sym=%s side=%s "
+                    "reason=%s",
+                    uid,
+                    prop_profile_id,
+                    tid,
+                    sym,
+                    side,
+                    str(
+                        getattr(
+                            b_assignment,
+                            "reason",
+                            "ASSIGNMENT_INVALID",
+                        )
+                    ),
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            # ---------------------------------------------
+            # Freeze the already-proven execution identity.
+            # Pure ownership contract only; this does not
+            # select another account/profile/device.
+            # ---------------------------------------------
+            b_ownership = ownership_from_assignment(
+                b_assignment
+            )
+
+            if not bool(
+                getattr(b_ownership, "allowed", False)
+            ):
+                log.warning(
+                    "[OPPT] STRATEGY_B_OWNERSHIP_BLOCK "
+                    "uid=%s profile=%s tid=%s sym=%s side=%s "
+                    "reason=%s",
+                    uid,
+                    prop_profile_id,
+                    tid,
+                    sym,
+                    side,
+                    str(
+                        getattr(
+                            b_ownership,
+                            "reason",
+                            "OWNERSHIP_INVALID",
+                        )
+                    ),
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            # ---------------------------------------------
+            # Fresh execution price from the exact existing
+            # production device-scoped price authority.
+            # ---------------------------------------------
+            b_price_key = (
+                f"xtl:price:{device_id}:{sym}"
+            )
+
+            try:
+                b_price_row = _sj(
+                    R.get(b_price_key),
+                    {},
+                )
+            except Exception:
+                log.exception(
+                    "[OPPT] STRATEGY_B_PRICE_READ_EXC "
+                    "uid=%s profile=%s tid=%s sym=%s "
+                    "device=%s",
+                    uid,
+                    prop_profile_id,
+                    tid,
+                    sym,
+                    device_id,
+                )
+                b_price_row = {}
+
+            b_execution_price = 0.0
+            b_price_ts_ms = 0
+
+            if isinstance(b_price_row, dict):
+                b_execution_price = _sf(
+                    b_price_row.get("price"),
+                    0.0,
+                )
+                b_price_ts_ms = _si(
+                    b_price_row.get("ts_ms"),
+                    0,
+                )
+
+            if (
+                b_execution_price <= 0
+                or b_price_ts_ms <= 0
+                or (
+                    now_ms() - b_price_ts_ms
+                ) > 120000
+            ):
+                log.warning(
+                    "[OPPT] STRATEGY_B_PRICE_NOT_FRESH "
+                    "uid=%s profile=%s tid=%s sym=%s "
+                    "device=%s price=%s ts_ms=%s age_ms=%s",
+                    uid,
+                    prop_profile_id,
+                    tid,
+                    sym,
+                    device_id,
+                    b_execution_price,
+                    b_price_ts_ms,
+                    (
+                        now_ms() - b_price_ts_ms
+                        if b_price_ts_ms > 0
+                        else -1
+                    ),
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            # ---------------------------------------------
+            # Point3 owns Strategy-B structural stop and
+            # raw sizing proposal.
+            # ---------------------------------------------
+            b_point3 = compose_strategy_b_point3(
+                assignment=b_assignment,
+                prop_config=prop_cfg,
+                risk_snapshot=risk_state,
+                entry_price=b_execution_price,
+                structural_invalidation_price=ev.get(
+                    "structural_invalidation_price"
+                ),
+                structural_buffer_price=ev.get(
+                    "structural_buffer_price"
+                ),
+                loss_per_lot_fn=compute_loss_per_lot_at_stop,
+            )
+
+            # Point3 is an observation/structural composition boundary,
+            # not Strategy-B production order authority.
+            #
+            # Production execution requires:
+            #   - a valid Point3 composition,
+            #   - a ready structural stop,
+            #   - authoritative loss-per-lot conversion.
+            #
+            # Do NOT require decision == "PLACE": Point3 intentionally
+            # returns RISK_PROPOSAL_READY_SHADOW and has no order authority.
+            # Its historical 0.10% shadow lot proposal is not production
+            # sizing authority.
+            if (
+                not bool(
+                    getattr(
+                        b_point3,
+                        "assignment_valid",
+                        False,
+                    )
+                )
+                or not bool(
+                    getattr(
+                        b_point3,
+                        "structural_stop_ready",
+                        False,
+                    )
+                )
+                or not bool(
+                    getattr(
+                        b_point3,
+                        "conversion_valid",
+                        False,
+                    )
+                )
+            ):
+                log.warning(
+                    "[OPPT] STRATEGY_B_POINT3_WAIT "
+                    "uid=%s profile=%s tid=%s sym=%s side=%s "
+                    "reason=%s",
+                    uid,
+                    prop_profile_id,
+                    tid,
+                    sym,
+                    side,
+                    str(
+                        getattr(
+                            b_point3,
+                            "reason",
+                            "POINT3_NOT_PLACE",
+                        )
+                    ),
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            b_stop_price = _sf(
+                getattr(
+                    b_point3,
+                    "proposed_stop_price",
+                    0.0,
+                ),
+                0.0,
+            )
+
+            # ---------------------------------------------
+            # Strategy-B production sizing authority.
+            #
+            # Point3 remains authoritative for B structural
+            # stop geometry only.  Its historical 0.10%
+            # observation/shadow lot proposal MUST NOT size
+            # a production order.
+            #
+            # Production requested risk comes from the same
+            # active prop-profile risk_pct used by Strategy A.
+            # If shared account capacity is smaller, reduce
+            # quantity -- NEVER move/tighten B structural SL.
+            # ---------------------------------------------
+            if b_stop_price <= 0:
+                log.warning(
+                    "[OPPT] STRATEGY_B_POINT3_INVALID_OUTPUT "
+                    "uid=%s tid=%s sym=%s stop=%s",
+                    uid,
+                    tid,
+                    sym,
+                    b_stop_price,
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            b_account_size = _sf(
+                prop_cfg.get("account_size"),
+                0.0,
+            )
+            b_profile_risk_pct = _sf(
+                prop_cfg.get("risk_pct"),
+                0.0,
+            )
+
+            if (
+                b_account_size <= 0
+                or b_profile_risk_pct <= 0
+            ):
+                log.warning(
+                    "[OPPT] STRATEGY_B_PROFILE_RISK_INVALID "
+                    "uid=%s profile=%s tid=%s sym=%s "
+                    "account_size=%s risk_pct=%s",
+                    uid,
+                    prop_profile_id,
+                    tid,
+                    sym,
+                    b_account_size,
+                    b_profile_risk_pct,
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            # Shared authoritative conversion using the exact
+            # B execution price and immutable structural SL.
+            b_loss = compute_loss_per_lot_at_stop(
+                symbol=sym,
+                entry=b_execution_price,
+                sl=b_stop_price,
+            )
+
+            if not bool(b_loss.get("data_ok")):
+                log.warning(
+                    "[OPPT] STRATEGY_B_LOSS_PER_LOT_BLOCK "
+                    "uid=%s tid=%s sym=%s reason=%s",
+                    uid,
+                    tid,
+                    sym,
+                    b_loss.get("reason"),
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            b_loss_per_lot = _sf(
+                b_loss.get("loss_per_lot_at_stop"),
+                0.0,
+            )
+
+            if b_loss_per_lot <= 0:
+                log.warning(
+                    "[OPPT] STRATEGY_B_LOSS_PER_LOT_INVALID "
+                    "uid=%s tid=%s sym=%s loss_per_lot=%s",
+                    uid,
+                    tid,
+                    sym,
+                    b_loss_per_lot,
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            # Normal per-trade risk requested by the active
+            # production prop profile -- same authority as A.
+            b_requested_risk_usd = (
+                b_account_size
+                * (b_profile_risk_pct / 100.0)
+            )
+
+            # Determine remaining account-level monetary room
+            # from the same authoritative prop rules used by
+            # Strategy A / validate_prop_capacity().
+            #
+            # Probe with a tiny positive proposed risk so the
+            # validator returns its derived daily/max-loss
+            # limits and rooms.  Do NOT read assumed limit
+            # fields from risk_state.
+            b_daily_used = _sf(
+                risk_state.get("daily_loss_used"),
+                0.0,
+            )
+            b_max_loss_used = _sf(
+                risk_state.get("max_loss_used"),
+                0.0,
+            )
+            b_open_risk_usd = _sf(
+                risk_state.get("open_risk_usd"),
+                0.0,
+            )
+            b_max_open_risk_pct = _sf(
+                prop_cfg.get("max_open_risk_pct"),
+                0.0,
+            )
+            b_max_open_positions = int(
+                prop_cfg.get("max_open_positions")
+                or 3
+            )
+
+            if b_max_open_risk_pct <= 0:
+                log.warning(
+                    "[OPPT] STRATEGY_B_CAPACITY_INPUT_INVALID "
+                    "uid=%s profile=%s tid=%s sym=%s "
+                    "max_open_risk_pct=%s",
+                    uid,
+                    prop_profile_id,
+                    tid,
+                    sym,
+                    b_max_open_risk_pct,
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            b_capacity_probe = validate_prop_capacity(
+                firm=str(
+                    prop_cfg.get("firm") or "ftmo"
+                ),
+                phase=str(
+                    prop_cfg.get("phase") or "challenge"
+                ),
+                account_size=float(b_account_size),
+                proposed_risk_usd=0.01,
+                daily_loss_used=float(b_daily_used),
+                max_loss_used=float(b_max_loss_used),
+                open_risk_usd=float(b_open_risk_usd),
+                open_positions_count=int(
+                    risk_state.get(
+                        "open_positions_count"
+                    )
+                    or 0
+                ),
+                max_open_risk_pct=float(
+                    b_max_open_risk_pct
+                ),
+                max_open_positions=int(
+                    b_max_open_positions
+                ),
+            )
+
+            b_daily_room = max(
+                0.0,
+                _sf(
+                    b_capacity_probe.get(
+                        "daily_room_usd"
+                    ),
+                    0.0,
+                ),
+            )
+            b_max_loss_room = max(
+                0.0,
+                _sf(
+                    b_capacity_probe.get(
+                        "max_loss_room_usd"
+                    ),
+                    0.0,
+                ),
+            )
+            b_open_risk_limit = (
+                b_account_size
+                * (b_max_open_risk_pct / 100.0)
+            )
+            b_open_risk_room = max(
+                0.0,
+                b_open_risk_limit - b_open_risk_usd,
+            )
+
+            b_allowed_risk_usd = min(
+                b_requested_risk_usd,
+                b_daily_room,
+                b_max_loss_room,
+                b_open_risk_room,
+            )
+
+            if b_allowed_risk_usd <= 0:
+                log.warning(
+                    "[OPPT] STRATEGY_B_NO_RISK_CAPACITY "
+                    "uid=%s profile=%s tid=%s sym=%s "
+                    "requested=%.2f daily_room=%.2f "
+                    "max_loss_room=%.2f open_risk_room=%.2f",
+                    uid,
+                    prop_profile_id,
+                    tid,
+                    sym,
+                    b_requested_risk_usd,
+                    b_daily_room,
+                    b_max_loss_room,
+                    b_open_risk_room,
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            b_raw_lots = (
+                b_allowed_risk_usd / b_loss_per_lot
+            )
+
+            # ---------------------------------------------
+            # Shared broker lot normalization.
+            # ---------------------------------------------
+            b_norm = normalize_lots_for_symbol(
+                symbol=sym,
+                raw_lots=b_raw_lots,
+            )
+
+            if not bool(b_norm.get("data_ok")):
+                log.warning(
+                    "[OPPT] STRATEGY_B_LOT_NORMALIZE_BLOCK "
+                    "uid=%s tid=%s sym=%s raw_lots=%s "
+                    "reason=%s",
+                    uid,
+                    tid,
+                    sym,
+                    b_raw_lots,
+                    b_norm.get("reason"),
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            b_lots = _sf(
+                b_norm.get("lots"),
+                0.0,
+            )
+
+            # ---------------------------------------------
+            # Recalculate actual USD risk after broker lot
+            # normalization. Point3 proposed risk is not the
+            # final reservation/capacity amount.
+            # ---------------------------------------------
+            b_loss = compute_loss_per_lot_at_stop(
+                symbol=sym,
+                entry=b_execution_price,
+                sl=b_stop_price,
+            )
+
+            if not bool(b_loss.get("data_ok")):
+                log.warning(
+                    "[OPPT] STRATEGY_B_LOSS_PER_LOT_BLOCK "
+                    "uid=%s tid=%s sym=%s reason=%s",
+                    uid,
+                    tid,
+                    sym,
+                    b_loss.get("reason"),
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            b_loss_per_lot = _sf(
+                b_loss.get(
+                    "loss_per_lot_at_stop"
+                ),
+                0.0,
+            )
+
+            b_actual_risk_usd = (
+                b_lots * b_loss_per_lot
+            )
+
+            if (
+                b_lots <= 0
+                or b_loss_per_lot <= 0
+                or b_actual_risk_usd <= 0
+            ):
+                log.warning(
+                    "[OPPT] STRATEGY_B_ACTUAL_RISK_INVALID "
+                    "uid=%s tid=%s sym=%s lots=%s "
+                    "loss_per_lot=%s risk_usd=%s",
+                    uid,
+                    tid,
+                    sym,
+                    b_lots,
+                    b_loss_per_lot,
+                    b_actual_risk_usd,
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            # ---------------------------------------------
+            # Shared account-level capacity authority.
+            # Uses the same fresh risk_state already computed
+            # for this ENTRY attempt.
+            # ---------------------------------------------
+            b_capacity = validate_prop_capacity(
+                firm=str(
+                    prop_cfg.get("firm") or "ftmo"
+                ),
+                phase=str(
+                    prop_cfg.get("phase") or "challenge"
+                ),
+                account_size=float(
+                    prop_cfg.get("account_size") or 0.0
+                ),
+                proposed_risk_usd=float(
+                    b_actual_risk_usd
+                ),
+                daily_loss_used=float(
+                    risk_state.get("daily_loss_used") or 0.0
+                ),
+                max_loss_used=float(
+                    risk_state.get("max_loss_used") or 0.0
+                ),
+                open_risk_usd=float(
+                    risk_state.get("open_risk_usd") or 0.0
+                ),
+                open_positions_count=int(
+                    risk_state.get(
+                        "open_positions_count"
+                    )
+                    or 0
+                ),
+                max_open_risk_pct=float(
+                    prop_cfg.get("max_open_risk_pct")
+                    or 3.0
+                ),
+                max_open_positions=int(
+                    prop_cfg.get("max_open_positions")
+                    or 3
+                ),
+            )
+
+            if str(
+                b_capacity.get("verdict") or ""
+            ).upper() != "OK":
+                log.warning(
+                    "[OPPT] STRATEGY_B_CAPACITY_BLOCK "
+                    "uid=%s profile=%s tid=%s sym=%s "
+                    "risk_usd=%.2f reasons=%s",
+                    uid,
+                    prop_profile_id,
+                    tid,
+                    sym,
+                    b_actual_risk_usd,
+                    b_capacity.get("reasons"),
+                )
+
+                try:
+                    R.delete(
+                        ENTRY_CLAIM_KEY.format(
+                            alert_id=alert_id,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    R.delete(exec_claim_key)
+                except Exception:
+                    pass
+
+                continue
+
+            # ---------------------------------------------
+            # Commit only local execution-attempt variables.
+            #
+            # setup_entry_price remains immutable in ev.
+            # B does not inherit Strategy-A target_rr TP.
+            # ---------------------------------------------
+            entry_price = float(b_execution_price)
+            qty_use = float(b_lots)
+            sl_price = float(b_stop_price)
+            tp_price = 0.0
+
+            # Retain exact actual risk for the B reservation
+            # step that follows successful MT5 enqueue.
+            b_execution_risk_usd = float(
+                b_actual_risk_usd
+            )
+
+            log.info(
+                "[OPPT] STRATEGY_B_SIZING_READY "
+                "uid=%s profile=%s tid=%s thesis=%s "
+                "capture=%s sym=%s side=%s device=%s "
+                "setup_entry=%s execution_entry=%s "
+                "sl=%s lots_raw=%s lots=%s risk_usd=%.2f",
+                uid,
+                prop_profile_id,
+                tid,
+                b_thesis_id,
+                b_capture_id,
+                sym,
+                side,
+                device_id,
+                ev.get("entry_price"),
+                entry_price,
+                sl_price,
+                b_raw_lots,
+                qty_use,
+                b_execution_risk_usd,
+            )
 
         # -------------------------------------------------
         # P0: UID/profile-scoped max-open-position guard.
@@ -14737,8 +18928,18 @@ def tick_user(uid: str) -> None:
         # reset the watch instead of chasing the move.
         # -------------------------------------------------
         try:
-            _wk_late = str(ev.get("watch_key") or "").strip()
-            if not _wk_late and sym and side:
+            _wk_late = (
+                str(ev.get("watch_key") or "").strip()
+                if strategy == STRATEGY_A
+                else ""
+            )
+
+            if (
+                strategy == STRATEGY_A
+                and not _wk_late
+                and sym
+                and side
+            ):
                 _wk_late = _zone_watch_key(
                     uid,
                     sym,
@@ -14946,6 +19147,27 @@ def tick_user(uid: str) -> None:
             })
             pos = {
                 "trade_id": tid,
+                "strategy": strategy,
+                "thesis_id": (
+                    ev.get("thesis_id")
+                    if strategy == STRATEGY_B
+                    else None
+                ),
+                "selected_capture_id": (
+                    ev.get("selected_capture_id")
+                    if strategy == STRATEGY_B
+                    else None
+                ),
+                "setup_entry_price": (
+                    ev.get("setup_entry_price")
+                    if strategy == STRATEGY_B
+                    else None
+                ),
+                "expected_dxy_direction": (
+                    ev.get("expected_dxy_direction")
+                    if strategy == STRATEGY_B
+                    else None
+                ),
                 "symbol": sym,
                 "side": side,
                 "entry_price": float(entry_price),
@@ -15004,15 +19226,49 @@ def tick_user(uid: str) -> None:
                 "trigger_type": ev.get("trigger_type"),
                 "trigger_level": ev.get("trigger_level"),
                 "setup_analysis": ev.get("setup_analysis"),
-                "entry_confirmation": ev.get("entry_confirmation"),
-                "entry_validation": ev.get("entry_validation"),
+                "entry_confirmation": ev.get(
+                    "entry_confirmation"
+                ),
+                "entry_validation": ev.get(
+                    "entry_validation"
+                ),
                 "point_a": ev.get("point_a"),
+
+                # Immutable pre-Point-A Analysis-1 decision.
+                "analysis1": ev.get("analysis1"),
+
                 "prop_check": prop_check,
+                
                 "profile_id": prop_profile_id,
                 "prop_firm": prop_check.get("firm") if isinstance(prop_check, dict) else None,
                 "prop_phase": prop_check.get("phase") if isinstance(prop_check, dict) else None,
-                "prop_risk_usd": prop_check.get("risk_usd") if isinstance(prop_check, dict) else None,
-                "prop_risk_pct": prop_check.get("risk_pct") if isinstance(prop_check, dict) else None,
+                "prop_risk_usd": (
+                    float(b_execution_risk_usd)
+                    if strategy == STRATEGY_B
+                    else (
+                        prop_check.get("risk_usd")
+                        if isinstance(prop_check, dict)
+                        else None
+                    )
+                ),
+                "prop_risk_pct": (
+                    (
+                        float(b_execution_risk_usd)
+                        / float(prop_cfg.get("account_size") or 0.0)
+                        * 100.0
+                    )
+                    if (
+                        strategy == STRATEGY_B
+                        and float(
+                            prop_cfg.get("account_size") or 0.0
+                        ) > 0.0
+                    )
+                    else (
+                        prop_check.get("risk_pct")
+                        if isinstance(prop_check, dict)
+                        else None
+                    )
+                ),
             }
 
           
@@ -15102,43 +19358,65 @@ def tick_user(uid: str) -> None:
 
             # -------------------------------------------------
             # CRITICAL: same-symbol lifecycle guard.
-            # Once one side is ORDER_PENDING/TRADE_ACTIVE, remove
-            # the opposite watch immediately. BUY active must block SELL,
-            # and SELL active must block BUY.
+            #
+            # Strategy A owns zone/watch lifecycle.
+            # Strategy B must never mutate Strategy-A watches.
             # -------------------------------------------------
-            try:
-                opp_side = "SELL" if side == "BUY" else "BUY"
-                zone_watch_delete(
-                    R,
-                    uid,
-                    sym,
-                    opp_side,
-                    tf="H1",
-                )
-                R.delete(
-                    break_state_key(
+            if strategy == STRATEGY_A:
+                try:
+                    opp_side = "SELL" if side == "BUY" else "BUY"
+                    zone_watch_delete(
+                        R,
+                        uid,
+                        sym,
+                        opp_side,
+                        tf="H1",
+                    )
+                    R.delete(
+                        break_state_key(
+                            uid,
+                            sym,
+                            opp_side,
+                            "H1",
+                        )
+                    )
+                    tenant_delete_latest_entry_claim(
+                        R,
                         uid,
                         sym,
                         opp_side,
                         "H1",
                     )
-                )
-                tenant_delete_latest_entry_claim(
-                    R,
+
+                    log.warning(
+                        "[WATCHLIST] OPPOSITE_WATCH_CLEARED_ON_ENTRY sym=%s active_side=%s cleared_side=%s trade_id=%s",
+                        sym, side, opp_side, tid,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "[WATCHLIST] OPPOSITE_WATCH_CLEAR_FAILED sym=%s side=%s err=%r",
+                        sym, side, e,
+                    )
+
+            elif strategy == STRATEGY_B:
+                log.debug(
+                    "[OPPT] STRATEGY_B_SKIP_A_OPPOSITE_WATCH_CLEANUP "
+                    "uid=%s tid=%s sym=%s side=%s",
                     uid,
+                    tid,
                     sym,
-                    opp_side,
-                    "H1",
+                    side,
                 )
 
-                log.warning(
-                    "[WATCHLIST] OPPOSITE_WATCH_CLEARED_ON_ENTRY sym=%s active_side=%s cleared_side=%s trade_id=%s",
-                    sym, side, opp_side, tid,
-                )
-            except Exception as e:
-                log.warning(
-                    "[WATCHLIST] OPPOSITE_WATCH_CLEAR_FAILED sym=%s side=%s err=%r",
-                    sym, side, e,
+            else:
+                log.error(
+                    "[OPPT] UNKNOWN_STRATEGY_SKIP_A_OPPOSITE_WATCH_CLEANUP "
+                    "uid=%s tid=%s sym=%s side=%s strategy=%r",
+                    uid,
+                    tid,
+                    sym,
+                    side,
+                    ev.get("strategy"),
                 )
 
             # -------------------------------------------------
@@ -15190,6 +19468,112 @@ def tick_user(uid: str) -> None:
                         uid, tid, sym,
                         prop_check.get("risk_usd"),
                         prop_check.get("lots"),
+                    )
+
+                elif (
+                    strategy == STRATEGY_B
+                    and bool(prop_cfg.get("enabled"))
+                ):
+                    # Strategy-B reservation uses the actual USD
+                    # risk after Point3 + broker lot normalization.
+                    #
+                    # Do not fabricate prop_check and do not reuse
+                    # Strategy-A target/stop sizing authority.
+                    b_reserved_risk_usd = float(
+                        b_execution_risk_usd
+                    )
+
+                    b_account_size = float(
+                        prop_cfg.get("account_size") or 0.0
+                    )
+
+                    b_reserved_risk_pct = (
+                        (
+                            b_reserved_risk_usd
+                            / b_account_size
+                        )
+                        * 100.0
+                        if b_account_size > 0
+                        else 0.0
+                    )
+
+                    _reserve_prop_open_risk(
+                        uid,
+                        tid,
+                        {
+                            "trade_id": tid,
+                            "profile_id": prop_profile_id,
+                            "strategy": "B",
+                            "thesis_id": b_thesis_id,
+                            "selected_capture_id": b_capture_id,
+                            "setup_entry_price": (
+                                ev.get("setup_entry_price")
+                            ),
+                            "expected_dxy_direction": (
+                                ev.get("expected_dxy_direction")
+                            ),
+                            "symbol": sym,
+                            "side": side,
+                            "risk_usd": b_reserved_risk_usd,
+                            "risk_pct": b_reserved_risk_pct,
+                            "lots": float(qty_use),
+                            "entry": float(entry_price),
+                            "sl": float(sl_price),
+                            "tp": (
+                                float(tp_price)
+                                if float(tp_price or 0.0) > 0
+                                else 0.0
+                            ),
+                            "firm": prop_cfg.get("firm"),
+                            "phase": prop_cfg.get("phase"),
+                            "source": (
+                                ev.get("source")
+                                or "strategy_b"
+                            ),
+                            "execution_source":
+                                "strategy_b_mt5_enqueued",
+                            "mt5_job_id": enq.get("job_id"),
+                            "device_id": enq.get("device_id"),
+                            "reserved_ts_ms": int(
+                                time.time() * 1000
+                            ),
+                        },
+                        profile_id=prop_profile_id,
+                    )
+
+                    _refresh_prop_risk_snapshot_after_event(
+                        uid,
+                        prop_profile_id,
+                        "RISK_RESERVED",
+                    )
+
+                    _invalidate_prop_dashboard_snapshot(
+                        uid,
+                        prop_profile_id,
+                        "RISK_RESERVED",
+                    )
+
+                    _schedule_prop_dashboard_warm_refresh(
+                        uid,
+                        prop_profile_id,
+                        "RISK_RESERVED",
+                    )
+
+                    log.warning(
+                        "[PROP] STRATEGY_B_RISK_RESERVED "
+                        "uid=%s profile=%s tid=%s thesis=%s "
+                        "capture=%s sym=%s side=%s "
+                        "risk_usd=%.2f risk_pct=%.6f lots=%s",
+                        uid,
+                        prop_profile_id,
+                        tid,
+                        b_thesis_id,
+                        b_capture_id,
+                        sym,
+                        side,
+                        b_reserved_risk_usd,
+                        b_reserved_risk_pct,
+                        qty_use,
                     )
             except Exception as e:
                 log.warning(

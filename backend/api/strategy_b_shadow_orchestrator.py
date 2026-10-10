@@ -299,7 +299,35 @@ def compose_strategy_b_shadow_decision(
         risk_proposal=risk_proposal,
     )
 
-    plan = _pretrade_path(current, pre.derived_state)
+    # Explicit pretrade reset authority.
+    #
+    # Ordinary lifecycle observation/replay remains forward-only and
+    # _pretrade_path() must continue rejecting silent rewinds.  The one
+    # authorized reset here is loss of the macro leg before an order/trade
+    # exists: a previously advanced pretrade thesis returns to OBSERVING
+    # under the same immutable thesis/evidence identity.
+    macro_leg_explicitly_lost = (
+        _field(macro_qualification, "macro_leg_established", None) is False
+    )
+    explicit_macro_leg_reset = (
+        current in _PRETRADE_SEQUENCE
+        and current != "OBSERVING"
+        and _upper(pre.derived_state) == "OBSERVING"
+        and macro_leg_explicitly_lost
+    )
+
+    if explicit_macro_leg_reset:
+        plan = (
+            StrategyBShadowTransitionPlan(
+                from_state=current,
+                to_state="OBSERVING",
+                reason="EXPLICIT_RESET_MACRO_LEG_INVALIDATED",
+                valid=True,
+            ),
+        )
+    else:
+        plan = _pretrade_path(current, pre.derived_state)
+
     valid = all(x.valid for x in plan)
 
     selected_symbol = _field(expression_ranking, "best_symbol")

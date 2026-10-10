@@ -84,6 +84,7 @@ def observe_strategy_b_symbol_h1_live(
     catalyst_first_seen_ms: Optional[int] = None,
     as_of_ms: Optional[int] = None,
     pattern_config: Optional[StrategyBH1PatternConfig] = None,
+    native_tf_cache: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
 ) -> StrategyBLiveSymbolH1Observation:
     """
     Observe selected-symbol H1 structure causally.
@@ -156,11 +157,17 @@ def observe_strategy_b_symbol_h1_live(
             )
         catalyst_source_field = "DIRECT_REPLAY_OR_TEST_OVERRIDE"
 
+    _snapshot_kwargs = {
+        "symbol": sym,
+        "side": side_u,
+        "as_of_ms": now_ms,
+    }
+    if native_tf_cache is not None:
+        _snapshot_kwargs["native_tf_cache"] = native_tf_cache
+
     loaded = load_strategy_b_symbol_snapshot_live(
         R,
-        symbol=sym,
-        side=side_u,
-        as_of_ms=now_ms,
+        **_snapshot_kwargs,
     )
     loaded = dict(_mapping(loaded))
 
@@ -189,10 +196,16 @@ def observe_strategy_b_symbol_h1_live(
     pair_bias = _mapping(snap.get("pair_bias"))
     structure = _mapping(snap.get("sr"))
 
+    _h1_kwargs = {
+        "symbol": sym,
+        "tf": "H1",
+    }
+    if native_tf_cache is not None:
+        _h1_kwargs["native_tf_cache"] = native_tf_cache
+
     h1row = _load_native_symbol_tf_from_redis(
         R,
-        symbol=sym,
-        tf="H1",
+        **_h1_kwargs,
     )
     h1row = dict(_mapping(h1row))
 

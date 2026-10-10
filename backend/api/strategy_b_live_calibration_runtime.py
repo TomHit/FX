@@ -12,7 +12,7 @@ It does NOT build the expression basket, place/modify/close broker orders,
 reserve risk, use Redis SCAN, or mutate Strategy A.
 
 Multi-process safety:
-- create a fresh StrategyBCalibrationJsonlStore for each capture call so its
+- accept an optional caller-owned StrategyBCalibrationJsonlStore; otherwise
   dedupe index is refreshed from disk;
 - the underlying writer uses an OS file lock for durable append;
 - the Strategy-B macro tick already has a cross-worker Redis lock, so the
@@ -62,6 +62,7 @@ def capture_strategy_b_runtime_calibration(
     source: str = "LIVE",
     path: Optional[str | os.PathLike[str]] = None,
     h1_observer: Any = None,
+    store: Any = None,
 ) -> dict[str, Any]:
     """
     Persist one already-built live Strategy-B expression basket.
@@ -71,8 +72,9 @@ def capture_strategy_b_runtime_calibration(
     - H1 causal observation failure -> no write;
     - incomplete basket / mandatory evidence failure -> no write.
 
-    The function intentionally creates a new store on each call so a worker
-    always reloads the current append-only capture-id index before dedupe.
+    A caller may supply a batch-local store to reuse one capture-id index
+    across a serialized macro batch. Without one, this function preserves the
+    standalone behavior and loads a fresh store before dedupe.
     """
     eid = str(evidence_id or "").strip()
     if not eid:
@@ -94,7 +96,8 @@ def capture_strategy_b_runtime_calibration(
         capture_strategy_b_live_calibration_with_h1,
     )
 
-    store = StrategyBCalibrationJsonlStore(target)
+    if store is None:
+        store = StrategyBCalibrationJsonlStore(target)
 
     try:
         capture_args = {

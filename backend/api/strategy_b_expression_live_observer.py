@@ -203,6 +203,7 @@ def observe_strategy_b_expression_basket_live(
         Mapping[tuple[str, str], Any]
     ] = None,
     forward_path_observer_fn: Optional[Callable[..., Any]] = None,
+    native_tf_cache: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
 ) -> StrategyBLiveExpressionBasket:
     """
     Observe every approved Strategy-B expression for one DXY direction.
@@ -231,6 +232,7 @@ def observe_strategy_b_expression_basket_live(
             ranking=None,
         )
 
+    _default_live_loader = live_loader is None
     if live_loader is None:
         from api.strategy_b_symbol_live_loader import (
             load_strategy_b_symbol_snapshot_live,
@@ -255,7 +257,10 @@ def observe_strategy_b_expression_basket_live(
         )
         htf_location_fn = observe_strategy_b_htf_location
 
-    _default_structural_invalidation = structural_invalidation_fn is None
+    _default_structural_invalidation = (
+        structural_invalidation_fn is None
+        and _default_live_loader
+    )
     if structural_invalidation_fn is None:
         from api.strategy_b_structural_invalidation_observer import (
             observe_strategy_b_structural_invalidation,
@@ -414,10 +419,16 @@ def observe_strategy_b_expression_basket_live(
                     # swing candidates. No broker HTTP and no Redis SCAN.
                     _native = {}
                     for _tf in ("D1", "H4", "H1"):
+                        _native_kwargs = {
+                            "symbol": symbol,
+                            "tf": _tf,
+                        }
+                        if native_tf_cache is not None:
+                            _native_kwargs["native_tf_cache"] = native_tf_cache
+
                         _row = _load_native_symbol_tf_from_redis(
                             R,
-                            symbol=symbol,
-                            tf=_tf,
+                            **_native_kwargs,
                         )
                         if _mapping(_row).get("ok") is not True:
                             raise RuntimeError(

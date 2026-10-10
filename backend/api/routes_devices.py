@@ -177,6 +177,12 @@ DEFAULT_TFS = ["M1","M15","H1","H4"]
 DEFAULT_TFS_CSV = ",".join(DEFAULT_TFS)
 
 
+# Strategy-B scheduled-event discovery.
+# Explicit owner registry avoids Redis SCAN in runtime paths.
+STRATEGY_B_SCHEDULE_OWNERS_KEY = (
+    "xtl:strategy_b:macro:schedule_owners"
+)
+
 @contextmanager
 def db():
     # Build DSN from env; use DATABASE_URL if set, else PG* vars
@@ -1659,6 +1665,25 @@ def mt5_calendar(
             status_code=503,
             detail=f"redis_error:{type(e).__name__}",
         )
+    # Strategy-B observation-only schedule discovery.
+    #
+    # This does NOT create macro evidence, interpret the event,
+    # authorize execution, or modify Strategy-A behavior.
+    # It only provides an explicit no-SCAN registry of calendar owners
+    # whose canonical MT5 schedule can be observed by Strategy-B.
+    try:
+        if calendar_owner_id:
+            R.sadd(
+                STRATEGY_B_SCHEDULE_OWNERS_KEY,
+                str(calendar_owner_id),
+            )
+    except Exception as exc:
+        log.warning(
+            "[STRATEGY_B_MACRO] SCHEDULE_OWNER_REGISTER_FAILED "
+            "owner=%s err=%r",
+            calendar_owner_id,
+            exc,
+        )
 
     log.info(
         "[MT5_CALENDAR] ACCEPT "
@@ -2460,6 +2485,7 @@ def mt5_calendar_result(
         "xtl:strategy_b:macro:release_index:"
         f"{calendar_owner_id}"
     )
+    
 
     # Release records live for 14 days. Keep the discovery
     # index slightly longer, but trim scores older than the

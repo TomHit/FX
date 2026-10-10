@@ -104,6 +104,11 @@ def persist_strategy_b_shadow_decision(
     value_id: str,
     shadow_decision: Any,
     now_ms: int,
+    thesis_id: Optional[str] = None,
+    selected_capture_id: Optional[str] = None,
+    selected_capture_link_status: Optional[str] = None,
+    selected_capture_link_reason: Optional[str] = None,
+    expected_dxy_direction: Optional[str] = None,
     ttl_sec: int = DEFAULT_TTL_SEC,
     max_history: int = DEFAULT_MAX_HISTORY,
 ) -> dict:
@@ -120,12 +125,70 @@ def persist_strategy_b_shadow_decision(
     previous_fp = _txt(previous.get("material_fingerprint")) if isinstance(previous, dict) else ""
     changed = previous_fp != fingerprint
 
+    # Research identity is telemetry/persistence metadata only.
+    # It MUST NOT participate in the material lifecycle fingerprint.
+    resolved_thesis_id = _txt(thesis_id) or evidence_id
+
+    incoming_expected_dxy_direction = _txt(
+        expected_dxy_direction
+    ).upper()
+
+    if incoming_expected_dxy_direction not in {
+        "BULLISH",
+        "BEARISH",
+    }:
+        incoming_expected_dxy_direction = ""
+
+    previous_expected_dxy_direction = (
+        _txt(previous.get("expected_dxy_direction")).upper()
+        if isinstance(previous, dict)
+        else ""
+    )
+
+    # Once frozen for this thesis, later observations may not rewrite
+    # the causal DXY direction used by the selected Strategy-B setup.
+    resolved_expected_dxy_direction = (
+        previous_expected_dxy_direction
+        or incoming_expected_dxy_direction
+    )
+
+    previous_capture_id = (
+        _txt(previous.get("selected_capture_id"))
+        if isinstance(previous, dict)
+        else ""
+    )
+    incoming_capture_id = _txt(selected_capture_id)
+
+    # Once a selected entry capture is linked to this thesis, preserve it
+    # across later observations/restarts. A newer calibration snapshot must
+    # never steal the original selected-entry identity.
+    resolved_capture_id = previous_capture_id or incoming_capture_id
+
+    if previous_capture_id:
+        resolved_link_status = (
+            _txt(previous.get("selected_capture_link_status")) or "LINKED"
+        )
+        resolved_link_reason = (
+            _txt(previous.get("selected_capture_link_reason"))
+            or "SELECTED_CAPTURE_ALREADY_LINKED"
+        )
+    else:
+        resolved_link_status = _txt(selected_capture_link_status)
+        resolved_link_reason = _txt(selected_capture_link_reason)
+
     wrapper = {
         "schema_version": 1,
         "service": "strategy_b_shadow_persistence",
         "evidence_id": evidence_id,
         "calendar_owner_id": _txt(calendar_owner_id),
         "value_id": _txt(value_id),
+        "thesis_id": resolved_thesis_id,
+        "selected_capture_id": resolved_capture_id or None,
+        "expected_dxy_direction": (
+            resolved_expected_dxy_direction or None
+        ),
+        "selected_capture_link_status": resolved_link_status or None,
+        "selected_capture_link_reason": resolved_link_reason or None,
         "material_fingerprint": fingerprint,
         "material_changed": bool(changed),
         "persisted_at_ms": int(now_ms),
@@ -154,6 +217,21 @@ def persist_strategy_b_shadow_decision(
         refreshed = dict(previous)
         refreshed["last_observed_at_ms"] = int(now_ms)
         refreshed["material_changed"] = False
+
+        # Identity enrichment is telemetry-only. It may update latest state
+        # without manufacturing a lifecycle-history transition.
+        refreshed["thesis_id"] = resolved_thesis_id
+        refreshed["selected_capture_id"] = resolved_capture_id or None
+        refreshed["expected_dxy_direction"] = (
+            resolved_expected_dxy_direction or None
+        )
+        refreshed["selected_capture_link_status"] = (
+            resolved_link_status or None
+        )
+        refreshed["selected_capture_link_reason"] = (
+            resolved_link_reason or None
+        )
+
         R.setex(latest_key, ttl, _json_dump(refreshed))
 
     return {
@@ -225,6 +303,17 @@ def reconstruct_strategy_b_shadow_state(
         "schema_version": 1,
         "evidence_id": evidence_id,
         "found": True,
+        "thesis_id": latest.get("thesis_id") or evidence_id,
+        "selected_capture_id": latest.get("selected_capture_id"),
+        "expected_dxy_direction": (
+            latest.get("expected_dxy_direction")
+        ),
+        "selected_capture_link_status": latest.get(
+            "selected_capture_link_status"
+        ),
+        "selected_capture_link_reason": latest.get(
+            "selected_capture_link_reason"
+        ),
         "derived_state": shadow.get("derived_state"),
         "decision": shadow.get("decision"),
         "reason": shadow.get("reason"),

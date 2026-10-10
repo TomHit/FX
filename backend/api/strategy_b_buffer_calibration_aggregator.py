@@ -243,7 +243,7 @@ def aggregate_strategy_b_buffer_calibration(
         invalidation_price = _num(
             payload.get("selected_invalidation_price")
         )
-        h1_break_ms = _int(payload.get("h1_break_ms"), 0)
+        buffer_pivot_ms = _int(payload.get("buffer_pivot_ms"), 0)
 
         # Fail closed for setup identity. We must not silently merge unrelated
         # calibration rows when their causal/structural identity is incomplete.
@@ -253,18 +253,22 @@ def aggregate_strategy_b_buffer_calibration(
         if invalidation_price is None:
             skipped["SETUP_INVALIDATION_PRICE_MISSING"] += 1
             continue
-        if h1_break_ms <= 0:
-            skipped["SETUP_H1_BREAK_MS_MISSING"] += 1
+        if buffer_pivot_ms <= 0:
+            skipped["SETUP_BUFFER_PIVOT_MS_MISSING"] += 1
             continue
 
+        # Statistical identity is the physical causal market setup.
+        #
+        # evidence_id / release_id remain capture-lineage metadata and
+        # evidence_id is still required above for traceability integrity,
+        # but neither may split one physical market structure into multiple
+        # calibration samples.
         setup_key = (
-            evidence_id,
-            release_id,
             symbol,
             side,
             tf,
+            int(buffer_pivot_ms),
             float(invalidation_price),
-            int(h1_break_ms),
         )
 
         previous_pair = setup_samples.get(setup_key)
@@ -419,7 +423,7 @@ def aggregate_strategy_b_buffer_calibration(
             - eligible_records
             - skipped.get("SETUP_EVIDENCE_ID_MISSING", 0)
             - skipped.get("SETUP_INVALIDATION_PRICE_MISSING", 0)
-            - skipped.get("SETUP_H1_BREAK_MS_MISSING", 0)
+            - skipped.get("SETUP_BUFFER_PIVOT_MS_MISSING", 0)
         ),
         "skipped": dict(sorted(skipped.items())),
         "group_count": len(out_groups),

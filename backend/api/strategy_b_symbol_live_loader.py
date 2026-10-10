@@ -288,6 +288,7 @@ def _load_native_symbol_tf_from_redis(
     *,
     symbol: str,
     tf: str,
+    native_tf_cache: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """
     Deterministic O(1) native OHLC lookup.
@@ -299,6 +300,11 @@ def _load_native_symbol_tf_from_redis(
     """
     sym = _upper(symbol)
     tf_u = _upper(tf)
+
+    cache_key = (sym, tf_u)
+    if native_tf_cache is not None and cache_key in native_tf_cache:
+        cached = native_tf_cache[cache_key]
+        return dict(cached)
 
     out = {
         "ok": False,
@@ -322,11 +328,15 @@ def _load_native_symbol_tf_from_redis(
         out["reason"] = (
             f"OHLC_POINTER_REDIS_ERROR:{type(exc).__name__}"
         )
+        if native_tf_cache is not None:
+            native_tf_cache[cache_key] = dict(out)
         return out
 
     dev = str(_decode(dev_raw) or "").strip()
     if not dev:
         out["reason"] = "OHLC_LATEST_POINTER_MISSING"
+        if native_tf_cache is not None:
+            native_tf_cache[cache_key] = dict(out)
         return out
 
     out["device_id"] = dev
@@ -339,6 +349,8 @@ def _load_native_symbol_tf_from_redis(
         out["reason"] = (
             f"OHLC_SNAPSHOT_REDIS_ERROR:{type(exc).__name__}"
         )
+        if native_tf_cache is not None:
+            native_tf_cache[cache_key] = dict(out)
         return out
 
     snap = _json_obj(raw)
@@ -348,11 +360,15 @@ def _load_native_symbol_tf_from_redis(
             if raw is None
             else "OHLC_SNAPSHOT_INVALID_JSON"
         )
+        if native_tf_cache is not None:
+            native_tf_cache[cache_key] = dict(out)
         return out
 
     bars = snap.get("bars")
     if not isinstance(bars, list):
         out["reason"] = "OHLC_SNAPSHOT_BARS_INVALID"
+        if native_tf_cache is not None:
+            native_tf_cache[cache_key] = dict(out)
         return out
 
     # Preserve only actual bar dictionaries. No timeframe synthesis, no
@@ -365,6 +381,8 @@ def _load_native_symbol_tf_from_redis(
 
     if not bars:
         out["reason"] = "OHLC_SNAPSHOT_BARS_EMPTY"
+        if native_tf_cache is not None:
+            native_tf_cache[cache_key] = dict(out)
         return out
 
     out.update({
@@ -377,6 +395,8 @@ def _load_native_symbol_tf_from_redis(
         "lastClosedTs": snap.get("lastClosedTs"),
         "nextCloseTs": snap.get("nextCloseTs"),
     })
+    if native_tf_cache is not None:
+        native_tf_cache[cache_key] = dict(out)
     return out
 
 
@@ -388,6 +408,7 @@ def load_strategy_b_symbol_snapshot_live(
     as_of_ms: Optional[int] = None,
     snapshot_builder: Optional[Callable[..., Any]] = None,
     sr_fallback_builder: Optional[Callable[..., Any]] = None,
+    native_tf_cache: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """
     Acquire one live Strategy-B symbol observation from canonical Redis OHLC.
@@ -456,6 +477,7 @@ def load_strategy_b_symbol_snapshot_live(
             R,
             symbol=sym,
             tf=tf,
+            native_tf_cache=native_tf_cache,
         )
         tf_rows[tf] = row
 

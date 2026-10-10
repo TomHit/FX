@@ -19,6 +19,7 @@ empty/default so no existing opportunity fields are affected.
 
 from __future__ import annotations
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -26,8 +27,9 @@ log = logging.getLogger("xtl.liq")
 
 # Process-local liquidity primitive cache.
 #
-# One entry per symbol. Reused only when H1/H4 bars and ATR are
-# exactly unchanged. No Redis, no TTL, no stale cross-process state.
+# One entry per device + symbol.
+# Reused only when H1/H4 bars and ATR are exactly unchanged.
+# No Redis, no TTL, no stale cross-process state.
 #
 # Final SR scoring and round-number calculations remain LIVE.
 _SR_LIQ_PRIMITIVE_CACHE: dict[str, dict] = {}
@@ -1690,7 +1692,16 @@ def _measure_reaction(bars, zone_low, zone_high, side, atr):
         return 0.0
 
 
-def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
+
+def score_sr_with_liquidity(
+    sym,
+    sr_bundle,
+    bars_h1,
+    bars_h4,
+    price,
+    atr,
+    device_id=None,
+):
     """
     Bridge: enrich SR active levels with liquidity evidence + quality_score.
 
@@ -1711,6 +1722,7 @@ def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
     try:
         if not bars_h1 or price <= 0:
             return out
+        
         _atr = atr if atr and atr > 0 else _atr14(bars_h1)
         if _atr <= 0:
             return out
@@ -1731,7 +1743,25 @@ def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
         # Round numbers + final SR scoring remain live every call.
         # ---------------------------------------------------------
         _cache_sym = str(sym or "").upper().strip()
-        _prim = _SR_LIQ_PRIMITIVE_CACHE.get(_cache_sym)
+        _cache_dev = str(device_id or "").strip()
+
+        # ---------------------------------------------------------
+        # PERF / CORRECTNESS:
+        # Cache liquidity primitives by device + symbol.
+        #
+        # The compute worker serves multiple broker/device snapshots.
+        # A symbol-only cache causes FTMO/FundingPips OHLC to evict
+        # each other continuously.
+        # ---------------------------------------------------------
+        _cache_key = (
+            _cache_dev,
+            _cache_sym,
+        )
+
+        _prim = _SR_LIQ_PRIMITIVE_CACHE.get(
+            _cache_key
+        )
+        
 
         _primitive_cache_hit = bool(
             isinstance(_prim, dict)
@@ -1739,6 +1769,7 @@ def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
             and _prim.get("bars_h1") == bars_h1
             and _prim.get("bars_h4") == bars_h4
         )
+        
 
         if _primitive_cache_hit:
             ob_bull = _prim["ob_bull"]
@@ -1749,6 +1780,11 @@ def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
             eq_bsl = _prim["eq_bsl"]
             sw_ssl = _prim["sw_ssl"]
             sw_bsl = _prim["sw_bsl"]
+            reaction_cache = _prim.get("reaction_cache")
+
+            if not isinstance(reaction_cache, dict):
+                reaction_cache = {}
+                _prim["reaction_cache"] = reaction_cache
 
         else:
             ob_bull = (
@@ -1834,11 +1870,12 @@ def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
                 )
                 if s.get("fresh")
             ]
+            reaction_cache = {}
 
             # One bounded entry per symbol. Replacing it on structural
             # change prevents an unbounded process-local cache.
             if _cache_sym:
-                _SR_LIQ_PRIMITIVE_CACHE[_cache_sym] = {
+                _SR_LIQ_PRIMITIVE_CACHE[_cache_key] = {
                     "atr": _atr,
                     "bars_h1": bars_h1,
                     "bars_h4": bars_h4,
@@ -1850,8 +1887,9 @@ def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
                     "eq_bsl": eq_bsl,
                     "sw_ssl": sw_ssl,
                     "sw_bsl": sw_bsl,
+                    "reaction_cache": reaction_cache,
                 }
-
+        
         # LIVE components — never cached by the structural cache.
         rn_buy = find_round_numbers(
             price,
@@ -1892,7 +1930,23 @@ def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
             score = base
 
             # reaction strength (capped contribution)
-            react = _measure_reaction(bars_h1, lo, hi, side, _atr)
+            reaction_key = (
+                str(side),
+                float(lo),
+                float(hi),
+            )
+
+            if reaction_key in reaction_cache:
+                react = reaction_cache[reaction_key]
+            else:
+                react = _measure_reaction(
+                    bars_h1,
+                    lo,
+                    hi,
+                    side,
+                    _atr,
+                )
+                reaction_cache[reaction_key] = react
             ev["reaction_atr"] = react
             score += min(react, 4.0) * 2.0          # up to +8
 
@@ -1983,7 +2037,13 @@ def score_sr_with_liquidity(sym, sr_bundle, bars_h1, bars_h4, price, atr):
         out["scored_resistances"] = scored_res
         out["best_support"] = scored_sup[0] if scored_sup else None
         out["best_resistance"] = scored_res[0] if scored_res else None
+        
+
+        
         return out
     except Exception as e:
         log.debug("score_sr_with_liquidity error sym=%s err=%s", sym, e)
+        
+
         return out
+        

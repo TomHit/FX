@@ -1271,6 +1271,74 @@ def _dxy_sr_confirmation_analytics(
         and h1_age_ms <= DXY_H1_FLOW_FRESH_MS
     )
 
+    # ---------------------------------------------------------
+    # POINT-A RULE-B CANONICAL REAL_DXY 20H CONTEXT
+    #
+    # Use the same completed canonical REAL_DXY H1 bars and the
+    # existing 20H direction model already owned by DXY analytics.
+    # No SYNTHETIC_DXY fallback.
+    # ---------------------------------------------------------
+    h1_20 = {}
+
+    try:
+        from api.dxy_tracker import _closed_real_dxy_bars
+        from api.xtl_analytics import (
+            _atr_from_bars,
+            _h1_window_direction,
+        )
+
+        _h1_20_bars_all = _closed_real_dxy_bars(
+            R,
+            real_dev,
+        )
+
+        # Point-A causality:
+        # never allow an H1 candle that had not completed by
+        # this specific entry evaluation into the 20H context.
+        _h1_20_bars = []
+
+        for _h1_bar in (_h1_20_bars_all or []):
+            if not isinstance(_h1_bar, dict):
+                continue
+
+            if not bool(_h1_bar.get("complete", True)):
+                continue
+
+            _h1_bar_close_ms = _to_ms_any(
+                _h1_bar.get("t_close_ms")
+                or _h1_bar.get("tCloseMs")
+                or _h1_bar.get("close_time_ms")
+            )
+
+            if (
+                _h1_bar_close_ms
+                and int(_h1_bar_close_ms) <= int(entry_ms)
+            ):
+                _h1_20_bars.append(_h1_bar)
+
+        _h1_20_atr = (
+            _atr_from_bars(_h1_20_bars)
+            if _h1_20_bars
+            else None
+        )
+
+        if (
+            _h1_20_bars
+            and _h1_20_atr is not None
+            and float(_h1_20_atr) > 0.0
+        ):
+            h1_20 = (
+                _h1_window_direction(
+                    _h1_20_bars,
+                    _h1_20_atr,
+                    n=20,
+                )
+                or {}
+            )
+
+    except Exception:
+        h1_20 = {}
+
     h1_bull_score = int(
         h1_feature.get("bull_evidence_score")
         or 0
@@ -2210,6 +2278,48 @@ def _dxy_sr_confirmation_analytics(
             ),
             "h1_evidence_margin": int(
                 h1_evidence_margin
+            ),
+            # Rule-B inputs: canonical REAL_DXY only.
+            "h1_20_direction": (
+                str(
+                    h1_20.get("h1_20_direction")
+                    or ""
+                ).upper()
+                or None
+            ),
+            "h1_20_direction_raw": (
+                str(
+                    h1_20.get("h1_20_direction_raw")
+                    or ""
+                ).upper()
+                or None
+            ),
+            "h1_20_net_atr": (
+                h1_20.get("h1_20_net_atr")
+            ),
+            "h1_20_slope_atr": (
+                h1_20.get("h1_20_slope_atr")
+            ),
+            "h1_20_r2": (
+                h1_20.get("h1_20_r2")
+            ),
+            "h1_20_bars_used": (
+                h1_20.get("h1_20_bars_used")
+            ),
+            "h1_slope_5_atr": (
+                h1_feature.get("slope_5_atr")
+            ),
+            "h1_bullish_bodies": (
+                h1_feature.get("bullish_bodies")
+            ),
+            "h1_bearish_bodies": (
+                h1_feature.get("bearish_bodies")
+            ),
+            "h1_up_steps": (
+                h1_feature.get("up_steps")
+            ),
+            "h1_down_steps": (
+                h1_feature.get("down_steps")
             ),
             "h1_raw_candidate_direction": (
                 str(
@@ -4590,7 +4700,10 @@ def zone_reversal_gate(
                 w0.get("point_a_rc_rearm_reason")
                 or ""
             ).upper().strip()
-            == "PRICE_TOO_FAR"
+            in (
+                "PRICE_TOO_FAR",
+                "WEAK_ZONE_TOO_FAR",
+            )
             and int(
                 w0.get("point_a_last_retired_rc_ms")
                 or 0
@@ -5436,126 +5549,6 @@ def zone_reversal_gate(
             gate["rev_state"] = dict(watch)
 
             return False, gate
-        # ------------------------------------------------------------
-        # Point-A WAIT presentation.
-        #
-        # Executor owns the WAIT lifecycle. The gate must preserve and
-        # expose that state instead of repairing it back to REV_OK.
-        # ------------------------------------------------------------
-        point_a_wait_state = (
-            w_state == "ENTRY_BLOCKED_POINT_A_WAIT"
-            or w_trade_state == "ENTRY_BLOCKED_POINT_A_WAIT"
-        )
-
-        if point_a_wait_state:
-            # --------------------------------------------------------
-            # P0 POINT-A WAIT STATE NORMALIZATION
-            #
-            # An active WAIT owns its crossed opportunity.
-            # Persist both lifecycle fields consistently and keep RC
-            # confirmed while the executor re-evaluates Point-A.
-            # --------------------------------------------------------
-            _wait_changed = bool(
-                w_state != "ENTRY_BLOCKED_POINT_A_WAIT"
-                or w_trade_state != "ENTRY_BLOCKED_POINT_A_WAIT"
-                or not bool(watch.get("rev_ok"))
-                or not bool(watch.get("entry_blocked"))
-            )
-
-            watch["state"] = "ENTRY_BLOCKED_POINT_A_WAIT"
-            watch["trade_state"] = "ENTRY_BLOCKED_POINT_A_WAIT"
-            watch["rev_ok"] = True
-            watch["entry_ready"] = False
-            watch["entry_triggered"] = False
-            watch["entry_blocked"] = True
-
-            if _wait_changed:
-                try:
-                    R.set(
-                        wkey,
-                        json.dumps(
-                            watch,
-                            separators=(",", ":"),
-                            default=str,
-                        ),
-                        ex=7 * 24 * 3600,
-                    )
-
-                    log.warning(
-                        "[POINT_A] GATE_WAIT_STATE_NORMALIZED "
-                        "sym=%s key=%s",
-                        sym_u,
-                        wkey,
-                    )
-
-                except Exception:
-                    log.exception(
-                        "[POINT_A] GATE_WAIT_STATE_NORMALIZE_FAILED "
-                        "sym=%s key=%s",
-                        sym_u,
-                        wkey,
-                    )
-            _pa_reason = str(
-                watch.get("point_a_reason")
-                or watch.get("entry_block_reason")
-                or "POINT_A_WAIT"
-            )
-
-            try:
-                _pa_wait_bars = int(
-                    watch.get("point_a_wait_m15_bars") or 0
-                )
-            except Exception:
-                _pa_wait_bars = 0
-
-            try:
-                _pa_max_wait_bars = int(
-                    watch.get("point_a_max_wait_m15_bars") or 16
-                )
-            except Exception:
-                _pa_max_wait_bars = 16
-
-            try:
-                _pa_disp = float(
-                    watch.get("point_a_displacement_atr") or 0.0
-                )
-            except Exception:
-                _pa_disp = 0.0
-
-            gate["blocked"] = True
-            gate["stage"] = "POINT_A_WAIT"
-
-            gate["reason"] = (
-                f"POINT-A WAIT | {_pa_reason} "
-                f"| M15 {_pa_wait_bars}/{_pa_max_wait_bars} "
-                f"| DISP {_pa_disp:.2f} ATR"
-            )
-
-            gate["watch_key"] = str(wkey)
-            gate["watch_reused"] = True
-
-            gate["resolved_dir"] = str(
-                watch.get("direction")
-                or resolved_dir
-                or ""
-            ).upper()
-
-            # RC itself remains valid while Point-A is waiting.
-            gate["rev_ok"] = True
-
-            gate["zone"] = dict(
-                watch.get("zone_used") or {}
-            )
-            gate["planned_zone"] = dict(
-                watch.get("zone_used") or {}
-            )
-            gate["zone_used"] = dict(
-                watch.get("zone_used") or {}
-            )
-
-            gate["rev_state"] = dict(watch)
-
-            return False, gate
         if (
             w_state in (
                 "MISSED_BREAKOUT",
@@ -6351,7 +6344,10 @@ def zone_reversal_gate(
                 )
                 or ""
             ).upper().strip()
-            == "PRICE_TOO_FAR"
+            in (
+                "PRICE_TOO_FAR",
+                "WEAK_ZONE_TOO_FAR",
+            )
             and int(
                 watch.get(
                     "point_a_last_retired_rc_ms"
@@ -6499,7 +6495,10 @@ def zone_reversal_gate(
                             )
                             or ""
                         ).upper().strip()
-                        == "PRICE_TOO_FAR"
+                        in (
+                            "PRICE_TOO_FAR",
+                            "WEAK_ZONE_TOO_FAR",
+                        )
                         and int(
                             watch.get(
                                 "point_a_last_retired_rc_ms"
@@ -7877,6 +7876,128 @@ def zone_reversal_gate(
                 return False, gate
         except Exception:
             pass
+
+        # ------------------------------------------------------------
+        # Point-A WAIT presentation AFTER locked-RC maintenance.
+        #
+        # Point-A owns the WAIT lifecycle, but the underlying RC must
+        # first pass the same maintenance as every other locked RC:
+        #   1) latest valid RC refresh
+        #   2) stored-RC revalidation
+        #   3) hard-zone invalidation
+        #
+        # A newer RC clears the old Point-A lifecycle in the refresh
+        # block above, so only an unchanged, still-valid WAIT reaches
+        # this presentation branch.
+        # ------------------------------------------------------------
+        _point_a_wait_after_rc_maintenance = (
+            str((watch or {}).get("state") or "").upper()
+            == "ENTRY_BLOCKED_POINT_A_WAIT"
+            or str((watch or {}).get("trade_state") or "").upper()
+            == "ENTRY_BLOCKED_POINT_A_WAIT"
+        )
+
+        if _point_a_wait_after_rc_maintenance:
+            _wait_changed = bool(
+                str(watch.get("state") or "").upper()
+                != "ENTRY_BLOCKED_POINT_A_WAIT"
+                or str(watch.get("trade_state") or "").upper()
+                != "ENTRY_BLOCKED_POINT_A_WAIT"
+                or not bool(watch.get("rev_ok"))
+                or not bool(watch.get("entry_blocked"))
+            )
+
+            watch["state"] = "ENTRY_BLOCKED_POINT_A_WAIT"
+            watch["trade_state"] = "ENTRY_BLOCKED_POINT_A_WAIT"
+            watch["rev_ok"] = True
+            watch["entry_ready"] = False
+            watch["entry_triggered"] = False
+            watch["entry_blocked"] = True
+
+            if _wait_changed:
+                try:
+                    R.set(
+                        wkey,
+                        json.dumps(
+                            watch,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        ex=7 * 24 * 3600,
+                    )
+                    log.warning(
+                        "[POINT_A] GATE_WAIT_STATE_NORMALIZED "
+                        "sym=%s key=%s",
+                        sym_u,
+                        wkey,
+                    )
+                except Exception:
+                    log.exception(
+                        "[POINT_A] GATE_WAIT_STATE_NORMALIZE_FAILED "
+                        "sym=%s key=%s",
+                        sym_u,
+                        wkey,
+                    )
+
+            _pa_reason = str(
+                watch.get("point_a_reason")
+                or watch.get("entry_block_reason")
+                or "POINT_A_WAIT"
+            )
+
+            try:
+                _pa_wait_bars = int(
+                    watch.get("point_a_wait_m15_bars") or 0
+                )
+            except Exception:
+                _pa_wait_bars = 0
+
+            try:
+                _pa_max_wait_bars = int(
+                    watch.get("point_a_max_wait_m15_bars") or 16
+                )
+            except Exception:
+                _pa_max_wait_bars = 16
+
+            try:
+                _pa_disp = float(
+                    watch.get("point_a_displacement_atr") or 0.0
+                )
+            except Exception:
+                _pa_disp = 0.0
+
+            gate["blocked"] = True
+            gate["stage"] = "POINT_A_WAIT"
+            gate["reason"] = (
+                f"POINT-A WAIT | {_pa_reason} "
+                f"| M15 {_pa_wait_bars}/{_pa_max_wait_bars} "
+                f"| DISP {_pa_disp:.2f} ATR"
+            )
+
+            gate["watch_key"] = str(wkey)
+            gate["watch_reused"] = True
+
+            gate["resolved_dir"] = str(
+                watch.get("direction")
+                or resolved_dir
+                or ""
+            ).upper()
+
+            gate["rev_ok"] = True
+
+            gate["zone"] = dict(
+                watch.get("zone_used") or {}
+            )
+            gate["planned_zone"] = dict(
+                watch.get("zone_used") or {}
+            )
+            gate["zone_used"] = dict(
+                watch.get("zone_used") or {}
+            )
+
+            gate["rev_state"] = dict(watch)
+
+            return False, gate
 
         return True, gate
 

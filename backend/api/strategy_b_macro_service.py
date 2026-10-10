@@ -46,6 +46,19 @@ from typing import Any, Mapping, Optional
 
 log = logging.getLogger("uvicorn.error")
 
+# Process-local Strategy-B calibration store.
+#
+# The calibration JSONL can be very large. Rebuilding its dedupe indexes for
+# every macro reevaluation batch causes the entire historical JSONL to be
+# parsed repeatedly. XAUAPI currently runs one Uvicorn process and the macro
+# observer is serialized by its Redis tick lock, so reuse one store for macro
+# batches within this process.
+#
+# The store itself updates its in-memory indexes for captures written through
+# this macro path. Keep initialization lazy so application startup is not
+# blocked by the historical JSONL load.
+_MACRO_CALIBRATION_STORE = None
+
 SCHEMA_VERSION = 1
 SERVICE_NAME = "strategy_b_macro_service"
 MODE = "OBSERVATION_ONLY"
@@ -57,6 +70,13 @@ MODE = "OBSERVATION_ONLY"
 RELEASE_OWNERS_KEY = "xtl:strategy_b:macro:release_owners"
 RELEASE_INDEX_PREFIX = "xtl:strategy_b:macro:release_index"
 RELEASE_CURSOR_PREFIX = "xtl:strategy_b:macro:release_cursor"
+
+# Phase-7 scheduled-event research discovery.
+# Separate from the immutable MT5 result/release path above.
+SCHEDULE_OWNERS_KEY = "xtl:strategy_b:macro:schedule_owners"
+SCHEDULE_EVENT_PREFIX = "xtl:strategy_b:phase7:schedule_event"
+SCHEDULE_EVENT_INDEX_KEY = "xtl:strategy_b:phase7:schedule_event_index"
+
 
 EVIDENCE_PREFIX = "xtl:strategy_b:macro:evidence"
 CONTEXT_PREFIX = "xtl:strategy_b:macro:context"
@@ -98,6 +118,50 @@ OWNER_BATCH = int(
 
 RELEASE_BATCH_PER_OWNER = int(
     os.getenv("XTL_STRATEGY_B_MACRO_RELEASE_BATCH", "20")
+)
+
+SCHEDULE_EVENTS_PER_OWNER = int(
+    os.getenv(
+        "XTL_STRATEGY_B_SCHEDULE_EVENTS_PER_OWNER",
+        "500",
+    )
+)
+
+SCHEDULE_CHECKPOINT_PREFIX = (
+    "xtl:strategy_b:phase7:checkpoint"
+)
+
+SCHEDULE_CHECKPOINT_ORDINALS = (1, 2, 4)
+
+SCHEDULE_CHECKPOINT_TTL_SEC = int(
+    os.getenv(
+        "XTL_STRATEGY_B_SCHEDULE_CHECKPOINT_TTL_SEC",
+        str(21 * 86_400),
+    )
+)
+
+SCHEDULE_CHECKPOINT_LOOKBACK_MS = 90 * 60 * 1000
+SCHEDULE_CHECKPOINT_LOOKAHEAD_MS = 15 * 60 * 1000
+
+SCHEDULE_CHECKPOINT_EVENT_BATCH = int(
+    os.getenv(
+        "XTL_STRATEGY_B_SCHEDULE_CHECKPOINT_EVENT_BATCH",
+        "50",
+    )
+)
+
+SCHEDULE_LOOKAHEAD_MS = int(
+    os.getenv(
+        "XTL_STRATEGY_B_SCHEDULE_LOOKAHEAD_MS",
+        str(8 * 86_400_000),
+    )
+)
+
+SCHEDULE_RESEARCH_RETENTION_SEC = int(
+    os.getenv(
+        "XTL_STRATEGY_B_SCHEDULE_RESEARCH_RETENTION_SEC",
+        str(21 * 86_400),
+    )
 )
 
 ACTIVE_BATCH = int(
@@ -192,6 +256,43 @@ def _release_cursor_key(calendar_owner_id: str) -> str:
 def _release_key(calendar_owner_id: str, value_id: str) -> str:
     return (
         "xtl:news:calendar:mt5:release:"
+        f"{calendar_owner_id}:{value_id}"
+    )
+
+def _schedule_key(calendar_owner_id: str) -> str:
+    return (
+        "xtl:news:calendar:mt5:"
+        f"{calendar_owner_id}"
+    )
+
+def _schedule_checkpoint_key(
+    calendar_owner_id: str,
+    value_id: str,
+    ordinal: int,
+) -> str:
+    return (
+        f"{SCHEDULE_CHECKPOINT_PREFIX}:"
+        f"{calendar_owner_id}:{value_id}:"
+        f"POST_M15_{int(ordinal)}"
+    )
+
+def _schedule_checkpoint_baseline_key(
+    calendar_owner_id: str,
+    value_id: str,
+) -> str:
+    return (
+        f"{SCHEDULE_CHECKPOINT_PREFIX}:"
+        f"{calendar_owner_id}:{value_id}:"
+        "EVENT_BASELINE"
+    )
+
+
+def _schedule_event_key(
+    calendar_owner_id: str,
+    value_id: str,
+) -> str:
+    return (
+        f"{SCHEDULE_EVENT_PREFIX}:"
         f"{calendar_owner_id}:{value_id}"
     )
 
@@ -498,7 +599,13 @@ def _load_real_dxy_bias(
     *,
     device_id: str,
     now_ms: int,
-) -> tuple[Optional[dict], list[dict], str]:
+) -> tuple[
+    Optional[dict],
+    list[dict],
+    list[dict],
+    list[dict],
+    str,
+]:
     """
     Reuse canonical underlying production components:
       - load_real_dxy_bars()
@@ -513,7 +620,7 @@ def _load_real_dxy_bias(
             compute_dxy_bias,
         )
     except Exception as exc:
-        return None, [], (
+        return None, [], [], [], (
             "DXY_BIAS_IMPORT_FAILED:"
             f"{type(exc).__name__}"
         )
@@ -553,9 +660,31 @@ def _load_real_dxy_bias(
         )
 
         if not isinstance(bias, dict):
-            return None, [], "DXY_BIAS_RESULT_INVALID"
+            return None, [], [], [], "DXY_BIAS_RESULT_INVALID"
 
         bias = dict(bias)
+
+        # Strategy-B structural D1 macro-leg evidence.
+        #
+        # Reuse the D1 bars already loaded above.  This is maturity
+        # evidence only; it does not grant execution authority and does
+        # not replace the existing D1/H4 macro-leg, location, M15, or H1
+        # qualification gates.
+        from api.strategy_b_d1_macro_leg import (
+            calculate_strategy_b_d1_macro_leg,
+        )
+
+        strategy_b_d1_macro_leg = (
+            calculate_strategy_b_d1_macro_leg(
+                bars_d1,
+                bias,
+            )
+        )
+
+        bias["strategy_b_d1_macro_leg"] = (
+            strategy_b_d1_macro_leg
+        )
+
         bias.update({
             "engine_version": BIAS_ENGINE_VERSION,
             "source": "REAL_DXY",
@@ -571,10 +700,16 @@ def _load_real_dxy_bias(
             "risk_wired": False,
         })
 
-        return bias, list(bars_h1), ""
+        return (
+            bias,
+            list(bars_d1),
+            list(bars_h4),
+            list(bars_h1),
+            "",
+        ) 
 
     except Exception as exc:
-        return None, [], (
+        return None, [], [], [], (
             "DXY_BIAS_LOAD_FAILED:"
             f"{type(exc).__name__}"
         )
@@ -846,7 +981,7 @@ def _load_strategy_b_dxy_inputs(
             "m15_precheck": precheck,
         }, "MANDATORY_DXY_INPUT_NOT_FRESH"
 
-    bias, h1_bars, err = _load_real_dxy_bias(
+    bias, d1_bars, h4_bars, h1_bars, err = _load_real_dxy_bias(
         device_id=device_id,
         now_ms=now_ms,
     )
@@ -874,6 +1009,8 @@ def _load_strategy_b_dxy_inputs(
         "device_id": device_id,
         "canonical_config": canonical_cfg,
         "dxy_bias": bias,
+        "dxy_d1_bars": list(d1_bars or []),
+        "dxy_h4_bars": list(h4_bars or []),
         "dxy_h1_bars": list(h1_bars or []),
         "dxy_m15": m15,
         "dxy_h1_turn": h1_turn,
@@ -918,6 +1055,26 @@ def _persist_evidence_and_context(
         "persisted_at_ms": _now_ms(),
     })
 
+    # Preserve an already-frozen Strategy-B D1 macro-thesis contract.
+    #
+    # The release cursor normally prevents duplicate release consumption,
+    # but permanent execution-dead state must not depend on cursor behavior.
+    # If this evidence_id is persisted again, retain its existing frozen
+    # structural identity and terminal latch.
+    existing_context = _json_load(
+        R.get(_context_key(evidence_id)),
+        {},
+    )
+    existing_macro_thesis_contract = (
+        existing_context.get("macro_thesis_contract")
+        if isinstance(existing_context, dict)
+        and isinstance(
+            existing_context.get("macro_thesis_contract"),
+            dict,
+        )
+        else None
+    )
+
     context = {
         "schema_version": SCHEMA_VERSION,
         "service": SERVICE_NAME,
@@ -944,6 +1101,11 @@ def _persist_evidence_and_context(
         "observation_only": True,
         "execution_authority": False,
     }
+
+    if isinstance(existing_macro_thesis_contract, dict):
+        context["macro_thesis_contract"] = dict(
+            existing_macro_thesis_contract
+        )
 
     pipe = R.pipeline(transaction=True)
     pipe.setex(
@@ -1189,6 +1351,59 @@ def _update_context_status(
     )
 
 
+def _persist_macro_thesis_contract(
+    R,
+    *,
+    evidence_id: str,
+    contract: Mapping[str, Any],
+) -> dict:
+    """
+    Persist one frozen Strategy-B D1 macro-thesis contract in the existing
+    evidence context.
+
+    execution_dead=True is terminal and monotonic.  A later reevaluation
+    must never replace a dead contract with an ACTIVE/WAIT contract.
+    """
+    key = _context_key(evidence_id)
+    context = _json_load(R.get(key), {})
+
+    if not isinstance(context, dict):
+        return {}
+
+    existing = (
+        context.get("macro_thesis_contract")
+        if isinstance(
+            context.get("macro_thesis_contract"),
+            dict,
+        )
+        else {}
+    )
+
+    if existing.get("execution_dead") is True:
+        return dict(existing)
+
+    incoming = (
+        dict(contract)
+        if isinstance(contract, Mapping)
+        else {}
+    )
+
+    if not incoming:
+        return dict(existing)
+
+    context["macro_thesis_contract"] = incoming
+    context["observation_only"] = True
+    context["execution_authority"] = False
+
+    R.setex(
+        key,
+        PERSIST_TTL_SEC,
+        _json_dump(context),
+    )
+
+    return dict(incoming)
+
+
 # ---------------------------------------------------------------------------
 # One evidence evaluation
 # ---------------------------------------------------------------------------
@@ -1243,33 +1458,106 @@ def _rebuild_evidence_from_persisted(
 
 
 
-def _compose_and_persist_strategy_b_macro_shadow(
-    R,
+
+def _strategy_b_apply_selected_h1_proof(
+    *,
+    macro_qualification,
+    selected_symbol,
+    selected_side,
+    h1_proof_by_candidate,
+):
+    """
+    Return a selected-expression Strategy-B macro qualification view with
+    only the selected candidate's approved H1 proof overlaid.
+
+    The canonical macro/DXY qualification remains unchanged.  This helper
+    has no execution, broker, risk, Redis, or Strategy-A authority.
+    """
+    from dataclasses import replace
+
+    if macro_qualification is None:
+        return None
+
+    symbol = str(selected_symbol or "").strip().upper()
+    side = str(selected_side or "").strip().upper()
+
+    if not symbol or side not in {"BUY", "SELL"}:
+        return None
+
+    proofs = (
+        h1_proof_by_candidate
+        if isinstance(h1_proof_by_candidate, dict)
+        else {}
+    )
+
+    proof = proofs.get((symbol, side))
+    if not isinstance(proof, dict):
+        return None
+
+    proof_symbol = str(proof.get("symbol") or "").strip().upper()
+    proof_side = str(proof.get("side") or "").strip().upper()
+
+    if proof_symbol != symbol or proof_side != side:
+        return None
+
+    proven = proof.get("h1_reversal_proven") is True
+    reason = str(
+        proof.get("reason")
+        or (
+            "APPROVED_H1_REVERSAL_PROOF"
+            if proven
+            else "NO_APPROVED_H1_REVERSAL_PROOF"
+        )
+    )
+
+    primary = str(proof.get("primary_proof_path") or "").strip()
+    status = str(proof.get("status") or "").strip()
+    source = primary or status or "H1_REVERSAL_NOT_PROVEN"
+
+    old_diagnostics = getattr(
+        macro_qualification,
+        "diagnostics",
+        None,
+    )
+    diagnostics = (
+        dict(old_diagnostics)
+        if isinstance(old_diagnostics, dict)
+        else {}
+    )
+
+    diagnostics["h1_confirmation_source"] = source
+    diagnostics["_strategy_b_symbol_h1_proof"] = dict(proof)
+
+    try:
+        return replace(
+            macro_qualification,
+            h1_reversal_confirmed=proven,
+            h1_reversal_reason=reason,
+            diagnostics=diagnostics,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _evaluate_strategy_b_canonical_macro_qualification(
     *,
     evidence,
-    evidence_id: str,
-    context: Mapping[str, Any],
     dxy_inputs: Mapping[str, Any],
-    now_ms: int,
-) -> dict:
+):
     """
-    Compose the Strategy-B pre-trade shadow view with the V6.4 live expression
-    basket and durable JSONL calibration capture.
+    Evaluate the existing canonical Strategy-B macro qualification without
+    granting any additional execution authority.
 
-    Still observation-only:
-    - no risk reservation;
-    - no broker order/modify/close calls;
-    - no Strategy-A mutation;
-    - no production structural buffer is invented.
+    This helper intentionally reuses the same live-input adapter and
+    qualification evaluator used by the shadow composition.  It exists so
+    frozen D1 thesis ownership can be established before H1 pattern,
+    expression, Point-3, risk, or order work.
     """
     from api.strategy_b_live_input_adapter import (
         build_strategy_b_live_inputs,
     )
     from api.strategy_b_macro_qualification import (
         evaluate_strategy_b_macro_qualification,
-    )
-    from api.strategy_b_shadow_orchestrator import (
-        compose_strategy_b_shadow_decision,
     )
 
     dxy_m15 = (
@@ -1308,6 +1596,43 @@ def _compose_and_persist_strategy_b_macro_shadow(
         dxy_structure=live.dxy_structure,
     )
 
+    return macro, live
+
+
+def _compose_and_persist_strategy_b_macro_shadow(
+    R,
+    *,
+    evidence,
+    evidence_id: str,
+    context: Mapping[str, Any],
+    dxy_inputs: Mapping[str, Any],
+    now_ms: int,
+    calibration_store: Any = None,
+) -> dict:
+    """
+    Compose the Strategy-B pre-trade shadow view with the V6.4 live expression
+    basket and durable JSONL calibration capture.
+
+    Still observation-only:
+    - no risk reservation;
+    - no broker order/modify/close calls;
+    - no Strategy-A mutation;
+    - no production structural buffer is invented.
+    """
+    from api.strategy_b_shadow_orchestrator import (
+        compose_strategy_b_shadow_decision,
+    )
+
+    macro, live = (
+        _evaluate_strategy_b_canonical_macro_qualification(
+            evidence=evidence,
+            dxy_inputs=dxy_inputs,
+        )
+    )
+
+    dxy_m15 = live.dxy_m15
+    dxy_structure = live.dxy_structure
+
     macro_row = macro.to_dict()
     if (
         _safe_int(macro_row.get("schema_version"), 0) < 2
@@ -1342,14 +1667,6 @@ def _compose_and_persist_strategy_b_macro_shadow(
         as_of_ms=now_ms,
     )
 
-    downstream_entry = evaluate_strategy_b_entry_patterns(
-        macro,
-        pattern_observations=(
-            pattern_observer.to_entry_pattern_observations()
-        ),
-        m15_state=live.dxy_m15,
-    )
-
     # Evidence-specific selected-symbol H1 observations.
     # Reuse the ranker's canonical public expression maps; do not duplicate map
     # policy in this service.
@@ -1370,6 +1687,14 @@ def _compose_and_persist_strategy_b_macro_shadow(
         approved_expressions = dict(USD_BULLISH_EXPRESSIONS)
     else:
         approved_expressions = {}
+
+    # Request/composition-scoped native OHLC cache.
+    #
+    # Lifetime is exactly this Strategy-B macro composition. It is deliberately
+    # not module-global, not persisted, has no TTL, and creates no Redis keys.
+    # D1/H4/H1 reads shared by H1 observation and expression structural
+    # invalidation therefore reuse the same immutable acquisition result.
+    native_tf_cache: dict[tuple[str, str], dict[str, Any]] = {}
 
     symbol_h1_rows: dict[tuple[str, str], dict[str, Any]] = {}
     h1_proof_by_candidate: dict[
@@ -1398,6 +1723,7 @@ def _compose_and_persist_strategy_b_macro_shadow(
                 side=_key[1],
                 evidence_id=evidence_id,
                 as_of_ms=now_ms,
+                native_tf_cache=native_tf_cache,
             )
             _h1_row = (
                 _h1.to_dict()
@@ -1482,6 +1808,7 @@ def _compose_and_persist_strategy_b_macro_shadow(
         h1_reference_atr_by_candidate=h1_reference_atr_by_candidate,
         preferred_htf_owner=None,
         structural_buffer_price=None,
+        native_tf_cache=native_tf_cache,
     )
     expression_row = expression_basket.to_dict()
 
@@ -1506,13 +1833,129 @@ def _compose_and_persist_strategy_b_macro_shadow(
         }
     )
 
-    # Shared account/prop risk is deliberately still unwired.
+    # Strategy-B Point-3 risk boundary.
+    #
+    # Consume only the finalized selected expression.  Do not recompute
+    # structural invalidation here.  Production structural buffer policy is
+    # deliberately not calibrated yet, so an invalid/unavailable finalized
+    # stop must short-circuit before any account/risk/conversion IO.
+    _selected_expression: dict[str, Any] = {}
+
+    _best_symbol = _upper(_ranking.get("best_symbol"))
+    _best_side = _upper(_ranking.get("best_side"))
+    _ranked = _ranking.get("ranked")
+
+    # Selected-expression H1 qualification boundary.
+    #
+    # The canonical macro/DXY qualification is intentionally not mutated.
+    # Only the expression ranker's selected (symbol, side) may contribute
+    # its symbol-specific H1 reversal proof to downstream entry/lifecycle.
+    _selected_macro = _strategy_b_apply_selected_h1_proof(
+        macro_qualification=macro,
+        selected_symbol=_best_symbol,
+        selected_side=_best_side,
+        h1_proof_by_candidate=h1_proof_by_candidate,
+    )
+
+    if _selected_macro is None:
+        # Fail closed when there is no canonical selected expression/proof.
+        # Never fall back to another candidate's H1 evidence.
+        _selected_macro = macro
+
+    downstream_entry = evaluate_strategy_b_entry_patterns(
+        _selected_macro,
+        pattern_observations=(
+            pattern_observer.to_entry_pattern_observations()
+        ),
+        m15_state=live.dxy_m15,
+    )
+
+    if (
+        _best_symbol
+        and _best_side in {"BUY", "SELL"}
+        and isinstance(_ranked, list)
+    ):
+        for _ranked_item in _ranked:
+            if not isinstance(_ranked_item, Mapping):
+                continue
+
+            if (
+                _upper(_ranked_item.get("symbol")) != _best_symbol
+                or _upper(_ranked_item.get("side")) != _best_side
+            ):
+                continue
+
+            _raw = _ranked_item.get("raw")
+            if isinstance(_raw, Mapping):
+                _selected_expression = dict(_raw)
+            break
+
+    _structural_invalidation_price = (
+        _selected_expression.get("structural_invalidation_price")
+        if _selected_expression
+        else None
+    )
+    _structural_buffer_price = (
+        _selected_expression.get("structural_buffer_price")
+        if _selected_expression
+        else None
+    )
+    _proposed_structural_stop_price = (
+        _selected_expression.get("proposed_structural_stop_price")
+        if _selected_expression
+        else None
+    )
+
+    _structural_stop_ready = bool(
+        _selected_expression
+        and _structural_invalidation_price is not None
+        and _structural_buffer_price is not None
+        and _proposed_structural_stop_price is not None
+    )
+
+    # Global Strategy-B readiness boundary.
+    #
+    # Account/profile-specific prop risk does NOT belong in this global
+    # macro service.  The per-UID executor owns execution assignment,
+    # authoritative prop capacity, loss-per-lot conversion, production
+    # sizing, broker normalization, risk reservation and order authority.
+    #
+    # At this boundary we prove only that the selected expression has
+    # complete structural trade geometry.  This allows the canonical
+    # ENTRY_READY shadow/lifecycle to publish a global Strategy-B intent;
+    # the executor must still pass every production risk/execution gate.
+    if not _selected_expression:
+        _risk_wait_reason = "SELECTED_EXPRESSION_NOT_AVAILABLE"
+        _risk_ready = False
+    elif not _structural_stop_ready:
+        _risk_wait_reason = "STRUCTURAL_STOP_NOT_READY"
+        _risk_ready = False
+    else:
+        _risk_wait_reason = "STRUCTURAL_RISK_READY_FOR_EXECUTION"
+        _risk_ready = True
+
     downstream_risk = {
-        "decision": "WAIT",
-        "reason": "RISK_INPUT_NOT_YET_WIRED",
-        "valid": False,
+        "decision": (
+            "RISK_PROPOSAL_READY_SHADOW"
+            if _risk_ready
+            else "WAIT"
+        ),
+        "reason": _risk_wait_reason,
+        "valid": bool(_risk_ready),
+        "symbol": _best_symbol or None,
+        "side": _best_side or None,
+        "structural_invalidation_price": _structural_invalidation_price,
+        "structural_buffer_price": _structural_buffer_price,
+        "proposed_structural_stop_price": _proposed_structural_stop_price,
+
+        # Deliberately unset here. Production monetary risk and lots are
+        # resolved later by the per-UID executor from the active prop
+        # profile and authoritative account-risk state.
         "proposed_risk_usd": None,
         "proposed_lots_raw": None,
+
+        # This global composition layer itself never has broker/order
+        # authority. Execution authority remains downstream.
         "observation_only": True,
         "execution_authority": False,
     }
@@ -1573,6 +2016,8 @@ def _compose_and_persist_strategy_b_macro_shadow(
                     environment="DEMO",
                     source="LIVE",
                     h1_observer=_cached_symbol_h1_observer,
+                    thesis_id=evidence_id,
+                    store=calibration_store,
                 )
             )
         except Exception as exc:
@@ -1620,11 +2065,30 @@ def _compose_and_persist_strategy_b_macro_shadow(
 
     shadow = compose_strategy_b_shadow_decision(
         current_state=current_state,
-        macro_qualification=macro,
+        macro_qualification=_selected_macro,
         entry_pattern=downstream_entry,
         expression_ranking=downstream_expression,
         risk_proposal=downstream_risk,
     )
+
+    try:
+        selected_capture_link = _resolve_strategy_b_selected_capture_link(
+            shadow_decision=shadow,
+            calibration_capture=calibration_capture,
+            prior_shadow=prior,
+        )
+    except Exception as exc:
+        log.exception(
+            "[STRATEGY_B_MACRO] SELECTED_CAPTURE_CORRELATION_ERROR "
+            "evidence_id=%s err=%r",
+            evidence_id,
+            exc,
+        )
+        selected_capture_link = {
+            "selected_capture_id": None,
+            "status": "SELECTED_CAPTURE_CORRELATION_ERROR",
+            "reason": "CORRELATION_EXCEPTION",
+        }
 
     persisted = persist_strategy_b_shadow(
         R,
@@ -1633,7 +2097,146 @@ def _compose_and_persist_strategy_b_macro_shadow(
         value_id=_txt(context.get("value_id")),
         shadow_decision=shadow,
         now_ms=now_ms,
+        thesis_id=evidence_id,
+        selected_capture_id=selected_capture_link["selected_capture_id"],
+        selected_capture_link_status=selected_capture_link["status"],
+        selected_capture_link_reason=selected_capture_link["reason"],
+        expected_dxy_direction=expected_dxy_direction,
     )
+
+    # Strategy-B lifecycle bootstrap is deliberately downstream of
+    # successful canonical shadow persistence. It is observation-only:
+    # lifecycle failure must never rewrite the macro shadow decision or
+    # escalate this service into broker/risk/order authority.
+    try:
+        from api.strategy_b_lifecycle_runtime_hook import (
+            process_strategy_b_lifecycle_bootstrap,
+        )
+
+        _b_lifecycle_bootstrap = (
+            process_strategy_b_lifecycle_bootstrap(
+                R,
+                evidence_id,
+            )
+        )
+
+        # Publish execution intent only when the canonical ENTRY_READY
+        # lifecycle bootstrap was committed or confirmed identical.
+        #
+        # ALREADY_ADVANCED must not recreate an old entry opportunity.
+        if (
+            getattr(_b_lifecycle_bootstrap, "ok", False) is True
+            and _upper(
+                getattr(
+                    _b_lifecycle_bootstrap,
+                    "action",
+                    "",
+                )
+            )
+            in {"BOOTSTRAPPED", "IDEMPOTENT"}
+        ):
+            _selected_key = (
+                _upper(_best_symbol),
+                _upper(_best_side),
+            )
+            _setup_entry_price = (
+                h1_break_close_by_candidate.get(
+                    _selected_key
+                )
+            )
+
+            if (
+                _setup_entry_price is not None
+                and _structural_invalidation_price is not None
+                and _structural_buffer_price is not None
+                and expected_dxy_direction
+                in {"BULLISH", "BEARISH"}
+                and _best_symbol
+                and _best_side in {"BUY", "SELL"}
+            ):
+                from api.strategy_b_entry_intent_transport import (
+                    build_strategy_b_entry_intent,
+                    publish_strategy_b_entry_intent,
+                )
+
+                _b_entry_intent = (
+                    build_strategy_b_entry_intent(
+                        thesis_id=evidence_id,
+                        selected_capture_id=(
+                            selected_capture_link[
+                                "selected_capture_id"
+                            ]
+                        ),
+                        symbol=_best_symbol,
+                        side=_best_side,
+                        setup_entry_price=(
+                            _setup_entry_price
+                        ),
+                        structural_invalidation_price=(
+                            _structural_invalidation_price
+                        ),
+                        structural_buffer_price=(
+                            _structural_buffer_price
+                        ),
+                        expected_dxy_direction=(
+                            expected_dxy_direction
+                        ),
+                        created_at_ms=now_ms,
+                    )
+                )
+
+                _b_entry_publish = (
+                    publish_strategy_b_entry_intent(
+                        R,
+                        intent=_b_entry_intent,
+                    )
+                )
+
+                log.info(
+                    "[STRATEGY_B_MACRO] ENTRY_INTENT "
+                    "evidence_id=%s thesis=%s "
+                    "capture=%s symbol=%s side=%s "
+                    "setup_entry=%s dxy=%s "
+                    "created=%s reason=%s",
+                    evidence_id,
+                    _b_entry_intent["thesis_id"],
+                    _b_entry_intent[
+                        "selected_capture_id"
+                    ],
+                    _b_entry_intent["symbol"],
+                    _b_entry_intent["side"],
+                    _b_entry_intent[
+                        "setup_entry_price"
+                    ],
+                    _b_entry_intent[
+                        "expected_dxy_direction"
+                    ],
+                    _b_entry_publish.get("created"),
+                    _b_entry_publish.get("reason"),
+                )
+            else:
+                log.warning(
+                    "[STRATEGY_B_MACRO] "
+                    "ENTRY_INTENT_NOT_READY "
+                    "evidence_id=%s symbol=%s side=%s "
+                    "setup_entry=%s invalidation=%s "
+                    "buffer=%s dxy=%s",
+                    evidence_id,
+                    _best_symbol,
+                    _best_side,
+                    _setup_entry_price,
+                    _structural_invalidation_price,
+                    _structural_buffer_price,
+                    expected_dxy_direction,
+                )
+
+    except Exception as exc:
+        log.exception(
+            "[STRATEGY_B_MACRO] LIFECYCLE_BOOTSTRAP_ERROR "
+            "evidence_id=%s err=%r",
+            evidence_id,
+            exc,
+        )
 
     return {
         "changed": bool(persisted.get("changed")),
@@ -1678,6 +2281,7 @@ def _evaluate_evidence(
     dxy_inputs: Optional[Mapping[str, Any]],
     dxy_input_error: str,
     now_ms: int,
+    calibration_store: Any = None,
 ) -> dict:
     evidence_row = _json_load(
         R.get(_evidence_key(evidence_id)),
@@ -1699,6 +2303,48 @@ def _evaluate_evidence(
         return {
             "ok": False,
             "reason": "CONTEXT_MISSING",
+            "remove_active": True,
+        }
+
+    existing_macro_thesis_contract = (
+        context.get("macro_thesis_contract")
+        if isinstance(
+            context.get("macro_thesis_contract"),
+            dict,
+        )
+        else {}
+    )
+
+    if existing_macro_thesis_contract.get(
+        "execution_dead"
+    ) is True:
+        dead_reason = (
+            _txt(
+                existing_macro_thesis_contract.get(
+                    "reason"
+                )
+            )
+            or "D1_MACRO_THESIS_EXECUTION_DEAD"
+        )
+
+        _update_context_status(
+            R,
+            evidence_id=evidence_id,
+            status="EXECUTION_DEAD",
+            reason=dead_reason,
+            now_ms=now_ms,
+            extra={
+                "macro_thesis_contract": dict(
+                    existing_macro_thesis_contract
+                ),
+            },
+        )
+
+        return {
+            "ok": False,
+            "terminal": True,
+            "execution_dead": True,
+            "reason": dead_reason,
             "remove_active": True,
         }
 
@@ -1745,6 +2391,195 @@ def _evaluate_evidence(
         evidence = _rebuild_evidence_from_persisted(
             evidence_row
         )
+
+        from api.strategy_b_macro_thesis_validity import (
+            STATE_ACTIVE,
+            STATE_INVALID,
+            build_frozen_d1_contract,
+            evaluate_frozen_d1_contract,
+        )
+
+        macro_for_contract, live_for_contract = (
+            _evaluate_strategy_b_canonical_macro_qualification(
+                evidence=evidence,
+                dxy_inputs=dxy_inputs,
+            )
+        )
+
+        contract = (
+            dict(existing_macro_thesis_contract)
+            if isinstance(
+                existing_macro_thesis_contract,
+                dict,
+            )
+            else {}
+        )
+
+        if not contract:
+            d1_macro_leg = (
+                live_for_contract.dxy_bias.get(
+                    "strategy_b_d1_macro_leg"
+                )
+                if isinstance(
+                    live_for_contract.dxy_bias,
+                    Mapping,
+                )
+                and isinstance(
+                    live_for_contract.dxy_bias.get(
+                        "strategy_b_d1_macro_leg"
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+
+            built_contract = build_frozen_d1_contract(
+                d1_macro_leg=d1_macro_leg,
+                old_direction=_txt(
+                    getattr(
+                        macro_for_contract,
+                        "old_macro_direction",
+                        "",
+                    )
+                ),
+                frozen_at_ms=_safe_int(
+                    getattr(
+                        macro_for_contract,
+                        "catalyst_first_seen_ms",
+                        0,
+                    ),
+                    0,
+                ),
+            )
+
+            built_contract_row = built_contract.to_dict()
+
+            if (
+                built_contract.state != STATE_ACTIVE
+                or built_contract.valid is not True
+            ):
+                _update_context_status(
+                    R,
+                    evidence_id=evidence_id,
+                    status="WAIT_MACRO_THESIS_VALIDITY",
+                    reason=built_contract.reason,
+                    now_ms=now_ms,
+                    extra={
+                        "macro_thesis_contract_candidate":
+                            built_contract_row,
+                    },
+                )
+
+                return {
+                    "ok": False,
+                    "wait": True,
+                    "reason": built_contract.reason,
+                    "macro_thesis_state":
+                        built_contract.state,
+                }
+
+            contract = _persist_macro_thesis_contract(
+                R,
+                evidence_id=evidence_id,
+                contract=built_contract_row,
+            )
+
+            if not contract:
+                _update_context_status(
+                    R,
+                    evidence_id=evidence_id,
+                    status="WAIT_MACRO_THESIS_VALIDITY",
+                    reason="D1_THESIS_CONTRACT_PERSIST_FAILED",
+                    now_ms=now_ms,
+                )
+
+                return {
+                    "ok": False,
+                    "wait": True,
+                    "reason":
+                        "D1_THESIS_CONTRACT_PERSIST_FAILED",
+                }
+
+        d1_bars = (
+            dxy_inputs.get("dxy_d1_bars")
+            if isinstance(
+                dxy_inputs.get("dxy_d1_bars"),
+                list,
+            )
+            else []
+        )
+
+        validity = evaluate_frozen_d1_contract(
+            contract=contract,
+            d1_bars=d1_bars,
+            as_of_ms=now_ms,
+        )
+        validity_row = validity.to_dict()
+
+        if (
+            validity.state == STATE_INVALID
+            or validity.execution_dead is True
+        ):
+            terminal_contract = (
+                _persist_macro_thesis_contract(
+                    R,
+                    evidence_id=evidence_id,
+                    contract=validity_row,
+                )
+            )
+
+            _update_context_status(
+                R,
+                evidence_id=evidence_id,
+                status="EXECUTION_DEAD",
+                reason=validity.reason,
+                now_ms=now_ms,
+                extra={
+                    "macro_thesis_contract": (
+                        terminal_contract
+                        or validity_row
+                    ),
+                },
+            )
+
+            return {
+                "ok": False,
+                "terminal": True,
+                "execution_dead": True,
+                "reason": validity.reason,
+                "remove_active": True,
+            }
+
+        if (
+            validity.state != STATE_ACTIVE
+            or validity.valid is not True
+        ):
+            _update_context_status(
+                R,
+                evidence_id=evidence_id,
+                status="WAIT_MACRO_THESIS_VALIDITY",
+                reason=validity.reason,
+                now_ms=now_ms,
+                extra={
+                    "macro_thesis_contract":
+                        validity_row,
+                },
+            )
+
+            return {
+                "ok": False,
+                "wait": True,
+                "reason": validity.reason,
+                "macro_thesis_state": validity.state,
+            }
+
+        # Keep the persisted frozen identity immutable.  ACTIVE validity
+        # results contain current checked_at_ms diagnostics; they do not
+        # replace the original frozen contract.
+        #
+        # H4/H1/M15 qualification now continues through the existing
+        # Strategy-B pipeline.  None of those layers can set
+        # execution_dead here.
 
         _, build_dxy_macro_thesis = _import_intelligence()
 
@@ -1804,6 +2639,7 @@ def _evaluate_evidence(
             context=context,
             dxy_inputs=dxy_inputs,
             now_ms=now_ms,
+            calibration_store=calibration_store,
         )
 
         _update_context_status(
@@ -2073,20 +2909,17 @@ def _consume_new_releases_for_owner(
 # ---------------------------------------------------------------------------
 
 def _trim_active(R, now_ms: int) -> int:
-    cutoff = int(now_ms - RELEASE_RETENTION_MS)
+    """
+    ACTIVE Strategy-B macro-thesis membership is structure-owned.
 
-    try:
-        removed = int(
-            R.zremrangebyscore(
-                ACTIVE_KEY,
-                "-inf",
-                cutoff,
-            )
-            or 0
-        )
-        return removed
-    except Exception:
-        return 0
+    Catalyst/release age is not an execution invalidation condition.
+    Terminal removal is performed by _evaluate_evidence() when the
+    frozen macro-thesis contract becomes execution-dead.
+
+    Keep this compatibility hook so existing tick statistics and call
+    sites remain unchanged.  It is intentionally non-destructive.
+    """
+    return 0
 
 
 def _active_round_robin_batch(R) -> list[str]:
@@ -2159,6 +2992,36 @@ def _reevaluate_tracked(
         "errors": 0,
     }
 
+    # Reuse one process-local calibration index across macro reevaluation
+    # batches. The first use performs the historical JSONL load; subsequent
+    # batches reuse the already-built dedupe indexes instead of reparsing the
+    # complete calibration file.
+    global _MACRO_CALIBRATION_STORE
+
+    if _MACRO_CALIBRATION_STORE is None:
+        from api.strategy_b_calibration_jsonl import (
+            StrategyBCalibrationJsonlStore,
+        )
+        from api.strategy_b_live_calibration_runtime import (
+            strategy_b_calibration_jsonl_path,
+        )
+
+        _calibration_path = strategy_b_calibration_jsonl_path()
+        _load_started_ms = int(time.time() * 1000)
+
+        _MACRO_CALIBRATION_STORE = StrategyBCalibrationJsonlStore(
+            _calibration_path
+        )
+
+        log.info(
+            "[STRATEGY_B_MACRO] CALIBRATION_STORE_READY "
+            "path=%s load_ms=%s",
+            _calibration_path,
+            int(time.time() * 1000) - _load_started_ms,
+        )
+
+    calibration_store = _MACRO_CALIBRATION_STORE
+
     for evidence_id in _active_round_robin_batch(R):
         stats["checked"] += 1
 
@@ -2168,6 +3031,7 @@ def _reevaluate_tracked(
             dxy_inputs=dxy_inputs,
             dxy_input_error=dxy_input_error,
             now_ms=now_ms,
+            calibration_store=calibration_store,
         )
 
         if result.get("remove_active"):
@@ -2177,6 +3041,30 @@ def _reevaluate_tracked(
             except Exception:
                 stats["errors"] += 1
             continue
+
+        # C4: execution lifetime is owned by structural validity, not age.
+        #
+        # A nonterminal evidence item remains part of the active structural
+        # reevaluation set.  Refresh only operational persistence TTLs;
+        # never mutate the ACTIVE ZSET score because it preserves the
+        # original first_result_seen_ms / catalyst ordering.
+        try:
+            pipe = R.pipeline(transaction=False)
+            pipe.expire(
+                _evidence_key(evidence_id),
+                PERSIST_TTL_SEC,
+            )
+            pipe.expire(
+                _context_key(evidence_id),
+                PERSIST_TTL_SEC,
+            )
+            pipe.expire(
+                ACTIVE_KEY,
+                PERSIST_TTL_SEC,
+            )
+            pipe.execute()
+        except Exception:
+            stats["errors"] += 1
 
         if result.get("ok"):
             stats["evaluated"] += 1
@@ -2192,6 +3080,138 @@ def _reevaluate_tracked(
 
 
 # ---------------------------------------------------------------------------
+# Strategy-B selected calibration-capture correlation
+# ---------------------------------------------------------------------------
+
+def _resolve_strategy_b_selected_capture_link(
+    *,
+    shadow_decision,
+    calibration_capture,
+    prior_shadow,
+) -> dict:
+    """
+    Pure correlation of an ENTRY_READY shadow expression to its causal
+    calibration snapshot.
+
+    This function has no Redis, broker, execution, risk-reservation, or
+    Strategy-A authority. It never changes the trading decision.
+
+    A selected capture may be latched only for a genuinely ENTRY_READY /
+    ENTRY_READY_SHADOW decision with a valid transition plan. An already
+    persisted selected_capture_id is immutable.
+    """
+
+    def _field(obj, name, default=None):
+        if isinstance(obj, Mapping):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    prior = prior_shadow if isinstance(prior_shadow, Mapping) else {}
+
+    prior_capture_id = _txt(prior.get("selected_capture_id"))
+    if prior_capture_id:
+        return {
+            "selected_capture_id": prior_capture_id,
+            "status": (
+                _txt(prior.get("selected_capture_link_status"))
+                or "LINKED"
+            ),
+            "reason": (
+                _txt(prior.get("selected_capture_link_reason"))
+                or "SELECTED_CAPTURE_ALREADY_LINKED"
+            ),
+        }
+
+    derived_state = _upper(
+        _field(shadow_decision, "derived_state", "")
+    )
+    decision = _upper(
+        _field(shadow_decision, "decision", "")
+    )
+    transition_plan_valid = (
+        _field(shadow_decision, "transition_plan_valid", False) is True
+    )
+    selected_symbol = _upper(
+        _field(shadow_decision, "selected_symbol", "")
+    )
+    selected_side = _upper(
+        _field(shadow_decision, "selected_side", "")
+    )
+
+    entry_ready = (
+        derived_state == "ENTRY_READY"
+        and decision == "ENTRY_READY_SHADOW"
+        and transition_plan_valid
+        and bool(selected_symbol)
+        and bool(selected_side)
+    )
+
+    if not entry_ready:
+        return {
+            "selected_capture_id": None,
+            "status": "NOT_APPLICABLE",
+            "reason": "SHADOW_NOT_ENTRY_READY",
+        }
+
+    capture = (
+        calibration_capture
+        if isinstance(calibration_capture, Mapping)
+        else {}
+    )
+
+    if capture.get("ok") is not True:
+        return {
+            "selected_capture_id": None,
+            "status": "CALIBRATION_CAPTURE_UNAVAILABLE",
+            "reason": (
+                _txt(capture.get("reason"))
+                or "CALIBRATION_CAPTURE_UNAVAILABLE"
+            ),
+        }
+
+    rows = capture.get("rows")
+    if not isinstance(rows, (list, tuple)):
+        rows = []
+
+    matches = []
+
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+
+        row_symbol = _upper(row.get("symbol"))
+        row_side = _upper(row.get("side"))
+        capture_id = _txt(row.get("capture_id"))
+
+        if (
+            row_symbol == selected_symbol
+            and row_side == selected_side
+            and capture_id
+        ):
+            matches.append(capture_id)
+
+    if len(matches) == 1:
+        return {
+            "selected_capture_id": matches[0],
+            "status": "LINKED",
+            "reason": "SELECTED_CAPTURE_MATCHED",
+        }
+
+    if not matches:
+        return {
+            "selected_capture_id": None,
+            "status": "SELECTED_CAPTURE_NOT_FOUND",
+            "reason": "NO_CAPTURE_ROW_MATCHED_SELECTED_EXPRESSION",
+        }
+
+    return {
+        "selected_capture_id": None,
+        "status": "SELECTED_CAPTURE_AMBIGUOUS",
+        "reason": "MULTIPLE_CAPTURE_ROWS_MATCHED_SELECTED_EXPRESSION",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Strategy-B composed shadow persistence hooks
 # ---------------------------------------------------------------------------
 
@@ -2203,6 +3223,11 @@ def persist_strategy_b_shadow(
     value_id: str,
     shadow_decision,
     now_ms: int,
+    thesis_id: Optional[str] = None,
+    selected_capture_id: Optional[str] = None,
+    selected_capture_link_status: Optional[str] = None,
+    selected_capture_link_reason: Optional[str] = None,
+    expected_dxy_direction: Optional[str] = None,
 ) -> dict:
     """
     Persist one already-composed Strategy-B shadow decision.
@@ -2224,6 +3249,11 @@ def persist_strategy_b_shadow(
         value_id=value_id,
         shadow_decision=shadow_decision,
         now_ms=now_ms,
+        thesis_id=thesis_id,
+        selected_capture_id=selected_capture_id,
+        selected_capture_link_status=selected_capture_link_status,
+        selected_capture_link_reason=selected_capture_link_reason,
+        expected_dxy_direction=expected_dxy_direction,
         ttl_sec=PERSIST_TTL_SEC,
         max_history=MAX_HISTORY,
     )
@@ -2299,6 +3329,854 @@ def reconstruct_strategy_b_macro_state(R) -> dict:
         "uses_redis_scan": False,
     }
 
+def _load_phase7_real_dxy_m15_bars(
+    *,
+    device_id: str,
+) -> tuple[list[dict], str]:
+    """
+    One bounded canonical REAL_DXY M15 load per Strategy-B tick.
+
+    Research-only. No synthetic fallback, Redis SCAN, execution authority,
+    or Strategy-A mutation.
+    """
+    try:
+        from api.xtl_analytics import load_real_dxy_bars
+    except Exception as exc:
+        return [], (
+            "PHASE7_DXY_M15_IMPORT_FAILED:"
+            f"{type(exc).__name__}"
+        )
+
+    try:
+        bars = (
+            load_real_dxy_bars(
+                device_id=device_id,
+                tf="M15",
+                max_bars=300,
+            )
+            or []
+        )
+    except Exception as exc:
+        return [], (
+            "PHASE7_DXY_M15_LOAD_FAILED:"
+            f"{type(exc).__name__}"
+        )
+
+    clean = []
+
+    for bar in bars:
+        if not isinstance(bar, Mapping):
+            continue
+
+        if bar.get("complete") is not True:
+            continue
+
+        open_ms = _safe_int(bar.get("t_open_ms"), 0)
+        close_ms = _safe_int(bar.get("t_close_ms"), 0)
+
+        if open_ms <= 0 or close_ms <= open_ms:
+            continue
+
+        clean.append(dict(bar))
+
+    clean.sort(
+        key=lambda row: _safe_int(
+            row.get("t_close_ms"),
+            0,
+        )
+    )
+
+    if not clean:
+        return [], "PHASE7_DXY_M15_BARS_EMPTY"
+
+    return clean, ""
+
+def _capture_phase7_schedule_checkpoints(
+    R,
+    *,
+    calendar_owner_id: str,
+    value_id: str,
+    frozen_event: Mapping,
+    dxy_device_id: str,
+    m15_bars: list[dict],
+    now_ms: int,
+) -> dict:
+    """
+    Freeze raw causal REAL_DXY observations for the 1st, 2nd and 4th
+    full completed M15 candles after scheduled event T0.
+
+    No directional classification is performed here.
+    """
+    out = {
+        "due": 0,
+        "frozen": 0,
+        "existing": 0,
+        "errors": 0,
+    }
+
+    owner = _txt(calendar_owner_id)
+    value = _txt(value_id)
+    event_time_ms = _safe_int(
+        frozen_event.get("event_time_utc_ms"),
+        0,
+    )
+
+    if (
+        not owner
+        or not value
+        or not dxy_device_id
+        or event_time_ms <= 0
+    ):
+        out["errors"] += 1
+        return out
+
+    # -------------------------------------------------------------
+    # Immutable pre-event REAL_DXY M15 baseline.
+    #
+    # Select the latest fully completed candle whose close was
+    # knowable at or before scheduled event T0.
+    #
+    # This preserves the causal reference price after the rolling
+    # canonical M15 history has expired.
+    # -------------------------------------------------------------
+    baseline_candidates = [
+        dict(bar)
+        for bar in (m15_bars or [])
+        if (
+            isinstance(bar, Mapping)
+            and bar.get("complete") is True
+            and _safe_int(bar.get("t_open_ms"), 0) > 0
+            and _safe_int(bar.get("t_close_ms"), 0)
+                > _safe_int(bar.get("t_open_ms"), 0)
+            and _safe_int(bar.get("t_close_ms"), 0)
+                <= event_time_ms
+        )
+    ]
+
+    baseline_candidates.sort(
+        key=lambda row: _safe_int(
+            row.get("t_close_ms"),
+            0,
+        )
+    )
+
+    if baseline_candidates:
+        baseline_bar = baseline_candidates[-1]
+
+        baseline_open_ms = _safe_int(
+            baseline_bar.get("t_open_ms"),
+            0,
+        )
+        baseline_close_ms = _safe_int(
+            baseline_bar.get("t_close_ms"),
+            0,
+        )
+
+        # Additional causal guard. Normally guaranteed because
+        # baseline_close_ms <= event_time_ms <= now_ms for a due event.
+        if (
+            baseline_close_ms > 0
+            and baseline_close_ms <= event_time_ms
+            and baseline_close_ms <= int(now_ms)
+        ):
+            baseline_key = (
+                _schedule_checkpoint_baseline_key(
+                    owner,
+                    value,
+                )
+            )
+
+            baseline_payload = {
+                "schema_version": SCHEMA_VERSION,
+                "source": "REAL_DXY",
+                "research_source":
+                    "STRATEGY_B_PHASE7_EVENT_EXPRESSION",
+                "calendar_owner_id": owner,
+                "event_id": _txt(
+                    frozen_event.get("event_id")
+                ),
+                "value_id": value,
+                "event_name": _txt(
+                    frozen_event.get("event_name")
+                ),
+                "currency": _upper(
+                    frozen_event.get("currency")
+                ),
+                "importance": _upper(
+                    frozen_event.get("importance")
+                ),
+                "event_time_utc_ms": event_time_ms,
+                "checkpoint": "EVENT_BASELINE",
+                "checkpoint_ordinal": 0,
+                "dxy_device_id": dxy_device_id,
+                "bar_open_ms": baseline_open_ms,
+                "bar_close_ms": baseline_close_ms,
+                "captured_at_ms": int(now_ms),
+                "capture_latency_ms": max(
+                    0,
+                    int(now_ms) - baseline_close_ms,
+                ),
+                "dxy_bar": {
+                    "o": baseline_bar.get("o"),
+                    "h": baseline_bar.get("h"),
+                    "l": baseline_bar.get("l"),
+                    "c": baseline_bar.get("c"),
+                    "v": baseline_bar.get("v"),
+                },
+                "observation_only": True,
+                "execution_authority": False,
+                "strategy_a_mutation": False,
+            }
+
+            try:
+                baseline_created = bool(
+                    R.set(
+                        baseline_key,
+                        _json_dump(
+                            baseline_payload
+                        ),
+                        nx=True,
+                        ex=SCHEDULE_CHECKPOINT_TTL_SEC,
+                    )
+                )
+
+                if baseline_created:
+                    log.info(
+                        "[STRATEGY_B_PHASE7] "
+                        "CHECKPOINT_BASELINE_FROZEN "
+                        "owner=%s value_id=%s "
+                        "bar_close_ms=%s",
+                        owner,
+                        value,
+                        baseline_close_ms,
+                    )
+
+            except Exception as exc:
+                out["errors"] += 1
+
+                log.warning(
+                    "[STRATEGY_B_PHASE7] "
+                    "CHECKPOINT_BASELINE_FREEZE_FAILED "
+                    "owner=%s value_id=%s err=%r",
+                    owner,
+                    value,
+                    exc,
+                )
+
+    # Only candles whose entire interval starts at/after T0.
+    post_bars = [
+        dict(bar)
+        for bar in (m15_bars or [])
+        if (
+            isinstance(bar, Mapping)
+            and bar.get("complete") is True
+            and _safe_int(bar.get("t_open_ms"), 0)
+                >= event_time_ms
+            and _safe_int(bar.get("t_close_ms"), 0)
+                > _safe_int(bar.get("t_open_ms"), 0)
+        )
+    ]
+
+    post_bars.sort(
+        key=lambda row: _safe_int(
+            row.get("t_close_ms"),
+            0,
+        )
+    )
+
+    for ordinal in SCHEDULE_CHECKPOINT_ORDINALS:
+        index = int(ordinal) - 1
+
+        if len(post_bars) <= index:
+            continue
+
+        bar = post_bars[index]
+        bar_close_ms = _safe_int(
+            bar.get("t_close_ms"),
+            0,
+        )
+
+        # Causal boundary: never freeze before that candle was knowable.
+        if bar_close_ms <= 0 or bar_close_ms > int(now_ms):
+            continue
+
+        out["due"] += 1
+
+        key = _schedule_checkpoint_key(
+            owner,
+            value,
+            ordinal,
+        )
+
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "source": "REAL_DXY",
+            "research_source":
+                "STRATEGY_B_PHASE7_EVENT_EXPRESSION",
+            "calendar_owner_id": owner,
+            "event_id": _txt(
+                frozen_event.get("event_id")
+            ),
+            "value_id": value,
+            "event_name": _txt(
+                frozen_event.get("event_name")
+            ),
+            "currency": _upper(
+                frozen_event.get("currency")
+            ),
+            "importance": _upper(
+                frozen_event.get("importance")
+            ),
+            "event_time_utc_ms": event_time_ms,
+            "checkpoint":
+                f"POST_M15_{int(ordinal)}",
+            "checkpoint_ordinal": int(ordinal),
+            "dxy_device_id": dxy_device_id,
+            "bar_open_ms": _safe_int(
+                bar.get("t_open_ms"),
+                0,
+            ),
+            "bar_close_ms": bar_close_ms,
+            "captured_at_ms": int(now_ms),
+            "capture_latency_ms": max(
+                0,
+                int(now_ms) - bar_close_ms,
+            ),
+            "dxy_bar": {
+                "o": bar.get("o"),
+                "h": bar.get("h"),
+                "l": bar.get("l"),
+                "c": bar.get("c"),
+                "v": bar.get("v"),
+            },
+            "observation_only": True,
+            "execution_authority": False,
+            "strategy_a_mutation": False,
+        }
+
+        try:
+            created = bool(
+                R.set(
+                    key,
+                    _json_dump(payload),
+                    nx=True,
+                    ex=SCHEDULE_CHECKPOINT_TTL_SEC,
+                )
+            )
+
+            if created:
+                out["frozen"] += 1
+
+                log.info(
+                    "[STRATEGY_B_PHASE7] "
+                    "CHECKPOINT_FROZEN "
+                    "owner=%s value_id=%s "
+                    "checkpoint=POST_M15_%s "
+                    "bar_close_ms=%s",
+                    owner,
+                    value,
+                    ordinal,
+                    bar_close_ms,
+                )
+            else:
+                out["existing"] += 1
+
+        except Exception as exc:
+            out["errors"] += 1
+
+            log.warning(
+                "[STRATEGY_B_PHASE7] "
+                "CHECKPOINT_FREEZE_FAILED "
+                "owner=%s value_id=%s "
+                "checkpoint=POST_M15_%s err=%r",
+                owner,
+                value,
+                ordinal,
+                exc,
+            )
+
+    return out
+
+def _process_phase7_due_schedule_checkpoints(
+    R,
+    *,
+    dxy_device_id: str,
+    now_ms: int,
+) -> dict:
+    """
+    Process only Strategy-B scheduled events near T0.
+
+    Uses the explicit Phase-7 schedule-event ZSET.
+    Loads canonical REAL_DXY M15 bars at most once for the whole batch.
+
+    Observation/research only:
+      - no Redis SCAN
+      - no synthetic DXY fallback
+      - no direction classification
+      - no execution/risk authority
+      - no Strategy-A mutation
+    """
+    out = {
+        "events_due": 0,
+        "events_loaded": 0,
+        "events_missing": 0,
+        "m15_loaded": 0,
+        "checkpoint_due": 0,
+        "checkpoint_frozen": 0,
+        "checkpoint_existing": 0,
+        "errors": 0,
+    }
+
+    device_id = _txt(dxy_device_id)
+
+    if not device_id:
+        out["errors"] += 1
+        return out
+
+    min_score = (
+        int(now_ms)
+        - SCHEDULE_CHECKPOINT_LOOKBACK_MS
+    )
+    max_score = (
+        int(now_ms)
+        + SCHEDULE_CHECKPOINT_LOOKAHEAD_MS
+    )
+
+    try:
+        members = R.zrangebyscore(
+            SCHEDULE_EVENT_INDEX_KEY,
+            min_score,
+            max_score,
+            start=0,
+            num=max(
+                1,
+                SCHEDULE_CHECKPOINT_EVENT_BATCH,
+            ),
+        ) or []
+    except Exception as exc:
+        out["errors"] += 1
+
+        log.warning(
+            "[STRATEGY_B_PHASE7] "
+            "CHECKPOINT_DUE_INDEX_READ_FAILED err=%r",
+            exc,
+        )
+
+        return out
+
+    decoded_members = [
+        _txt(member)
+        for member in members
+        if _txt(member)
+    ]
+
+    out["events_due"] = len(decoded_members)
+
+    if not decoded_members:
+        return out
+
+    # Exactly one bounded canonical M15 load for the entire due-event batch.
+    m15_bars, m15_err = (
+        _load_phase7_real_dxy_m15_bars(
+            device_id=device_id,
+        )
+    )
+
+    if not m15_bars:
+        out["errors"] += 1
+
+        log.warning(
+            "[STRATEGY_B_PHASE7] "
+            "CHECKPOINT_M15_UNAVAILABLE "
+            "device_id=%s reason=%s",
+            device_id,
+            m15_err or "UNKNOWN",
+        )
+
+        return out
+
+    out["m15_loaded"] = len(m15_bars)
+
+    for member in decoded_members:
+        if ":" not in member:
+            out["errors"] += 1
+
+            log.warning(
+                "[STRATEGY_B_PHASE7] "
+                "CHECKPOINT_INDEX_MEMBER_INVALID "
+                "member=%s",
+                member,
+            )
+
+            continue
+
+        owner, value_id = member.split(":", 1)
+
+        owner = _txt(owner)
+        value_id = _txt(value_id)
+
+        if not owner or not value_id:
+            out["errors"] += 1
+            continue
+
+        try:
+            frozen_event = _json_load(
+                R.get(
+                    _schedule_event_key(
+                        owner,
+                        value_id,
+                    )
+                ),
+                {},
+            )
+        except Exception as exc:
+            out["errors"] += 1
+
+            log.warning(
+                "[STRATEGY_B_PHASE7] "
+                "CHECKPOINT_EVENT_READ_FAILED "
+                "owner=%s value_id=%s err=%r",
+                owner,
+                value_id,
+                exc,
+            )
+
+            continue
+
+        if not isinstance(frozen_event, Mapping):
+            out["events_missing"] += 1
+            continue
+
+        # Fail closed on identity mismatch.
+        if (
+            _txt(
+                frozen_event.get(
+                    "calendar_owner_id"
+                )
+            )
+            != owner
+            or _txt(
+                frozen_event.get("value_id")
+            )
+            != value_id
+        ):
+            out["errors"] += 1
+
+            log.warning(
+                "[STRATEGY_B_PHASE7] "
+                "CHECKPOINT_EVENT_IDENTITY_REJECT "
+                "owner=%s value_id=%s",
+                owner,
+                value_id,
+            )
+
+            continue
+
+        out["events_loaded"] += 1
+
+        result = (
+            _capture_phase7_schedule_checkpoints(
+                R,
+                calendar_owner_id=owner,
+                value_id=value_id,
+                frozen_event=frozen_event,
+                dxy_device_id=device_id,
+                m15_bars=m15_bars,
+                now_ms=now_ms,
+            )
+        )
+
+        out["checkpoint_due"] += int(
+            result.get("due") or 0
+        )
+        out["checkpoint_frozen"] += int(
+            result.get("frozen") or 0
+        )
+        out["checkpoint_existing"] += int(
+            result.get("existing") or 0
+        )
+        out["errors"] += int(
+            result.get("errors") or 0
+        )
+
+    return out
+
+def _phase7_full_post_event_m15_bars(
+    bars: list,
+    *,
+    event_time_ms: int,
+) -> list:
+    """
+    Return completed REAL_DXY M15 bars whose entire interval is
+    causally after the scheduled event.
+
+    No pre-event portion of a candle is allowed.
+    """
+    event_ms = int(event_time_ms or 0)
+
+    out = []
+
+    for bar in bars or []:
+        if not isinstance(bar, Mapping):
+            continue
+
+        if bar.get("complete") is not True:
+            continue
+
+        open_ms = _safe_int(
+            bar.get("t_open_ms"),
+            0,
+        )
+        close_ms = _safe_int(
+            bar.get("t_close_ms"),
+            0,
+        )
+
+        if (
+            open_ms <= 0
+            or close_ms <= open_ms
+        ):
+            continue
+
+        # Entire candle must start at/after T0.
+        if open_ms < event_ms:
+            continue
+
+        out.append(dict(bar))
+
+    out.sort(
+        key=lambda x: _safe_int(
+            x.get("t_close_ms"),
+            0,
+        )
+    )
+
+    return out
+
+
+def _freeze_strategy_b_schedule_events_for_owner(
+    R,
+    *,
+    calendar_owner_id: str,
+    now_ms: int,
+) -> dict:
+    """
+    Phase-7 observation-only scheduled-event discovery.
+
+    Reads one exact canonical MT5 calendar snapshot and freezes genuine
+    upcoming HIGH-impact event identity into a Strategy-B research namespace.
+
+    This function:
+      - does not build MacroEvidence
+      - does not infer direction
+      - does not consume MT5 result releases
+      - does not mutate Strategy-A
+      - has no broker/order/risk authority
+      - does not SCAN Redis
+    """
+    out = {
+        "seen": 0,
+        "eligible": 0,
+        "frozen": 0,
+        "existing": 0,
+        "errors": 0,
+    }
+
+    owner = _txt(calendar_owner_id)
+    if not owner:
+        out["errors"] += 1
+        return out
+
+    try:
+        snapshot = _json_load(
+            R.get(_schedule_key(owner)),
+            {},
+        )
+    except Exception as exc:
+        out["errors"] += 1
+        log.warning(
+            "[STRATEGY_B_PHASE7] SCHEDULE_READ_FAILED "
+            "owner=%s err=%r",
+            owner,
+            exc,
+        )
+        return out
+
+    if not isinstance(snapshot, Mapping):
+        out["errors"] += 1
+        return out
+
+    if _upper(snapshot.get("source")) != "MT5_CALENDAR":
+        out["errors"] += 1
+        log.warning(
+            "[STRATEGY_B_PHASE7] SCHEDULE_SOURCE_REJECT "
+            "owner=%s source=%s",
+            owner,
+            _txt(snapshot.get("source")),
+        )
+        return out
+
+    snapshot_owner = _txt(
+        snapshot.get("calendar_owner_id")
+    )
+    if snapshot_owner != owner:
+        out["errors"] += 1
+        log.warning(
+            "[STRATEGY_B_PHASE7] SCHEDULE_OWNER_REJECT "
+            "expected=%s actual=%s",
+            owner,
+            snapshot_owner,
+        )
+        return out
+
+    events = snapshot.get("events")
+    if not isinstance(events, list):
+        out["errors"] += 1
+        return out
+
+    # Hard runtime bound even if a malformed/oversized snapshot reaches Redis.
+    events = events[:max(1, SCHEDULE_EVENTS_PER_OWNER)]
+
+    max_event_ms = int(now_ms) + max(
+        0,
+        SCHEDULE_LOOKAHEAD_MS,
+    )
+
+    for event in events:
+        out["seen"] += 1
+
+        if not isinstance(event, Mapping):
+            continue
+
+        event_id = _txt(event.get("event_id"))
+        value_id = _txt(event.get("value_id"))
+        event_name = _txt(event.get("event_name"))
+        currency = _upper(event.get("currency"))
+        importance = _upper(event.get("importance"))
+        event_time_ms = _safe_int(
+            event.get("event_time_utc_ms"),
+            0,
+        )
+
+        # Phase-7 clean sample starts with major scheduled events only.
+        if importance != "HIGH":
+            continue
+
+        if (
+            not event_id
+            or not value_id
+            or not event_name
+            or not currency
+            or event_time_ms <= 0
+        ):
+            continue
+
+        # Do not create new research observations for already-past events.
+        # Once frozen, however, the immutable record survives schedule rollover.
+        if event_time_ms < int(now_ms):
+            continue
+
+        if event_time_ms > max_event_ms:
+            continue
+
+        out["eligible"] += 1
+
+        frozen = {
+            "schema_version": SCHEMA_VERSION,
+            "source": "MT5_CALENDAR",
+            "research_source": "STRATEGY_B_PHASE7_SCHEDULE",
+            "calendar_owner_id": owner,
+            "event_id": event_id,
+            "value_id": value_id,
+            "event_name": event_name,
+            "currency": currency,
+            "importance": importance,
+            "event_time_utc_ms": event_time_ms,
+            "first_schedule_seen_ms": int(now_ms),
+            "calendar_collected_at_ms": _safe_int(
+                snapshot.get("collected_at_ms"),
+                0,
+            ),
+            "event": dict(event),
+            "observation_only": True,
+            "execution_authority": False,
+            "strategy_a_mutation": False,
+        }
+
+        key = _schedule_event_key(
+            owner,
+            value_id,
+        )
+
+        try:
+            created = bool(
+                R.set(
+                    key,
+                    _json_dump(frozen),
+                    nx=True,
+                    ex=SCHEDULE_RESEARCH_RETENTION_SEC,
+                )
+            )
+
+            if created:
+                # Explicit due-time index for later checkpoint processing.
+                # No runtime SCAN will be required.
+                R.zadd(
+                    SCHEDULE_EVENT_INDEX_KEY,
+                    {
+                        f"{owner}:{value_id}": event_time_ms
+                    },
+                )
+                out["frozen"] += 1
+
+                log.info(
+                    "[STRATEGY_B_PHASE7] SCHEDULE_EVENT_FROZEN "
+                    "owner=%s value_id=%s event_id=%s "
+                    "currency=%s importance=%s event_time_ms=%s",
+                    owner,
+                    value_id,
+                    event_id,
+                    currency,
+                    importance,
+                    event_time_ms,
+                )
+            else:
+                out["existing"] += 1
+
+        except Exception as exc:
+            out["errors"] += 1
+            log.warning(
+                "[STRATEGY_B_PHASE7] SCHEDULE_EVENT_FREEZE_FAILED "
+                "owner=%s value_id=%s err=%r",
+                owner,
+                value_id,
+                exc,
+            )
+
+    # Keep the explicit research index bounded to retained observations.
+    try:
+        cutoff_ms = int(now_ms) - (
+            SCHEDULE_RESEARCH_RETENTION_SEC * 1000
+        )
+        R.zremrangebyscore(
+            SCHEDULE_EVENT_INDEX_KEY,
+            "-inf",
+            cutoff_ms,
+        )
+        R.expire(
+            SCHEDULE_EVENT_INDEX_KEY,
+            SCHEDULE_RESEARCH_RETENTION_SEC,
+        )
+    except Exception as exc:
+        out["errors"] += 1
+        log.warning(
+            "[STRATEGY_B_PHASE7] SCHEDULE_INDEX_TRIM_FAILED "
+            "owner=%s err=%r",
+            owner,
+            exc,
+        )
+
+    return out
 
 # ---------------------------------------------------------------------------
 # Public tick
@@ -2340,6 +4218,20 @@ def tick_strategy_b_macro_observer(
         "observation_only": True,
         "execution_authority": False,
         "strategy_a_mutation": False,
+        "schedule_owners": 0,
+        "schedule_seen": 0,
+        "schedule_eligible": 0,
+        "schedule_frozen": 0,
+        "schedule_existing": 0,
+        "schedule_errors": 0,
+        "checkpoint_events_due": 0,
+        "checkpoint_events_loaded": 0,
+        "checkpoint_events_missing": 0,
+        "checkpoint_m15_loaded": 0,
+        "checkpoint_due": 0,
+        "checkpoint_frozen": 0,
+        "checkpoint_existing": 0,
+        "checkpoint_errors": 0,
     }
 
     token = _acquire_tick_lock(R)
@@ -2376,7 +4268,103 @@ def tick_strategy_b_macro_observer(
                 else "MANDATORY_DXY_INPUT_NOT_FRESH"
             )
         )
+        # -------------------------------------------------------------
+        # Phase-7 genuine scheduled-event research discovery.
+        # Independent from the existing result/release consumer below.
+        # -------------------------------------------------------------
+        try:
+            schedule_owners = sorted(
+                _txt(x)
+                for x in (
+                    R.smembers(SCHEDULE_OWNERS_KEY)
+                    or set()
+                )
+                if _txt(x)
+            )
+        except Exception as exc:
+            schedule_owners = []
+            stats["schedule_errors"] += 1
+            log.warning(
+                "[STRATEGY_B_PHASE7] SCHEDULE_OWNER_READ_FAILED "
+                "err=%r",
+                exc,
+            )
 
+        schedule_owners = schedule_owners[
+            :max(1, OWNER_BATCH)
+        ]
+        stats["schedule_owners"] = len(
+            schedule_owners
+        )
+
+        for schedule_owner in schedule_owners:
+            schedule_stats = (
+                _freeze_strategy_b_schedule_events_for_owner(
+                    R,
+                    calendar_owner_id=schedule_owner,
+                    now_ms=started_ms,
+                )
+            )
+
+            stats["schedule_seen"] += int(
+                schedule_stats.get("seen") or 0
+            )
+            stats["schedule_eligible"] += int(
+                schedule_stats.get("eligible") or 0
+            )
+            stats["schedule_frozen"] += int(
+                schedule_stats.get("frozen") or 0
+            )
+            stats["schedule_existing"] += int(
+                schedule_stats.get("existing") or 0
+            )
+            stats["schedule_errors"] += int(
+                schedule_stats.get("errors") or 0
+            )
+
+        # -------------------------------------------------------------
+        # Phase-7 causal REAL_DXY M15 checkpoint capture.
+        #
+        # Runs once per Strategy-B tick, outside the schedule-owner loop.
+        # Uses only bounded due-event ZSET discovery and one shared M15 load.
+        # -------------------------------------------------------------
+        checkpoint_device_id = _txt(
+            stats.get("canonical_dxy_device_id")
+        )
+
+        if checkpoint_device_id:
+            checkpoint_stats = (
+                _process_phase7_due_schedule_checkpoints(
+                    R,
+                    dxy_device_id=checkpoint_device_id,
+                    now_ms=started_ms,
+                )
+            )
+
+            stats["checkpoint_events_due"] = int(
+                checkpoint_stats.get("events_due") or 0
+            )
+            stats["checkpoint_events_loaded"] = int(
+                checkpoint_stats.get("events_loaded") or 0
+            )
+            stats["checkpoint_events_missing"] = int(
+                checkpoint_stats.get("events_missing") or 0
+            )
+            stats["checkpoint_m15_loaded"] = int(
+                checkpoint_stats.get("m15_loaded") or 0
+            )
+            stats["checkpoint_due"] = int(
+                checkpoint_stats.get("checkpoint_due") or 0
+            )
+            stats["checkpoint_frozen"] = int(
+                checkpoint_stats.get("checkpoint_frozen") or 0
+            )
+            stats["checkpoint_existing"] = int(
+                checkpoint_stats.get("checkpoint_existing") or 0
+            )
+            stats["checkpoint_errors"] = int(
+                checkpoint_stats.get("errors") or 0
+            )
         try:
             owners = sorted(
                 _txt(x)

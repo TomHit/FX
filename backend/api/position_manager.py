@@ -21,6 +21,11 @@ import uuid
 from typing import Any
 
 from api.trend_endpoints import _resolve_prop_profile_device
+from api.strategy_execution_ownership import (
+    STRATEGY_A,
+    STRATEGY_B,
+    execution_strategy_from_record,
+)
 
 log = logging.getLogger("uvicorn.error")
 
@@ -50,6 +55,14 @@ BE_BUFFER_R: dict[str, float] = {
     "GBPUSD": 0.05,
 
 }
+
+# Existing production hard-loss boundary from oppt_executor.py.
+# This is not a new trading rule; position_manager enforces the same boundary
+# at its faster active-position cadence.
+DEFENSIVE_LOSS_HARD_EXIT_R = -0.50
+DEFENSIVE_LOSS_EXIT_REASON = "DEFENSIVE_LOSS_050R"
+DEFENSIVE_RETRY_MIN_MS = 1_000
+
 
 
 POLL_SEC = 1.0
@@ -355,6 +368,426 @@ def _enqueue_be_modify(
     return {"ok": True, "job_id": job_id, "device_id": device_id}
 
 
+def _enqueue_defensive_close(
+    R,
+    *,
+    uid: str,
+    pos: dict,
+    bp: dict,
+    device_id: str,
+    current_r: float,
+    now_ms: int,
+) -> dict:
+    """Queue the same hedging-safe close_position command used by OPPT."""
+    ticket = _i(
+        pos.get("mt5_ticket")
+        or pos.get("broker_ticket")
+        or pos.get("position_ticket"),
+        0,
+    )
+    symbol = str(pos.get("symbol") or "").upper().strip()
+    qty = _f(bp.get("volume") or pos.get("qty"), 0.0)
+
+    if ticket <= 0 or not symbol or qty <= 0:
+        return {
+            "ok": False,
+            "error": "DEFENSIVE_CLOSE_ROUTE_METADATA_MISSING",
+        }
+
+    job_id = "mt5_" + uuid.uuid4().hex
+
+    payload = {
+        "job_id": job_id,
+        "type": "close_position",
+        "mt5_account": str(
+            pos.get("mt5_account") or "demo"
+        ).lower().strip(),
+        "symbol": symbol,
+        "ticket": int(ticket),
+        "qty": float(qty),
+        "comment": "XTL LOSS_050R",
+        "trade_id": f"DEFENSIVE_LOSS_CLOSE:{ticket}:LOSS_050R",
+        "exit_reason": DEFENSIVE_LOSS_EXIT_REASON,
+        "user_id": uid,
+        "source": "oppt",
+        "profile_id": str(pos.get("profile_id") or ""),
+        "device_id": device_id,
+        "profile_resolve_reason": "POSITION_MANAGER_PROFILE_RESOLVE",
+        "ts_ms": int(now_ms),
+    }
+
+    qkey = CMDQ_TEMPLATE.format(device_id=device_id)
+
+    R.rpush(
+        qkey,
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+    R.ltrim(qkey, -200, -1)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "device_id": device_id,
+        "observed_r": round(float(current_r), 4),
+    }
+
+
+def _defensive_job_still_queued(
+    R,
+    device_id: str,
+    job_id: str,
+) -> bool:
+    if not device_id or not job_id:
+        return False
+
+    qkey = CMDQ_TEMPLATE.format(device_id=device_id)
+
+    for raw in (R.lrange(qkey, 0, -1) or []):
+        row = _json(raw, {})
+
+        if (
+            isinstance(row, dict)
+            and str(row.get("job_id") or "") == job_id
+        ):
+            return True
+
+    return False
+
+
+def _release_owned_lock(R, lock_key: str, lock_token: str) -> None:
+    """
+    Release a Redis lock only when it is still owned by this caller.
+
+    Compare-and-delete prevents this process from deleting a lock that
+    expired and was subsequently acquired by another process.
+    """
+    try:
+        R.eval(
+            """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            end
+            return 0
+            """,
+            1,
+            lock_key,
+            lock_token,
+        )
+    except Exception:
+        # TTL remains the final safety release.
+        pass
+
+def _manage_defensive_close(
+    R,
+    *,
+    uid: str,
+    trade_id: str,
+    pos: dict,
+    bp: dict,
+    device_id: str,
+    entry: float,
+    initial_risk: float,
+    current_r: float,
+    now_ms: int,
+) -> tuple[bool, str] | None:
+    """
+    Enforce existing -0.50R hard-loss decision.
+
+    Once triggered, the close decision is latched.
+    Price recovery does not cancel it.
+    Retry until broker position disappears.
+    """
+
+    ticket = _i(
+        pos.get("mt5_ticket")
+        or pos.get("broker_ticket")
+        or pos.get("position_ticket"),
+        0,
+    )
+
+    if ticket <= 0:
+        return None
+
+    pm = pos.get("position_management")
+
+    if not isinstance(pm, dict):
+        pm = {}
+        pos["position_management"] = pm
+
+    latched = bool(
+        pm.get("defensive_close_latched")
+    )
+
+    # Nothing to do until existing -0.50R boundary is reached.
+    if (
+        not latched
+        and current_r > DEFENSIVE_LOSS_HARD_EXIT_R
+    ):
+        return None
+
+    # -------------------------------------------------
+    # LATCH
+    # Once -0.50R has been observed, this trade must close.
+    # -------------------------------------------------
+    if not latched:
+        pm["defensive_close_latched"] = True
+        pm["defensive_close_triggered_at_ms"] = int(now_ms)
+        pm["defensive_close_trigger_r"] = round(
+            float(current_r),
+            4,
+        )
+        pm["defensive_close_threshold_r"] = float(
+            DEFENSIVE_LOSS_HARD_EXIT_R
+        )
+        pm["defensive_close_reason"] = (
+            DEFENSIVE_LOSS_EXIT_REASON
+        )
+
+        log.warning(
+            "[POSITION_MGR] DEFENSIVE_CLOSE_LATCH "
+            "uid=%s trade_id=%s ticket=%s "
+            "sym=%s side=%s current_r=%.4f threshold_r=%.2f",
+            uid,
+            trade_id,
+            ticket,
+            str(pos.get("symbol") or "").upper().strip(),
+            str(pos.get("side") or "").upper().strip(),
+            current_r,
+            DEFENSIVE_LOSS_HARD_EXIT_R,
+        )
+
+    pm["defensive_close_last_observed_r"] = round(
+        float(current_r),
+        4,
+    )
+    pm["defensive_close_last_checked_at_ms"] = int(now_ms)
+
+    # -------------------------------------------------
+    # Don't stack another close while exact previous job
+    # is still waiting for the Agent.
+    # -------------------------------------------------
+    pending_job = str(
+        pm.get("defensive_close_pending_job_id") or ""
+    ).strip()
+
+    if pending_job:
+        try:
+            if _defensive_job_still_queued(
+                R,
+                device_id,
+                pending_job,
+            ):
+                return True, "DEFENSIVE_CLOSE_PENDING"
+
+        except Exception:
+            # Never cancel the latched close decision.
+            return True, "DEFENSIVE_CLOSE_QUEUE_CHECK_ERROR"
+
+    last_attempt_ms = _i(
+        pm.get("defensive_close_last_attempt_ms"),
+        0,
+    )
+
+    if (
+        last_attempt_ms
+        and now_ms - last_attempt_ms
+        < DEFENSIVE_RETRY_MIN_MS
+    ):
+        return True, "DEFENSIVE_CLOSE_RETRY_WAIT"
+
+    # -------------------------------------------------
+    # Cross-process protection.
+    # -------------------------------------------------
+    lock_key = (
+        f"xtl:position_manager:"
+        f"defensive_close_lock:{ticket}"
+    )
+
+    lock_token = uuid.uuid4().hex
+
+    try:
+        locked = bool(
+            R.set(
+                lock_key,
+                lock_token,
+                nx=True,
+                px=PER_TICKET_LOCK_MS,
+            )
+        )
+
+    except Exception:
+        return True, "DEFENSIVE_CLOSE_LOCK_ERROR"
+
+    if not locked:
+        return True, "DEFENSIVE_CLOSE_LOCK_BUSY"
+
+    try:
+        # ---------------------------------------------
+        # Re-read broker truth inside lock.
+        # ---------------------------------------------
+        bp2 = _load_broker_position(
+            R,
+            device_id,
+            str(
+                pos.get("mt5_account") or "demo"
+            ).lower().strip(),
+            ticket,
+        )
+
+        # Position already disappeared from broker.
+        if not bp2:
+            pm["defensive_close_broker_gone_at_ms"] = int(
+                now_ms
+            )
+            pm["defensive_close_pending_job_id"] = None
+
+            return True, "DEFENSIVE_CLOSE_BROKER_GONE"
+
+        price2 = _f(
+            bp2.get("price_current"),
+            0.0,
+        )
+
+        side = str(
+            pos.get("side") or ""
+        ).upper().strip()
+
+        current_r2 = current_r
+
+        if price2 > 0 and initial_risk > 0:
+            current_r2 = (
+                (price2 - entry) / initial_risk
+                if side == "BUY"
+                else (entry - price2) / initial_risk
+            )
+
+        # ---------------------------------------------
+        # Position still exists -> issue/reissue close.
+        # ---------------------------------------------
+        enq = _enqueue_defensive_close(
+            R,
+            uid=uid,
+            pos=pos,
+            bp=bp2,
+            device_id=device_id,
+            current_r=float(current_r2),
+            now_ms=now_ms,
+        )
+
+        pm["defensive_close_last_attempt_ms"] = int(
+            now_ms
+        )
+
+        pm["defensive_close_attempts"] = (
+            _i(
+                pm.get("defensive_close_attempts"),
+                0,
+            )
+            + 1
+        )
+
+        if not bool(enq.get("ok")):
+            pm["defensive_close_last_error"] = str(
+                enq.get("error") or "ENQUEUE_FAILED"
+            )
+
+            log.error(
+                "[POSITION_MGR] "
+                "DEFENSIVE_CLOSE_ENQUEUE_FAIL "
+                "uid=%s trade_id=%s ticket=%s err=%s",
+                uid,
+                trade_id,
+                ticket,
+                pm["defensive_close_last_error"],
+            )
+
+            return True, "DEFENSIVE_CLOSE_ENQUEUE_FAIL"
+
+        pm["defensive_close_pending_job_id"] = (
+            enq["job_id"]
+        )
+        pm["defensive_close_last_error"] = None
+
+        pm["defensive_close_last_request_r"] = round(
+            float(current_r2),
+            4,
+        )
+
+        pm["defensive_close_last_request_price"] = float(
+            price2
+        )
+
+        # ---------------------------------------------
+        # Keep executor-compatible audit fields.
+        # ---------------------------------------------
+        pos["requested_exit_reason"] = (
+            DEFENSIVE_LOSS_EXIT_REASON
+        )
+        pos["requested_exit_at_ms"] = int(now_ms)
+
+        pos["defensive_loss_exit_requested"] = True
+        pos["defensive_loss_exit_action"] = (
+            "EARLY_CLOSE_LOSS"
+        )
+        pos["defensive_loss_exit_job_id"] = (
+            enq["job_id"]
+        )
+        pos["defensive_loss_observed_price"] = float(
+            price2
+        )
+        pos["defensive_loss_observed_r"] = round(
+            float(current_r2),
+            4,
+        )
+        pos["defensive_loss_threshold_r"] = float(
+            DEFENSIVE_LOSS_HARD_EXIT_R
+        )
+
+        log.warning(
+            "[POSITION_MGR] DEFENSIVE_CLOSE_ENQUEUE "
+            "uid=%s trade_id=%s ticket=%s "
+            "sym=%s side=%s current_r=%.4f "
+            "threshold_r=%.2f attempt=%s "
+            "job=%s device=%s",
+            uid,
+            trade_id,
+            ticket,
+            str(pos.get("symbol") or "").upper().strip(),
+            side,
+            current_r2,
+            DEFENSIVE_LOSS_HARD_EXIT_R,
+            pm["defensive_close_attempts"],
+            enq["job_id"],
+            device_id,
+        )
+
+        return True, "DEFENSIVE_CLOSE_ENQUEUED"
+
+    except Exception as exc:
+        pm["defensive_close_last_error"] = (
+            f"EXCEPTION:{type(exc).__name__}:{exc}"
+        )
+
+        log.exception(
+            "[POSITION_MGR] DEFENSIVE_CLOSE_EXCEPTION "
+            "uid=%s trade_id=%s ticket=%s",
+            uid,
+            trade_id,
+            ticket,
+        )
+
+        return True, "DEFENSIVE_CLOSE_EXCEPTION"
+    finally:
+        _release_owned_lock(
+            R,
+            lock_key,
+            lock_token,
+        )
+
 def _manage_trade(R, uid: str, trade_id: str, pos: dict, now_ms: int) -> tuple[bool, str]:
     symbol = str(pos.get("symbol") or "").upper().strip()
     trigger_r = BE_TRIGGER_R.get(symbol)
@@ -463,6 +896,22 @@ def _manage_trade(R, uid: str, trade_id: str, pos: dict, now_ms: int) -> tuple[b
         if side == "BUY"
         else (entry - price) / initial_risk
     )
+
+    defensive_result = _manage_defensive_close(
+        R,
+        uid=uid,
+        trade_id=trade_id,
+        pos=pos,
+        bp=bp,
+        device_id=device_id,
+        entry=float(entry),
+        initial_risk=float(initial_risk),
+        current_r=float(current_r),
+        now_ms=now_ms,
+    )
+
+    if defensive_result is not None:
+        return defensive_result
 
     pm = pos.get("position_management")
     if not isinstance(pm, dict):
@@ -617,6 +1066,8 @@ def tick_position_manager(R) -> dict:
         "managed": 0,
         "enqueued": 0,
         "verified": 0,
+        "defensive_enqueued": 0,
+        "defensive_pending": 0,
         "stale_uids": 0,
         "errors": 0,
     }
@@ -695,6 +1146,39 @@ def tick_position_manager(R) -> dict:
 
                 stats["checked"] += 1
 
+                strategy_owner = execution_strategy_from_record(pos)
+
+                if strategy_owner == STRATEGY_B:
+                    log.debug(
+                        "[POSITION_MGR] STRATEGY_B_SKIP_A_BE "
+                        "uid=%s trade_id=%s ticket=%s sym=%s",
+                        uid,
+                        trade_id,
+                        (
+                            pos.get("mt5_ticket")
+                            or pos.get("broker_ticket")
+                            or pos.get("position_ticket")
+                        ),
+                        str(pos.get("symbol") or "").upper().strip(),
+                    )
+                    continue
+
+                if strategy_owner != STRATEGY_A:
+                    log.error(
+                        "[POSITION_MGR] UNKNOWN_STRATEGY_SKIP_A_BE "
+                        "uid=%s trade_id=%s strategy=%r ticket=%s sym=%s",
+                        uid,
+                        trade_id,
+                        pos.get("strategy"),
+                        (
+                            pos.get("mt5_ticket")
+                            or pos.get("broker_ticket")
+                            or pos.get("position_ticket")
+                        ),
+                        str(pos.get("symbol") or "").upper().strip(),
+                    )
+                    continue
+
                 try:
                     changed, reason = _manage_trade(
                         R,
@@ -721,6 +1205,16 @@ def tick_position_manager(R) -> dict:
 
                     if reason == "BE_ENQUEUED":
                         stats["enqueued"] += 1
+
+                    if reason == "DEFENSIVE_CLOSE_ENQUEUED":
+                        stats["defensive_enqueued"] += 1
+
+                    if reason in (
+                        "DEFENSIVE_CLOSE_PENDING",
+                        "DEFENSIVE_CLOSE_RETRY_WAIT",
+                        "DEFENSIVE_CLOSE_LOCK_BUSY",
+                    ):
+                        stats["defensive_pending"] += 1
 
                     if (
                         reason.startswith("BE_ALREADY")
@@ -762,13 +1256,24 @@ def start_position_manager(R) -> None:
         while True:
             try:
                 stats = tick_position_manager(R)
-                if stats.get("enqueued") or stats.get("verified") or stats.get("errors"):
+                if (
+                    stats.get("enqueued")
+                    or stats.get("verified")
+                    or stats.get("defensive_enqueued")
+                    or stats.get("errors")
+                ):
                     log.warning(
-                        "[POSITION_MGR] TICK checked=%s managed=%s enqueued=%s verified=%s errors=%s",
+                        "[POSITION_MGR] TICK "
+                        "checked=%s managed=%s "
+                        "enqueued=%s verified=%s "
+                        "defensive_enqueued=%s defensive_pending=%s "
+                        "errors=%s",
                         stats.get("checked"),
                         stats.get("managed"),
                         stats.get("enqueued"),
                         stats.get("verified"),
+                        stats.get("defensive_enqueued"),
+                        stats.get("defensive_pending"),
                         stats.get("errors"),
                     )
             except Exception:

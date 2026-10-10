@@ -1732,6 +1732,25 @@ def _discover_missing_prop_profiles(uid: str) -> None:
                 profile_id=pid,
             )
 
+            _start_new_prop_account_epoch(
+                uid_u,
+                pid,
+                old_login=current_login,
+                new_login=str(
+                    saved.get("account_login") or ""
+                ).strip(),
+                new_server=str(
+                    saved.get("account_server") or ""
+                ).strip(),
+                broker_balance=float(
+                    live_balance or 0.0
+                ),
+                epoch_ms=int(now_ms),
+                reason=(
+                    "AUTO_VALIDATED_ACCOUNT_REPLACEMENT"
+                ),
+            )
+
             log.warning(
                 "[PROP] PROFILE_ACCOUNT_AUTO_REBOUND "
                 "uid=%s profile=%s old_login=%s "
@@ -1977,6 +1996,176 @@ def _prop_uid_daily_key(
 
  
 
+
+def _start_new_prop_account_epoch(
+    uid: str,
+    profile_id: str,
+    *,
+    old_login: str,
+    new_login: str,
+    new_server: str,
+    broker_balance: float,
+    epoch_ms: int,
+    reason: str,
+) -> dict:
+    """
+    Start a fresh account-owned prop-risk lifecycle after a validated
+    broker account-login replacement.
+
+    Account identity rule:
+      same login  -> preserve runtime risk state
+      changed login -> new account-risk epoch
+
+    Historical trades / analytics / profile configuration are untouched.
+    """
+    uid_u = _require_prop_runtime_uid(uid)
+    pid = _norm_prop_profile_id(profile_id)
+
+    old_login_s = str(old_login or "").strip()
+    new_login_s = str(new_login or "").strip()
+    new_server_s = str(new_server or "").strip()
+
+    if not new_login_s:
+        raise ValueError("PROP_ACCOUNT_EPOCH_LOGIN_REQUIRED")
+
+    # Idempotence / reconnect protection.
+    if old_login_s == new_login_s:
+        return {
+            "changed": False,
+            "reason": "ACCOUNT_IDENTITY_UNCHANGED",
+            "account_login": new_login_s,
+        }
+
+    balance = float(broker_balance or 0.0)
+
+    if balance <= 0.0:
+        raise ValueError(
+            "PROP_ACCOUNT_EPOCH_BALANCE_REQUIRED"
+        )
+
+    epoch_ms_i = int(epoch_ms or 0)
+
+    if epoch_ms_i <= 0:
+        raise ValueError(
+            "PROP_ACCOUNT_EPOCH_TIMESTAMP_REQUIRED"
+        )
+
+    day = _prop_today(uid_u, pid)
+
+    daily_key = _prop_uid_daily_key(
+        uid_u,
+        day,
+        pid,
+    )
+    stats_key = _prop_uid_stats_key(
+        uid_u,
+        pid,
+    )
+    open_risk_key = _prop_uid_open_risk_key(
+        uid_u,
+        pid,
+    )
+    snapshot_key = _prop_risk_snapshot_key(
+        uid_u,
+        pid,
+    )
+
+    stats = R.hgetall(stats_key) or {}
+
+    halt_fields = [
+        "trading_halted",
+        "halt_reason",
+        "halt_ts",
+        "halt_scope",
+        "halt_day",
+        "halt_until_manual_reset",
+    ]
+
+    for key in stats.keys():
+        if isinstance(key, (bytes, bytearray)):
+            key_s = key.decode("utf-8", "ignore")
+        else:
+            key_s = str(key)
+
+        if key_s.startswith("halt_meta_"):
+            halt_fields.append(key_s)
+
+    # Fields owned by the previous broker-account lifecycle.
+    stats_reset_fields = [
+        "consecutive_losing_days",
+        "last_loss_day",
+        "last_day_eval",
+        "last_evaluated_prev_pnl",
+    ]
+
+    daily_mapping = {
+        "account_login": new_login_s,
+        "account_server": new_server_s,
+        "account_epoch_ms": epoch_ms_i,
+        "start_balance": balance,
+        "start_balance_source": "account_identity_change",
+        "start_balance_captured_ts": epoch_ms_i,
+        "broker_balance": balance,
+        "today_closed_pnl": 0.0,
+        "current_daily_result": 0.0,
+        "daily_loss_used": 0.0,
+        "daily_risk_reserved": 0.0,
+        "wins_today": 0,
+        "losses_today": 0,
+        "daily_r": 0.0,
+        "snapshot_valid": 0,
+        "snapshot_fresh": 0,
+    }
+
+    # One Redis transaction prevents readers from observing a partially
+    # reset account-risk epoch.
+    pipe = R.pipeline(transaction=True)
+
+    pipe.hset(
+        daily_key,
+        mapping=daily_mapping,
+    )
+
+    pipe.hdel(
+        stats_key,
+        *sorted(
+            set(
+                halt_fields
+                + stats_reset_fields
+            )
+        ),
+    )
+
+    pipe.delete(open_risk_key)
+    pipe.delete(snapshot_key)
+
+    pipe.execute()
+
+    log.warning(
+        "[PROP] NEW_ACCOUNT_RISK_EPOCH "
+        "uid=%s profile=%s old_login=%s "
+        "new_login=%s server=%s balance=%.2f "
+        "day=%s epoch_ms=%s reason=%s",
+        uid_u,
+        pid,
+        old_login_s,
+        new_login_s,
+        new_server_s,
+        balance,
+        day,
+        epoch_ms_i,
+        str(reason or ""),
+    )
+
+    return {
+        "changed": True,
+        "reason": str(reason or ""),
+        "day": day,
+        "account_login": new_login_s,
+        "account_server": new_server_s,
+        "account_epoch_ms": epoch_ms_i,
+        "start_balance": balance,
+    }
 
 
 DEFAULT_PROP_CFG = {
@@ -3011,12 +3200,22 @@ def _ensure_prop_day_initialized(
 
         now_ms = int(time.time() * 1000)
 
+        _account_login = str(
+            (broker_account or {}).get("login") or ""
+        ).strip()
+        _account_server = str(
+            (broker_account or {}).get("server") or ""
+        ).strip()
+
         R.hset(
             daily_key,
             mapping={
                 "profile_id": pid,
                 "firm": str(ctx.get("firm") or ""),
                 "day": day,
+                "account_login": _account_login,
+                "account_server": _account_server,
+                "account_epoch_ms": now_ms,
                 "start_balance": round(balance, 2),
                 "start_balance_source": (
                     "profile_timezone_day_initializer"
@@ -4917,6 +5116,86 @@ def prop_profile_rebind_account(
             ),
         )
 
+    # Match automatic-rebind safety: never move account ownership
+    # while an XTL trade for this profile remains open.
+    profile_has_open_trade = False
+
+    try:
+        open_rows = (
+            R.hvals(
+                f"xtl:strategy:oppt:open:{uid}"
+            )
+            or []
+        )
+
+        for raw_trade in open_rows:
+            if isinstance(
+                raw_trade,
+                (bytes, bytearray),
+            ):
+                raw_trade = raw_trade.decode(
+                    "utf-8",
+                    "replace",
+                )
+
+            try:
+                trade = json.loads(raw_trade)
+            except Exception:
+                trade = {}
+
+            if not isinstance(trade, dict):
+                continue
+
+            trade_pid = str(
+                trade.get("profile_id") or ""
+            ).strip().lower()
+
+            trade_state = str(
+                trade.get("trade_state")
+                or trade.get("status")
+                or ""
+            ).strip().upper()
+
+            if (
+                trade_pid == pid
+                and trade_state not in {
+                    "CLOSED",
+                    "FAILED",
+                    "ORDER_FAILED",
+                    "EXPIRED",
+                }
+            ):
+                profile_has_open_trade = True
+                break
+
+    except Exception:
+        log.exception(
+            "[PROP] MANUAL_REBIND_OPEN_TRADE_CHECK_FAILED "
+            "uid=%s profile=%s old_login=%s new_login=%s",
+            uid,
+            pid,
+            old_login,
+            selected.get("login"),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="REBIND_OPEN_TRADE_CHECK_FAILED",
+        )
+
+    if profile_has_open_trade:
+        log.error(
+            "[PROP] MANUAL_REBIND_BLOCKED_OPEN_TRADE "
+            "uid=%s profile=%s old_login=%s new_login=%s",
+            uid,
+            pid,
+            old_login,
+            selected.get("login"),
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="REBIND_BLOCKED_OPEN_TRADE",
+        )
+
     updated = dict(existing)
 
     updated["account_login"] = str(
@@ -4976,6 +5255,44 @@ def prop_profile_rebind_account(
         updated,
         profile_id=pid,
     )
+
+    new_login = str(
+        selected.get("login") or ""
+    ).strip()
+
+    if old_login != new_login:
+        selected_account = (
+            selected.get("account")
+            if isinstance(
+                selected.get("account"),
+                dict,
+            )
+            else {}
+        )
+
+        rebind_balance = float(
+            selected_account.get("balance")
+            or selected.get("balance")
+            or 0.0
+        )
+
+        _start_new_prop_account_epoch(
+            uid,
+            pid,
+            old_login=old_login,
+            new_login=new_login,
+            new_server=str(
+                selected.get("server") or ""
+            ).strip(),
+            broker_balance=rebind_balance,
+            epoch_ms=int(
+                updated.get("account_rebound_at_ms")
+                or int(time.time() * 1000)
+            ),
+            reason=(
+                "USER_CONFIRMED_ACCOUNT_REPLACEMENT"
+            ),
+        )
 
     log.warning(
         "[PROP] PROFILE_ACCOUNT_REBOUND "
@@ -8438,7 +8755,67 @@ def _get_prop_risk_state(
         )
 
         if snapshot_valid:
-            if sod_balance > 0 and broker_balance > 0:
+            # -------------------------------------------------
+            # Account-risk ownership invariant.
+            #
+            # Never combine the balance of a replacement MT5
+            # account with a start balance owned by another
+            # account.
+            # -------------------------------------------------
+            _daily_account_login = str(
+                daily.get("account_login") or ""
+            ).strip()
+            _daily_account_server = str(
+                daily.get("account_server") or ""
+            ).strip()
+            _broker_account_login = str(
+                broker.get("login") or ""
+            ).strip()
+            _broker_account_server = str(
+                broker.get("server") or ""
+            ).strip()
+
+            _account_risk_identity_mismatch = bool(
+                _daily_account_login
+                and _broker_account_login
+                and _daily_account_login != _broker_account_login
+            )
+
+            if (
+                not _account_risk_identity_mismatch
+                and _daily_account_server
+                and _broker_account_server
+                and not _broker_identity_matches(
+                    _daily_account_server,
+                    _broker_account_server,
+                )
+            ):
+                _account_risk_identity_mismatch = True
+
+            if _account_risk_identity_mismatch:
+                log.error(
+                    "[PROP] ACCOUNT_RISK_IDENTITY_MISMATCH "
+                    "uid=%s profile=%s day=%s "
+                    "daily_login=%s broker_login=%s "
+                    "daily_server=%s broker_server=%s",
+                    uid_u,
+                    pid,
+                    day,
+                    _daily_account_login,
+                    _broker_account_login,
+                    _daily_account_server,
+                    _broker_account_server,
+                )
+
+                # Fail closed. Never fabricate a replacement SOD.
+                snapshot_valid = False
+                snapshot_fresh = False
+
+            if (
+                snapshot_valid
+                and sod_balance > 0
+                and broker_balance > 0
+            ):
                 today_closed_pnl = (
                     float(broker_balance)
                     - float(sod_balance)
@@ -8609,6 +8986,22 @@ def _get_prop_risk_state(
                 "firm": firm_u,
                 "phase": phase_u,
                 "day": day,
+
+                "account_login": str(
+                    daily.get("account_login")
+                    or broker.get("login")
+                    or ""
+                ).strip(),
+                "account_server": str(
+                    daily.get("account_server")
+                    or broker.get("server")
+                    or ""
+                ).strip(),
+                "account_epoch_ms": str(
+                    daily.get("account_epoch_ms")
+                    or daily.get("start_balance_captured_ts")
+                    or int(time.time() * 1000)
+                ),
 
                 "start_balance": round(float(sod_balance), 2),
                 "broker_balance": round(float(broker_balance), 2),
